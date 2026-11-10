@@ -14,7 +14,8 @@
 //!   lost the lease commits nothing; the system tables once a night by the default cell, a scope's in its turn;
 //! - when a table holds more data files than its threshold, or (the ledger and the summaries) its last compaction
 //!   is older than a day (read as of the window's close) and there are files to merge:
-//!   - the ledger: `MEMSTORE_LEDGER_COMPACT_FILES` (500), `_EVERY` (24h), up to `_MAX_FILES` (2000);
+//!   - the ledger: `MEMSTORE_LEDGER_COMPACT_FILES` (500), `_EVERY` (24h), up to `_MAX_FILES` (100,000) and
+//!     `_MAX_BYTES` (1 GiB);
 //!   - each scope's summaries: `MEMSTORE_AGGREGATES_COMPACT_FILES` (200), `_EVERY` (24h), up to `_MAX_FILES` (20,000);
 //!   - every other table (facts, episodes, quotes, closures, extractions, schemas, retention, retractions, the
 //!     answer log, feedback, summary requests, workspace snapshots; the directory and its snapshots, installations,
@@ -61,9 +62,19 @@ pub struct Config {
 }
 
 impl Config {
-    /// The ledger's: `MEMSTORE_LEDGER_COMPACT*`.
+    /// The ledger's: `MEMSTORE_LEDGER_COMPACT*`. Its ceiling is a day's commits and more: every write is a ledger
+    /// commit and a file, a busy deployment's day is thousands (dev: 1,200 to 6,000), and a ceiling under that
+    /// (2,000, set when it was compacted hourly) had the window leave it alone every night from then on, 37,000
+    /// files that a server's start took minutes to read. A rewrite holds its rows in memory, so 1 GiB at most, as
+    /// every other table (dev's 69,000 rows are 105 MB).
     pub fn from_env() -> Result<Self> {
-        Self::read("MEMSTORE_LEDGER_COMPACT", 500, Some(24 * 3600), 2000, None)
+        Self::read(
+            "MEMSTORE_LEDGER_COMPACT",
+            500,
+            Some(24 * 3600),
+            100_000,
+            Some(1 << 30),
+        )
     }
 
     /// Each scope's summaries': `MEMSTORE_AGGREGATES_COMPACT*`. Fewer files before a compaction than the

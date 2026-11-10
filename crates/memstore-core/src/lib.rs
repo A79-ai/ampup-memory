@@ -8395,6 +8395,7 @@ async fn load_plan_once(catalog: &dyn Catalog, ns: &str) -> Result<(Table, Vec<F
             table
                 .scan()
                 .select_all()
+                .with_concurrency_limit(LOAD_CONCURRENCY)
                 .build()?
                 .plan_files()
                 .await?
@@ -8728,11 +8729,18 @@ async fn read_planned(
     Ok((read_tasks(table, tasks, cached).await?, planned))
 }
 
+/// Object-store reads one table load keeps in flight: its manifests while planning, then its data files. They wait
+/// on the network, not the CPU, so the planner's default (one per CPU, 4 on a 3.5-CPU pod) left a ledger of 37,000
+/// one-commit files planning for minutes, past the life of the snapshot it was planning; and an unbounded fan-out
+/// of the data files asks the store for every file at once.
+const LOAD_CONCURRENCY: usize = 64;
+
 /// Every scan task of the table's current snapshot.
 async fn plan_all(table: &Table) -> Result<Vec<FileScanTask>> {
     Ok(table
         .scan()
         .select_all()
+        .with_concurrency_limit(LOAD_CONCURRENCY)
         .build()?
         .plan_files()
         .await?
@@ -8888,7 +8896,9 @@ pub(crate) async fn read_tasks(
             Ok((key, Arc::new(read_task(table, task).await?)))
         }
     });
-    Ok(futures::future::try_join_all(reads)
+    Ok(futures::stream::iter(reads)
+        .buffer_unordered(LOAD_CONCURRENCY)
+        .try_collect::<Vec<_>>()
         .await?
         .into_iter()
         .collect())
