@@ -148,7 +148,7 @@ async fn an_admin_holds_a_note_and_a_harness_notice_is_never_a_task() {
     let map = json!({"categories": {"work": {"description": "d", "situations": {
             "do-it": {"when": "rank accounts by churn", "skills": []}}}},
         "assign": assign, "notes": {"work/do-it": "h"}, "acl": ["*"], "linked": "",
-        "written": {"work/do-it": {"runs": 4, "wrong": 0, "context": "", "format": "kinds-2-cited-backed"}}});
+        "written": {"work/do-it": {"runs": 4, "wrong": 0, "context": "", "format": "kinds-3-budgeted"}}});
     store
         .commit(
             &acme,

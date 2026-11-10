@@ -323,7 +323,7 @@ async fn a_notes_lessons_are_traced_item_by_item_across_its_versions() {
     let map = json!({"categories": {"work": {"description": "d", "situations": {
             "do-it": {"when": "rank accounts by churn", "skills": []}}}},
         "assign": assign, "notes": {"work/do-it": "h"}, "held": ["work/do-it"], "acl": ["*"], "linked": "",
-        "written": {"work/do-it": {"runs": 4, "wrong": 0, "context": "", "format": "kinds-2-cited-backed"}}});
+        "written": {"work/do-it": {"runs": 4, "wrong": 0, "context": "", "format": "kinds-3-budgeted"}}});
     let old = "# Advice: do it\n\n## When\nrank accounts by churn\n\n## Steps\n\
                1. [how-to] KEEP-STEP query the table\n2. [fact] OLD-FACT churn lives in billing\n\n\
                ## Pitfalls\n- [pitfall] OLD-PITFALL skipping the check of the export\n";
