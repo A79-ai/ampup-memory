@@ -800,6 +800,8 @@ pub async fn serve_with(
                             }
                         });
                     }
+                    // People's notes due a dream (`crate::notes_dream`): looked at hourly, a pass in the background.
+                    crate::notes_dream::sweep(&store, &scope, st.fixed());
                 }
             }
         });
@@ -3703,9 +3705,9 @@ const RESERVED_SOURCES: [&str; 4] = ["mcp:", "goal:", "compile:", "advice:"];
 
 /// Document keys the server writes itself: goals (`goals/`, from before they were retired), compiled skills and their AIP graphs
 /// ([`crate::compile::SKILLS`], [`crate::compile::AIP`]), learned advice ([`crate::advice::PREFIX`]), which
-/// `get_advice` serves as the scope's own, people's profiles ([`crate::profile::PREFIX`]), and sessions'
-/// transcripts ([`crate::transcripts::PREFIX`]).
-const RESERVED_DOCUMENTS: [&str; 7] = [
+/// `get_advice` serves as the scope's own, people's profiles and notes dream records ([`crate::profile::PREFIX`],
+/// [`crate::notes_dream::PREFIX`]), and sessions' transcripts ([`crate::transcripts::PREFIX`]).
+const RESERVED_DOCUMENTS: [&str; 8] = [
     "goals/",
     crate::compile::SKILLS,
     crate::compile::AIP,
@@ -3713,6 +3715,7 @@ const RESERVED_DOCUMENTS: [&str; 7] = [
     crate::advice::MINE,
     crate::profile::PREFIX,
     crate::transcripts::PREFIX,
+    crate::notes_dream::PREFIX,
 ];
 
 /// The largest version of a starter document a note may write (the hooks send files of up to this).
@@ -13527,6 +13530,8 @@ async fn forget(
         crate::profile::forgotten(store, scope, me, state.fixed(), episode_id).await?;
         // A part of a session's transcript goes in every version, so no earlier send of it is read again.
         let more = crate::transcripts::forgotten(store, scope, me, episode_id).await?;
+        // Nor any record their notes dream rests on it (or on another version of the same part).
+        crate::notes_dream::forgotten(store, scope, me, state.fixed(), episode_id).await?;
         if more > 0 {
             return Ok(format!(
                 "forgot episode {episode_id}, and {more} other version{} of the same transcript part",

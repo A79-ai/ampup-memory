@@ -2098,7 +2098,10 @@ async fn agent_model() -> String {
 /// fact search, nor the first ask for advice in their own session, which hands the notes that bear on its task (an
 /// agent's on `/mcp`, the hooks' on `/mcp/hook`); nor an agent run (`/agent/run`) for someone else that asks for it by
 /// id and by key. Carol reads hers: by a start that says what she asked, and by the first ask in a session that
-/// started with nothing asked, whose start hands none.
+/// started with nothing asked, whose start hands none. So is what dreaming over her notes concluded
+/// (`memstore::notes_dream`): a session of hers says her first note changed, in a record the agent wrote, so the
+/// replacement proposed stands as a conflict; the record that says so (which quotes the session) is read by her alone,
+/// on every path.
 /// The server has a BigQuery inbox (`AMPUP_MEMORY_INBOX_TABLE`, as a GCP deployment does): the deployment's one inbox,
 /// drained into the default org's memory, takes the served scope's writes only. What acme's members remember goes
 /// into acme's memory, never the inbox; acme's reader key is refused a write still.
@@ -2244,6 +2247,29 @@ async fn a_persons_profile_reaches_no_one_else() {
         "{carol_body}"
     );
     *carol_profile.lock().unwrap() = carol_id.clone();
+    // A session of hers says her first note changed; her notes are dreamed over. An ended session's record is the
+    // agent's text, whose `User:` line may be the agent's own: the replacement the model proposes from it stands as a
+    // conflict, the line no one's.
+    let decided = dream_notes(
+        s,
+        "?org=acme",
+        &carol,
+        (&store, &acme, "carol@acme.com"),
+        "User: xprofdreamcarol we indent with tabs now, not spaces\nAssistant: noted",
+    )
+    .await;
+    let conflict = decided
+        .iter()
+        .find(|d| d["kind"] == "conflict" && d["proposed"] == "replaced" && d["from"] == "unknown")
+        .unwrap_or_else(|| panic!("no replacement made a conflict: {decided:?}"));
+    assert!(
+        !decided.iter().any(|d| d["kind"] == "replaced"),
+        "{decided:?}"
+    );
+    let (dream_key, dream_id) = (
+        conflict["record"].as_str().unwrap().to_string(),
+        conflict["episode"].as_str().unwrap().to_string(),
+    );
 
     // What a session's start or first ask is about: the notes that bear on it are handed.
     let task = "how should I indent this file, with spaces?";
@@ -2301,9 +2327,35 @@ async fn a_persons_profile_reaches_no_one_else() {
             &[],
         );
     }
+    // And what her notes dream concluded: the record reads, by its key and its id, once the server reads past it
+    // (its snapshot is up to a second old).
+    for (tool, args) in [
+        ("get_episode", json!({"document": dream_key})),
+        (
+            "get_episode",
+            json!({"episode_id": dream_id, "whole": true}),
+        ),
+    ] {
+        let t = std::time::Instant::now();
+        loop {
+            let (_, raw) = mcp_call(s, "?org=acme", &carol, tool, args.clone()).await;
+            let text = tool_text(&raw).0;
+            if text.contains("xprofdreamcarol") || t.elapsed() > std::time::Duration::from_secs(10)
+            {
+                assert_sees(
+                    &format!("carol's dream {tool}"),
+                    &text,
+                    &["xprofdreamcarol".to_string()],
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
 
     // No one else reads it, on any path.
-    let foreign = vec!["xprofcarol".to_string()];
+    let foreign = vec!["xprofcarol".to_string(), "xprofdreamcarol".to_string()];
+    let asked = vec![carol_doc.clone(), dream_key.clone()];
     let others = [
         ("acme admin", person("alice@acme.com"), "?org=acme"),
         ("acme member with a profile", bob.clone(), "?org=acme"),
@@ -2356,6 +2408,13 @@ async fn a_persons_profile_reaches_no_one_else() {
                 json!({"episode_id": carol_id, "whole": true}),
             ),
             ("get_episode", json!({"document": carol_doc})),
+            // Her notes dream's record, by its key and its id, and the list of its documents.
+            ("get_episode", json!({"document": dream_key})),
+            (
+                "get_episode",
+                json!({"episode_id": dream_id, "whole": true}),
+            ),
+            ("get_episode", json!({"document": "notes-dream/"})),
             // By her notes' words: a query is echoed, so not by the tag.
             (
                 "search_memory",
@@ -2368,12 +2427,7 @@ async fn a_persons_profile_reaches_no_one_else() {
             ("list_facts", json!({"limit": 500})),
         ] {
             let (_, raw) = mcp_call(s, sel, bearer, tool, args).await;
-            assert_clean(
-                &what(&format!("/mcp {tool}")),
-                &raw,
-                &foreign,
-                std::slice::from_ref(&carol_doc),
-            );
+            assert_clean(&what(&format!("/mcp {tool}")), &raw, &foreign, &asked);
             checked += 1;
         }
         for (path, body) in [
@@ -2381,24 +2435,24 @@ async fn a_persons_profile_reaches_no_one_else() {
             ("/document", json!({"calls": [[""]]})),
             ("/document", json!({"calls": [[carol_doc]]})),
             ("/browse", json!({"op": "episode", "id": carol_id})),
+            ("/episode", json!({"calls": [[dream_id]]})),
+            ("/document", json!({"calls": [[dream_key]]})),
+            ("/browse", json!({"op": "episode", "id": dream_id})),
             (
                 "/search",
                 json!({"calls": [["preference indent spaces", 50, -1, 400]]}),
             ),
         ] {
             let (_, answer) = post(&format!("{s}{path}{sel}"), bearer, &body).await;
-            assert_clean(
-                &what(path),
-                &answer,
-                &foreign,
-                std::slice::from_ref(&carol_doc),
-            );
-            // The list of documents never names her profile's key.
-            assert!(
-                !answer.contains(&carol_doc) || body.to_string().contains(&carol_doc),
-                "{}: {answer}",
-                what(path)
-            );
+            assert_clean(&what(path), &answer, &foreign, &asked);
+            // The list of documents never names her profile's key, nor her notes dream's.
+            for key in &asked {
+                assert!(
+                    !answer.contains(key.as_str()) || body.to_string().contains(key.as_str()),
+                    "{}: {answer}",
+                    what(path)
+                );
+            }
             checked += 1;
         }
     }
@@ -2447,6 +2501,59 @@ fn first_ask(path: &str, session_id: &str, task: &str) -> Value {
     }
     json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
            "params": {"name": "get_advice", "arguments": args}})
+}
+
+/// Ends a session of `bearer`'s in `sel` with `transcript`, then dreams over `user`'s notes in `scope`
+/// (`memstore::notes_dream`, as `memstore dream --notes --person` does, with the stand-in model, which proposes
+/// replacing their oldest note by the session's first `User:` line, a conflict as the record is the agent's text):
+/// the decisions it committed, each naming its record and episode.
+pub(crate) async fn dream_notes(
+    server: &str,
+    sel: &str,
+    bearer: &str,
+    (store, scope, user): (&Store, &Scope, &str),
+    transcript: &str,
+) -> Vec<Value> {
+    let (_, raw) = mcp_call(
+        server,
+        sel,
+        bearer,
+        "start_session",
+        json!({"harness": "test"}),
+    )
+    .await;
+    let started: Value = serde_json::from_str(&tool_text(&raw).0).unwrap();
+    let id = started["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_string();
+    let (_, raw) = mcp_call(
+        server,
+        sel,
+        bearer,
+        "end_session",
+        json!({"session_id": id, "transcript": transcript, "outcome": "done"}),
+    )
+    .await;
+    assert!(!tool_text(&raw).1, "{raw}");
+    let ex = memstore::extract::Extractor::notes_dream_from_env()
+        .unwrap()
+        .expect("a model");
+    let budget = memstore::notes_dream::Budget::from_env().unwrap();
+    memstore::notes_dream::pass(
+        store,
+        scope,
+        &ex,
+        &budget,
+        false,
+        Some(user),
+        false,
+        false,
+        &mut |_| {},
+    )
+    .await
+    .unwrap()
+    .decisions
 }
 
 /// A model API (OpenAI-compatible) standing in for both models the profile flow calls: a profile fold adds each note
@@ -2532,6 +2639,17 @@ async fn stand_in(
                     } else {
                         json!({"role": "assistant", "content": results.join("\n")})
                     }
+                } else if prompt.starts_with("You check one person's memory") {
+                    // A notes dream (`memstore::notes_dream`): the oldest note replaced by the first session, in the
+                    // words of the first thing the session has the user say.
+                    let said = prompt
+                        .lines()
+                        .skip_while(|l| *l != "Sessions:")
+                        .find_map(|l| l.strip_prefix("User: "))
+                        .unwrap_or_default();
+                    let reply = json!({"replaced": [{"note": "N1", "by": "S1", "now": said, "quote": said,
+                                                     "why": "the session says it changed"}]});
+                    json!({"role": "assistant", "content": reply.to_string()})
                 } else if prompt.starts_with("You keep one person's profile") {
                     if let Some((asked, mut open)) = gate {
                         asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

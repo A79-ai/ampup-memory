@@ -2029,8 +2029,12 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
 /// What a person forgets leaves their profile (`memstore::profile`, the setting `profile`), and forgetting the person
 /// deletes it. Carol tells her agent five things in acme, which folds profiles; then she forgets one of them
 /// (`forget_memory`): the profile she is handed and reads holds the other four and nothing of it, and the version
-/// folded before, which held it, is read by no one. Then acme's admin forgets Carol: every version of her profile is
-/// gone from every file in the warehouse and the index, with her notes, and Bob's note stays.
+/// folded before, which held it, is read by no one. Her notes are dreamed over (`memstore::notes_dream`) against a
+/// session of hers that says her first note changed, and she reads the record that says so (a conflict, as the
+/// session's record is the agent's text); she forgets the session, and the record (which quotes the session) goes
+/// with it at once. Then acme's admin forgets Carol: every version of her profile is gone
+/// from every file in the warehouse and the index, with her notes and her notes dream's record, and Bob's note
+/// stays.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forgotten_note_leaves_its_owners_profile() {
     if !crate::own_process("offboarding::a_forgotten_note_leaves_its_owners_profile") {
@@ -2249,10 +2253,49 @@ async fn a_forgotten_note_leaves_its_owners_profile() {
         assert!(!raw.contains("xpfold"), "{raw}");
     }
 
+    // A session of hers says her first note changed: dreamed over, she reads the record that says so.
+    let decided = crate::isolation::dream_notes(
+        s,
+        "?org=acme",
+        &carol,
+        (&store, &acme, "carol@acme.com"),
+        "User: xpdreamsaid we indent with tabs now\nAssistant: noted",
+    )
+    .await;
+    // (A conflict: an ended session's `User:` line is the agent's text.)
+    let conflict = decided
+        .iter()
+        .find(|d| d["kind"] == "conflict")
+        .unwrap_or_else(|| panic!("no conflict: {decided:?}"));
+    let [dream_key, dream_id, session] =
+        ["record", "episode", "session"].map(|k| conflict[k].as_str().unwrap().to_string());
+    // Once the server reads past the record (its snapshot is up to a second old).
+    let t = Instant::now();
+    loop {
+        let read = tool(&carol, "get_episode", json!({"document": dream_key})).await;
+        if read.contains("xpdreamsaid") {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "{read}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // She forgets the session: the record that concluded from it goes at once (as the server reads).
+    let said = tool(&carol, "forget_memory", json!({"episode_id": session})).await;
+    assert!(said.starts_with("forgot episode"), "{said}");
+    let t = Instant::now();
+    loop {
+        let read = tool(&carol, "get_episode", json!({"document": dream_key})).await;
+        if !read.contains("xpdreamsaid") {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "{read}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
     // Acme's admin forgets Carol: every version of her profile goes from every file, with her notes.
     assert!(
-        !in_files("xpfoldzero").is_empty(),
-        "her notes and profile are stored"
+        !in_files("xpfoldzero").is_empty() && !files_with(&warehouse, &dream_id).is_empty(),
+        "her notes, profile and notes dream are stored"
     );
     let (status, body) = admin_as(
         s,
@@ -2268,6 +2311,15 @@ async fn a_forgotten_note_leaves_its_owners_profile() {
     for t in tags {
         assert_eq!(in_files(t), Vec::<PathBuf>::new(), "{t} still stored");
     }
+    let dream_files: Vec<PathBuf> = files_with(&warehouse, &dream_id)
+        .into_iter()
+        .filter(|f| f.to_string_lossy().contains("/episodes/"))
+        .collect();
+    assert_eq!(
+        dream_files,
+        Vec::<PathBuf>::new(),
+        "her notes dream's record"
+    );
     assert!(
         !in_files("xpbobkeeps").is_empty(),
         "bob's note went with her"

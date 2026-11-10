@@ -301,9 +301,18 @@ enum Cmd {
         /// JSON lines, and commit nothing
         #[arg(long)]
         dry_run: bool,
-        /// Most model calls this pass (else AMPUP_MEMORY_DREAM_CALLS, default 100)
+        /// Most model calls this pass (else AMPUP_MEMORY_DREAM_CALLS, default 100; with --notes,
+        /// AMPUP_MEMORY_NOTES_DREAM_CALLS, default 20)
         #[arg(long)]
         calls: Option<usize>,
+        /// Dream over each person's own notes instead, against their own sessions: mark a note the person changed
+        /// in a later session replaced, doubt and conflicts, and duplicates. AMPUP_MEMORY_NOTES_DREAM picks the
+        /// backend (else AMPUP_MEMORY_EXTRACT's; Claude Opus 5.5 unless AMPUP_MEMORY_NOTES_DREAM_MODEL names another)
+        #[arg(long)]
+        notes: bool,
+        /// With --notes, only this person (their user id), weighed whatever is new
+        #[arg(long, requires = "notes")]
+        person: Option<String>,
         /// A `serve --local` directory, instead of the catalog the environment names (stop the server first)
         #[arg(long)]
         local: Option<PathBuf>,
@@ -387,7 +396,8 @@ enum Cmd {
     /// Take back facts, for every reader: one by id, or every commit an extractor made so far (an actor prefix
     /// from the ledger, such as extract:<model>@g1/schema:<name>@v2, or a dreamer's, dream:<model>@s2). A withdrawn
     /// extractor's episodes are read again by the next extraction, summaries citing its facts are redone by the next
-    /// aggregation, and a withdrawn dreamer's endings, links and aliases are gone
+    /// aggregation, and a withdrawn dreamer's endings, links and aliases are gone (a notes dreamer's,
+    /// dream:notes:<model>@n1, its records of people's notes)
     RetractFacts {
         scope: String,
         #[arg(
@@ -1595,6 +1605,64 @@ async fn extract(
 }
 
 /// `memstore dream`: one pass, or with `dry_run` what a pass would do.
+/// `memstore dream --notes`: a pass over people's own notes (`memstore::notes_dream`), whatever the setting and the
+/// cadence say, printing each decision with its evidence as a JSON line. `one_caller`: a `serve --local` store,
+/// whose one caller's notes are everyone's.
+async fn dream_notes(
+    store: &Store,
+    scope: &str,
+    dry_run: bool,
+    calls: Option<usize>,
+    person: Option<&str>,
+    one_caller: bool,
+) -> Result<()> {
+    let ex = memstore::extract::Extractor::notes_dream_from_env()?
+        .ok_or_else(|| anyhow::anyhow!(NO_MODEL))?;
+    let scope = Scope::parse(scope)?;
+    let mut budget = memstore::notes_dream::Budget::from_env()?;
+    if let Some(n) = calls {
+        anyhow::ensure!(n > 0, "--calls is a whole number above 0");
+        budget.calls = n;
+    }
+    let r = memstore::notes_dream::pass(
+        store,
+        &scope,
+        &ex,
+        &budget,
+        one_caller,
+        person,
+        false,
+        dry_run,
+        &mut |d| println!("{d}"),
+    )
+    .await?;
+    eprintln!(
+        "{}{}: {} people due, {} weighed in {} calls ({} failed, {} left for the next pass); {} replaced, \
+         {} unsure, {} conflicts ({} proposed as replacements from words not the person's), {} duplicates, {} \
+         refused, {} released; {}",
+        r.dreamer,
+        if dry_run {
+            " (dry run, nothing committed)"
+        } else {
+            ""
+        },
+        r.due,
+        r.weighed,
+        r.calls,
+        r.failed,
+        r.left,
+        r.replaced,
+        r.unsure,
+        r.conflicts,
+        r.downgraded,
+        r.same,
+        r.refused,
+        r.released,
+        ex.calls()
+    );
+    Ok(())
+}
+
 async fn dream(store: &Store, scope: &str, dry_run: bool, calls: Option<usize>) -> Result<()> {
     let ex =
         memstore::extract::Extractor::dream_from_env()?.ok_or_else(|| anyhow::anyhow!(NO_MODEL))?;
@@ -1729,9 +1797,14 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             scope,
             dry_run,
             calls,
+            notes,
+            person,
             local: Some(dir),
         } => {
             let store = local_store(dir).await?;
+            if *notes {
+                return dream_notes(&store, scope, *dry_run, *calls, person.as_deref(), true).await;
+            }
             return dream(&store, scope, *dry_run, *calls).await;
         }
         Cmd::Load {
@@ -2518,6 +2591,14 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             branch,
             ..
         } => extract(&store, &scope, &branch, limit, dry_run).await?,
+        Cmd::Dream {
+            scope,
+            dry_run,
+            calls,
+            notes: true,
+            person,
+            ..
+        } => dream_notes(&store, &scope, dry_run, calls, person.as_deref(), false).await?,
         Cmd::Dream {
             scope,
             dry_run,

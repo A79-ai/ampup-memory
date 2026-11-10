@@ -309,7 +309,7 @@ pub fn wrote(key: &str, by_server: bool, text: &str, answer: &str) {
 }
 
 /// A text's words of three letters or more, and its numbers, lowercased.
-fn words(text: &str) -> (HashSet<String>, HashSet<String>) {
+pub(crate) fn words(text: &str) -> (HashSet<String>, HashSet<String>) {
     let all = text
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
@@ -795,10 +795,11 @@ pub async fn own_matching(
             crate::timestamps(b, "occurred_at"),
         );
         for i in 0..ids.len() {
-            // Their profile (`crate::profile`) isn't a note of theirs to forget: it is folded from them.
+            // Their profile (`crate::profile`) and their notes dream's records (`crate::notes_dream`) aren't notes
+            // of theirs to forget: they are drawn from them (`memstore:`).
             let theirs = sources[i]
                 .strip_prefix(&own)
-                .is_some_and(|s| !s.starts_with("run:") && s != crate::profile::SOURCE_TAIL);
+                .is_some_and(|s| !s.starts_with("run:") && !s.starts_with("memstore:"));
             if theirs && vis.committed.contains(&commits[i]) && vis.can_see_episode(&ids[i], who) {
                 found.insert(ids[i].clone(), at[i].unwrap_or_default());
             }

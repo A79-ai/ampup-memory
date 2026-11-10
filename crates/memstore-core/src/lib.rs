@@ -54,11 +54,20 @@ pub const PERSONAL_ADVICE_SOURCE: &str = "advice:mine:";
 /// id, so a purge of a note takes every version naming it ([`is_profile_source`]).
 pub const PROFILE_SOURCE_TAIL: &str = "memstore:profile";
 
-/// Whether `source` is a person's profile's ([`PROFILE_SOURCE_TAIL`]).
+/// What follows a person in the source of their notes dream's records (`mcp:remember_memory:<them>:memstore:dream`,
+/// `memstore::notes_dream`): no note may take it. A record names the notes and sessions it rests on by id, and may
+/// quote a session, so a purge of any of them takes it, as it takes a profile version ([`is_profile_source`]).
+pub const NOTES_DREAM_SOURCE_TAIL: &str = "memstore:dream";
+
+/// Whether `source` is what the server derives from one person's own notes and sessions and files under their
+/// name: their profile's ([`PROFILE_SOURCE_TAIL`]) or their notes dream's records ([`NOTES_DREAM_SOURCE_TAIL`]).
 pub fn is_profile_source(source: &str) -> bool {
     source
         .strip_prefix(REMEMBER_SOURCE)
-        .and_then(|s| s.strip_suffix(PROFILE_SOURCE_TAIL))
+        .and_then(|s| {
+            s.strip_suffix(PROFILE_SOURCE_TAIL)
+                .or_else(|| s.strip_suffix(NOTES_DREAM_SOURCE_TAIL))
+        })
         .is_some_and(|who| who.len() > 2 && who.starts_with(':') && who.ends_with(':'))
 }
 /// The documents a dream records its duplicate links under, `dream/same/<kept fact>/<duplicate fact>`: one

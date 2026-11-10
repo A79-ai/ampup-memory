@@ -932,7 +932,9 @@ async fn the_nightly_window_purges_what_aged_out_or_was_deleted_where_the_org_as
 /// versions that held them are hidden. Past the grace, the window's first try at the purge stops right after it
 /// deleted the bodies, before the rows (as a server killed there would): only a version's body said what it names.
 /// The next night's purge still deletes both notes and every version naming them from every file of the warehouse
-/// and the index; her other notes and the profile now standing stay.
+/// and the index; her other notes and the profile now standing stay. So too the record her notes dream
+/// (`memstore::notes_dream`) made of her oldest note, which a later session of hers says otherwise than: it names the
+/// note, so it goes with it.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_nightly_window_purges_the_profile_versions_naming_what_it_purges() {
     if !crate::own_process(
@@ -1099,6 +1101,25 @@ async fn the_nightly_window_purges_the_profile_versions_naming_what_it_purges() 
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
+    // A session of hers says otherwise than her oldest note, and her notes dream records it (a conflict: an ended
+    // session's `User:` line is the agent's text).
+    let decided = crate::isolation::dream_notes(
+        s,
+        "?org=acme",
+        &carol,
+        (&store, &acme, "carol@acme.com"),
+        "User: xprofdreamsaid we indent with spaces now\nAssistant: noted",
+    )
+    .await;
+    let conflict = decided
+        .iter()
+        .find(|d| d["kind"] == "conflict")
+        .unwrap_or_else(|| panic!("no conflict: {decided:?}"));
+    let dreamed = conflict["episode"].as_str().unwrap().to_string();
+    assert!(
+        conflict["note"] == "xprofagednote preference: indent with tabs",
+        "{conflict}"
+    );
 
     // Her oldest note ages out, and her source deletes another.
     let (status, body) = admin_as(
@@ -1220,9 +1241,15 @@ async fn the_nightly_window_purges_the_profile_versions_naming_what_it_purges() 
         Vec::<PathBuf>::new(),
         "the version naming them"
     );
-    // Every version of hers still stored has its body, and cites neither note.
+    assert_eq!(
+        episode_files(&dreamed),
+        Vec::<PathBuf>::new(),
+        "the notes dream's record naming the aged note"
+    );
+    // Every version of hers still stored, and every record of her notes dream, has its body and cites neither note.
     store.invalidate(&acme.namespace(), memstore::EPISODES);
     let source = memstore::profile::source("carol@acme.com");
+    let dream_source = memstore::notes_dream::source("carol@acme.com");
     let versions: Vec<String> = store
         .rows(&acme.namespace(), memstore::EPISODES)
         .await
@@ -1234,7 +1261,7 @@ async fn the_nightly_window_purges_the_profile_versions_naming_what_it_purges() 
                 .into_iter()
                 .zip(memstore::strings(b, "source"))
         })
-        .filter(|(_, s)| *s == source)
+        .filter(|(_, s)| *s == source || *s == dream_source)
         .map(|(id, _)| id)
         .collect();
     let bodies = store.episode_bodies(&acme, versions.clone()).await.unwrap();

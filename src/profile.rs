@@ -188,7 +188,7 @@ pub fn document(author: &str) -> String {
 
 /// Who wrote a `remember_memory` episode, and the rest of its source after them: a service key's `key:<org>/<name>`,
 /// else everything up to the next `:`.
-fn author_of(source: &str) -> Option<(&str, &str)> {
+pub(crate) fn author_of(source: &str) -> Option<(&str, &str)> {
     let rest = source
         .strip_prefix(crate::REMEMBER_SOURCE)?
         .strip_prefix(':')?;
@@ -199,13 +199,14 @@ fn author_of(source: &str) -> Option<(&str, &str)> {
 
 /// Whether what follows a note's author in its source is a note to hand at a session's start: not a run's trace, a
 /// session's (`session:<id>`) or the conversation a Stop kept of one, a hook's session note (what was said, not
-/// what to honour) or its transcript, or a profile.
+/// what to honour) or its transcript, nor what the server files under them (`memstore:`: a profile, a notes
+/// dream's records).
 pub(crate) fn is_note(rest: &str) -> bool {
     !rest.starts_with("run:")
         && !rest.starts_with("session:")
         && !rest.starts_with(crate::transcripts::SOURCE)
         && !crate::keep::session_note(rest)
-        && rest != SOURCE_TAIL
+        && !rest.starts_with("memstore:")
 }
 
 /// One person's notes and their profile in a session.
@@ -217,6 +218,11 @@ pub(crate) struct Theirs {
     pub profile: Option<(String, i64)>,
     /// Every version of it they can read (one, but for a moment while a new one is written).
     pub versions: Vec<String>,
+    /// The records of their sessions they can read (`crate::notes_dream::TRANSCRIPTS`): what their notes are
+    /// checked against.
+    pub sessions: Vec<crate::notes_dream::Material>,
+    /// Their notes dream's records they can read, by id: when each was written, and its document.
+    pub dreamed: HashMap<String, (i64, String)>,
 }
 
 /// Every person's notes and profile in `session` (`only`: one person's), from the episode rows the store keeps in
@@ -253,7 +259,16 @@ pub(crate) async fn scan(
                     .as_deref()
                     .is_some_and(|d| d.starts_with(PREFIX))
                 && vis.actor(&commits[i]) == Some(crate::keep::SHARER);
-            if !profile && !is_note(rest) {
+            // A record of their notes dream: by a notes dreamer, under their own source, of its documents.
+            let dreamed = (rest == crate::notes_dream::SOURCE_TAIL)
+                .then(|| documents[i].as_deref())
+                .flatten()
+                .filter(|d| {
+                    d.starts_with(crate::notes_dream::PREFIX)
+                        && crate::notes_dream::by_dreamer(vis.actor(&commits[i]))
+                });
+            let session = crate::notes_dream::session_of(rest);
+            if !profile && dreamed.is_none() && session.is_none() && !is_note(rest) {
                 continue;
             }
             let id = &ids[i];
@@ -262,15 +277,33 @@ pub(crate) async fn scan(
                 [one] => *one == format!("user:{author}") || (one_caller && one == "*"),
                 _ => false,
             };
+            // A session of the one caller of a server that identifies no one is kept to its groups.
+            let groups = match session {
+                Some(_) if one_caller && !alone => crate::notes_dream::one_callers(acl),
+                _ => vec![],
+            };
             let reader = readers
                 .entry(author.to_string())
                 .or_insert_with(|| crate::Principal::new(author, &[]));
-            if !alone || !vis.can_see_episode(id, reader) {
+            let seen = match groups.is_empty() {
+                true => alone && vis.can_see_episode(id, reader),
+                false => vis.can_see_episode(id, &crate::Principal::new(author, &groups)),
+            };
+            if !seen {
                 continue;
             }
             let theirs = out.entry(author.to_string()).or_default();
             let t = at[i].unwrap_or_default();
-            if profile {
+            if let Some(d) = dreamed {
+                theirs.dreamed.insert(id.clone(), (t, d.to_string()));
+            } else if let Some((rank, key)) = session {
+                theirs.sessions.push(crate::notes_dream::Material {
+                    id: id.clone(),
+                    at: t,
+                    rank,
+                    key,
+                });
+            } else if profile {
                 if theirs.profile.as_ref().is_none_or(|(_, p)| t > *p) {
                     theirs.profile = Some((id.clone(), t));
                 }
@@ -313,7 +346,11 @@ async fn load(store: &Store, scope: &Scope, id: &str) -> Result<Option<Profile>>
 }
 
 /// The notes `ids` as one line of words each (empty where a body can't be read).
-async fn texts(store: &Store, scope: &Scope, ids: Vec<String>) -> Result<HashMap<String, String>> {
+pub(crate) async fn texts(
+    store: &Store,
+    scope: &Scope,
+    ids: Vec<String>,
+) -> Result<HashMap<String, String>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -425,7 +462,7 @@ pub(crate) async fn handed(
 }
 
 /// `2026-04-15`, UTC.
-fn day(us: i64) -> String {
+pub(crate) fn day(us: i64) -> String {
     chrono::DateTime::from_timestamp_micros(us)
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_default()
@@ -621,7 +658,7 @@ async fn commit(
 
 /// One person's turn at their profile in a scope: a fold and a forget's repair never run at once, so a fold that read
 /// a note before it was forgotten can't write a version holding it after the repair.
-fn turn(scope: &Scope, author: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn turn(scope: &Scope, author: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static TURNS: LazyLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
         LazyLock::new(Default::default);
     TURNS
@@ -634,7 +671,7 @@ fn turn(scope: &Scope, author: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
 
 /// `scope` on main as the store holds it now, not as a read up to a second old saw it (as [`Store::forget`] reads):
 /// what was folded or forgotten a moment ago is in it.
-async fn fresh(store: &Store, scope: &Scope) -> Result<Session> {
+pub(crate) async fn fresh(store: &Store, scope: &Scope) -> Result<Session> {
     store.invalidate(crate::SYSTEM_NS, "ledger");
     store.invalidate(&scope.namespace(), crate::EPISODES);
     store.pin(scope, MAIN).await

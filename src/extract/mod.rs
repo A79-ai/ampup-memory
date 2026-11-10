@@ -562,6 +562,38 @@ impl Extractor {
         )
     }
 
+    /// The model a person's notes are dreamed over with (`crate::notes_dream`): `AMPUP_MEMORY_NOTES_DREAM` and its
+    /// `_URL`, `_REGION`, `_KEY` and `_KEY_FILE`, each falling back to the extractor's (`AMPUP_MEMORY_EXTRACT…`). Its
+    /// model is `AMPUP_MEMORY_NOTES_DREAM_MODEL` alone, else the backend's strong default (Claude Opus 5.5 on OpenRouter
+    /// and Anthropic): what it concludes is handed at the start of every later session of that person, as advice
+    /// is read on every later task, and a pass is one call a person a day at most. Never the Batch API: a pass
+    /// waits on its answers. `AMPUP_MEMORY_NOTES_DREAM=off` turns it off.
+    pub fn notes_dream_from_env() -> Result<Option<Self>> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        Self::from_vars(
+            "AMPUP_MEMORY_NOTES_DREAM",
+            |k| {
+                let v = var(k).or_else(|| {
+                    (k != "AMPUP_MEMORY_NOTES_DREAM_MODEL")
+                        .then(|| {
+                            var(&k.replacen("AMPUP_MEMORY_NOTES_DREAM", "AMPUP_MEMORY_EXTRACT", 1))
+                        })
+                        .flatten()
+                });
+                match v {
+                    Some(c)
+                        if k == "AMPUP_MEMORY_NOTES_DREAM"
+                            && c.eq_ignore_ascii_case("openrouter-batch") =>
+                    {
+                        Some("openrouter".into())
+                    }
+                    v => v,
+                }
+            },
+            Tier::Strong,
+        )
+    }
+
     /// The model that judges how runs and sessions went (`crate::sessions::judge`, `crate::advice_loop::judge`):
     /// `AMPUP_MEMORY_JUDGE` and its `_URL`, `_REGION`, `_KEY` and `_KEY_FILE`, each falling back to advice's, then
     /// compile's, then extraction's. Its model is `AMPUP_MEMORY_JUDGE_MODEL` alone, else the backend's small default
@@ -2124,8 +2156,8 @@ async fn run_with(
         }
         tried.extend(todo.iter().map(|e| e.episode_id.clone()));
         tried.extend(unreadable.iter().cloned());
-        // Goals, the compiled skills and people's profiles (`goals/…`, `skills/…`, `aip/…`, `profile-mine/…`) are
-        // about the memory, not sources: read, no facts.
+        // Goals, the compiled skills, people's profiles and their notes dream's records (`goals/…`, `skills/…`,
+        // `aip/…`, `profile-mine/…`, `notes-dream/…`) are about the memory, not sources: read, no facts.
         let (todo, own): (Vec<Episode>, Vec<Episode>) = todo.into_iter().partition(|e| {
             !e.document.as_deref().is_some_and(|d| {
                 [
@@ -2133,6 +2165,7 @@ async fn run_with(
                     crate::compile::SKILLS,
                     crate::compile::AIP,
                     crate::profile::PREFIX,
+                    crate::notes_dream::PREFIX,
                 ]
                 .iter()
                 .any(|p| d.starts_with(p))

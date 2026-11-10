@@ -325,7 +325,12 @@ pub struct On(Vec<String>);
 
 impl On {
     pub fn from_env() -> Option<Self> {
-        let v = std::env::var("AMPUP_MEMORY_DREAM_ON").ok()?;
+        Self::from_var("AMPUP_MEMORY_DREAM_ON")
+    }
+
+    /// The scopes another variable names the same way (`AMPUP_MEMORY_NOTES_DREAM_ON`, `crate::notes_dream`).
+    pub fn from_var(var: &str) -> Option<Self> {
+        let v = std::env::var(var).ok()?;
         let names: Vec<String> = v
             .split(',')
             .map(|s| s.trim().to_string())

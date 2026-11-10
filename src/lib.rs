@@ -64,6 +64,7 @@ pub use memstore_client::hook;
 pub mod hook_install;
 pub mod keep;
 pub mod mail;
+pub mod notes_dream;
 #[cfg(feature = "control-plane")]
 #[rustfmt::skip] // not in this repository; rustfmt would look for it
 pub mod onboard;
