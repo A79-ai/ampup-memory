@@ -95,6 +95,204 @@ pub(crate) fn repeats(newer: &str, older: &str) -> bool {
     on.is_subset(&n) && ow.intersection(&w).count() * 10 >= ow.len().max(1) * 9
 }
 
+/// Words that say how or how much, not what about: a text's topic is what is left without them ([`topic`]). Never
+/// in the share's check of whose words a sentence uses ([`stems`]): only in what is handed, and in whether a shared
+/// sentence says anything ([`says_something`]).
+const GENERIC: [&str; 82] = [
+    "about",
+    "after",
+    "again",
+    "agree",
+    "agreed",
+    "also",
+    "always",
+    "another",
+    "anything",
+    "away",
+    "back",
+    "because",
+    "before",
+    "being",
+    "both",
+    "could",
+    "decide",
+    "decided",
+    "decision",
+    "does",
+    "doing",
+    "done",
+    "each",
+    "either",
+    "else",
+    "enough",
+    "even",
+    "ever",
+    "every",
+    "everyone",
+    "everything",
+    "first",
+    "from",
+    "have",
+    "instead",
+    "just",
+    "less",
+    "like",
+    "made",
+    "make",
+    "makes",
+    "many",
+    "more",
+    "most",
+    "much",
+    "must",
+    "need",
+    "needs",
+    "never",
+    "next",
+    "note",
+    "notes",
+    "nothing",
+    "once",
+    "only",
+    "other",
+    "others",
+    "please",
+    "prefer",
+    "preference",
+    "preferred",
+    "prefers",
+    "rather",
+    "really",
+    "run",
+    "running",
+    "runs",
+    "same",
+    "should",
+    "some",
+    "something",
+    "still",
+    "such",
+    "team",
+    "than",
+    "then",
+    "thing",
+    "things",
+    "use",
+    "used",
+    "uses",
+    "using",
+];
+
+/// A text's words, lowercased, but the [`GENERIC`] ones.
+fn specific(text: &str) -> String {
+    text.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|w| !w.is_empty() && !GENERIC.contains(&w.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A text's topic: its words as the full-text index holds them (stemmed, stop words out), but the [`GENERIC`] ones
+/// and bare numbers.
+fn topic(text: &str) -> HashSet<String> {
+    crate::search::stems(&specific(text))
+        .into_iter()
+        .filter(|w| !w.chars().all(|c| c.is_ascii_digit()))
+        .collect()
+}
+
+/// The names in a text, lowercased: what it writes as a name (a capital past a sentence's start or inside a word,
+/// a `-`, `_`, `.` or `/` inside one, or in backticks). Two notes alike but for the repo or product they name are
+/// two notes.
+fn names(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut starts = true;
+    for raw in text.split_whitespace() {
+        let w = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        let mut chars = w.chars();
+        let named = raw.starts_with('`')
+            || w.contains(['-', '_', '.', '/'])
+            || chars.next().is_some_and(|c| c.is_uppercase() && !starts)
+            || chars.any(char::is_uppercase);
+        if named && !w.is_empty() {
+            out.insert(w.to_lowercase());
+        }
+        starts = raw.ends_with(['.', '!', '?', ':', ';']);
+    }
+    out
+}
+
+/// What a text says, as [`Said::says`] compares it, read once: its words and numbers ([`words`]), its names
+/// ([`names`]), each word it is written with, lowercased, and its topic ([`topic`]).
+pub(crate) struct Said {
+    words: HashSet<String>,
+    numbers: HashSet<String>,
+    names: HashSet<String>,
+    written: HashSet<String>,
+    topic: HashSet<String>,
+}
+
+impl Said {
+    pub(crate) fn of(text: &str) -> Self {
+        let (words, numbers) = words(text);
+        Said {
+            words,
+            numbers,
+            names: names(text),
+            written: text
+                .split_whitespace()
+                .map(|w| {
+                    w.trim_matches(|c: char| !c.is_alphanumeric())
+                        .to_lowercase()
+                })
+                .collect(),
+            topic: topic(text),
+        }
+    }
+
+    /// Whether this text, the newer, says what `older` does, so that handing both hands one thing twice. Every
+    /// number of the older is in it, and either most of the older's words are ([`repeats`]), or every name of the
+    /// older is and so is its topic, all of it, or all but one word of five or more. Cheap and the same every time
+    /// (no model, no embedding): it folds a note said again with its words reordered or inflected, or with
+    /// how-words (always, never, every, use, run) added or dropped, and lets through one that swaps a word for a
+    /// synonym. "Use pnpm in the billing repo" and "... in the website repo" differ by one word too, and are two
+    /// notes.
+    pub(crate) fn says(&self, older: &Said) -> bool {
+        if !older.numbers.is_subset(&self.numbers) {
+            return false;
+        }
+        if older.words.intersection(&self.words).count() * 10 >= older.words.len().max(1) * 9 {
+            return true;
+        }
+        if !older.names.is_subset(&self.written) {
+            return false;
+        }
+        let missing = older.topic.difference(&self.topic).count();
+        older.topic.len() >= 2 && (missing == 0 || (missing == 1 && older.topic.len() >= 5))
+    }
+}
+
+/// Whether `newer` says what `older` does ([`Said::says`]).
+pub(crate) fn says_same(newer: &str, older: &str) -> bool {
+    Said::of(newer).says(&Said::of(older))
+}
+
+/// Whether a team-shared sentence says something: at least two words that aren't [`GENERIC`] and that the share's
+/// check counts (four letters or more, not the commonest, or a number: [`stems`]). What three people's notes have in
+/// common can be only short and common words, and a sentence of those ("Do a bit, not a lot.") passes the check and
+/// says nothing.
+pub(crate) fn says_something(sentence: &str) -> bool {
+    stems(&specific(sentence)).len() >= 2
+}
+
+/// A handed note's text without the day it leads with (`(2026-10-25) `).
+fn undated(note: &str) -> &str {
+    note.strip_prefix('(')
+        .and_then(|r| r.split_once(") "))
+        .filter(|(day, _)| day.len() == 10 && day.chars().all(|c| c.is_ascii_digit() || c == '-'))
+        .map_or(note, |(_, t)| t)
+}
+
 /// Notes that `key` wrote `text` by this path, answered `answer`.
 pub fn wrote(key: &str, by_server: bool, text: &str, answer: &str) {
     RECENT
@@ -321,7 +519,8 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
     let mut wrote = 0;
     let found = groups(&reply);
     let groups_n = found.len();
-    let (mut too_few, mut unbacked, mut repeated) = (0, 0, 0);
+    let (mut too_few, mut unbacked, mut empty, mut repeated) = (0, 0, 0, 0);
+    let mut written: Vec<String> = vec![];
     for (text, named) in found {
         let cited: Vec<&(&str, HashSet<String>)> = named
             .iter()
@@ -370,7 +569,16 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
                 t
             }
         };
-        if already.iter().any(|a| same(a, &text)) {
+        // What the check leaves can be only short and common words: such a sentence says nothing.
+        if !says_something(&text) {
+            empty += 1;
+            continue;
+        }
+        if already
+            .iter()
+            .chain(&written)
+            .any(|a| same(a, &text) || says_same(a, &text))
+        {
             repeated += 1;
             continue;
         }
@@ -380,11 +588,13 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
             "keep: shared with {scope} what {} people said: {text}",
             who.len()
         );
+        written.push(text);
         wrote += 1;
     }
     eprintln!(
         "keep: share in {scope}: {} kept notes from {} people; {} groups found, {too_few} by fewer than \
-         {SHARED_AT} people, {unbacked} in words fewer than {SHARED_AT} used, {repeated} already shared, {wrote} shared",
+         {SHARED_AT} people, {unbacked} in words fewer than {SHARED_AT} used, {empty} saying nothing, {repeated} \
+         already shared, {wrote} shared",
         notes.len(),
         people.len(),
         groups_n
@@ -519,9 +729,11 @@ pub async fn for_session(
         )
         .await?;
     // Newest first, each with the day it was said: where two disagree (a prefix changed), the agent can tell which
-    // stands. One a newer note says the same as is left out, so a preference said in many sessions is one line.
-    let texts = |ids: &[(String, i64)]| {
-        let mut kept: Vec<String> = vec![];
+    // stands. One a newer note says the same as ([`says_same`]) is left out, so a preference said in many sessions,
+    // or said again in other words, is one line: the newest. A team sentence that says nothing is left out too.
+    let texts = |ids: &[(String, i64)], team: bool| {
+        // The ones handed: a note left out is one a handed note says.
+        let mut kept: Vec<Said> = vec![];
         let mut out = vec![];
         for (id, at) in ids {
             let Some(t) = bodies
@@ -530,24 +742,35 @@ pub async fn for_session(
             else {
                 continue;
             };
-            if t.is_empty()
-                || t.chars().count() > HANDED_CHARS
-                || kept.iter().any(|k| repeats(k, &t))
-            {
+            if t.is_empty() || t.chars().count() > HANDED_CHARS || (team && !says_something(&t)) {
+                continue;
+            }
+            let read = Said::of(&t);
+            if kept.iter().any(|k| k.says(&read)) {
                 continue;
             }
             let day = chrono::DateTime::from_timestamp_micros(*at)
                 .map(|d| d.format("%Y-%m-%d").to_string())
                 .unwrap_or_default();
             out.push(format!("({day}) {t}"));
-            kept.push(t);
+            kept.push(read);
             if out.len() == HANDED {
                 break;
             }
         }
         out
     };
-    Ok((folded.unwrap_or_else(|| texts(&mine)), texts(&team)))
+    let mine = folded.unwrap_or_else(|| texts(&mine, false));
+    // What the user's own notes say already (theirs may be one the team's sentence was made from) isn't handed again.
+    let own: Vec<Said> = mine.iter().map(|m| Said::of(undated(m))).collect();
+    let team = texts(&team, true)
+        .into_iter()
+        .filter(|t| {
+            let read = Said::of(undated(t));
+            !own.iter().any(|m| m.says(&read))
+        })
+        .collect();
+    Ok((mine, team))
 }
 
 /// The notes `who` wrote (`remember_memory`, the server's keep, a session's note; a run's trace and their profile
