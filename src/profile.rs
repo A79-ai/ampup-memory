@@ -302,6 +302,7 @@ pub(crate) async fn scan(
                     at: t,
                     rank,
                     key,
+                    document: documents[i].clone(),
                 });
             } else if profile {
                 if theirs.profile.as_ref().is_none_or(|(_, p)| t > *p) {

@@ -100,14 +100,17 @@ Reply with JSON only:
 {"replaced":[{"note":"N2","by":"S3","now":"...","quote":"...","why":"..."}],"unsure":[{"note":"N4","by":"S1","quote":"...","why":"..."}],"conflicts":[{"note":"N1","with":"N5","why":"..."},{"note":"N3","with":"S2","quote":"...","why":"..."}],"same":[{"keep":"N6","dup":"N7","why":"..."}]}
 "#;
 
-/// A kind of record of a person's sessions, which their notes are checked against: its name, and the session an
-/// episode of theirs holds, from what follows them in its source, where it is of this kind.
+/// A kind of record of a person's sessions, which their notes are checked against: its name, the session an episode
+/// of theirs holds, from what follows them in its source, where it is of this kind, and whether a session's record
+/// of this kind is in parts (each a document of its own, read in the order of their keys, its newest version each).
 pub struct Transcript {
     pub kind: &'static str,
     pub session: fn(&str) -> Option<String>,
+    pub in_parts: bool,
     /// Whether whose turn each part of the record is, is marked by the harness's hook rather than by text a model
-    /// wrote: only such a record can show the person's own words, so only such a record replaces a note. In one a
-    /// model wrote any of, a `User:` line may be the agent's own text (an agent told by a page to write one).
+    /// wrote ([`marked_turns`]): only such a record can show the person's own words, so only such a record replaces
+    /// a note. In one a model wrote any of, a `User:` line may be the agent's own text (an agent told by a page to
+    /// write one).
     pub marks_turns: bool,
 }
 
@@ -115,17 +118,28 @@ pub struct Transcript {
 /// (its newest version). A fuller record of a session (its whole transcript, with its tool calls and their
 /// results) goes in ahead of the kinds it holds more than, naming its session as they do.
 pub const TRANSCRIPTS: &[Transcript] = &[
+    // A coding agent's session as it ran (`crate::transcripts`): every prompt, answer and tool call with its input
+    // and its result, in parts (`transcripts/<harness>/<session>/<from>`), named by the session note's own source.
+    // The hook heads each turn and indents its text under the heading: the one record whose turns it marks.
+    Transcript {
+        kind: "full transcript",
+        session: whole,
+        in_parts: true,
+        marks_turns: true,
+    },
     // What `end_session` kept: the task, the trace and the outcome, all the agent's text (its transcript, or the
     // trace a hook condensed with the agent's answers unindented).
     Transcript {
         kind: "transcript",
         session: ended,
+        in_parts: false,
         marks_turns: false,
     },
     // What a session's advice steps sent so far (`conversation_so_far`), for one not ended yet: the agent's text.
     Transcript {
         kind: "conversation",
         session: so_far,
+        in_parts: false,
         marks_turns: false,
     },
     // A coding agent's hook's condensed note of a session (`<harness>:<repo>:<session id>`): the agent's answers
@@ -133,9 +147,17 @@ pub const TRANSCRIPTS: &[Transcript] = &[
     Transcript {
         kind: "session note",
         session: hook_note,
+        in_parts: false,
         marks_turns: false,
     },
 ];
+
+fn whole(rest: &str) -> Option<String> {
+    // Only the server writes it (a `memstore:` source), from a harness, a repo and a session's id it checked.
+    rest.strip_prefix(crate::transcripts::SOURCE)
+        .filter(|session| !session.is_empty())
+        .map(str::to_string)
+}
 
 fn ended(rest: &str) -> Option<String> {
     let id = rest.strip_prefix("session:")?;
@@ -162,13 +184,15 @@ pub fn session_of(rest: &str) -> Option<(usize, String)> {
         .find_map(|(i, t)| (t.session)(rest).map(|k| (i, k)))
 }
 
-/// One record of a person's session: its episode, when it occurred, its kind ([`TRANSCRIPTS`]) and its session.
+/// One record of a person's session: its episode, when it occurred, its kind ([`TRANSCRIPTS`]), its session, and the
+/// document it is a version of (a part of a record in parts).
 #[derive(Clone, Debug)]
 pub struct Material {
     pub id: String,
     pub at: i64,
     pub rank: usize,
     pub key: String,
+    pub document: Option<String>,
 }
 
 /// The groups a session's record is kept to where it is the one caller's own on a server that identifies no one:
@@ -701,10 +725,44 @@ fn parts(text: &str) -> Vec<(Who, String)> {
     out
 }
 
-/// Whose words `q` (as [`plain`] reads it) is in a session's record: the person's where a turn of theirs holds it,
-/// else whoever's part holds it whole; none where no one part does.
-fn spoken_by(text: &str, q: &str) -> Option<Who> {
-    let holding: Vec<Who> = parts(text)
+/// A record whose turns the harness's hook marks ([`Transcript::marks_turns`]: a whole transcript's part) in parts,
+/// each with whose words it is. The hook writes each turn as a paragraph: its heading alone on a line (`User:`,
+/// `<agent>:`, `<agent> called <tool> (call n):`, `Result of <tool> (call n):`, `Error from <tool> (call n):`, and
+/// `… (continued):` past a long turn's first paragraph), then every line of the turn's text indented two spaces (a
+/// blank line in it too), paragraphs a blank line apart. So no text a model or a tool wrote starts a line. A
+/// paragraph is the person's only where it is exactly that, a `User:` heading (or the continuation of one) over
+/// indented lines, and the turn is something they asked ([`crate::sessions::an_ask`]), not what the harness or
+/// another agent sent in their place. Anything else is no one's, and so is a paragraph a cut (`[...]`) runs into.
+fn marked_turns(text: &str) -> Vec<(Who, String)> {
+    let mut out = vec![];
+    // Whether the turn a `User (continued):` paragraph goes on with is the person's.
+    let mut theirs = false;
+    for paragraph in text.split("\n\n") {
+        let mut lines = paragraph.lines();
+        let head = lines.next().unwrap_or_default();
+        let body: Vec<&str> = lines.collect();
+        let said = body.join("\n");
+        let indented = !body.is_empty() && body.iter().all(|l| l.starts_with("  "));
+        let who = match head {
+            _ if !indented => Who::Unknown,
+            "User:" if crate::sessions::an_ask(&said) => Who::Person,
+            "User (continued):" if theirs => Who::Person,
+            h if h.starts_with("User") => Who::Unknown,
+            h if h.starts_with("Result of ") || h.starts_with("Error from ") => Who::Tool,
+            h if h.ends_with("):") && h.contains(" called ") => Who::Tool,
+            h if h.ends_with(':') && h.starts_with(char::is_uppercase) => Who::Agent,
+            _ => Who::Unknown,
+        };
+        theirs = who == Who::Person;
+        out.push((who, said));
+    }
+    out
+}
+
+/// Whose words `q` (as [`plain`] reads it) is in a session's record in `parts`: the person's where a turn of theirs
+/// holds it, else whoever's part holds it whole; none where no one part does.
+fn spoken_by(parts: Vec<(Who, String)>, q: &str) -> Option<Who> {
+    let holding: Vec<Who> = parts
         .into_iter()
         .filter(|(_, t)| plain(t).contains(q))
         .map(|(w, _)| w)
@@ -715,19 +773,22 @@ fn spoken_by(text: &str, q: &str) -> Option<Who> {
     }
 }
 
-/// Whose words `q` (as [`plain`] reads it) is in session `s`, as far as its record can tell: the person's only where
-/// the harness marks the turns ([`Transcript::marks_turns`]). In any other record a `User:` line may be the agent's
-/// own text, so a quote there is the person's to no one: the record's.
-fn whose(s: &Shown, q: &str) -> Who {
-    match spoken_by(&s.text, q).unwrap_or(Who::Unknown) {
-        Who::Person if !s.marks_turns => Who::Unknown,
-        w => w,
+/// Whose words `q` (as [`plain`] reads it) is in a piece of a session's record, as far as the record can tell: where
+/// the harness marks the turns ([`marked_turns`]), the person's where a turn of theirs holds it. In any other record
+/// ([`parts`]) a `User:` line may be the agent's own text, so a quote there is the person's to no one: the record's.
+fn whose(marks_turns: bool, text: &str, q: &str) -> Who {
+    match marks_turns {
+        true => spoken_by(marked_turns(text), q).unwrap_or(Who::Unknown),
+        false => match spoken_by(parts(text), q).unwrap_or(Who::Unknown) {
+            Who::Person => Who::Unknown,
+            w => w,
+        },
     }
 }
 
-/// The person's own words in a session's record: every turn of theirs.
+/// The person's own words in a record whose turns the harness marks: every turn of theirs.
 fn persons_words(text: &str) -> String {
-    parts(text)
+    marked_turns(text)
         .into_iter()
         .filter(|(w, _)| *w == Who::Person)
         .map(|(_, t)| t)
@@ -771,13 +832,39 @@ fn excerpt(text: &str) -> String {
     }
 }
 
-/// One note or session a call shows (`marks_turns`: as [`Transcript::marks_turns`]; a note's is false).
+/// One note or session a call shows. A session's `pieces` are the episodes it is shown from, each with what of it
+/// is shown (`text` is theirs, in order): one, or a whole transcript's first part and its last. `marks_turns`: as
+/// [`Transcript::marks_turns`] (a note's is false).
 struct Shown {
     id: String,
     at: i64,
     text: String,
     kind: &'static str,
     marks_turns: bool,
+    pieces: Vec<Piece>,
+}
+
+/// An episode of a session's record as a call shows it.
+struct Piece {
+    id: String,
+    at: i64,
+    text: String,
+}
+
+/// The piece of session `s` holding `q` (as [`plain`] reads it) whole, and whose words it is there: one where it is
+/// the person's first. None where no one piece holds it.
+fn located<'a>(s: &'a Shown, q: &str) -> Option<(&'a Piece, Who)> {
+    let holding: Vec<(&Piece, Who)> = s
+        .pieces
+        .iter()
+        .filter(|p| plain(&p.text).contains(q))
+        .map(|p| (p, whose(s.marks_turns, &p.text, q)))
+        .collect();
+    holding
+        .iter()
+        .find(|(_, w)| *w == Who::Person)
+        .or(holding.first())
+        .copied()
 }
 
 /// What weighing one person concluded.
@@ -831,39 +918,108 @@ async fn shown(
                 text: t.clone(),
                 kind: "note",
                 marks_turns: false,
+                pieces: vec![],
             })
         })
         .take(NOTES_SHOWN)
         .collect();
     notes.reverse();
     let since = notes.first().map_or(i64::MAX, |n| n.at - DAY);
-    // Each session's fullest record, its newest version.
-    let mut best: HashMap<&str, &Material> = HashMap::new();
+    // Each session's fullest kind of record: its newest version, or of one in parts the newest version of each part,
+    // in order.
+    let mut fullest: HashMap<&str, usize> = HashMap::new();
     for m in &theirs.sessions {
-        let e = best.entry(m.key.as_str()).or_insert(m);
-        if (m.rank, std::cmp::Reverse(m.at)) < (e.rank, std::cmp::Reverse(e.at)) {
-            *e = m;
-        }
+        let r = fullest.entry(m.key.as_str()).or_insert(m.rank);
+        *r = (*r).min(m.rank);
     }
-    let mut sessions: Vec<&Material> = best.into_values().filter(|m| m.at >= since).collect();
-    sessions.sort_by_key(|m| (std::cmp::Reverse(m.at), m.id.clone()));
-    sessions.truncate(SESSIONS_SHOWN);
-    sessions.reverse();
-    let bodies = store
-        .episode_bodies(scope, sessions.iter().map(|m| m.id.clone()).collect())
-        .await?;
-    let sessions: Vec<Shown> = sessions
+    let mut of_session: HashMap<&str, Vec<&Material>> = HashMap::new();
+    for m in theirs
+        .sessions
         .iter()
-        .filter_map(|m| {
-            let t = String::from_utf8_lossy(bodies.get(&m.id)?)
-                .trim()
-                .to_string();
-            (!t.is_empty()).then(|| Shown {
-                id: m.id.clone(),
-                at: m.at,
-                text: excerpt(&t),
-                kind: TRANSCRIPTS[m.rank].kind,
-                marks_turns: TRANSCRIPTS[m.rank].marks_turns,
+        .filter(|m| fullest[m.key.as_str()] == m.rank)
+    {
+        of_session.entry(m.key.as_str()).or_default().push(m);
+    }
+    let mut records: Vec<Vec<&Material>> = of_session
+        .into_values()
+        .map(|mut ms| {
+            ms.sort_by_key(|m| (std::cmp::Reverse(m.at), m.id.clone()));
+            if TRANSCRIPTS[ms[0].rank].in_parts {
+                let mut seen = HashSet::new();
+                ms.retain(|m| seen.insert(m.document.clone()));
+                ms.sort_by(|a, b| a.document.cmp(&b.document));
+            } else {
+                ms.truncate(1);
+            }
+            ms
+        })
+        .collect();
+    let last = |r: &[&Material]| r.iter().map(|m| m.at).max().unwrap_or_default();
+    records.retain(|r| last(r) >= since);
+    records.sort_by_key(|r| (std::cmp::Reverse(last(r)), r[0].id.clone()));
+    records.truncate(SESSIONS_SHOWN);
+    records.reverse();
+    // A record's start and its end; of one in parts, its first part's start and its last part's end.
+    let read: Vec<String> = records
+        .iter()
+        .flat_map(|r| match r.as_slice() {
+            [first, .., end] => vec![first.id.clone(), end.id.clone()],
+            r => r.iter().map(|m| m.id.clone()).collect(),
+        })
+        .collect();
+    let bodies = store.episode_bodies(scope, read).await?;
+    let body = |id: &str| {
+        bodies
+            .get(id)
+            .map(|b| String::from_utf8_lossy(b).trim().to_string())
+            .filter(|t| !t.is_empty())
+    };
+    let sessions: Vec<Shown> = records
+        .iter()
+        .filter_map(|r| {
+            let pieces = match r.as_slice() {
+                [first, .., end] => {
+                    let (start, last) = (body(&first.id)?, body(&end.id)?);
+                    let head: String = start.chars().take(SESSION_HEAD).collect();
+                    // From a whole line (as a record's end is shown, [`excerpt`]); where anything between them isn't
+                    // shown, the end starts past a cut.
+                    let tail = tail_lines(&last, SESSION_TAIL);
+                    let cut = head.len() < start.len() || r.len() > 2 || tail.len() < last.len();
+                    vec![
+                        Piece {
+                            id: first.id.clone(),
+                            at: first.at,
+                            text: head,
+                        },
+                        Piece {
+                            id: end.id.clone(),
+                            at: end.at,
+                            text: match cut {
+                                true => format!("[...]\n{tail}"),
+                                false => tail.to_string(),
+                            },
+                        },
+                    ]
+                }
+                [m] => vec![Piece {
+                    id: m.id.clone(),
+                    at: m.at,
+                    text: excerpt(&body(&m.id)?),
+                }],
+                [] => return None,
+            };
+            let end = pieces.last().expect("a piece");
+            Some(Shown {
+                id: end.id.clone(),
+                at: last(r),
+                text: pieces
+                    .iter()
+                    .map(|p| p.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                kind: TRANSCRIPTS[r[0].rank].kind,
+                marks_turns: TRANSCRIPTS[r[0].rank].marks_turns,
+                pieces,
             })
         })
         .collect();
@@ -921,7 +1077,15 @@ async fn weigh(
     let f = fence(&[&data]);
     let prompt = format!("{}\n{f}\n{data}\n{f}\n", PROMPT.replace("FENCE", &f));
     let log = train_log::Ctx::new("notes_dream", scope, json!({"dreamer": dreamer}));
-    let shown_ids: Vec<String> = notes.iter().chain(sessions).map(|s| s.id.clone()).collect();
+    let shown_ids: Vec<String> = notes
+        .iter()
+        .map(|n| n.id.clone())
+        .chain(
+            sessions
+                .iter()
+                .flat_map(|s| s.pieces.iter().map(|p| p.id.clone())),
+        )
+        .collect();
     let reply = log
         .run(async {
             train_log::also_read(shown_ids);
@@ -985,11 +1149,16 @@ async fn weigh(
             w.refused += 1;
             continue;
         };
-        let Some(quote) = o["quote"].as_str().and_then(|q| quote_of(s, q)) else {
+        // The episode holding the quote (of a whole transcript, its part), and whose words it is there.
+        let Some((quote, (p, from))) = o["quote"]
+            .as_str()
+            .and_then(|q| quote_of(s, q))
+            .and_then(|q| located(s, &plain(&q)).map(|l| (q, l)))
+        else {
             w.refused += 1;
             continue;
         };
-        if s.at <= n.at || decided.contains(n.id.as_str()) {
+        if p.at <= n.at || decided.contains(n.id.as_str()) {
             w.refused += 1;
             continue;
         }
@@ -997,18 +1166,17 @@ async fn weigh(
         // Only the person's own words replace what they said, in a record whose turns the harness marks ([`whose`]).
         // The assistant's, a tool's result's or a file's (what the work showed, or what a page told it), or any line
         // of a record a model wrote, stand against the note as a conflict at most.
-        let from = whose(s, &plain(&quote));
         if from != Who::Person {
             w.downgraded += 1;
-            let evidence = json!({"note": n.text, "said": day(n.at), "with": quote, "session": s.id,
-                                  "with_day": day(s.at), "with_kind": s.kind, "from": from.tag(),
+            let evidence = json!({"note": n.text, "said": day(n.at), "with": quote, "session": p.id,
+                                  "with_day": day(p.at), "with_kind": s.kind, "from": from.tag(),
                                   "proposed": "replaced", "why": why(o)});
             take(
                 &mut w,
                 Decision::Conflict {
                     note: n.id.clone(),
-                    with: s.id.clone(),
-                    at: s.at,
+                    with: p.id.clone(),
+                    at: p.at,
                     quote: Some(quote),
                     from: Some(from.tag().into()),
                 },
@@ -1025,22 +1193,22 @@ async fn weigh(
                 !t.is_empty()
                     && t.chars().count() <= NOW_CHARS
                     && crate::keep::stems(t).is_subset(
-                        &crate::keep::stems(&persons_words(&s.text))
+                        &crate::keep::stems(&persons_words(&p.text))
                             .union(&crate::keep::stems(&n.text))
                             .cloned()
                             .collect(),
                     )
             })
             .unwrap_or_else(|| short(&quote, NOW_CHARS));
-        let evidence = json!({"note": n.text, "said": day(n.at), "session": s.id, "session_day": day(s.at),
+        let evidence = json!({"note": n.text, "said": day(n.at), "session": p.id, "session_day": day(p.at),
                               "session_kind": s.kind, "now": now, "quote": quote, "from": "person",
                               "why": why(o)});
         take(
             &mut w,
             Decision::Replaced {
                 note: n.id.clone(),
-                by: s.id.clone(),
-                at: s.at,
+                by: p.id.clone(),
+                at: p.at,
                 now,
                 quote,
             },
@@ -1052,13 +1220,18 @@ async fn weigh(
             w.refused += 1;
             continue;
         };
-        let (with, at, quote, other) = match (
+        // Another note, or the episode of a session holding the quote, and whose words it is there.
+        let (with, kind, at, quote, from) = match (
             pick(notes, 'N', &o["with"]),
             pick(sessions, 'S', &o["with"]),
         ) {
-            (Some(m), _) if m.id != n.id => (m, m.at, None, m.text.clone()),
-            (_, Some(s)) => match o["quote"].as_str().and_then(|q| quote_of(s, q)) {
-                Some(q) => (s, s.at, Some(q.clone()), q),
+            (Some(m), _) if m.id != n.id => (&m.id, m.kind, m.at, None, None),
+            (_, Some(s)) => match o["quote"]
+                .as_str()
+                .and_then(|q| quote_of(s, q))
+                .and_then(|q| located(s, &plain(&q)).map(|l| (q, l)))
+            {
+                Some((q, (p, who))) => (&p.id, s.kind, p.at, Some(q), Some(who.tag())),
                 None => {
                     w.refused += 1;
                     continue;
@@ -1069,21 +1242,28 @@ async fn weigh(
                 continue;
             }
         };
-        if decided.contains(n.id.as_str()) || decided.contains(with.id.as_str()) {
+        if decided.contains(n.id.as_str()) || decided.contains(with.as_str()) {
             w.refused += 1;
             continue;
         }
-        let from = quote.as_deref().map(|q| whose(with, &plain(q)).tag());
+        let other = match &quote {
+            Some(q) => q.clone(),
+            None => notes
+                .iter()
+                .find(|m| &m.id == with)
+                .map(|m| m.text.clone())
+                .unwrap_or_default(),
+        };
         let mut evidence = json!({"note": n.text, "said": day(n.at), "with": other, "with_day": day(at),
-                                  "with_kind": with.kind, "from": from, "why": why(o)});
+                                  "with_kind": kind, "from": from, "why": why(o)});
         if quote.is_some() {
-            evidence["session"] = json!(with.id);
+            evidence["session"] = json!(with);
         }
         take(
             &mut w,
             Decision::Conflict {
                 note: n.id.clone(),
-                with: with.id.clone(),
+                with: with.clone(),
                 at,
                 quote,
                 from: from.map(str::to_string),
@@ -1122,25 +1302,28 @@ async fn weigh(
             w.refused += 1;
             continue;
         };
-        let Some(quote) = o["quote"].as_str().and_then(|q| quote_of(s, q)) else {
+        let Some((quote, (p, from))) = o["quote"]
+            .as_str()
+            .and_then(|q| quote_of(s, q))
+            .and_then(|q| located(s, &plain(&q)).map(|l| (q, l)))
+        else {
             w.refused += 1;
             continue;
         };
-        if s.at < n.at || decided.contains(n.id.as_str()) {
+        if p.at < n.at || decided.contains(n.id.as_str()) {
             w.refused += 1;
             continue;
         }
-        let from = whose(s, &plain(&quote)).tag();
-        let evidence = json!({"note": n.text, "said": day(n.at), "session": s.id, "session_day": day(s.at),
-                              "session_kind": s.kind, "quote": quote, "from": from, "why": why(o)});
+        let evidence = json!({"note": n.text, "said": day(n.at), "session": p.id, "session_day": day(p.at),
+                              "session_kind": s.kind, "quote": quote, "from": from.tag(), "why": why(o)});
         take(
             &mut w,
             Decision::Unsure {
                 note: n.id.clone(),
-                by: s.id.clone(),
-                at: s.at,
+                by: p.id.clone(),
+                at: p.at,
                 quote,
-                from: Some(from.into()),
+                from: Some(from.tag().into()),
             },
             evidence,
         );
