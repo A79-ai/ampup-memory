@@ -40,6 +40,13 @@ pub struct Lookup {
     /// step, how relevant and useful it found the lines it would hand on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fit: Option<f64>,
+    /// How likely the decisions model found the request to be in the situation the routed note's `When` describes,
+    /// read with where in the session it was asked ([`crate::advice_route::fits`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<f64>,
+    /// How likely it found one of the note's `Withhold when` cases to describe the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withhold: Option<f64>,
     /// What the person's own advice came to first, when they have some and it served nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub own: Option<String>,
@@ -68,6 +75,10 @@ pub mod outcome {
     pub const NO_ADVICE: &str = "no_advice";
     /// Routed, but the advice read whole was judged to be for another task.
     pub const OFF_TASK: &str = "off_task";
+    /// Routed to a note whose `When` the request isn't in, or one of whose `Withhold when` cases it is, read with
+    /// where in the session it was asked (a follow-up note for a request that starts a task of its own, a task's note
+    /// for a message that only steers the work under way): withheld ([`crate::advice_route::fits`]).
+    pub const WHEN_MISMATCH: &str = "when_mismatch";
     /// Nothing to route over: no situation, no skill.
     pub const NO_LINES: &str = "no_lines";
     /// A later moment re-read the note the session was served, cut to the moment.
@@ -78,6 +89,13 @@ pub mod outcome {
     pub const STEP_HANDED: &str = "step_handed";
     /// A hook's step: lines found, judged not relevant or useful enough to hand on.
     pub const STEP_NOT_USEFUL: &str = "step_not_useful";
+    /// A hook's step: the lines of the served note would go on, but the step isn't in the situation the note's
+    /// `When` describes (a follow-up note's lines at a step with no new message from the user), or one of its
+    /// `Withhold when` cases is it ([`crate::sessions::useful`]).
+    pub const STEP_WHEN_MISMATCH: &str = "step_when_mismatch";
+    /// A hook's step routed afresh, but what it found was judged not relevant or useful enough now: withheld, and
+    /// not recorded as served, so no later step hands its lines on.
+    pub const NOT_USEFUL: &str = "not_useful";
     /// A hook's step: nothing of the served note bears on it, or the session had all it hands on.
     pub const STEP_NOTHING: &str = "step_nothing";
     /// A program's session (its harness named `:sdk`) in a scope whose `advice_automated` is off: nothing routed.
@@ -105,6 +123,7 @@ struct Step {
     key: Option<String>,
     score: Option<f64>,
     fit: Option<f64>,
+    when: Option<(f64, Option<f64>)>,
 }
 
 struct Trace {
@@ -112,9 +131,11 @@ struct Trace {
     started: Instant,
     at: i64,
     steps: Vec<Step>,
-    /// The decisions model's best score and the fit, noted before the step they belong to ends.
+    /// The decisions model's best score, the fit and the note's `When` (and `Withhold when`), noted before the
+    /// step they belong to ends.
     score: Option<f64>,
     fit: Option<f64>,
+    when: Option<(f64, Option<f64>)>,
     /// What went wrong on the way ([`trouble`]).
     trouble: Option<String>,
 }
@@ -134,6 +155,7 @@ pub async fn traced<F: std::future::Future>(moment: &str, f: F) -> F::Output {
                 steps: vec![],
                 score: None,
                 fit: None,
+                when: None,
                 trouble: None,
             }),
             f,
@@ -163,6 +185,7 @@ pub fn carry<F: std::future::Future>(f: F) -> impl std::future::Future<Output = 
                             steps: vec![],
                             score: None,
                             fit: None,
+                            when: None,
                             trouble: None,
                         }),
                         f,
@@ -183,6 +206,27 @@ pub fn fitted(p: f64) {
     let _ = TRACE.try_with(|t| t.borrow_mut().fit = Some(p));
 }
 
+/// How likely the request is in the routed note's `When`, and one of its `Withhold when` cases (when it has some).
+pub fn when_fitted(when: f64, withhold: Option<f64>) {
+    let _ = TRACE.try_with(|t| t.borrow_mut().when = Some((when, withhold)));
+}
+
+/// What routed to `key` was withheld after all (`outcome`), by a check after routing: its step says so, with the
+/// scores it was routed and fitted at.
+pub fn withheld_after(outcome: &'static str, key: &str) {
+    let _ = TRACE.try_with(|t| {
+        if let Some(s) = t
+            .borrow_mut()
+            .steps
+            .iter_mut()
+            .rev()
+            .find(|s| s.key.as_deref() == Some(key))
+        {
+            s.outcome = outcome;
+        }
+    });
+}
+
 /// Something went wrong on the way that the outcome alone doesn't say: kept with the lookup.
 pub fn trouble(what: &str) {
     let _ = TRACE.try_with(|t| t.borrow_mut().trouble = Some(what.chars().take(300).collect()));
@@ -192,13 +236,14 @@ pub fn trouble(what: &str) {
 pub fn step(own: bool, outcome: &'static str, key: Option<String>) {
     let _ = TRACE.try_with(|t| {
         let mut t = t.borrow_mut();
-        let (score, fit) = (t.score.take(), t.fit.take());
+        let (score, fit, when) = (t.score.take(), t.fit.take(), t.when.take());
         t.steps.push(Step {
             own,
             outcome,
             key,
             score,
             fit,
+            when,
         });
     });
 }
@@ -251,6 +296,8 @@ pub fn finish(outcome: &str, key: Option<&str>) -> Option<Lookup> {
                 key,
                 score: step.and_then(|s| s.score).or(t.score),
                 fit: step.and_then(|s| s.fit).or(t.fit),
+                when: step.and_then(|s| s.when).or(t.when).map(|(w, _)| w),
+                withhold: step.and_then(|s| s.when).or(t.when).and_then(|(_, h)| h),
                 own: own.filter(|o| o != ROUTED),
                 error: t.trouble.clone(),
                 ms: t.started.elapsed().as_millis() as u64,

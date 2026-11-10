@@ -117,9 +117,9 @@ impl Tally {
 
 /// When advice was served and when it wasn't, over `entries`' sessions and their lookups since `since` (µs): in sum,
 /// by outcome, by moment, by caller (people, or programs: sessions a program ran, [`crate::sessions::automated`]),
-/// by person and by harness; the notes served most, and the kinds of task most often matched with no advice to serve
-/// or judged off-task. Sessions kept before lookups were recorded count in `sessions` and `sessions_served` only:
-/// `lookups_since` says from when lookups are known.
+/// by person and by harness; the notes served most, and the kinds of task most often matched with no advice to serve,
+/// judged off-task or withheld for a `When` the request wasn't in. Sessions kept before lookups were recorded count
+/// in `sessions` and `sessions_served` only: `lookups_since` says from when lookups are known.
 fn serving<'a>(entries: impl Iterator<Item = &'a Logged>, since: i64) -> Value {
     use crate::advice_lookups::outcome;
     let (mut all, mut moments, mut callers) = (
@@ -131,8 +131,9 @@ fn serving<'a>(entries: impl Iterator<Item = &'a Logged>, since: i64) -> Value {
         BTreeMap::<String, Tally>::new(),
         BTreeMap::<String, Tally>::new(),
     );
-    let (mut top_served, mut no_advice, mut off_task) = (
+    let (mut top_served, mut no_advice, mut off_task, mut when_mismatch) = (
         BTreeMap::<String, (usize, BTreeSet<&str>)>::new(),
+        BTreeMap::<String, usize>::new(),
         BTreeMap::<String, usize>::new(),
         BTreeMap::<String, usize>::new(),
     );
@@ -171,6 +172,9 @@ fn serving<'a>(entries: impl Iterator<Item = &'a Logged>, since: i64) -> Value {
                     }
                     outcome::NO_ADVICE => *no_advice.entry(k.clone()).or_default() += 1,
                     outcome::OFF_TASK => *off_task.entry(k.clone()).or_default() += 1,
+                    outcome::WHEN_MISMATCH | outcome::STEP_WHEN_MISMATCH => {
+                        *when_mismatch.entry(k.clone()).or_default() += 1
+                    }
                     _ => {}
                 }
             }
@@ -225,6 +229,7 @@ fn serving<'a>(entries: impl Iterator<Item = &'a Logged>, since: i64) -> Value {
     );
     out["top_no_advice"] = json!(ranked(no_advice));
     out["top_off_task"] = json!(ranked(off_task));
+    out["top_when_mismatch"] = json!(ranked(when_mismatch));
     out
 }
 

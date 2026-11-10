@@ -1579,6 +1579,8 @@ struct Asked {
     used: std::time::Instant,
     /// The last question routed afresh.
     routed: Option<u64>,
+    /// The user's message the last hook step was at ([`new_at_step`]).
+    stepped: Option<u64>,
     /// Lines of advice handed on, by hash: a line is handed once.
     handed: std::collections::HashSet<u64>,
     /// Pieces of advice handed on.
@@ -1611,6 +1613,7 @@ fn asked_in<R>(scope: &Scope, who: &Principal, id: &str, f: impl FnOnce(&mut Ask
     let a = all.entry(key).or_insert_with(|| Asked {
         used: std::time::Instant::now(),
         routed: None,
+        stepped: None,
         handed: Default::default(),
         count: 0,
         procedures: vec![],
@@ -1633,6 +1636,17 @@ pub fn new_question(scope: &Scope, who: &Principal, id: &str, question: &str) ->
         let h = hash_of(question);
         let new = a.routed != Some(h);
         a.routed = Some(h);
+        new
+    })
+}
+
+/// Whether `question`, the user's last message as a hook's step sends it, came since session `id`'s last hook step
+/// (a new message from the user), or the agent only moved on to its next step under it; noted for the next step.
+pub fn new_at_step(scope: &Scope, who: &Principal, id: &str, question: &str) -> bool {
+    asked_in(scope, who, id, |a| {
+        let h = hash_of(question);
+        let new = a.stepped != Some(h);
+        a.stepped = Some(h);
         new
     })
 }
@@ -1669,8 +1683,9 @@ pub enum StepAdvice {
     NoNote,
     /// Every line of its notes that bears on this step was handed already.
     Nothing,
-    /// The lines (as served text) that best fit this step.
-    Lines(String),
+    /// The lines (as served text) that best fit this step, and the `When` of the note they come from (none for a
+    /// procedure's steps, or a note that states no `When`).
+    Lines(String, Option<crate::advice_route::When>),
 }
 
 /// The lines of the notes session `id` was served (what to check, the steps ahead, the pitfalls) that best fit the
@@ -1715,16 +1730,23 @@ pub async fn step_advice(
             return Ok(StepAdvice::Nothing);
         }
         let body: Vec<&str> = ahead.iter().map(|t| t.as_str()).collect();
-        return Ok(StepAdvice::Lines(format!(
-            "Situation: `{k}`\nThe step you are at in this procedure, and the one after:\n{}",
-            body.join("\n")
-        )));
+        return Ok(StepAdvice::Lines(
+            format!(
+                "Situation: `{k}`\nThe step you are at in this procedure, and the one after:\n{}",
+                body.join("\n")
+            ),
+            None,
+        ));
     }
     let mut lines: Vec<(String, String)> = vec![];
+    let mut whens: BTreeMap<String, crate::advice_route::When> = BTreeMap::new();
     for k in served.iter().rev() {
         let Some(note) = Box::pin(served_note(store, scope, who, k)).await? else {
             continue;
         };
+        if let Some(w) = crate::advice_route::When::of(&note) {
+            whens.insert(k.clone(), w);
+        }
         for heading in ["Verification", "Steps", "Pitfalls"] {
             for line in crate::advice::section_body(&note, heading)
                 .unwrap_or_default()
@@ -1755,20 +1777,50 @@ pub async fn step_advice(
         return Ok(StepAdvice::Nothing);
     };
     let body: Vec<&str> = picked.iter().map(|(_, t)| t.as_str()).collect();
-    Ok(StepAdvice::Lines(format!(
-        "Situation: `{k}`\nFor the step you are at, from past runs of this kind of task:\n{}",
-        body.join("\n")
-    )))
+    let when = whens.remove(&k);
+    Ok(StepAdvice::Lines(
+        format!(
+            "Situation: `{k}`\nFor the step you are at, from past runs of this kind of task:\n{}",
+            body.join("\n")
+        ),
+        when,
+    ))
+}
+
+/// What the usefulness check ([`useful`]) came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Useful {
+    /// Relevant to what the agent is doing now, and would help it next: handed on.
+    Yes,
+    /// Not, or no model answered.
+    No,
+    /// The step isn't in the situation the note's `When` describes, one of its `Withhold when` cases is the work
+    /// asked for, or its `When` is the moment a message from the user arrives and none came since the last step.
+    WhenMismatch,
 }
 
 /// Whether `advice`, found for the agent's `task` and the end of its `conversation`, is relevant to what it is
 /// doing now and would help it next: a decisions model answers, and advice below `MEMSTORE_ADVICE_USEFUL_MIN`
 /// (0.4) is dropped. With no decisions model, or none that answers, nothing is served: advice no one checked
 /// stays out of the way.
-pub async fn useful(task: &str, conversation: &str, advice: &str) -> Result<bool> {
+///
+/// With the `When` of the note the advice comes from, the same call also asks whether the agent's step is in that
+/// situation and the work asked for in none of its `Withhold when` cases, read with `asked`: what happened since the
+/// last step (a new message from the user, or none, the agent only moving on). At a step with none it also asks
+/// whether the `When` is the moment such a message arrives (a follow-up, a correction), which is the step that
+/// message came at, not every step after it: on one production org from 11-06 to 11-10, a person's follow-up note
+/// had its lines handed on 28 times at the agent's own steps.
+pub async fn useful(
+    task: &str,
+    conversation: &str,
+    advice: &str,
+    when: Option<&crate::advice_route::When>,
+    asked: Option<&crate::advice_route::Asked>,
+) -> Result<Useful> {
     let Some(d) = crate::decide::Decider::from_env()? else {
-        return Ok(false);
+        return Ok(Useful::No);
     };
+    let no_user_message = asked.is_some_and(|a| a.no_user_message);
     let min = std::env::var("MEMSTORE_ADVICE_USEFUL_MIN")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
@@ -1777,23 +1829,77 @@ pub async fn useful(task: &str, conversation: &str, advice: &str) -> Result<bool
         let n = conversation.chars().count();
         conversation.chars().skip(n.saturating_sub(3_000)).collect()
     };
-    let state = json!({
+    let mut state = json!({
         "task": head(task, 1_500),
         "conversation_end": crate::hook::redact(&recent),
-        "advice": head(advice, 3_000),
     });
-    let question = crate::decide::Question::Likely(
-        "An AI agent is working for a user, and the team's advice above was found for it. Is that advice \
-         relevant to exactly what the agent is doing right now, and would it change or sharpen what the agent \
-         does next? Answer low for advice about a different kind of task, advice the agent has plainly already \
-         followed, or generic advice that says nothing specific to this work."
-            .into(),
-    );
-    let answers = d.decide(&state, vec![("useful".into(), question)]).await?;
-    let p = answers.get("useful").map_or(0.0, |a| a.likely());
+    if let Some(a) = asked {
+        state["asked"] = json!(a.place);
+    }
+    let mut questions = vec![(
+        "useful".to_string(),
+        crate::decide::Question::Likely(
+            "An AI agent is working for a user, and the team's advice above was found for it. Is that advice \
+             relevant to exactly what the agent is doing right now, and would it change or sharpen what the agent \
+             does next? Answer low for advice about a different kind of task, advice the agent has plainly already \
+             followed, or generic advice that says nothing specific to this work."
+                .into(),
+        ),
+    )];
+    if let Some(w) = when {
+        state["when"] = json!(w.when);
+        questions.push((
+            "when".into(),
+            crate::decide::Question::Likely(crate::advice_route::STEP_WHEN_ASK.into()),
+        ));
+        if let Some(h) = &w.withhold {
+            state["withhold_when"] = json!(h);
+            questions.push((
+                "withhold".into(),
+                crate::decide::Question::Likely(crate::advice_route::STEP_WITHHOLD_ASK.into()),
+            ));
+        }
+        if no_user_message {
+            questions.push((
+                "arrival".into(),
+                crate::decide::Question::Likely(crate::advice_route::ARRIVAL_ASK.into()),
+            ));
+        }
+    }
+    state["advice"] = json!(head(advice, 3_000));
+    let answers = d.decide(&state, questions).await?;
+    let likely = |k: &str| answers.get(k).map_or(0.0, |a| a.likely());
+    let p = likely("useful");
     crate::advice_lookups::fitted(p);
-    eprintln!("advice useful: {p:.2} (bar {min})");
-    Ok(p >= min)
+    if let Some(w) = when {
+        let (pw, ph, pa) = (
+            likely("when"),
+            w.withhold.as_ref().map(|_| likely("withhold")),
+            no_user_message.then(|| likely("arrival")),
+        );
+        crate::advice_lookups::when_fitted(pw, ph);
+        let (when_min, withhold_min, arrival_min) = (
+            crate::advice_route::when_min(),
+            crate::advice_route::withhold_min(),
+            crate::advice_route::arrival_min(),
+        );
+        eprintln!(
+            "advice useful: {p:.2} (bar {min}), its When {pw:.2} (bar {when_min}){}{}",
+            ph.map(|h| format!(", its Withhold when {h:.2} (bar {withhold_min})"))
+                .unwrap_or_default(),
+            pa.map(|a| format!(", for a message arriving {a:.2} (bar {arrival_min}), with none"))
+                .unwrap_or_default()
+        );
+        if pw < when_min
+            || ph.is_some_and(|h| h >= withhold_min)
+            || pa.is_some_and(|a| a >= arrival_min)
+        {
+            return Ok(Useful::WhenMismatch);
+        }
+    } else {
+        eprintln!("advice useful: {p:.2} (bar {min})");
+    }
+    Ok(if p >= min { Useful::Yes } else { Useful::No })
 }
 
 /// A later moment of open session `l` (not [`Moment::Start`]): the note it was served last, cut to what the

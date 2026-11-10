@@ -6489,9 +6489,9 @@ async fn handle(
                         (&who, &via),
                         id,
                         &question,
-                        conversation,
+                        (conversation, conversation),
                         (format, max_chars, procedures),
-                        (false, args["keep"].as_bool() != Some(false)),
+                        (false, args["keep"].as_bool() != Some(false), false),
                         also.clone(),
                     )
                 ),
@@ -6531,6 +6531,7 @@ async fn handle(
                     None,
                     notes,
                     &also,
+                    None,
                 )
                 .await;
                 if let Ok(found) = &found {
@@ -11233,7 +11234,23 @@ async fn advice(
     arm: Option<&str>,
     notes: bool,
     also: &[Session],
+    asked: Option<crate::advice_route::Asked>,
 ) -> Result<Option<crate::advice::Advised>> {
+    // Where in its session the question was asked, which the fit check reads with a note's When.
+    if let Some(a) = asked {
+        let routed = advice(
+            session,
+            store,
+            who,
+            question,
+            (format, max_chars, procedures),
+            arm,
+            notes,
+            also,
+            None,
+        );
+        return Box::pin(crate::advice_route::asking(a, routed)).await;
+    }
     let Some(router) = crate::extract::Extractor::route_from_env()? else {
         return Err(ToolError("advice is routed by a model: this server has none".into()).into());
     };
@@ -11684,6 +11701,7 @@ async fn open_session(
                 arm.as_deref(),
                 true,
                 &also,
+                Some(crate::advice_route::Asked::opening()),
             ));
             let found = routed.await.unwrap_or_else(|e| {
                 eprintln!("advice: a session's opening routed nothing: {e:#}");
@@ -11711,6 +11729,7 @@ async fn open_session(
             arm,
             true,
             &also,
+            Some(crate::advice_route::Asked::opening()),
         )
         .await
         {
@@ -11838,9 +11857,9 @@ async fn session_advice(
     (who, via): (&Principal, &SignIn),
     id: &str,
     question: &str,
-    conversation: Option<&str>,
+    (conversation, seen): (Option<&str>, Option<&str>),
     asked: Asked,
-    (agent, keep): (bool, bool),
+    (agent, keep, decide): (bool, bool, bool),
     also: Vec<Session>,
 ) -> Result<std::sync::Arc<crate::sessions::Served>> {
     use crate::sessions::Served;
@@ -11850,6 +11869,13 @@ async fn session_advice(
         );
     }
     let mut l = crate::sessions::active(store, session.scope(), who, id).await?;
+    // Where in the session the question came, read before it names the task: its first request, a later message
+    // (with `seen`, the conversation it was asked in), or the agent's own words.
+    let place = match agent {
+        true => crate::advice_route::Asked::agent(&l.question, question),
+        false => crate::advice_route::Asked::in_session(&l.question, question, seen),
+    };
+    let said = place.clone();
     // Named before routing, which may fail: the session's task is there whatever it is served. Not with `keep:
     // false` (MEMSTORE_CAPTURE=off), where nothing the user said is kept.
     if keep {
@@ -11876,10 +11902,52 @@ async fn session_advice(
                 arm.as_deref(),
                 true,
                 &also,
+                Some(place),
             )
             .await?;
-            crate::sessions::advise(store, session.scope(), who, &signed, l, found, conversation)
-                .await
+            // A hook's step hands on what it routed only if the decisions model finds it useful now, and only
+            // then is it recorded as served: one withheld here is no note of the session's, so no later step
+            // hands its lines on (it was, and 7 of the 21 notes judged unapplied on one production org from
+            // 11-06 to 11-10 went out so).
+            let found = match found {
+                Some(a) if decide && arm.as_deref() != Some("holdout") => {
+                    use crate::advice_lookups::outcome;
+                    let withheld = if !crate::sessions::under_cap(session.scope(), who, id) {
+                        Some(outcome::STEP_NOTHING)
+                    } else {
+                        let text = format!("Situation: `{}`\n{}", a.key, a.text);
+                        let seen = seen.unwrap_or_default();
+                        match crate::sessions::useful(question, seen, &text, None, Some(&said))
+                            .await?
+                        {
+                            crate::sessions::Useful::Yes => None,
+                            _ => Some(outcome::NOT_USEFUL),
+                        }
+                    };
+                    match withheld {
+                        Some(o) => {
+                            crate::advice_lookups::withheld_after(o, &a.key);
+                            None
+                        }
+                        None => Some(a),
+                    }
+                }
+                found => found,
+            };
+            let served = crate::sessions::advise(
+                store,
+                session.scope(),
+                who,
+                &signed,
+                l,
+                found,
+                conversation,
+            )
+            .await?;
+            if decide && matches!(served, Served::Note { .. } | Served::Procedures { .. }) {
+                crate::sessions::hand(session.scope(), who, id, &served_text(&served));
+            }
+            Ok(served)
         }
         .await;
         if let Err(e) = &served {
@@ -11914,6 +11982,7 @@ async fn session_advice(
                 arm.as_deref(),
                 true,
                 &also,
+                Some(place),
             ));
             let found = routed.await?;
             crate::sessions::advise(
@@ -11941,11 +12010,13 @@ async fn session_advice(
 /// model call. None when the session was served no note and the moment may be a new kind of task (a fork, being
 /// stuck), so the caller routes it as an advice step; being done with no note is answered here, as nothing learned
 /// applies.
+#[allow(clippy::too_many_arguments)]
 async fn session_moment(
     session: &Session,
     store: &Store,
     (who, via): (&Principal, &SignIn),
     id: &str,
+    question: &str,
     moment: crate::sessions::Moment,
     conversation: Option<&str>,
     step: Option<&str>,
@@ -11958,6 +12029,8 @@ async fn session_moment(
     let l = Box::pin(crate::sessions::active(store, session.scope(), who, id)).await?;
     // A hook's step (`decide`): the lines of the served notes that fit the step, not the note again.
     if let Some(step) = step {
+        // Whether the user's last message came since the last step, noted before anything else reads it.
+        let new = crate::sessions::new_at_step(session.scope(), who, id, question);
         let end: String = {
             let n = step.chars().count();
             step.chars().skip(n.saturating_sub(700)).collect()
@@ -11981,7 +12054,21 @@ async fn session_moment(
                     crate::sessions::note_lookup(store, session.scope(), who, id, lookup).await;
                     Some(NO_NEW_ADVICE.into())
                 }
-                crate::sessions::StepAdvice::Lines(t) => Some(t),
+                crate::sessions::StepAdvice::Lines(t, when) => {
+                    let asked = crate::advice_route::Asked::at_step(&l.question, question, new);
+                    Some(
+                        Box::pin(hand_on(
+                            store,
+                            session.scope(),
+                            who,
+                            id,
+                            (question, step),
+                            &t,
+                            (when.as_ref(), &asked),
+                        ))
+                        .await?,
+                    )
+                }
             },
         );
     }
@@ -12010,6 +12097,51 @@ async fn session_moment(
         }
         None => None,
     })
+}
+
+/// What a hook's step hands the agent of `text`, the lines of a note its session was served: them, if the session
+/// is under its cap and the decisions model finds them useful now (with the note's `When`, `when`, and the step in
+/// it, read with `asked`), else nothing new. The lookup is recorded either way.
+async fn hand_on(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    id: &str,
+    (question, conversation): (&str, &str),
+    text: &str,
+    (when, asked): (
+        Option<&crate::advice_route::When>,
+        &crate::advice_route::Asked,
+    ),
+) -> Result<String> {
+    use crate::advice_lookups::{finish, outcome};
+    use crate::sessions::Useful;
+    let situation = text
+        .strip_prefix("Situation: `")
+        .and_then(|t| t.split_once('`'))
+        .map(|(k, _)| k.to_string());
+    if !crate::sessions::under_cap(scope, who, id) {
+        let lookup = finish(outcome::STEP_NOTHING, situation.as_deref());
+        crate::sessions::note_lookup(store, scope, who, id, lookup).await;
+        return Ok(NO_NEW_ADVICE.into());
+    }
+    let useful = crate::sessions::useful(question, conversation, text, when, Some(asked))
+        .await
+        .map_err(runs_error)?;
+    let lookup = finish(
+        match useful {
+            Useful::Yes => outcome::STEP_HANDED,
+            Useful::No => outcome::STEP_NOT_USEFUL,
+            Useful::WhenMismatch => outcome::STEP_WHEN_MISMATCH,
+        },
+        situation.as_deref(),
+    );
+    crate::sessions::note_lookup(store, scope, who, id, lookup).await;
+    if useful != Useful::Yes {
+        return Ok(NO_NEW_ADVICE.into());
+    }
+    crate::sessions::hand(scope, who, id, text);
+    Ok(text.to_string())
 }
 
 /// Public capabilities never enter the learned-advice ledger or a holdout session. This runs only
@@ -12144,42 +12276,8 @@ async fn advise_tool(
             json!({"text": text, "remembered_for_you": mine, "team_shared": team}).to_string(),
         );
     }
-    if args["decide"].as_bool() != Some(true) || !text.starts_with("Situation: ") {
-        return Ok(text);
-    }
-    let id = resolved
-        .as_deref()
-        .unwrap_or_else(|| args["session_id"].as_str().unwrap_or_default());
-    use crate::advice_lookups::{finish, outcome};
-    let situation = text
-        .strip_prefix("Situation: `")
-        .and_then(|t| t.split_once('`'))
-        .map(|(k, _)| k.to_string());
-    if !crate::sessions::under_cap(scope, who, id) {
-        let lookup = finish(outcome::STEP_NOTHING, situation.as_deref());
-        crate::sessions::note_lookup(store, scope, who, id, lookup).await;
-        return Ok(NO_NEW_ADVICE.into());
-    }
-    let useful = crate::sessions::useful(
-        args["question"].as_str().unwrap_or_default(),
-        args["conversation_so_far"].as_str().unwrap_or_default(),
-        &text,
-    )
-    .await
-    .map_err(runs_error)?;
-    let lookup = finish(
-        if useful {
-            outcome::STEP_HANDED
-        } else {
-            outcome::STEP_NOT_USEFUL
-        },
-        situation.as_deref(),
-    );
-    crate::sessions::note_lookup(store, scope, who, id, lookup).await;
-    if !useful {
-        return Ok(NO_NEW_ADVICE.into());
-    }
-    crate::sessions::hand(scope, who, id, &text);
+    // A hook's step (`decide`) gated what it hands on where it was found: the lines of a served note in
+    // [`session_moment`], a note routed afresh in [`session_advice`], before it is recorded as served.
     Ok(text)
 }
 
@@ -12278,6 +12376,7 @@ async fn get_advice_step(
                 store,
                 (who, via),
                 id,
+                question,
                 m,
                 conversation,
                 args["conversation_so_far"].as_str().filter(|_| decide),
@@ -12309,7 +12408,7 @@ async fn get_advice_step(
                     (who, via),
                     id,
                     question,
-                    conversation,
+                    (conversation, args["conversation_so_far"].as_str()),
                     // A hook fits the advice to its context's cap (not offered to agents).
                     (
                         crate::advice::Format::from_env(),
@@ -12318,12 +12417,18 @@ async fn get_advice_step(
                     ),
                     (
                         args["max_chars"].is_null(),
-                        args["keep"].as_bool() != Some(false)
+                        args["keep"].as_bool() != Some(false),
+                        decide,
                     ),
                     also.clone(),
                 ),
                 error_leads(session, store, who, question, &also),
             );
+            // Routed afresh: a hook's step doesn't route the same question again. The session's first request, which
+            // its prompt hook routed, came back with the step after it and was routed a second time.
+            if served.is_ok() && !decide {
+                crate::sessions::new_question(scope, who, id, question);
+            }
             served
                 .map(|served| {
                     with_leads_text(
@@ -12380,7 +12485,9 @@ async fn get_advice_step(
         );
         let also = advice_reads(state, store, session).await;
         let (found, leads) = tokio::join!(
-            advice(session, store, who, question, asked, None, true, &also),
+            advice(
+                session, store, who, question, asked, None, true, &also, None
+            ),
             error_leads(session, store, who, question, &also),
         );
         found.map(|found| {

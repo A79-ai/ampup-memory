@@ -5034,14 +5034,16 @@ async fn route(
         return Ok(None);
     }
     let noted = note.is_some();
+    // What the note says of when it applies, read from the note whole: the text served may leave its Withhold when out.
+    let when = note.as_deref().and_then(crate::advice_route::When::of);
     let (text, dropped) = fit(note, procedures, more, format, max_chars);
-    let fits = match check_fit {
-        Some(d) => crate::advice_route::fits(d, question, &text).await,
-        None => crate::advice_route::fits_chat(router, question, &text).await,
+    let fit = match check_fit {
+        Some(d) => crate::advice_route::fits(d, question, when.as_ref(), &text).await,
+        None => crate::advice_route::fits_chat(router, question, when.as_ref(), &text).await,
     };
     let key = format!("{}{}", space.tag(), lines[i].0);
-    if !fits {
-        crate::advice_lookups::step(mine, crate::advice_lookups::outcome::OFF_TASK, Some(key));
+    if let Some(withheld) = fit.withheld() {
+        crate::advice_lookups::step(mine, withheld, Some(key));
         return Ok(None);
     }
     crate::advice_lookups::step(mine, crate::advice_lookups::ROUTED, Some(key.clone()));
