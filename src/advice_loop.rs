@@ -2,19 +2,19 @@
 //! (`crate::advice`), where the scope's admins turned it on (`set_settings {settings: {advice: true}}`, a team's
 //! over its org's), and on a server that identifies no one, in its own scope.
 //!
-//! Each round (`MEMSTORE_ADVICE_SECS`, default 600), in each such scope:
-//! 1. **Judge.** A run nobody rewarded, once it is older than `MEMSTORE_ADVICE_JUDGE_AFTER_SECS` (default 1800,
+//! Each round (`AMPUP_MEMORY_ADVICE_SECS`, default 600), in each such scope:
+//! 1. **Judge.** A run nobody rewarded, once it is older than `AMPUP_MEMORY_ADVICE_JUDGE_AFTER_SECS` (default 1800,
 //!    so its recorder had time to), goes to the advice model: its task, the end of its trace and its outcome,
 //!    and no goal (what a good outcome is comes from the task itself). The model answers 1 (the run clearly got the outcome the task wanted), -1
 //!    (it clearly didn't, and what was wrong or missing) or 0 (it can't tell). The answer goes in the answer
 //!    log as a row of the run's recorder, its reason starting `judged: ` ([`crate::qa_log::judged`]); a 0 is a
 //!    reason with no reward, so nothing learns from it and the run isn't judged again. A recorder's own
-//!    `reward_run` later replaces any of them. At most `MEMSTORE_ADVICE_JUDGE_MAX` (default 50) runs a round.
-//!    Judging is on unless `MEMSTORE_ADVICE_JUDGE=off`. A judge's reward is a model's opinion (it has not been
+//!    `reward_run` later replaces any of them. At most `AMPUP_MEMORY_ADVICE_JUDGE_MAX` (default 50) runs a round.
+//!    Judging is on unless `AMPUP_MEMORY_ADVICE_JUDGE=off`. A judge's reward is a model's opinion (it has not been
 //!    checked against outcomes known otherwise, a benchmark's verifier), so what is learned from it is a candidate:
 //!    a note is served beyond the people whose sessions taught it only once others' judged sessions ratify it
 //!    (`crate::sessions`). Ended sessions are judged the same way, as they end (`crate::sessions::judge`).
-//! 2. **Learn.** Once at least `MEMSTORE_ADVICE_MIN_NEW` (default 10) rewarded runs aren't in the advice map
+//! 2. **Learn.** Once at least `AMPUP_MEMORY_ADVICE_MIN_NEW` (default 10) rewarded runs aren't in the advice map
 //!    yet, [`crate::advice::learn`] runs, for the audience the map was last learned for (everyone, `*`, at
 //!    first): an admin's narrower audience is never widened by the timer.
 //!
@@ -120,20 +120,20 @@ fn off(var: &str) -> bool {
     std::env::var(var).is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"))
 }
 
-/// Whether unrewarded runs are judged: unless `MEMSTORE_ADVICE_JUDGE=off` (see the module's doc).
+/// Whether unrewarded runs are judged: unless `AMPUP_MEMORY_ADVICE_JUDGE=off` (see the module's doc).
 pub(crate) fn judging() -> bool {
-    !off("MEMSTORE_ADVICE_JUDGE")
+    !off("AMPUP_MEMORY_ADVICE_JUDGE")
 }
 
-/// Whether the server learns advice on its own at all: `MEMSTORE_ADVICE_LEARN=off` turns the timer off
+/// Whether the server learns advice on its own at all: `AMPUP_MEMORY_ADVICE_LEARN=off` turns the timer off
 /// whatever the settings say (the admin op still learns when asked).
 pub fn enabled() -> bool {
-    !off("MEMSTORE_ADVICE_LEARN")
+    !off("AMPUP_MEMORY_ADVICE_LEARN")
 }
 
-/// The timer's period: `MEMSTORE_ADVICE_SECS`, default 600.
+/// The timer's period: `AMPUP_MEMORY_ADVICE_SECS`, default 600.
 pub fn every() -> Duration {
-    Duration::from_secs(env_secs("MEMSTORE_ADVICE_SECS", 600).max(1))
+    Duration::from_secs(env_secs("AMPUP_MEMORY_ADVICE_SECS", 600).max(1))
 }
 
 /// What a round's judging did.
@@ -204,14 +204,14 @@ pub async fn round(
     if judging()
         && let Some(jx) = judge_cx
     {
-        let after = env_secs("MEMSTORE_ADVICE_JUDGE_AFTER_SECS", 1800) as i64 * 1_000_000;
-        let max = env_secs("MEMSTORE_ADVICE_JUDGE_MAX", 50) as usize;
+        let after = env_secs("AMPUP_MEMORY_ADVICE_JUDGE_AFTER_SECS", 1800) as i64 * 1_000_000;
+        let max = env_secs("AMPUP_MEMORY_ADVICE_JUDGE_MAX", 50) as usize;
         done.judged = judge(store, scope, jx, after, max).await?;
     }
     let (new, audience) = unsorted(store, scope).await?;
     let fresh = new.iter().filter(|id| !tried.contains(*id)).count();
     done.new = new.len();
-    let min = env_secs("MEMSTORE_ADVICE_MIN_NEW", 10).max(1) as usize;
+    let min = env_secs("AMPUP_MEMORY_ADVICE_MIN_NEW", 10).max(1) as usize;
     if fresh >= min {
         let acl = if audience.is_empty() {
             vec!["*".to_string()]
@@ -240,7 +240,7 @@ pub async fn round(
 /// Where `scope` asks for people's own advice sooner (`advice_personal_runs`), learns it now for each person with
 /// that many rewarded runs or sessions their map doesn't hold, instead of at the timer's next round: for the
 /// server's session sweep, right after sessions end and are judged. At most once per person every [`SOON_EVERY`],
-/// at most `MEMSTORE_ADVICE_PERSONAL_MAX` people a call, and never while the scope learns already ([`claim`]): the
+/// at most `AMPUP_MEMORY_ADVICE_PERSONAL_MAX` people a call, and never while the scope learns already ([`claim`]): the
 /// timer learns whatever this leaves. Returns how many people it learned for.
 pub async fn personal_soon(store: &Store, scope: &Scope, cx: &Extractor) -> Result<usize> {
     if crate::advice::personal_runs(store, scope).await.is_none() {
@@ -279,8 +279,8 @@ pub async fn personal_soon(store: &Store, scope: &Scope, cx: &Extractor) -> Resu
 }
 
 /// Learns each person's own advice (`crate::advice::Space::mine`) from the runs and sessions they asked, for the
-/// people with at least `MEMSTORE_ADVICE_MIN_NEW` rewarded ones their map doesn't hold yet (fewer where the scope
-/// asks: [`crate::advice::personal_runs`]) and whom `due` lets learn now; at most `MEMSTORE_ADVICE_PERSONAL_MAX`
+/// people with at least `AMPUP_MEMORY_ADVICE_MIN_NEW` rewarded ones their map doesn't hold yet (fewer where the scope
+/// asks: [`crate::advice::personal_runs`]) and whom `due` lets learn now; at most `AMPUP_MEMORY_ADVICE_PERSONAL_MAX`
 /// (default 3) people a round. A person's advice is written for them alone and served to them at once
 /// ([`crate::advice::get_in`]); the team's is learned apart from it. Returns how many people it learned for.
 async fn personal(
@@ -290,8 +290,8 @@ async fn personal(
     tried: &mut BTreeSet<String>,
     due: impl Fn(&str) -> bool,
 ) -> Result<usize> {
-    let max = env_secs("MEMSTORE_ADVICE_PERSONAL_MAX", 3) as usize;
-    let min = env_secs("MEMSTORE_ADVICE_MIN_NEW", 10).max(1) as usize;
+    let max = env_secs("AMPUP_MEMORY_ADVICE_PERSONAL_MAX", 3) as usize;
+    let min = env_secs("AMPUP_MEMORY_ADVICE_MIN_NEW", 10).max(1) as usize;
     let min = crate::advice::personal_runs(store, scope)
         .await
         .map_or(min, |n| min.min(n));

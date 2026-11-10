@@ -245,7 +245,7 @@ impl std::fmt::Display for Scope {
     }
 }
 
-pub use memstore_client::check_name;
+pub use memstore_client::{check_name, naming};
 
 /// Who is reading. Groups come from the customer's IdP (SCIM); the engine defines none. They are the
 /// caller's closure: every team, role, account and channel they hold, already flattened.
@@ -347,7 +347,7 @@ pub struct Closure {
 fn not_held(branch: &str) -> Result<()> {
     anyhow::ensure!(
         !branch.starts_with(governance::HELD_PREFIX),
-        "branch names starting {:?} are memstore's own: nothing is written there but by extraction",
+        "branch names starting {:?} are AmpUp Memory's own: nothing is written there but by extraction",
         governance::HELD_PREFIX
     );
     Ok(())
@@ -711,11 +711,11 @@ pub fn distinct_bytes<'a>(
         .sum()
 }
 
-/// The most decoded table rows the cache holds, in bytes (`MEMSTORE_CACHE_BYTES`, default 3 GiB or a quarter
+/// The most decoded table rows the cache holds, in bytes (`AMPUP_MEMORY_CACHE_BYTES`, default 3 GiB or a quarter
 /// of the container's memory if that is less ([`metrics::sized`]); 0 for no limit). Past it, whole scopes are
 /// dropped, least recently read first, and loaded again when next read.
 pub fn cache_budget() -> usize {
-    std::env::var("MEMSTORE_CACHE_BYTES")
+    std::env::var("AMPUP_MEMORY_CACHE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| metrics::sized(3 << 30, 0.25))
@@ -1884,7 +1884,7 @@ pub struct Store {
     cache: Arc<Cache>,
     max_staleness: Duration,
     /// Never serve cached rows or plans older than this without blocking on a refresh, even if
-    /// background refreshes keep failing (`MEMSTORE_HARD_STALENESS_MS`, default 60000).
+    /// background refreshes keep failing (`AMPUP_MEMORY_HARD_STALENESS_MS`, default 60000).
     hard_staleness: Duration,
     /// Per scope: facts table metadata and its planned data files, for at most the staleness
     /// window, so key lookups don't reload the catalog each time.
@@ -1904,7 +1904,7 @@ pub struct Store {
     no_side_table: Arc<Mutex<HashMap<String, Instant>>>,
     clock_offset_us: i64,
     index_base: String,
-    /// How passages are chunked, as (bytes, overlap): `MEMSTORE_CHUNK_BYTES` and `MEMSTORE_CHUNK_OVERLAP`
+    /// How passages are chunked, as (bytes, overlap): `AMPUP_MEMORY_CHUNK_BYTES` and `AMPUP_MEMORY_CHUNK_OVERLAP`
     /// (default 1500 and 150). Another chunking is another passage index ([`search::passages`]).
     chunking: (usize, usize),
     /// Shared by this store's clones: one group commit per store, whichever clone writes.
@@ -1961,7 +1961,7 @@ struct DirState {
     snapshot_events: std::sync::atomic::AtomicU64,
     /// Load latency, commit retries, and whether the log holds a change this engine can't read.
     metrics: metrics::DirMetrics,
-    /// The key snapshots are sealed with and checked against (`MEMSTORE_SECRET_KEY`, or the server's own:
+    /// The key snapshots are sealed with and checked against (`AMPUP_MEMORY_SECRET_KEY`, or the server's own:
     /// [`Store::with_directory_key`]). Taken from the environment on first use if no one set it.
     key: std::sync::OnceLock<Option<auth::secret::SecretKey>>,
 }
@@ -1971,17 +1971,17 @@ struct DirState {
 const DIRECTORY_ATTEMPTS: u32 = 50;
 
 /// After this many changes past the newest snapshot, the server that writes the next change also writes
-/// a snapshot (`MEMSTORE_DIRECTORY_SNAPSHOT_EVERY`; 0: never on its own).
+/// a snapshot (`AMPUP_MEMORY_DIRECTORY_SNAPSHOT_EVERY`; 0: never on its own).
 fn snapshot_every() -> u64 {
-    std::env::var("MEMSTORE_DIRECTORY_SNAPSHOT_EVERY")
+    std::env::var("AMPUP_MEMORY_DIRECTORY_SNAPSHOT_EVERY")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(500)
 }
 
 impl Store {
-    /// Reads may be up to `MEMSTORE_MAX_STALENESS_MS` (default 1000) behind other writers, and
-    /// block on the catalog rather than serve rows older than `MEMSTORE_HARD_STALENESS_MS`
+    /// Reads may be up to `AMPUP_MEMORY_MAX_STALENESS_MS` (default 1000) behind other writers, and
+    /// block on the catalog rather than serve rows older than `AMPUP_MEMORY_HARD_STALENESS_MS`
     /// (default 60000); this store's own writes are always visible to its next read.
     pub fn new(catalog: Arc<dyn Catalog>) -> Self {
         // Only this cell's memory, whatever the call path (`cell`).
@@ -1989,8 +1989,8 @@ impl Store {
         Store {
             catalog: Arc::new(std::sync::RwLock::new(catalog)),
             cache: Arc::default(),
-            max_staleness: env_millis("MEMSTORE_MAX_STALENESS_MS", 1000),
-            hard_staleness: env_millis("MEMSTORE_HARD_STALENESS_MS", 60_000),
+            max_staleness: env_millis("AMPUP_MEMORY_MAX_STALENESS_MS", 1000),
+            hard_staleness: env_millis("AMPUP_MEMORY_HARD_STALENESS_MS", 60_000),
             plans: Arc::default(),
             plan_generation: Arc::default(),
             tail: Arc::default(),
@@ -2040,7 +2040,7 @@ impl Store {
 
     /// Seal directory snapshots with `key`, and load only those it sealed without reading the log before
     /// them (none: every snapshot is checked against the log). A store's first use of its directory
-    /// fixes this: unless a server set it before, it is `MEMSTORE_SECRET_KEY`.
+    /// fixes this: unless a server set it before, it is `AMPUP_MEMORY_SECRET_KEY`.
     pub fn with_directory_key(self, key: Option<auth::secret::SecretKey>) -> Self {
         let _ = self.dir.key.set(key);
         self
@@ -2316,7 +2316,7 @@ impl Store {
         self.max_staleness
     }
 
-    /// How old a cached read may get before a reader waits for a fresh one (`MEMSTORE_HARD_STALENESS_MS`).
+    /// How old a cached read may get before a reader waits for a fresh one (`AMPUP_MEMORY_HARD_STALENESS_MS`).
     pub fn hard_staleness(&self) -> Duration {
         self.hard_staleness
     }
@@ -3633,7 +3633,7 @@ impl Store {
         // so no one else may make a branch it would take for its own.
         anyhow::ensure!(
             !branch.starts_with(governance::HELD_PREFIX),
-            "branch names starting {:?} are memstore's own",
+            "branch names starting {:?} are AmpUp Memory's own",
             governance::HELD_PREFIX
         );
         self.make_branch(scope, branch, actor).await
@@ -4685,7 +4685,7 @@ impl Store {
         }
     }
 
-    /// The directory, folded: at most `MEMSTORE_MAX_STALENESS_MS` behind other servers, and never behind
+    /// The directory, folded: at most `AMPUP_MEMORY_MAX_STALENESS_MS` behind other servers, and never behind
     /// this server's own changes. A server folds the log once: after that it reads, and folds, only
     /// the changes after the last it folded (on its first load, those after the newest snapshot).
     pub async fn directory(&self) -> Result<Arc<directory::Folded>> {
@@ -8014,13 +8014,13 @@ pub(crate) fn commit_state_unknown(e: &anyhow::Error) -> bool {
 /// that lists every snapshot so far and a manifest list that names every manifest so far, so with nothing
 /// removed a table's metadata grows with the square of its commits: a replay's local ledger reached 2,500
 /// commits and 2.6 GB of metadata over 10 MB of manifests and 8 MB of rows, and past a catalog's limit on
-/// metadata size every write fails. What is kept: the newest `MEMSTORE_MAINTAIN_KEEP` snapshots (default 10;
+/// metadata size every write fails. What is kept: the newest `AMPUP_MEMORY_MAINTAIN_KEEP` snapshots (default 10;
 /// 0 keeps everything) and that many entries of the metadata log. The tables are append-only (no row deletes), so
 /// the newest snapshot names every manifest and data file, and an expired snapshot leaves behind only its manifest
 /// list; a rewrite (`offboard`) replaces the files in one commit and deletes the replaced manifests and data files
 /// itself, from the list it wrote before committing, whether or not this has expired their snapshots by then. That is deleted once the snapshot stopped being
-/// current `MEMSTORE_MAINTAIN_GRACE_SECS` ago (default 120, twice the longest a cached handle is used,
-/// `MEMSTORE_HARD_STALENESS_MS`): a handle loaded before then may still plan a scan from it.
+/// current `AMPUP_MEMORY_MAINTAIN_GRACE_SECS` ago (default 120, twice the longest a cached handle is used,
+/// `AMPUP_MEMORY_HARD_STALENESS_MS`): a handle loaded before then may still plan a scan from it.
 #[derive(Clone, Copy, Debug)]
 pub struct History {
     pub keep: usize,
@@ -8030,12 +8030,12 @@ pub struct History {
 impl History {
     pub fn from_env() -> Self {
         static FROM_ENV: std::sync::LazyLock<History> = std::sync::LazyLock::new(|| History {
-            keep: std::env::var("MEMSTORE_MAINTAIN_KEEP")
+            keep: std::env::var("AMPUP_MEMORY_MAINTAIN_KEEP")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
             grace: Duration::from_secs(
-                std::env::var("MEMSTORE_MAINTAIN_GRACE_SECS")
+                std::env::var("AMPUP_MEMORY_MAINTAIN_GRACE_SECS")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(120),
@@ -8947,10 +8947,10 @@ async fn read_appended(
     }
     let mut keys: HashSet<String> = prev_files.keys().cloned().collect();
     keys.extend(tasks.iter().map(file_key));
-    // MEMSTORE_CHECK_PLAN (set in CI's test run): every incremental read is checked against a full plan, its
+    // AMPUP_MEMORY_CHECK_PLAN (set in CI's test run): every incremental read is checked against a full plan, its
     // files and how each new one is read. A divergence aborts the process: a refresh in the background only
     // logs its errors, and the test that hit it must fail.
-    if std::env::var_os("MEMSTORE_CHECK_PLAN").is_some() {
+    if std::env::var_os("AMPUP_MEMORY_CHECK_PLAN").is_some() {
         let full = plan_all(table).await?;
         let full_keys: HashSet<String> = full.iter().map(file_key).collect();
         let by_key: HashMap<String, &FileScanTask> =
@@ -8965,7 +8965,7 @@ async fn read_appended(
         });
         if full_keys != keys || misread.is_some() {
             eprintln!(
-                "MEMSTORE_CHECK_PLAN: the incremental plan of {} differs from the full plan: {} files only in it, \
+                "AMPUP_MEMORY_CHECK_PLAN: the incremental plan of {} differs from the full plan: {} files only in it, \
                  {} only in the full plan, new file read differently: {:?}",
                 meta.location(),
                 keys.difference(&full_keys).count(),

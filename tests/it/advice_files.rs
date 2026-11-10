@@ -115,13 +115,13 @@ async fn advice_by_files_serves_only_what_the_caller_may_read() {
     let model = stand_in_model(seen.clone()).await;
     // SAFETY: this test runs alone in its process (`own_process`).
     unsafe {
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE", "openrouter");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE", "openrouter");
         std::env::set_var(
-            "MEMSTORE_ADVICE_ROUTE_URL",
+            "AMPUP_MEMORY_ADVICE_ROUTE_URL",
             format!("http://127.0.0.1:{model}/v1"),
         );
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE_KEY", "stand-in");
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE_KEY", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
     }
 
     let dir = tempfile::tempdir().unwrap();

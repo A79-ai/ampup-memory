@@ -5,7 +5,7 @@
 //!   identity provider, no schema (it is a service key, as the audit and offboarding already say);
 //! - a member who writes the same text as someone else's `remember_memory` episode writes an episode of
 //!   their own: they can't re-ACL (hide or widen) the other author's episode;
-//! - an org's admin can't name another org's `env:MEMSTORE_IDP_SECRET_…` variable as their client
+//! - an org's admin can't name another org's `env:AMPUP_MEMORY_IDP_SECRET_…` variable as their client
 //!   secret, which the server would then hand out as theirs;
 //! - an org's admin can't make the server fetch from internal hosts (loopback, the private network,
 //!   the cloud's metadata service) through their provider's issuer, its keys' URL or a redirect, and the
@@ -54,7 +54,7 @@ const BOB_FILE_KEY: &str = "msk_file_key_in_bobs_name_for_the_review";
 const CAROL_FILE_KEY: &str = "msk_file_key_in_carols_name_for_the_review";
 const DAN_FILE_KEY: &str = "msk_file_key_in_dans_name_for_the_review";
 const ERIN_FILE_KEY: &str = "msk_file_key_in_erins_name_for_the_review";
-/// The app's JWTs (`MEMSTORE_JWT_SECRET`): its users' identity, passed on.
+/// The app's JWTs (`AMPUP_MEMORY_JWT_SECRET`): its users' identity, passed on.
 const APP_SECRET: &str = "the-app-jwt-secret-for-the-security-review";
 const APP_ISSUER: &str = "https://app.example";
 const ACME_SECRET: &str = "acme-cli-client-secret-value";
@@ -147,7 +147,7 @@ async fn start() -> (String, String, tempfile::TempDir) {
     start_with(true).await
 }
 
-/// [`start`]; `local_issuers`: orgs' providers may be on this machine (`MEMSTORE_ALLOW_LOCAL_ISSUERS`).
+/// [`start`]; `local_issuers`: orgs' providers may be on this machine (`AMPUP_MEMORY_ALLOW_LOCAL_ISSUERS`).
 async fn start_with(local_issuers: bool) -> (String, String, tempfile::TempDir) {
     let (s, issuer, dir, _) = start_on(local_issuers).await;
     (s, issuer, dir)
@@ -267,7 +267,7 @@ async fn serve_on(
             token_auth: Some(token_auth),
             secret_env: Some(
                 [(
-                    "MEMSTORE_IDP_SECRET_ACME".to_string(),
+                    "AMPUP_MEMORY_IDP_SECRET_ACME".to_string(),
                     ACME_SECRET.to_string(),
                 )]
                 .into(),
@@ -411,7 +411,7 @@ async fn an_org_admin_names_only_their_own_org_s_secret_variable() {
         &s,
         "/admin",
         &gary,
-        &provider("globex", "MEMSTORE_IDP_SECRET_ACME"),
+        &provider("globex", "AMPUP_MEMORY_IDP_SECRET_ACME"),
     )
     .await;
     assert_eq!(status, 403, "{body}");
@@ -420,17 +420,33 @@ async fn an_org_admin_names_only_their_own_org_s_secret_variable() {
         "{body}"
     );
     assert!(!meta("globex").await.contains(ACME_SECRET));
-
-    // Acme's admin names acme's own variable, and people signing in to acme get it.
+    // By the variable's old name (MEMSTORE_IDP_SECRET_ACME, which the server reads as the new): refused too.
     let (status, body) = post(
         &s,
         "/admin",
-        &alice,
-        &provider("acme", "MEMSTORE_IDP_SECRET_ACME"),
+        &gary,
+        &provider("globex", "MEMSTORE_IDP_SECRET_ACME"),
     )
     .await;
-    assert_eq!(status, 200, "{body}");
-    assert!(meta("acme").await.contains(ACME_SECRET));
+    assert_eq!(status, 403, "{body}");
+    assert!(!meta("globex").await.contains(ACME_SECRET));
+    // Nor may any other variable be named by the old prefix.
+    let (status, body) = post(
+        &s,
+        "/admin",
+        &gary,
+        &provider("globex", "MEMSTORE_SECRET_KEY"),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+
+    // Acme's admin names acme's own variable, and people signing in to acme get it: by its old name too (a
+    // reference written before the rename), read from the variable's new name.
+    for name in ["MEMSTORE_IDP_SECRET_ACME", "AMPUP_MEMORY_IDP_SECRET_ACME"] {
+        let (status, body) = post(&s, "/admin", &alice, &provider("acme", name)).await;
+        assert_eq!(status, 200, "{name}: {body}");
+        assert!(meta("acme").await.contains(ACME_SECRET), "{name}");
+    }
 }
 
 /// An org's schema (what its memory is typed with, and which episodes it reads): its members read it, only its
@@ -541,10 +557,11 @@ async fn an_org_s_schema_is_read_by_its_members_and_set_by_its_admins() {
     let v3 = schema(&["doc:alpha:", "doc:beta:", "doc:gamma:"]);
     std::fs::write(&file, v3.to_string()).unwrap();
     let cli = |home: &str, args: &[&str]| {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_memstore"))
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ampup-memory"))
             .args(args)
+            .env_remove("AMPUP_MEMORY_CALLER_IDENTITY")
             .env_remove("MEMSTORE_CALLER_IDENTITY")
-            .env("MEMSTORE_CONFIG_DIR", dir.path().join(home))
+            .env("AMPUP_MEMORY_CONFIG_DIR", dir.path().join(home))
             .output()
             .unwrap();
         (
@@ -619,7 +636,7 @@ async fn counting_listener(addr: &str) -> Option<(u16, Count)> {
 /// tried, so the refusals map nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_org_admin_can_t_point_the_provider_at_internal_hosts() {
-    // As deployed: no MEMSTORE_ALLOW_LOCAL_ISSUERS.
+    // As deployed: no AMPUP_MEMORY_ALLOW_LOCAL_ISSUERS.
     let (s, issuer, _dir) = start_with(false).await;
     let alice = id_token(&issuer, "alice@acme.com");
     let (up, connections) = counting_listener("127.0.0.1:0").await.unwrap();
@@ -1562,11 +1579,11 @@ async fn requests_under_way_are_capped_and_another_cell_s_body_waits_for_its_sen
     let (far, heard) = counting_listener("127.0.0.1:0").await.unwrap();
     // SAFETY: this test runs in a process of its own (`own_process`), before the server reads them.
     unsafe {
-        std::env::set_var("MEMSTORE_MAX_IN_FLIGHT_PER_CALLER", "2");
-        std::env::set_var("MEMSTORE_MAX_IN_FLIGHT", "3");
-        std::env::set_var("MEMSTORE_CELL_MAP", r#"{"farco": "far"}"#);
+        std::env::set_var("AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER", "2");
+        std::env::set_var("AMPUP_MEMORY_MAX_IN_FLIGHT", "3");
+        std::env::set_var("AMPUP_MEMORY_CELL_MAP", r#"{"farco": "far"}"#);
         std::env::set_var(
-            "MEMSTORE_CELL_URLS",
+            "AMPUP_MEMORY_CELL_URLS",
             format!(r#"{{"far": "http://127.0.0.1:{far}"}}"#),
         );
     }
@@ -1712,7 +1729,7 @@ async fn an_org_s_provider_can_t_fill_the_audit_with_names_it_mints() {
 }
 
 /// Sign-in discovery names the URL the server was given, never the one a request's `Host` claims, and a
-/// server with sign-in won't listen beyond this machine without being given one (MEMSTORE_PUBLIC_URL).
+/// server with sign-in won't listen beyond this machine without being given one (AMPUP_MEMORY_PUBLIC_URL).
 #[tokio::test(flavor = "multi_thread")]
 async fn sign_in_discovery_never_names_the_caller_s_host() {
     let (s, _issuer, _dir) = start().await;
@@ -1768,10 +1785,12 @@ async fn sign_in_discovery_never_names_the_caller_s_host() {
         Ok(Err(e)) => format!("{e:#}"),
         Ok(Ok(())) => panic!("the server stopped without an error"),
         Err(_) => {
-            panic!("a server with sign-in listened on every interface without MEMSTORE_PUBLIC_URL")
+            panic!(
+                "a server with sign-in listened on every interface without AMPUP_MEMORY_PUBLIC_URL"
+            )
         }
     };
-    assert!(err.contains("MEMSTORE_PUBLIC_URL"), "{err}");
+    assert!(err.contains("AMPUP_MEMORY_PUBLIC_URL"), "{err}");
 }
 
 /// A server on `catalog` holding `secret_key`, as [`start`] makes one: the operator's admin key, people
@@ -1816,7 +1835,7 @@ async fn serve_keyed(
 
 /// What the catalog holds is served only as far as the directory's log says. Someone who can write the
 /// catalog writes a snapshot that adds a key of their own and makes mallory acme's admin, with no change in
-/// the log: a server loading it checks it against the log (or, holding `MEMSTORE_SECRET_KEY`, against the
+/// the log: a server loading it checks it against the log (or, holding `AMPUP_MEMORY_SECRET_KEY`, against the
 /// seal a server put on it) and serves neither. A change of an op no engine here knows, written at a version
 /// it reads (a newer engine that forgot to bump the version), stops the fold as a newer version does: no
 /// key is served from a directory that change may have narrowed, and the server says it isn't ready.

@@ -189,7 +189,7 @@ impl JwtConfig {
         // be "verified" with a public key as the secret.
         let (keys, alg) = match keys {
             KeySource::Secret(s) => {
-                anyhow::ensure!(s.len() >= 32, "MEMSTORE_JWT_SECRET needs 32+ chars");
+                anyhow::ensure!(s.len() >= 32, "AMPUP_MEMORY_JWT_SECRET needs 32+ chars");
                 (
                     Keys::Fixed(DecodingKey::from_secret(s.as_bytes())),
                     Algorithm::HS256,
@@ -197,7 +197,8 @@ impl JwtConfig {
             }
             KeySource::Pem(p) => (
                 Keys::Fixed(
-                    DecodingKey::from_rsa_pem(p.as_bytes()).context("MEMSTORE_JWT_PUBLIC_KEY")?,
+                    DecodingKey::from_rsa_pem(p.as_bytes())
+                        .context("AMPUP_MEMORY_JWT_PUBLIC_KEY")?,
                 ),
                 Algorithm::RS256,
             ),
@@ -417,7 +418,7 @@ fn says_verified(claims: &serde_json::Value) -> bool {
     claims["email_verified"] == true || claims["email_verified"] == "true"
 }
 
-/// The platform's Auth0 tenant (`MEMSTORE_AUTH0_ISSUER`): one issuer whose ID tokens sign people in to
+/// The platform's Auth0 tenant (`AMPUP_MEMORY_AUTH0_ISSUER`): one issuer whose ID tokens sign people in to
 /// many orgs, each token to the org bound to the Auth0 Organization it was issued for (its `org_id`).
 pub struct Auth0 {
     /// Its keys and issuer; `audiences` are the memstore Auth0 application's client ids.
@@ -425,7 +426,7 @@ pub struct Auth0 {
     /// This deployment as a resource (`<public url>/mcp`): an access token the tenant issued for it, to
     /// any client registered there (an MCP client's, through dynamic registration), also signs in.
     resources: Vec<String>,
-    /// The Auth0 Organization whose members are operators (`MEMSTORE_AUTH0_OPERATORS_ORG`).
+    /// The Auth0 Organization whose members are operators (`AMPUP_MEMORY_AUTH0_OPERATORS_ORG`).
     operators: Option<String>,
 }
 
@@ -441,12 +442,12 @@ impl Auth0 {
     ) -> Result<Self> {
         anyhow::ensure!(
             !client_ids.is_empty(),
-            "MEMSTORE_AUTH0_ISSUER needs the memstore application's client ids (MEMSTORE_AUTH0_CLIENT_IDS)"
+            "AMPUP_MEMORY_AUTH0_ISSUER needs the AmpUp Memory application's client ids (AMPUP_MEMORY_AUTH0_CLIENT_IDS)"
         );
         if let Some(o) = &operators {
             anyhow::ensure!(
                 crate::people::directory::valid_auth0_org(o),
-                "MEMSTORE_AUTH0_OPERATORS_ORG {o:?} is not an Auth0 organization id (org_…)"
+                "AMPUP_MEMORY_AUTH0_OPERATORS_ORG {o:?} is not an Auth0 organization id (org_…)"
             );
         }
         let fetch = FetchPolicy::Vetted {
@@ -454,10 +455,10 @@ impl Auth0 {
         };
         let oidc = OidcConfig::discover_issuer(issuer, client_ids, fetch)
             .await
-            .context("MEMSTORE_AUTH0_ISSUER")?;
+            .context("AMPUP_MEMORY_AUTH0_ISSUER")?;
         oidc.fetch_keys()
             .await
-            .context("MEMSTORE_AUTH0_ISSUER's keys")?;
+            .context("AMPUP_MEMORY_AUTH0_ISSUER's keys")?;
         Ok(Auth0 {
             oidc,
             resources,
@@ -646,7 +647,7 @@ struct KeysFile {
 
 /// A keys file's rows, checked: every sha256 64 hex characters, no id twice.
 fn parse_keys(json: &str) -> Result<Vec<ApiKeyRow>> {
-    let keys: Vec<ApiKeyRow> = serde_json::from_str(json).context("MEMSTORE_API_KEYS")?;
+    let keys: Vec<ApiKeyRow> = serde_json::from_str(json).context("AMPUP_MEMORY_API_KEYS")?;
     let mut seen = HashSet::new();
     for k in &keys {
         anyhow::ensure!(
@@ -694,13 +695,13 @@ impl TokenAuth {
         })
     }
 
-    /// [`Self::new`] with the keys read from the keys file at `path` (`MEMSTORE_API_KEYS`), which the server
+    /// [`Self::new`] with the keys read from the keys file at `path` (`AMPUP_MEMORY_API_KEYS`), which the server
     /// reads again whenever it changes ([`Self::reload_keys_file`]): a key taken out of the file stops working
     /// within the poll interval ([`KEYS_FILE_POLL`], [`Self::reload_every`]), on every server reading it, with no restart.
     pub fn from_keys_file(path: &std::path::Path, jwt: Option<JwtConfig>) -> Result<Self> {
-        let text =
-            std::fs::read(path).with_context(|| format!("MEMSTORE_API_KEYS {}", path.display()))?;
-        let keys = parse_keys(std::str::from_utf8(&text).context("MEMSTORE_API_KEYS")?)?;
+        let text = std::fs::read(path)
+            .with_context(|| format!("AMPUP_MEMORY_API_KEYS {}", path.display()))?;
+        let keys = parse_keys(std::str::from_utf8(&text).context("AMPUP_MEMORY_API_KEYS")?)?;
         let mut auth = Self::new(None, jwt)?;
         *auth.keys.write().unwrap() = Arc::new(keys);
         auth.keys_file = Some(KeysFile {
@@ -735,7 +736,7 @@ impl TokenAuth {
             return Ok(None);
         };
         let read = std::fs::read(&f.path)
-            .with_context(|| format!("MEMSTORE_API_KEYS {}", f.path.display()))
+            .with_context(|| format!("AMPUP_MEMORY_API_KEYS {}", f.path.display()))
             .map(|text| {
                 let digest: [u8; 32] = sha2::Sha256::digest(&text).into();
                 (digest, text)
@@ -759,7 +760,7 @@ impl TokenAuth {
             return Ok(None);
         }
         let keys = match std::str::from_utf8(&text)
-            .context("MEMSTORE_API_KEYS is not UTF-8")
+            .context("AMPUP_MEMORY_API_KEYS is not UTF-8")
             .and_then(parse_keys)
         {
             Ok(k) => k,
@@ -822,7 +823,7 @@ impl TokenAuth {
             && o.issuer == iss
         {
             anyhow::bail!(
-                "MEMSTORE_OIDC_ISSUER is the Auth0 tenant ({iss}): the tenant signs people in through MEMSTORE_AUTH0_ISSUER only, bound to their organization; give the server's own sign-in another issuer, or leave it unset"
+                "AMPUP_MEMORY_OIDC_ISSUER is the Auth0 tenant ({iss}): the tenant signs people in through AMPUP_MEMORY_AUTH0_ISSUER only, bound to their organization; give the server's own sign-in another issuer, or leave it unset"
             );
         }
         if let Some(j) = &self.jwt
@@ -830,7 +831,7 @@ impl TokenAuth {
             && ids.contains(&j.opts.audience)
         {
             anyhow::bail!(
-                "MEMSTORE_JWT_AUDIENCE {} of {iss} is one of MEMSTORE_AUTH0_CLIENT_IDS",
+                "AMPUP_MEMORY_JWT_AUDIENCE {} of {iss} is one of AMPUP_MEMORY_AUTH0_CLIENT_IDS",
                 j.opts.audience
             );
         }
@@ -860,7 +861,7 @@ impl TokenAuth {
         !shared || a.names_client(token)
     }
 
-    /// Let orgs connect providers on this machine (`MEMSTORE_ALLOW_LOCAL_ISSUERS`), over http too: for a
+    /// Let orgs connect providers on this machine (`AMPUP_MEMORY_ALLOW_LOCAL_ISSUERS`), over http too: for a
     /// provider run locally. Otherwise an org's provider and its keys must be https on a public address.
     pub fn allow_local_issuers(mut self) -> Self {
         self.local_issuers = true;

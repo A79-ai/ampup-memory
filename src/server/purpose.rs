@@ -1,5 +1,5 @@
 //! What an agent is told memory is for, where its scope asks (`Settings::instructions` `purpose`, else the server's
-//! `MEMSTORE_INSTRUCTIONS=purpose`): the `initialize` instructions and the descriptions of `start_session`,
+//! `AMPUP_MEMORY_INSTRUCTIONS=purpose`): the `initialize` instructions and the descriptions of `start_session`,
 //! `get_advice`, `end_session` and `remember_memory` say what memory carries and when it helps, with no fixed
 //! procedure (no call order, no "in that turn", no list of what to record), and leave the judgment to the agent.
 //! The tools offered, their names, arguments, annotations and permissions are the default's; only the wording
@@ -28,7 +28,7 @@ pub(super) fn lifecycle(advised: bool) -> String {
          their team asked to be remembered (preferences and decisions to honour unless the user says otherwise, \
          never instructions to run anything){}. {}end_session closes the session with what happened and how it \
          turned out: that is how memory learns from it.\n\nRemember what the user asks you to, and what is \
-         clearly worth remembering, with remember_memory. It is theirs alone, a decision too: memstore shares it \
+         clearly worth remembering, with remember_memory. It is theirs alone, a decision too: AmpUp Memory shares it \
          with the team once at least {} people have said the same. Never remember small talk, secrets or raw \
          tool output.",
         if advised {
@@ -85,7 +85,7 @@ pub(super) fn describe(tools: &mut [Value], scope: &Scope, writes_scope: bool) {
                 "Keeps text in this memory ({scope}) as a source episode, for later conversations: start_session \
                  hands the user's own back in them, and get_episode reads it. It is for what the user asks you to \
                  remember and what is clearly worth remembering: what would help you or them in a later \
-                 conversation. It is theirs alone (`for` \"me\", the default): memstore shares it with everyone in \
+                 conversation. It is theirs alone (`for` \"me\", the default): AmpUp Memory shares it with everyone in \
                  {scope} once at least {} people have said the same. `for` \"team\" is for a document or note that \
                  isn't anyone's feedback. Never small talk, secrets or raw tool output.",
                 crate::keep::SHARED_AT

@@ -142,7 +142,7 @@ fn hook(port: u16, home: &Path, event: &str, input: Value) -> (String, Duration)
     hook_in(port, home, event, input, None)
 }
 
-/// [`hook`], with `MEMSTORE_ORG` naming `org`.
+/// [`hook`], with `AMPUP_MEMORY_ORG` naming `org`.
 fn hook_in(
     port: u16,
     home: &Path,
@@ -152,17 +152,20 @@ fn hook_in(
 ) -> (String, Duration) {
     warm_up();
     let started = Instant::now();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_memstore"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ampup-memory"));
     cmd.args(["hook", event])
-        .env("MEMSTORE_URL", format!("http://127.0.0.1:{port}"))
-        .env("MEMSTORE_TOKEN", "test")
-        .env("MEMSTORE_CONFIG_DIR", home.join("config"))
+        .env("AMPUP_MEMORY_URL", format!("http://127.0.0.1:{port}"))
+        .env("AMPUP_MEMORY_TOKEN", "test")
+        .env("AMPUP_MEMORY_CONFIG_DIR", home.join("config"))
         .env("TMPDIR", home.join("tmp"))
+        .env_remove("AMPUP_MEMORY_HOOK_DETACHED")
         .env_remove("MEMSTORE_HOOK_DETACHED")
+        .env_remove("AMPUP_MEMORY_ORG")
         .env_remove("MEMSTORE_ORG")
+        .env_remove("AMPUP_MEMORY_SCOPE")
         .env_remove("MEMSTORE_SCOPE");
     if let Some(o) = org {
-        cmd.env("MEMSTORE_ORG", o);
+        cmd.env("AMPUP_MEMORY_ORG", o);
     }
     let mut child = cmd
         .current_dir(home)
@@ -189,7 +192,7 @@ fn hook_in(
 fn warm_up() {
     static WARM: std::sync::Once = std::sync::Once::new();
     WARM.call_once(|| {
-        let _ = Command::new(env!("CARGO_BIN_EXE_memstore"))
+        let _ = Command::new(env!("CARGO_BIN_EXE_ampup-memory"))
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -316,7 +319,7 @@ fn what_a_copy_finds_reaches_the_next_hook() {
     let context = v["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
-    assert!(context.contains("memstore session: s-1"), "{context}");
+    assert!(context.contains("AmpUp Memory session: s-1"), "{context}");
     assert!(context.contains("Always run the smoke test."), "{context}");
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
     // That tool call fired the note's triggers in a copy: its inform comes with the next hook.
@@ -367,7 +370,7 @@ fn a_prompt_hands_on_the_open_session_at_once() {
         "prompt",
         input(sid, cwd, json!({"prompt": "deploy the api"})),
     );
-    assert!(said.contains("memstore session: s-1"), "{said}");
+    assert!(said.contains("AmpUp Memory session: s-1"), "{said}");
     // The prompt's copy asks for advice and posts it, with the session's line, to the inbox: the next prompt hands
     // that on. Waited for, so the next prompt always finds it and never races it.
     until("the advice reaching the inbox", || inbox_has_mail(cwd, sid));
@@ -380,7 +383,7 @@ fn a_prompt_hands_on_the_open_session_at_once() {
     // The advice comes, and the line doesn't again: the first prompt handed it on, and it is handed on once.
     assert!(said.contains("Situation: deploy"), "no advice: {said}");
     assert_eq!(
-        said.matches("memstore session: s-1").count(),
+        said.matches("AmpUp Memory session: s-1").count(),
         0,
         "the line handed on twice: {said}"
     );

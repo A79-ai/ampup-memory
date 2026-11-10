@@ -5,7 +5,7 @@
 //! Backends:
 //! - `local`: a fastembed model run in-process (default `Xenova/bge-small-en-v1.5`, 384 dims).
 //!   Any model fastembed ships can be named; its files are fetched on first use into
-//!   `MEMSTORE_MODEL_DIR` (default `~/.cache/memstore/models`).
+//!   `AMPUP_MEMORY_MODEL_DIR` (default `~/.cache/memstore/models`).
 //! - `openai`: OpenAI's embeddings API (default `text-embedding-3-small`, 1,536 dims), or any
 //!   server with its `/embeddings` shape.
 //! - `openrouter`: OpenRouter's embeddings API, where one key reaches every vendor's embedding
@@ -14,20 +14,20 @@
 //!   carries no vendor adapters of its own.
 //!
 //! Environment:
-//! - `MEMSTORE_EMBED`: `local`, `openai` or `openrouter`. Unset: `openai` when an embeddings key
-//!   of its own is set (`MEMSTORE_EMBED_KEY` or `MEMSTORE_EMBED_KEY_FILE`), else `openrouter` when
+//! - `AMPUP_MEMORY_EMBED`: `local`, `openai` or `openrouter`. Unset: `openai` when an embeddings key
+//!   of its own is set (`AMPUP_MEMORY_EMBED_KEY` or `AMPUP_MEMORY_EMBED_KEY_FILE`), else `openrouter` when
 //!   `OPENROUTER_API_KEY` is (the default, as for extraction: the local model is slow to index
 //!   with on a few CPUs), else `openai` with `OPENAI_API_KEY`, else `local`. A deployment's
 //!   control plane can name it (`crate::agent`'s `embedding`). `cargo test` and `cargo run` pin
 //!   `local` (`.cargo/config.toml`), so the test suite never calls an API, whatever keys the
 //!   machine carries.
-//! - `MEMSTORE_EMBED_MODEL`: the model name (a fastembed model code, an OpenAI model id, or an
+//! - `AMPUP_MEMORY_EMBED_MODEL`: the model name (a fastembed model code, an OpenAI model id, or an
 //!   OpenRouter model id with its vendor).
-//! - `MEMSTORE_EMBED_DIMS`: vector width, for API models that accept one. Required for an API
+//! - `AMPUP_MEMORY_EMBED_DIMS`: vector width, for API models that accept one. Required for an API
 //!   model the engine doesn't know; the local model's width comes from the model.
-//! - `MEMSTORE_EMBED_URL`: the API base URL (default `https://api.openai.com/v1` for `openai`,
+//! - `AMPUP_MEMORY_EMBED_URL`: the API base URL (default `https://api.openai.com/v1` for `openai`,
 //!   `https://openrouter.ai/api/v1` for `openrouter`; a proxy or any server with the same
-//!   `/embeddings` shape works). `MEMSTORE_EMBED_KEY`: the key (or `MEMSTORE_EMBED_KEY_FILE`,
+//!   `/embeddings` shape works). `AMPUP_MEMORY_EMBED_KEY`: the key (or `AMPUP_MEMORY_EMBED_KEY_FILE`,
 //!   a file holding it, for mounted secrets), else `OPENAI_API_KEY` or `OPENROUTER_API_KEY`.
 //!
 //! Vectors from different backends, or models, are not comparable, so a non-default choice
@@ -69,14 +69,14 @@ pub enum Provider {
         dims: i32,
     },
     /// OpenAI's `/embeddings`, or a server with its shape. The key is read from the environment
-    /// at call time (`MEMSTORE_EMBED_KEY`, else `OPENAI_API_KEY`), never held here.
+    /// at call time (`AMPUP_MEMORY_EMBED_KEY`, else `OPENAI_API_KEY`), never held here.
     OpenAI {
         model: String,
         dims: i32,
         base_url: String,
     },
     /// OpenRouter's `/embeddings`. The key is read from the environment at call time
-    /// (`MEMSTORE_EMBED_KEY`, else `OPENROUTER_API_KEY`), never held here.
+    /// (`AMPUP_MEMORY_EMBED_KEY`, else `OPENROUTER_API_KEY`), never held here.
     OpenRouter {
         model: String,
         dims: i32,
@@ -93,18 +93,18 @@ impl Provider {
                 .filter(|v| !v.is_empty())
         };
         let own_key =
-            var("MEMSTORE_EMBED_KEY").is_some() || var("MEMSTORE_EMBED_KEY_FILE").is_some();
-        let choice = match var("MEMSTORE_EMBED").map(|c| c.to_ascii_lowercase()) {
+            var("AMPUP_MEMORY_EMBED_KEY").is_some() || var("AMPUP_MEMORY_EMBED_KEY_FILE").is_some();
+        let choice = match var("AMPUP_MEMORY_EMBED").map(|c| c.to_ascii_lowercase()) {
             Some(c) => c,
             None if own_key => "openai".into(),
             None if var("OPENROUTER_API_KEY").is_some() => "openrouter".into(),
             None if var("OPENAI_API_KEY").is_some() => "openai".into(),
             None => "local".into(),
         };
-        let model = var("MEMSTORE_EMBED_MODEL");
-        let dims = match var("MEMSTORE_EMBED_DIMS") {
+        let model = var("AMPUP_MEMORY_EMBED_MODEL");
+        let dims = match var("AMPUP_MEMORY_EMBED_DIMS") {
             Some(d) => Some(d.parse::<i32>().ok().filter(|d| *d > 0).with_context(|| {
-                format!("MEMSTORE_EMBED_DIMS must be a positive integer, not {d:?}")
+                format!("AMPUP_MEMORY_EMBED_DIMS must be a positive integer, not {d:?}")
             })?),
             None => None,
         };
@@ -114,7 +114,7 @@ impl Provider {
                 let info = local_model(&code)?;
                 anyhow::ensure!(
                     dims.is_none_or(|d| d as usize == info.dim),
-                    "MEMSTORE_EMBED_DIMS does not apply to the local model {code} ({} dims)",
+                    "AMPUP_MEMORY_EMBED_DIMS does not apply to the local model {code} ({} dims)",
                     info.dim
                 );
                 Ok(Provider::Local {
@@ -135,13 +135,15 @@ impl Provider {
                 };
                 anyhow::ensure!(
                     own_key || var(key_var).is_some(),
-                    "MEMSTORE_EMBED={api} needs MEMSTORE_EMBED_KEY, MEMSTORE_EMBED_KEY_FILE or {key_var}"
+                    "AMPUP_MEMORY_EMBED={api} needs AMPUP_MEMORY_EMBED_KEY, AMPUP_MEMORY_EMBED_KEY_FILE or {key_var}"
                 );
                 let model = model.unwrap_or_else(|| default_model.into());
                 let dims = dims.or_else(|| known_dims(&model)).with_context(|| {
-                    format!("set MEMSTORE_EMBED_DIMS: the engine doesn't know the width of {model}")
+                    format!(
+                        "set AMPUP_MEMORY_EMBED_DIMS: the engine doesn't know the width of {model}"
+                    )
                 })?;
-                let base_url = var("MEMSTORE_EMBED_URL")
+                let base_url = var("AMPUP_MEMORY_EMBED_URL")
                     .map(|u| u.trim_end_matches('/').to_string())
                     .unwrap_or_else(|| default_url.into());
                 Ok(if api == "openai" {
@@ -159,7 +161,9 @@ impl Provider {
                 })
             }
             other => {
-                anyhow::bail!("MEMSTORE_EMBED must be local, openai or openrouter, not {other:?}")
+                anyhow::bail!(
+                    "AMPUP_MEMORY_EMBED must be local, openai or openrouter, not {other:?}"
+                )
             }
         }
     }
@@ -286,16 +290,16 @@ pub async fn embed(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
     }
 }
 
-/// The API key: `MEMSTORE_EMBED_KEY`, the contents of the file `MEMSTORE_EMBED_KEY_FILE` names
+/// The API key: `AMPUP_MEMORY_EMBED_KEY`, the contents of the file `AMPUP_MEMORY_EMBED_KEY_FILE` names
 /// (mounted secrets), or the provider's own variable (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`).
 fn api_key(provider: &Provider) -> Result<String> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    if let Some(k) = var("MEMSTORE_EMBED_KEY") {
+    if let Some(k) = var("AMPUP_MEMORY_EMBED_KEY") {
         return Ok(k.trim().to_string());
     }
-    if let Some(f) = var("MEMSTORE_EMBED_KEY_FILE") {
+    if let Some(f) = var("AMPUP_MEMORY_EMBED_KEY_FILE") {
         return Ok(std::fs::read_to_string(&f)
-            .with_context(|| format!("MEMSTORE_EMBED_KEY_FILE {f}"))?
+            .with_context(|| format!("AMPUP_MEMORY_EMBED_KEY_FILE {f}"))?
             .trim()
             .to_string());
     }
@@ -305,7 +309,7 @@ fn api_key(provider: &Provider) -> Result<String> {
     };
     var(own)
         .map(|k| k.trim().to_string())
-        .with_context(|| format!("MEMSTORE_EMBED_KEY, MEMSTORE_EMBED_KEY_FILE or {own}"))
+        .with_context(|| format!("AMPUP_MEMORY_EMBED_KEY, AMPUP_MEMORY_EMBED_KEY_FILE or {own}"))
 }
 
 /// The local model, loaded once per process, for index updates' batches.
@@ -348,7 +352,7 @@ async fn embed_local(provider: &Provider, texts: Vec<String>) -> Result<Vec<Vec<
             }
             let mut m = which.lock();
             if m.is_none() {
-                let dir = std::env::var("MEMSTORE_MODEL_DIR").unwrap_or_else(|_| {
+                let dir = std::env::var("AMPUP_MEMORY_MODEL_DIR").unwrap_or_else(|_| {
                     format!(
                         "{}/.cache/memstore/models",
                         std::env::var("HOME").unwrap_or_else(|_| ".".into())
@@ -613,7 +617,7 @@ async fn embed_api_in(
                 for v in &vecs {
                     anyhow::ensure!(
                         v.len() == *dims as usize,
-                        "{label}: the model returned {} dims, the index expects {dims}; set MEMSTORE_EMBED_DIMS={} and rebuild the index",
+                        "{label}: the model returned {} dims, the index expects {dims}; set AMPUP_MEMORY_EMBED_DIMS={} and rebuild the index",
                         v.len(),
                         v.len()
                     );

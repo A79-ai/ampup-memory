@@ -4,7 +4,7 @@
 //! `…__get_advice`), or advice memstore's own hooks handed the agent (a `hook_additional_context` attachment
 //! beginning [`super::ADVICE_LEAD`]). Each Stop that finds an answered call not sent yet sends a part of the
 //! session's one trace: what each transcript gained since the last part (its new lines and calls); only where the org keeps them (asked once, then remembered for
-//! [`OFF_FOR`] where it doesn't), never with `MEMSTORE_CAPTURE=off`.
+//! [`OFF_FOR`] where it doesn't), never with `AMPUP_MEMORY_CAPTURE=off`.
 //!
 //! What leaves the machine: the user and assistant lines, their text, tool calls and tool results (each cut to
 //! [`RESULT_CAP`] characters) with secret-looking words redacted, and the advice the hooks handed on; of every
@@ -243,7 +243,7 @@ type Part = (String, usize, Vec<Value>, Vec<Value>);
 /// call not sent yet.
 pub(super) async fn send(client: &Client, input: &Value, harness: Harness) -> Result<()> {
     if harness != Harness::ClaudeCode
-        || std::env::var("MEMSTORE_CAPTURE").unwrap_or_default() == "off"
+        || std::env::var("AMPUP_MEMORY_CAPTURE").unwrap_or_default() == "off"
     {
         return Ok(());
     }

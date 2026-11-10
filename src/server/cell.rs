@@ -3,9 +3,9 @@
 //! (`_writer-<cell>`), warm and do background work only for the orgs mapped to their cell, and the default
 //! cell's servers forward a request that selects another cell's org to that cell.
 //!
-//! - `MEMSTORE_CELL`: this server's cell (default `default`).
-//! - `MEMSTORE_CELL_MAP`: JSON, org to cell (`{"acme": "acme"}`); an org not named is the default cell's.
-//! - `MEMSTORE_CELL_URLS`: JSON, cell to the URL the default cell forwards to (`{"acme": "http://memstore-acme"}`).
+//! - `AMPUP_MEMORY_CELL`: this server's cell (default `default`).
+//! - `AMPUP_MEMORY_CELL_MAP`: JSON, org to cell (`{"acme": "acme"}`); an org not named is the default cell's.
+//! - `AMPUP_MEMORY_CELL_URLS`: JSON, cell to the URL the default cell forwards to (`{"acme": "http://memstore-acme"}`).
 //!
 //! A user's own scope's background work and the catalog-wide work (the ledger's compaction) are the default
 //! cell's. Only the default cell forwards, so a request never goes round in a loop. Another cell's org is never
@@ -20,9 +20,9 @@ pub use memstore_core::cell::{DEFAULT, is_default, me, of_org};
 
 /// Cell to the URL the default cell forwards to.
 static URLS: LazyLock<HashMap<String, String>> =
-    LazyLock::new(|| match std::env::var("MEMSTORE_CELL_URLS") {
+    LazyLock::new(|| match std::env::var("AMPUP_MEMORY_CELL_URLS") {
         Ok(v) if !v.trim().is_empty() => serde_json::from_str(&v)
-            .unwrap_or_else(|e| panic!("MEMSTORE_CELL_URLS is a JSON object of strings: {e}")),
+            .unwrap_or_else(|e| panic!("AMPUP_MEMORY_CELL_URLS is a JSON object of strings: {e}")),
         _ => HashMap::new(),
     });
 

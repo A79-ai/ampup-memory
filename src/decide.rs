@@ -5,9 +5,9 @@
 //! one of the options, never free text to parse, it comes with how sure the model is, and it costs a few
 //! thousandths of a chat call. A caller acts only on answers it is sure enough of.
 //!
-//! `MEMSTORE_DECIDE` (`openai`, `openrouter` or `off`), `MEMSTORE_DECIDE_MODEL` (default `gpt-6-luna`, or
-//! `typesafe/jev-1.13` on OpenRouter), `MEMSTORE_DECIDE_URL` (default the backend's decisions endpoint) and
-//! `MEMSTORE_DECIDE_KEY` (else `OPENAI_API_KEY` or `OPENROUTER_API_KEY`). Unset, it is OpenAI's where there is an
+//! `AMPUP_MEMORY_DECIDE` (`openai`, `openrouter` or `off`), `AMPUP_MEMORY_DECIDE_MODEL` (default `gpt-6-luna`, or
+//! `typesafe/jev-1.13` on OpenRouter), `AMPUP_MEMORY_DECIDE_URL` (default the backend's decisions endpoint) and
+//! `AMPUP_MEMORY_DECIDE_KEY` (else `OPENAI_API_KEY` or `OPENROUTER_API_KEY`). Unset, it is OpenAI's where there is an
 //! OpenAI key, else OpenRouter's where there is an OpenRouter key, else off.
 
 use std::collections::HashMap;
@@ -72,15 +72,15 @@ impl Decider {
     /// The decisions model the environment configures, if any.
     pub fn from_env() -> Result<Option<Self>> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        let api = match var("MEMSTORE_DECIDE") {
+        let api = match var("AMPUP_MEMORY_DECIDE") {
             Some(c) if c.eq_ignore_ascii_case("off") => return Ok(None),
             Some(c) if c.eq_ignore_ascii_case("openai") => Api::OpenAi,
             Some(c) if c.eq_ignore_ascii_case("openrouter") => Api::OpenRouter,
-            Some(c) => anyhow::bail!("MEMSTORE_DECIDE is openai, openrouter or off, not {c:?}"),
+            Some(c) => anyhow::bail!("AMPUP_MEMORY_DECIDE is openai, openrouter or off, not {c:?}"),
             None if var("OPENAI_API_KEY").is_some() => Api::OpenAi,
             None if var("OPENROUTER_API_KEY").is_some() => Api::OpenRouter,
-            None if var("MEMSTORE_DECIDE_KEY").is_some()
-                || var("MEMSTORE_DECIDE_URL").is_some() =>
+            None if var("AMPUP_MEMORY_DECIDE_KEY").is_some()
+                || var("AMPUP_MEMORY_DECIDE_URL").is_some() =>
             {
                 Api::OpenAi
             }
@@ -100,9 +100,9 @@ impl Decider {
         };
         Ok(Some(Decider {
             api,
-            url: var("MEMSTORE_DECIDE_URL").unwrap_or_else(|| url.into()),
-            key: var("MEMSTORE_DECIDE_KEY").or(key),
-            model: var("MEMSTORE_DECIDE_MODEL").unwrap_or_else(|| model.into()),
+            url: var("AMPUP_MEMORY_DECIDE_URL").unwrap_or_else(|| url.into()),
+            key: var("AMPUP_MEMORY_DECIDE_KEY").or(key),
+            model: var("AMPUP_MEMORY_DECIDE_MODEL").unwrap_or_else(|| model.into()),
             spent: Arc::default(),
         }))
     }

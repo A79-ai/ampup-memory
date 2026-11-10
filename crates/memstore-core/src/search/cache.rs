@@ -4,7 +4,7 @@
 //! the cache full, as a busy server's is, a keyword search loaded its postings from object storage twice before
 //! keeping them (a production facts index: a 4-term search took 16 s, 5 s, then 50 ms), and again for each new file an
 //! index update or merge wrote. A keyword search loads a term's postings one part at a time, so a long query paid
-//! one storage round trip per term, field and part: 10 to 30 s searches. `MEMSTORE_INDEX_CACHE_HOT` (percent,
+//! one storage round trip per term, field and part: 10 to 30 s searches. `AMPUP_MEMORY_INDEX_CACHE_HOT` (percent,
 //! default 50) is the share kept for entries read again; the rest holds new ones until their second read.
 
 use std::pin::Pin;

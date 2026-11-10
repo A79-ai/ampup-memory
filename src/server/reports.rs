@@ -3,7 +3,7 @@
 //! Only the process holding the deployment's credential sends telemetry, but every process counts: a
 //! worker's extraction tokens and commits, a cell's searches and ingests, each one's requests. Each writes
 //! what it counted to `<memory_system>/_reports/<holder>.json` (beside the writer lease, reached the same
-//! way) every minute (`MEMSTORE_USAGE_PERSIST_SECS`): its usage book and its alert readings. The sender adds
+//! way) every minute (`AMPUP_MEMORY_USAGE_PERSIST_SECS`): its usage book and its alert readings. The sender adds
 //! them up: usage from every report, a stopped process's too (its hours are still the deployment's), and
 //! readings from those written in the last few minutes. A report is deleted once its newest hour is past
 //! [`crate::usage::KEEP_DAYS`].

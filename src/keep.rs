@@ -4,7 +4,7 @@
 //! the session calls (`start_session`'s context, `get_advice`'s question, `end_session`'s transcript): one small
 //! model call on them finds what to keep, and the server remembers it for that user alone, a decision too.
 //! What at least [`SHARED_AT`] people said the same of is shared with everyone in the scope ([`share`]).
-//! `MEMSTORE_KEEP=off` turns both off.
+//! `AMPUP_MEMORY_KEEP=off` turns both off.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
@@ -24,9 +24,9 @@ pub struct Kept {
     pub text: String,
 }
 
-/// Whether the server keeps what users say (`MEMSTORE_KEEP`, on unless `off`).
+/// Whether the server keeps what users say (`AMPUP_MEMORY_KEEP`, on unless `off`).
 pub fn on() -> bool {
-    !std::env::var("MEMSTORE_KEEP").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"))
+    !std::env::var("AMPUP_MEMORY_KEEP").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"))
 }
 
 /// How many people must have said the same thing, each in their own memory, before everyone in the scope reads it.

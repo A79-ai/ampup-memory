@@ -1,11 +1,11 @@
-//! Non-admin keys in the keys file (`MEMSTORE_API_KEYS`), on their way out. A deployment's keys belong in the
+//! Non-admin keys in the keys file (`AMPUP_MEMORY_API_KEYS`), on their way out. A deployment's keys belong in the
 //! directory (`memstore apikey`): two key systems side by side are how one bearer came to name two callers. So
 //! each server says, for every non-admin file key, what becomes of it (a log line when that changes, the
 //! `memstore_file_keys` gauge, `memstore identity check`), and the server holding the writer lease imports each
 //! one that a directory key can stand for exactly: the same key, now revocable in the directory.
 //!
 //! Only a key the directory can hold with no more and no less than it reads now is imported: a server that
-//! reads every request through the directory (`MEMSTORE_DIRECTORY=required`), a key holding no groups, whose
+//! reads every request through the directory (`AMPUP_MEMORY_DIRECTORY=required`), a key holding no groups, whose
 //! user is a member of one org and of none of its teams. Every other key stays the file's and is named in
 //! an `ALERT` line with what to do. The import is the operator's own `apikey import`, verified (this server
 //! holds the key), planned inside the directory's commit like any other change: a key revoked in the
@@ -47,7 +47,7 @@ impl Fate {
         let who = format!("file key {} ({})", k.id, k.user);
         match self {
             Fate::Imported { org, name } => format!(
-                "{who} is the directory's key {org}/{name}: revoke it there (memstore apikey revoke {name} --org {org}), and take it out of the keys file"
+                "{who} is the directory's key {org}/{name}: revoke it there (ampup-memory apikey revoke {name} --org {org}), and take it out of the keys file"
             ),
             Fate::Refused(why) => {
                 format!("ALERT {who} is refused ({why}): take it out of the keys file")
@@ -65,7 +65,7 @@ impl Fate {
 /// What becomes of the non-admin file key `k` against the directory `dir`, decided as a request with it is
 /// (`request_principal`): its verified import if it has one, else refused if revoked or another directory
 /// key's hash, else the file's. `through_directory`: every request is read through the directory
-/// (`MEMSTORE_DIRECTORY=required`); otherwise one that selects no org reads the served scope, which no
+/// (`AMPUP_MEMORY_DIRECTORY=required`); otherwise one that selects no org reads the served scope, which no
 /// directory key does. `more_groups`: the groups this server gives the key's user on top of the key's own (the
 /// server's groups, closures), which a directory key holds none of.
 pub fn fate(
@@ -101,7 +101,7 @@ pub fn fate(
     }
     if !k.groups.is_empty() {
         return Fate::Kept(format!(
-            "it holds groups ({}), and a directory key holds none: give the service a key of the team those groups stand for (memstore apikey create --team <team>)",
+            "it holds groups ({}), and a directory key holds none: give the service a key of the team those groups stand for (ampup-memory apikey create --team <team>)",
             k.groups.join(", ")
         ));
     }
@@ -113,7 +113,7 @@ pub fn fate(
     }
     if !through_directory {
         return Fate::Kept(
-            "a request that selects no org reads this server's own scope (MEMSTORE_DIRECTORY isn't required), which no directory key reads".into(),
+            "a request that selects no org reads this server's own scope (AMPUP_MEMORY_DIRECTORY isn't required), which no directory key reads".into(),
         );
     }
     let user = user_id(&k.user);
@@ -128,7 +128,7 @@ pub fn fate(
         [(org, a)] => {
             let teams: Vec<&str> = a.teams.iter().map(String::as_str).collect();
             return Fate::Kept(format!(
-                "its user {user} is also in teams of {org} ({}), which a key of {org} doesn't read: import it for the scope it serves (memstore apikey import --org {org} [--team <team>] --from <keys file> --only {})",
+                "its user {user} is also in teams of {org} ({}), which a key of {org} doesn't read: import it for the scope it serves (ampup-memory apikey import --org {org} [--team <team>] --from <keys file> --only {})",
                 teams.join(", "),
                 k.id
             ));
@@ -136,7 +136,7 @@ pub fn fate(
         many => {
             let orgs: Vec<&str> = many.iter().map(|(o, _)| o.as_str()).collect();
             return Fate::Kept(format!(
-                "its user {user} is a member of several orgs ({}), and a directory key reads one: import it into the one it serves (memstore apikey import --org <org> --from <keys file> --only {}) and give each other one a key of its own",
+                "its user {user} is a member of several orgs ({}), and a directory key reads one: import it into the one it serves (ampup-memory apikey import --org <org> --from <keys file> --only {}) and give each other one a key of its own",
                 orgs.join(", "),
                 k.id
             ));

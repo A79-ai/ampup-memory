@@ -14,14 +14,14 @@
 //! Each part is an episode of its author's own (source `<signature>advice-trace:<session>`), readable by them alone,
 //! left out of passage search and never extracted; nothing is sent or kept twice (a part sent again is the same
 //! episode), and the export merges a session's parts into its one trace ([`merged`]). One person sends at most
-//! `MEMSTORE_ADVICE_TRACES_PER_DAY` (10,000) parts a day; past that the server answers 429 and the client sends again
+//! `AMPUP_MEMORY_ADVICE_TRACES_PER_DAY` (10,000) parts a day; past that the server answers 429 and the client sends again
 //! later. Forgetting them, a retention policy, offboarding their author and deleting the org remove them as any of
 //! their episodes. Only the org's admins (and the operator) read them all: `/admin {op: "advice_traces"}` answers one
 //! training example per call, the conversation up to and including the call (its `parentUuid` chain), the advice (an
 //! advisor's plaintext reply, or `get_advice`'s answer, when there is one) and the agent's next turn.
 //!
 //! Off unless the operator turns it on for the org (`Settings::advice_traces`); where the org's setting is unset,
-//! the server's `MEMSTORE_ADVICE_TRACES` decides (off unless on), which is for a server of one org (a local one):
+//! the server's `AMPUP_MEMORY_ADVICE_TRACES` decides (off unless on), which is for a server of one org (a local one):
 //! on a server of many it would keep every org's that never set it. A directory that can't be read keeps nothing.
 //! An org whose `pii` setting is on has personal identifiers replaced in what is kept, as in all it stores.
 
@@ -98,11 +98,11 @@ pub fn is_trace(source: &str) -> bool {
         .is_some_and(|rest| rest.contains(&format!(":{SOURCE}")))
 }
 
-/// Whether `scope` keeps advice traces: its team's or org's setting, else the server's `MEMSTORE_ADVICE_TRACES`.
+/// Whether `scope` keeps advice traces: its team's or org's setting, else the server's `AMPUP_MEMORY_ADVICE_TRACES`.
 pub fn keeps(dir: &Directory, scope: &Scope) -> bool {
     match dir.keeps_advice_traces(scope) {
         Some(on) => on,
-        None => std::env::var("MEMSTORE_ADVICE_TRACES").is_ok_and(|v| {
+        None => std::env::var("AMPUP_MEMORY_ADVICE_TRACES").is_ok_and(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "on" | "true" | "yes"
@@ -312,10 +312,10 @@ async fn sent_today(store: &Store, scope: &Scope, prefix: &str) -> Result<usize>
     Ok(n)
 }
 
-/// Most parts of advice traces one person may send in a scope in a day: `MEMSTORE_ADVICE_TRACES_PER_DAY`, default
+/// Most parts of advice traces one person may send in a scope in a day: `AMPUP_MEMORY_ADVICE_TRACES_PER_DAY`, default
 /// 10,000. Each Stop that finds a new ask sends a part, so it counts sends, not sessions.
 fn max_per_day() -> usize {
-    std::env::var("MEMSTORE_ADVICE_TRACES_PER_DAY")
+    std::env::var("AMPUP_MEMORY_ADVICE_TRACES_PER_DAY")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(10_000)

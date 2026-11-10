@@ -97,7 +97,7 @@ pub struct Shell;
 
 impl Runner for Shell {
     fn run(&mut self, cmd: &Cmd) -> Result<Output> {
-        let program = if cmd.program == "memstore" {
+        let program = if cmd.program == crate::naming::BIN {
             std::env::current_exe()?
         } else {
             cmd.program.clone().into()
@@ -172,7 +172,7 @@ pub fn rows_not_yet(target: &str) -> Option<&'static [&'static str]> {
 /// account, `<name>-load` the job, `<name>` the connection.
 pub const NAME: &str = "memstore";
 /// The description `init` gives each routine it creates: in a dataset that isn't memstore's, it replaces only routines
-/// carrying it.
+/// carrying it. Unchanged by the rename: it is how routines an earlier `init` made are told apart.
 pub const MARKER: &str = "Created by memstore init; replaced on each apply.";
 
 /// The dataset `init` creates when the customer brings none (the IAM templates' `<name>_api`, name `memstore`).
@@ -214,7 +214,7 @@ const FUNCTIONS: [(&str, &str, &str, &str, Option<u32>); 3] = [
         "/episode",
         Some(50),
     ),
-    // The engine calls it once at start to learn BigQuery's caller id (MEMSTORE_WHOAMI_FUNCTION).
+    // The engine calls it once at start to learn BigQuery's caller id (AMPUP_MEMORY_WHOAMI_FUNCTION).
     ("_whoami", "nonce STRING", "STRING", "/whoami", None),
 ];
 
@@ -589,7 +589,7 @@ impl Gcp {
                 "--project",
                 &self.project,
                 "--display-name",
-                "memstore engine (Cloud Run)",
+                "AmpUp Memory engine (Cloud Run)",
             ],
         )
     }
@@ -665,6 +665,8 @@ impl Gcp {
 
     fn service_deploy(&self, image: &str) -> Cmd {
         let p = &self.project;
+        // memstore's names (MEMSTORE_*): the plan's image may be from before the rename, which reads only these;
+        // a newer engine reads them as AMPUP_MEMORY_* (memstore_client::naming). The job's below likewise.
         let env = [
             ("MEMSTORE_PLATFORM", "gcp".to_string()),
             ("GCP_PROJECT", p.clone()),
@@ -926,7 +928,7 @@ impl Gcp {
 
     fn org_env(&self) -> Vec<(String, String)> {
         [
-            ("MEMSTORE_PLATFORM", "gcp"),
+            ("AMPUP_MEMORY_PLATFORM", "gcp"),
             ("GCP_PROJECT", &self.project),
             ("GCP_REGION", &self.region),
             ("GCS_BUCKET", &self.bucket),
@@ -937,13 +939,13 @@ impl Gcp {
     }
 
     fn org_list(&self) -> Cmd {
-        let mut c = Cmd::new("memstore", false, &["org", "list", "--direct"]);
+        let mut c = Cmd::new(crate::naming::BIN, false, &["org", "list", "--direct"]);
         c.env = self.org_env();
         c
     }
 
     fn org_create(&self) -> Cmd {
-        let mut c = Cmd::new("memstore", true, &["org", "create", &self.org]);
+        let mut c = Cmd::new(crate::naming::BIN, true, &["org", "create", &self.org]);
         if let Some(a) = &self.admin {
             c.args.extend(["--admin".into(), a.clone()]);
         }
@@ -1738,11 +1740,11 @@ impl<'a> Apply<'a> {
                     let id = format!("{}.{}", g.dataset_ref(), f.0);
                     return Err(Failed {
                         reason: format!(
-                            "routine {id} exists and memstore didn't create it (its description isn't memstore's \
+                            "routine {id} exists and AmpUp Memory didn't create it (its description isn't init's \
                              marker); init won't replace it"
                         ),
                         fix: format!(
-                            "{} --existing-dataset <a dataset for memstore alone>   # or, if {id} is memstore's \
+                            "{} --existing-dataset <a dataset for AmpUp Memory alone>   # or, if {id} is AmpUp Memory's \
                              and may go: bq rm --routine {id}; then {}",
                             self.retry_without("--existing-dataset"),
                             self.retry

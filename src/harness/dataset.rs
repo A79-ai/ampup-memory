@@ -1,7 +1,7 @@
 //! Datasets in GCS, fetched when needed: corpora, eval inputs and extraction caches live at
 //! `<root>/<name>/<version>/` with a `manifest.json` (each file's path, size and SHA-256) and
 //! `<root>/<name>/LATEST` naming the newest version. `get` downloads what is missing or differs and
-//! checks every hash; `put` uploads a directory as a new version. The root is `MEMSTORE_DATASETS`
+//! checks every hash; `put` uploads a directory as a new version. The root is `AMPUP_MEMORY_DATASETS`
 //! (required, e.g. `gs://example-bucket/datasets`); access is the caller's Google credentials,
 //! so a private bucket keeps internal corpora internal.
 
@@ -33,11 +33,11 @@ struct Root {
 }
 
 fn root() -> Result<Root> {
-    let r = std::env::var("MEMSTORE_DATASETS")
-        .context("set MEMSTORE_DATASETS to the datasets root, gs://bucket/prefix")?;
+    let r = std::env::var("AMPUP_MEMORY_DATASETS")
+        .context("set AMPUP_MEMORY_DATASETS to the datasets root, gs://bucket/prefix")?;
     let rest = r
         .strip_prefix("gs://")
-        .context("MEMSTORE_DATASETS must be gs://bucket/prefix")?;
+        .context("AMPUP_MEMORY_DATASETS must be gs://bucket/prefix")?;
     let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
     Ok(Root {
         bucket: bucket.into(),
@@ -179,7 +179,9 @@ pub async fn get(spec: &str, dir: &Path) -> Result<(usize, usize)> {
         None => {
             let latest = fetch(&client, &r, &format!("{spec}/LATEST"))
                 .await?
-                .with_context(|| format!("no dataset {spec:?} (try `memstore dataset list`)"))?;
+                .with_context(|| {
+                    format!("no dataset {spec:?} (try `ampup-memory dataset list`)")
+                })?;
             (
                 spec.to_string(),
                 String::from_utf8_lossy(&latest).trim().to_string(),

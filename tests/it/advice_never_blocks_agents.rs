@@ -1,6 +1,6 @@
 //! An agent's own `start_session` never waits on routing: against a routing model that takes 3 s, an agent's
-//! session opens within the server's wait (`MEMSTORE_ADVICE_WAIT_MS`) with its advice pending. The session's next
-//! `get_advice`, whatever it asks, waits for that routing (up to `MEMSTORE_ADVICE_ASK_WAIT_MS`) and hands on what
+//! session opens within the server's wait (`AMPUP_MEMORY_ADVICE_WAIT_MS`) with its advice pending. The session's next
+//! `get_advice`, whatever it asks, waits for that routing (up to `AMPUP_MEMORY_ADVICE_ASK_WAIT_MS`) and hands on what
 //! it picked, rather than answering "still being looked up". A hook's call (one that fits the advice to its
 //! context, `max_chars`) still waits for the advice.
 
@@ -115,17 +115,17 @@ async fn an_agents_session_opens_before_its_advice_is_routed() {
     let router = slow_router(Duration::from_secs(3)).await;
     // SAFETY: this test runs alone in its process (`own_process`).
     unsafe {
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE", "openrouter");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE", "openrouter");
         std::env::set_var(
-            "MEMSTORE_ADVICE_ROUTE_URL",
+            "AMPUP_MEMORY_ADVICE_ROUTE_URL",
             format!("http://127.0.0.1:{router}/v1"),
         );
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE_KEY", "stand-in");
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_DECIDE", "off");
-        std::env::set_var("MEMSTORE_ADVICE_WAIT_MS", "500");
-        std::env::set_var("MEMSTORE_ADVICE_HOLDOUT", "0");
-        std::env::set_var("MEMSTORE_ADVICE_TRIAL", "0");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE_KEY", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_DECIDE", "off");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_WAIT_MS", "500");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_HOLDOUT", "0");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_TRIAL", "0");
     }
     let dir = tempfile::tempdir().unwrap();
     let catalog = platform::local(&format!("file://{}", dir.path().display()))

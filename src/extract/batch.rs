@@ -1,10 +1,10 @@
-//! OpenRouter's Batch API (`MEMSTORE_EXTRACT=openrouter-batch`, for experiments): the same requests at half the
+//! OpenRouter's Batch API (`AMPUP_MEMORY_EXTRACT=openrouter-batch`, for experiments): the same requests at half the
 //! price, answered within 24 hours (usually minutes) instead of seconds.
 //!
 //! A caller asks as it would synchronously ([`super::Extractor::complete_with`]) and waits for its own reply.
-//! Everything asked of one model within a short window (`MEMSTORE_BATCH_GATHER_SECS`, default 5) goes to
-//! OpenRouter as one batch, up to `MEMSTORE_BATCH_MAX_REQUESTS` requests (default 5,000) and
-//! `MEMSTORE_BATCH_MAX_MB` of request bodies (default 100); a run that asks more fills several batches at once.
+//! Everything asked of one model within a short window (`AMPUP_MEMORY_BATCH_GATHER_SECS`, default 5) goes to
+//! OpenRouter as one batch, up to `AMPUP_MEMORY_BATCH_MAX_REQUESTS` requests (default 5,000) and
+//! `AMPUP_MEMORY_BATCH_MAX_MB` of request bodies (default 100); a run that asks more fills several batches at once.
 //! In batch mode the extractor and the compiler put every request of a run in flight together
 //! ([`super::Extractor::parallel`]), so a run's requests share batches.
 //!
@@ -104,9 +104,9 @@ async fn drain(
     model: String,
     mut rx: mpsc::UnboundedReceiver<Job>,
 ) {
-    let gather = Duration::from_secs(setting("MEMSTORE_BATCH_GATHER_SECS", 5));
-    let max_requests = setting("MEMSTORE_BATCH_MAX_REQUESTS", 5_000) as usize;
-    let max_bytes = setting("MEMSTORE_BATCH_MAX_MB", 100) as usize * 1_000_000;
+    let gather = Duration::from_secs(setting("AMPUP_MEMORY_BATCH_GATHER_SECS", 5));
+    let max_requests = setting("AMPUP_MEMORY_BATCH_MAX_REQUESTS", 5_000) as usize;
+    let max_bytes = setting("AMPUP_MEMORY_BATCH_MAX_MB", 100) as usize * 1_000_000;
     while let Some(first) = rx.recv().await {
         let until = tokio::time::Instant::now() + gather;
         let mut jobs = vec![first];

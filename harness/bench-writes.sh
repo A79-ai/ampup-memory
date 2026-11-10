@@ -3,7 +3,7 @@
 # facts per commit. Appends one JSON line per run to reports/writes.jsonl and prints a table.
 set -uo pipefail
 ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
-B=./target/release/memstore
+B=./target/release/ampup-memory
 mkdir -p reports
 cargo build --release -q || exit 1
 source harness/env.sh

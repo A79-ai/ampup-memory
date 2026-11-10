@@ -3,12 +3,12 @@
 //! A rewrite (a compaction of a table, `compaction`) reads a whole table and writes it again. Run on
 //! a timer at any hour, they landed in the working day (one org's summaries: 428 MB rewritten at 13:45 Pacific), and
 //! right after a start every scope's ran at once, and object storage answered the burst with 429s. So every rewrite
-//! runs in one announced window a night, `MEMSTORE_MAINTAIN_WINDOW` (default `02:00-06:00 America/Los_Angeles`;
+//! runs in one announced window a night, `AMPUP_MEMORY_MAINTAIN_WINDOW` (default `02:00-06:00 America/Los_Angeles`;
 //! `<HH:MM>-<HH:MM> [<IANA zone>]`, the zone America/Los_Angeles when not given; a window may cross midnight):
 //!
 //! - on the writer lease's holder only, through its fenced store (a server that lost the lease commits nothing);
-//! - one scope at a time, a pause of `MEMSTORE_MAINTAIN_PACE` (default `2s`; `0` for none) between two, within a
-//!   budget, `MEMSTORE_MAINTAIN_BUDGET` (default: until the window closes). Past it, or once the window closes,
+//! - one scope at a time, a pause of `AMPUP_MEMORY_MAINTAIN_PACE` (default `2s`; `0` for none) between two, within a
+//!   budget, `AMPUP_MEMORY_MAINTAIN_BUDGET` (default: until the window closes). Past it, or once the window closes,
 //!   nothing more starts, and a scope not reached is logged as skipped and waits for the next night;
 //! - least recently maintained first: when the window last finished with a scope is a property of its episodes
 //!   table ([`crate::offboard::MAINTAINED_AT_PROP`]), so a scope the budget didn't reach goes first the next night,
@@ -19,16 +19,16 @@
 //!
 //! The system tables (the ledger, the directory, the audit log, ...) come first, by the default cell. Then, in each scope, in this order:
 //!
-//! 1. the dream step ([`dream_step`], `crate::dream`, on the scopes `MEMSTORE_DREAM_ON` names): a pass over the
+//! 1. the dream step ([`dream_step`], `crate::dream`, on the scopes `AMPUP_MEMORY_DREAM_ON` names): a pass over the
 //!    scope's memory before it is rewritten. It never holds back what follows: a failure, or a pass past its budget
-//!    (`MEMSTORE_DREAM_BUDGET`, default `10m`, and never past the night's), is logged and the rewrite and the sweep
+//!    (`AMPUP_MEMORY_DREAM_BUDGET`, default `10m`, and never past the night's), is logged and the rewrite and the sweep
 //!    run anyway; no model call starts past 85% of it, so what the pass did by then is committed (and a pass commits
 //!    in batches as it goes, so one cut off keeps what it committed before). Deletion never
 //!    waits on it either: forget and retract take effect on request, not here;
 //! 2. the rewrites: the scope's tables listed once, and each past its threshold compacted (`compaction`), what
 //!    cites episodes first and the episodes last; the files a rewrite replaced are deleted as it lands, and what an
 //!    interrupted one left is finished. Where the scope's org turned on the scheduled purge (`Settings::purge`),
-//!    what its sources deleted and what aged past its retention, hidden for longer than `MEMSTORE_PURGE_GRACE`
+//!    what its sources deleted and what aged past its retention, hidden for longer than `AMPUP_MEMORY_PURGE_GRACE`
 //!    (default `7d`), is left out of the same rewrites ([`crate::offboard::Erasure`], as `memstore org purge`
 //!    deletes it), a table with rows to delete rewritten whether or not a compaction is due, and the org's audit
 //!    says how much went. A rewrite of the facts or the episodes makes every file new to the scope's
@@ -38,7 +38,7 @@
 //!    `search::tidy_night`): the deltas the day's updates left beside each index merged into it, which an update
 //!    leaves alone (merging it every few updates rewrote one org's whole vector index, 1.2 GB, for a dozen rows),
 //!    their files compacted once there are too many, and rows written twice dropped;
-//! 3. the sweep: every table's snapshots past the newest `MEMSTORE_MAINTAIN_KEEP` expired, and the manifest lists
+//! 3. the sweep: every table's snapshots past the newest `AMPUP_MEMORY_MAINTAIN_KEEP` expired, and the manifest lists
 //!    and metadata files only they named deleted.
 //!
 //! Each scope's turn logs one line, counts only: `maintenance: {"night":...,"scope":...,"result":"done",
@@ -46,10 +46,10 @@
 //! "episodes":{"result":"not_due","data_files":12},...},"reindex":{...},"index_tidy":{...},"sweep":{"tables":13,
 //! "snapshots_before":...,"snapshots_after":...},"duration_ms":...}`,
 //! a scope the budget didn't reach `{"result":"skipped_for_budget"}`, and the night one more
-//! (`maintenance night: {...}`). The day's maintenance round (`MEMSTORE_MAINTAIN_SECS`) still expires snapshots of
+//! (`maintenance night: {...}`). The day's maintenance round (`AMPUP_MEMORY_MAINTAIN_SECS`) still expires snapshots of
 //! busy tables, which every write needs, and keeps the ledger's metrics; it rewrites nothing.
 //!
-//! `MEMSTORE_MAINTAIN_WINDOW=always` keeps the window open: a pass every round, each one a "night" (to watch it
+//! `AMPUP_MEMORY_MAINTAIN_WINDOW=always` keeps the window open: a pass every round, each one a "night" (to watch it
 //! work); `off` rewrites nothing on a timer (`memstore compact-ledger` still does by hand).
 
 use std::collections::{HashMap, VecDeque};
@@ -65,7 +65,7 @@ use serde_json::{Value, json};
 use super::{ScopeWalk, State, cell, compaction};
 use crate::{Scope, Store};
 
-/// The window when `MEMSTORE_MAINTAIN_WINDOW` is not set.
+/// The window when `AMPUP_MEMORY_MAINTAIN_WINDOW` is not set.
 pub const DEFAULT_WINDOW: &str = "02:00-06:00 America/Los_Angeles";
 /// The zone of a window that names none.
 const DEFAULT_ZONE: Tz = chrono_tz::America::Los_Angeles;
@@ -74,7 +74,7 @@ pub const THROTTLE_TRIES: u32 = 3;
 /// The pause between two reads of when a scope was last maintained, the first night after a start.
 const MARKER_PACE: Duration = Duration::from_millis(100);
 
-/// When the window is open (`MEMSTORE_MAINTAIN_WINDOW`).
+/// When the window is open (`AMPUP_MEMORY_MAINTAIN_WINDOW`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Window {
     /// Each night from `start` to `end`, local time in `zone`.
@@ -109,7 +109,7 @@ impl Window {
         }
         let bad = || {
             anyhow::anyhow!(
-                "MEMSTORE_MAINTAIN_WINDOW is <HH:MM>-<HH:MM> [<IANA zone>] (like {DEFAULT_WINDOW:?}), always or \
+                "AMPUP_MEMORY_MAINTAIN_WINDOW is <HH:MM>-<HH:MM> [<IANA zone>] (like {DEFAULT_WINDOW:?}), always or \
                  off, got {s:?}"
             )
         };
@@ -118,7 +118,7 @@ impl Window {
                 t,
                 z.trim().parse::<Tz>().map_err(|_| {
                     anyhow::anyhow!(
-                        "MEMSTORE_MAINTAIN_WINDOW: {:?} is not an IANA time zone",
+                        "AMPUP_MEMORY_MAINTAIN_WINDOW: {:?} is not an IANA time zone",
                         z.trim()
                     )
                 })?,
@@ -130,14 +130,14 @@ impl Window {
         let (start, end) = (time(a)?, time(b)?);
         anyhow::ensure!(
             start != end,
-            "MEMSTORE_MAINTAIN_WINDOW opens and closes at the same time ({s:?}): use always or off"
+            "AMPUP_MEMORY_MAINTAIN_WINDOW opens and closes at the same time ({s:?}): use always or off"
         );
         Ok(Window::Daily { start, end, zone })
     }
 
     /// The window from the environment.
     pub fn from_env() -> Result<Window> {
-        match std::env::var("MEMSTORE_MAINTAIN_WINDOW") {
+        match std::env::var("AMPUP_MEMORY_MAINTAIN_WINDOW") {
             Ok(v) if !v.trim().is_empty() => Window::parse(&v),
             _ => Window::parse(DEFAULT_WINDOW),
         }
@@ -199,9 +199,9 @@ impl Window {
             Window::Daily { start, end, zone } => {
                 format!("{}-{} {zone}", start.format("%H:%M"), end.format("%H:%M"))
             }
-            Window::Always => "always open (MEMSTORE_MAINTAIN_WINDOW=always)".into(),
+            Window::Always => "always open (AMPUP_MEMORY_MAINTAIN_WINDOW=always)".into(),
             Window::Off => {
-                "off (MEMSTORE_MAINTAIN_WINDOW=off): nothing is rewritten on a timer".into()
+                "off (AMPUP_MEMORY_MAINTAIN_WINDOW=off): nothing is rewritten on a timer".into()
             }
         }
     }
@@ -220,23 +220,23 @@ fn local(zone: &Tz, day: NaiveDate, time: NaiveTime) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 
-/// The window and what it does: `MEMSTORE_MAINTAIN_*`, `MEMSTORE_DREAM_BUDGET` and the compaction settings.
+/// The window and what it does: `AMPUP_MEMORY_MAINTAIN_*`, `AMPUP_MEMORY_DREAM_BUDGET` and the compaction settings.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub window: Window,
-    /// The most one night's pass may take (`MEMSTORE_MAINTAIN_BUDGET`); None: until the window closes.
+    /// The most one night's pass may take (`AMPUP_MEMORY_MAINTAIN_BUDGET`); None: until the window closes.
     pub budget: Option<Duration>,
-    /// The pause between two scopes (`MEMSTORE_MAINTAIN_PACE`).
+    /// The pause between two scopes (`AMPUP_MEMORY_MAINTAIN_PACE`).
     pub pace: Duration,
-    /// The most the dream step may take in one scope (`MEMSTORE_DREAM_BUDGET`).
+    /// The most the dream step may take in one scope (`AMPUP_MEMORY_DREAM_BUDGET`).
     pub dream: Duration,
-    /// Snapshots kept of each table by the sweep (`MEMSTORE_MAINTAIN_KEEP`).
+    /// Snapshots kept of each table by the sweep (`AMPUP_MEMORY_MAINTAIN_KEEP`).
     pub keep: usize,
     pub ledger: compaction::Config,
     pub aggregates: compaction::Config,
-    /// Every other table's (`MEMSTORE_COMPACT*`).
+    /// Every other table's (`AMPUP_MEMORY_COMPACT*`).
     pub tables: compaction::Config,
-    /// How long what a scheduled purge deletes must have been hidden first (`MEMSTORE_PURGE_GRACE`).
+    /// How long what a scheduled purge deletes must have been hidden first (`AMPUP_MEMORY_PURGE_GRACE`).
     pub purge_grace: Duration,
 }
 
@@ -254,17 +254,18 @@ impl Config {
         };
         Ok(Config {
             window: Window::from_env()?,
-            budget: span("MEMSTORE_MAINTAIN_BUDGET")?.filter(|d| !d.is_zero()),
-            pace: span("MEMSTORE_MAINTAIN_PACE")?.unwrap_or(Duration::from_secs(2)),
-            dream: span("MEMSTORE_DREAM_BUDGET")?.unwrap_or(Duration::from_secs(600)),
-            keep: var("MEMSTORE_MAINTAIN_KEEP")
+            budget: span("AMPUP_MEMORY_MAINTAIN_BUDGET")?.filter(|d| !d.is_zero()),
+            pace: span("AMPUP_MEMORY_MAINTAIN_PACE")?.unwrap_or(Duration::from_secs(2)),
+            dream: span("AMPUP_MEMORY_DREAM_BUDGET")?.unwrap_or(Duration::from_secs(600)),
+            keep: var("AMPUP_MEMORY_MAINTAIN_KEEP")
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(10usize)
                 .max(1),
             ledger: compaction::Config::from_env()?,
             aggregates: compaction::Config::aggregates_from_env()?,
             tables: compaction::Config::tables_from_env()?,
-            purge_grace: span("MEMSTORE_PURGE_GRACE")?.unwrap_or(Duration::from_secs(7 * 86_400)),
+            purge_grace: span("AMPUP_MEMORY_PURGE_GRACE")?
+                .unwrap_or(Duration::from_secs(7 * 86_400)),
         })
     }
 
@@ -306,7 +307,7 @@ impl Config {
 
 /// The pre-rewrite dream step: a pass over a scope's memory before the night's rewrite of it, within `budget`
 /// ([`run_dream`] bounds it). It is the dream's own gated step (`crate::dream::tick`: releases, and a pass once a
-/// day when enough new facts wait), only on the scopes `MEMSTORE_DREAM_ON` names, so off by default; it answers
+/// day when enough new facts wait), only on the scopes `AMPUP_MEMORY_DREAM_ON` names, so off by default; it answers
 /// what it did as counts for the night's line. Whatever it returns, or however long it takes, the rewrite and the
 /// sweep run after it ([`run_dream`] catches its failure).
 pub async fn dream_step(store: &Store, scope: &Scope, budget: Duration) -> Result<Value> {
@@ -316,7 +317,7 @@ pub async fn dream_step(store: &Store, scope: &Scope, budget: Duration) -> Resul
         (true, Some(ex)) => {
             // No call starts past 85% of the budget, so the calls in flight finish and what the pass did is committed
             // before [`run_dream`] gives up on it. A pass cut off there still keeps the batches it committed before
-            // (`MEMSTORE_DREAM_COMMIT_EVERY`, `MEMSTORE_DREAM_COMMIT_SECS`), and the next goes on after them.
+            // (`AMPUP_MEMORY_DREAM_COMMIT_EVERY`, `AMPUP_MEMORY_DREAM_COMMIT_SECS`), and the next goes on after them.
             let mut gate = crate::dream::Gate::from_env()?;
             gate.budget.until = Some(Instant::now() + budget.mul_f64(0.85));
             Ok(crate::dream::tick(store, scope, &ex, &gate).await?.counts())

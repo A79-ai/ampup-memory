@@ -32,14 +32,14 @@ impl Lobby {
 
 /// How a client names an org, for `org` (or `<org>` when none is chosen yet).
 fn how_to_name(org: &str) -> String {
-    let server = std::env::var("MEMSTORE_PUBLIC_URL")
-        .unwrap_or_else(|_| "https://<this memstore server>".into());
+    let server = std::env::var("AMPUP_MEMORY_PUBLIC_URL")
+        .unwrap_or_else(|_| "https://<this AmpUp Memory server>".into());
     let server = server.trim_end_matches('/');
     format!(
         "Name the org in the MCP client's settings for this server: the header `x-memstore-org: {org}` \
         (or `?org={org}` on the server URL), then restart the client.\n\n\
         Codex, in ~/.codex/config.toml:\n\n\
-        [mcp_servers.memstore]\n\
+        [mcp_servers.ampup-memory]\n\
         url = \"{server}/mcp\"\n\
         http_headers = {{ \"x-memstore-org\" = \"{org}\" }}\n\n\
         Claude Code: /memstore:login --org {org}"
@@ -49,13 +49,13 @@ fn how_to_name(org: &str) -> String {
 fn instructions(lobby: &Lobby, user: &str) -> String {
     match lobby {
         Lobby::Several(orgs) => format!(
-            "memstore: {user} belongs to several orgs ({}) and this client named none, so no memory is open yet. \
+            "AmpUp Memory: {user} belongs to several orgs ({}) and this client named none, so no memory is open yet. \
             Call choose_org to tell the user which orgs are theirs and how to pick one; until they do, \
-            memstore has nothing to search or remember.",
+            AmpUp Memory has nothing to search or remember.",
             orgs.join(", ")
         ),
         Lobby::NoOrg => format!(
-            "memstore: {user} belongs to no org yet, so no memory is open. If the user names the org they \
+            "AmpUp Memory: {user} belongs to no org yet, so no memory is open. If the user names the org they \
             work in, call request_join with it: its admins are emailed to approve. Never guess an org."
         ),
     }
@@ -65,7 +65,7 @@ fn tools(lobby: &Lobby) -> Value {
     match lobby {
         Lobby::Several(_) => json!([{
             "name": "choose_org",
-            "description": "List the memstore orgs this user belongs to and how to name one in this client. \
+            "description": "List the AmpUp Memory orgs this user belongs to and how to name one in this client. \
                 No memory is open until the client names one.",
             "inputSchema": {"type": "object", "properties": {}},
             // It only reads the caller's own orgs: a client runs it without asking (Codex asks otherwise, and
@@ -74,7 +74,7 @@ fn tools(lobby: &Lobby) -> Value {
         }]),
         Lobby::NoOrg => json!([{
             "name": "request_join",
-            "description": "Ask a memstore org's admins to let this user in: they get an email to approve. \
+            "description": "Ask an AmpUp Memory org's admins to let this user in: they get an email to approve. \
                 Only an org the user named; never guess one.",
             "inputSchema": {
                 "type": "object",
@@ -101,7 +101,7 @@ pub(super) async fn answer(
         "initialize" => ok(json!({
             "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "memstore", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {"name": crate::naming::MCP_SERVER, "version": env!("CARGO_PKG_VERSION")},
             "instructions": instructions(lobby, who.user()),
         })),
         "ping" => ok(json!({})),
@@ -111,7 +111,7 @@ pub(super) async fn answer(
             match (req["params"]["name"].as_str().unwrap_or_default(), lobby) {
                 ("choose_org", Lobby::Several(orgs)) => ok(text(
                     format!(
-                        "{} belongs to these memstore orgs: {}.\n\n{}",
+                        "{} belongs to these AmpUp Memory orgs: {}.\n\n{}",
                         who.user(),
                         orgs.join(", "),
                         how_to_name(orgs.first().map_or("<org>", |o| o.as_str()))

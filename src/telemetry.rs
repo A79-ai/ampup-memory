@@ -70,20 +70,20 @@ struct DeploymentIdSchema(#[schemars(regex(pattern = r"^[a-z0-9-]{1,64}$"))] Str
 impl DeploymentId {
     pub const UNENROLLED: &str = "unenrolled";
 
-    /// The id in `MEMSTORE_DEPLOYMENT_CREDENTIAL` (what `memstore deployment enroll` wrote), else
-    /// `MEMSTORE_DEPLOYMENT_ID`, else `unenrolled`. Both set: they must agree.
+    /// The id in `AMPUP_MEMORY_DEPLOYMENT_CREDENTIAL` (what `memstore deployment enroll` wrote), else
+    /// `AMPUP_MEMORY_DEPLOYMENT_ID`, else `unenrolled`. Both set: they must agree.
     pub fn from_env() -> anyhow::Result<Self> {
-        let named = std::env::var("MEMSTORE_DEPLOYMENT_ID")
+        let named = std::env::var("AMPUP_MEMORY_DEPLOYMENT_ID")
             .ok()
             .map(Self::try_from)
             .transpose()?;
-        let Ok(path) = std::env::var("MEMSTORE_DEPLOYMENT_CREDENTIAL") else {
+        let Ok(path) = std::env::var("AMPUP_MEMORY_DEPLOYMENT_CREDENTIAL") else {
             return Ok(named.unwrap_or_else(|| Self(Self::UNENROLLED.into())));
         };
         let enrolled = crate::deployment::Credential::load(path.as_ref())?.deployment;
         anyhow::ensure!(
             named.is_none_or(|n| n == enrolled),
-            "MEMSTORE_DEPLOYMENT_ID isn't the id enrolled in MEMSTORE_DEPLOYMENT_CREDENTIAL ({})",
+            "AMPUP_MEMORY_DEPLOYMENT_ID isn't the id enrolled in AMPUP_MEMORY_DEPLOYMENT_CREDENTIAL ({})",
             enrolled.0
         );
         Ok(enrolled)
@@ -174,7 +174,7 @@ pub struct State {
     pub index_failures: u64,
 }
 
-/// `MEMSTORE_PLATFORM`.
+/// `AMPUP_MEMORY_PLATFORM`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
@@ -188,7 +188,7 @@ pub enum Platform {
 
 impl Platform {
     pub fn from_env() -> Self {
-        match std::env::var("MEMSTORE_PLATFORM").as_deref() {
+        match std::env::var("AMPUP_MEMORY_PLATFORM").as_deref() {
             Ok("local") => Platform::Local,
             Ok("rest") => Platform::Rest,
             Ok("gcp") => Platform::Gcp,
@@ -835,7 +835,7 @@ impl NoteId {
     /// else one of this process's alone (a server that isn't enrolled sends nothing).
     pub fn salt() -> [u8; 32] {
         static OWN: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-        std::env::var("MEMSTORE_DEPLOYMENT_CREDENTIAL")
+        std::env::var("AMPUP_MEMORY_DEPLOYMENT_CREDENTIAL")
             .ok()
             .and_then(|p| crate::deployment::Credential::load(p.as_ref()).ok())
             .and_then(|c| c.salt("advice note ids").ok())
@@ -964,18 +964,18 @@ pub const BATCH_MAX: usize = 100;
 pub const MIRROR_MAX_BYTES: u64 = 10 << 20;
 
 impl Outbox {
-    /// Exporting: on when `MEMSTORE_DEPLOYMENT_CREDENTIAL` is set, unless `MEMSTORE_TELEMETRY=off`.
-    /// The mirror is `MEMSTORE_TELEMETRY_MIRROR`, else `telemetry.jsonl` beside the credential.
+    /// Exporting: on when `AMPUP_MEMORY_DEPLOYMENT_CREDENTIAL` is set, unless `AMPUP_MEMORY_TELEMETRY=off`.
+    /// The mirror is `AMPUP_MEMORY_TELEMETRY_MIRROR`, else `telemetry.jsonl` beside the credential.
     pub fn from_env() -> anyhow::Result<Option<Self>> {
-        let Ok(credential) = std::env::var("MEMSTORE_DEPLOYMENT_CREDENTIAL") else {
+        let Ok(credential) = std::env::var("AMPUP_MEMORY_DEPLOYMENT_CREDENTIAL") else {
             return Ok(None);
         };
-        match std::env::var("MEMSTORE_TELEMETRY").as_deref() {
+        match std::env::var("AMPUP_MEMORY_TELEMETRY").as_deref() {
             Ok("off") => return Ok(None),
             Ok("on") | Err(_) => {}
-            Ok(v) => anyhow::bail!("MEMSTORE_TELEMETRY is on or off, not {v}"),
+            Ok(v) => anyhow::bail!("AMPUP_MEMORY_TELEMETRY is on or off, not {v}"),
         }
-        let mirror = std::env::var("MEMSTORE_TELEMETRY_MIRROR")
+        let mirror = std::env::var("AMPUP_MEMORY_TELEMETRY_MIRROR")
             .ok()
             .map(Into::into);
         Ok(Some(Self::at(credential.into(), mirror)))

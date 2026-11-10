@@ -8,12 +8,17 @@ T=${1:-memstore:local}
 cargo build --release -q
 ctx=$(mktemp -d)
 trap 'rm -rf "$ctx"' EXIT
-cp target/release/memstore "$ctx/" && strip "$ctx/memstore"
+mkdir "$ctx/bin"
+cp target/release/ampup-memory "$ctx/bin/" && strip "$ctx/bin/ampup-memory"
+# the command's name before the rename, a link the image keeps
+ln -s ampup-memory "$ctx/bin/memstore"
 # fetch the model into the context (hf-hub cache layout; -L turns its symlinks into files)
-MEMSTORE_MODEL_DIR="$ctx/fetch" "$ctx/memstore" embed warmup >/dev/null
+AMPUP_MEMORY_MODEL_DIR="$ctx/fetch" "$ctx/bin/ampup-memory" embed warmup >/dev/null
 cp -rL "$ctx/fetch" "$ctx/models" && rm -rf "$ctx/fetch"
 find "$ctx/models" -name '*.lock' -delete
 mkdir "$ctx/doc" && cp LICENSE NOTICE THIRD-PARTY-NOTICES.txt "$ctx/doc/"
 docker build -q -t "$T" -f deploy/spcs/Dockerfile "$ctx" >/dev/null
 docker run --rm --network none --user 65532:65532 --read-only "$T" embed offline check
+# and by its old name
+docker run --rm --network none --user 65532:65532 --read-only --entrypoint /usr/local/bin/memstore "$T" --version
 echo "built $T"

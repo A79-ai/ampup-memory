@@ -114,7 +114,10 @@ pub async fn make(
 ) -> Result<PathBuf> {
     let at = Utc::now();
     let dir = out.map(Path::to_path_buf).unwrap_or_else(|| {
-        PathBuf::from(format!("memstore-bundle-{}", at.format("%Y%m%dT%H%M%SZ")))
+        PathBuf::from(format!(
+            "ampup-memory-bundle-{}",
+            at.format("%Y%m%dT%H%M%SZ")
+        ))
     });
     anyhow::ensure!(
         !dir.exists(),

@@ -4,7 +4,7 @@
 //! **The shortlist.** Each line costs every routing call about 125 tokens, and the lines grow with the skill
 //! library: about 0.29 skills per source compiled, so a year of an org's merged PRs (about 18,000 episodes) makes
 //! about 5,000 skills, some 650k tokens a call, past the routing model's context. So above
-//! `MEMSTORE_ADVICE_ROUTE_SHORTLIST` lines (default [`SHORTLIST`], 60; `0` never shortlists) the lines are first
+//! `AMPUP_MEMORY_ADVICE_ROUTE_SHORTLIST` lines (default [`SHORTLIST`], 60; `0` never shortlists) the lines are first
 //! ranked against the question as memstore's search ranks facts: BM25 over the words its full-text index keeps
 //! (stemmed, stop words out), and the embeddings' cosine similarity, fused by reciprocal rank
 //! ([`crate::search::RRF_K`]). The router is then shown the best 60, in their own order. Situations learned from
@@ -57,10 +57,10 @@ const STEMS_MAX: usize = 50_000;
 static LINE_VECTORS: LazyLock<Mutex<HashMap<String, Arc<Vec<f32>>>>> =
     LazyLock::new(Default::default);
 
-/// `MEMSTORE_ADVICE_ROUTE_SHORTLIST`: shortlist above this many lines, to this many (default [`SHORTLIST`]); `0`
+/// `AMPUP_MEMORY_ADVICE_ROUTE_SHORTLIST`: shortlist above this many lines, to this many (default [`SHORTLIST`]); `0`
 /// never shortlists.
 pub fn shortlist_size() -> usize {
-    std::env::var("MEMSTORE_ADVICE_ROUTE_SHORTLIST")
+    std::env::var("AMPUP_MEMORY_ADVICE_ROUTE_SHORTLIST")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(SHORTLIST)
@@ -168,23 +168,23 @@ pub async fn ranked(question: &str, texts: &[String]) -> (Vec<usize>, &'static s
 /// Lines a decisions model is asked about: the best ranked.
 pub const DECIDE_LINES: usize = 20;
 
-/// Kinds of task learned from runs a decisions model is asked about at once (`MEMSTORE_ADVICE_DECIDE_KINDS`, default
+/// Kinds of task learned from runs a decisions model is asked about at once (`AMPUP_MEMORY_ADVICE_DECIDE_KINDS`, default
 /// 150), weighed on their own before any compiled skill (`crate::advice`'s `advice_skills`): every one, where a scope
 /// has no more, else the best ranked. A scope learns a few hundred kinds of task at most (one production org: 131), and asking about
 /// all 131 took 0.36 s at the median against 0.31 s for 20 (ten calls each), at about $0.0004 a call. Ranked
 /// first, the right kind of task can miss the cut: on that org, with 621 compiled skills on the same list, the 20 lines
 /// weighed held 4 kinds of task on average, and none at all in about half the lookups.
 pub fn kinds_cap() -> usize {
-    std::env::var("MEMSTORE_ADVICE_DECIDE_KINDS")
+    std::env::var("AMPUP_MEMORY_ADVICE_DECIDE_KINDS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(150)
 }
-/// Longest a routing call waits for the decisions model (`MEMSTORE_ADVICE_DECIDE_WAIT_SECS`, default 5): an agent
+/// Longest a routing call waits for the decisions model (`AMPUP_MEMORY_ADVICE_DECIDE_WAIT_SECS`, default 5): an agent
 /// waits on it, so a slow model gives way to the chat router rather than stall the turn.
 fn decide_wait() -> Duration {
-    wait_secs("MEMSTORE_ADVICE_DECIDE_WAIT_SECS", 5.0)
+    wait_secs("AMPUP_MEMORY_ADVICE_DECIDE_WAIT_SECS", 5.0)
 }
 
 /// `var` as a wait in seconds (fractions allowed), else `default`.
@@ -197,10 +197,10 @@ fn wait_secs(var: &str, default: f64) -> Duration {
     Duration::from_secs_f64(secs)
 }
 
-/// `MEMSTORE_ADVICE_ROUTE_MIN`: how likely the decisions model must find the best line for it to be served (default
+/// `AMPUP_MEMORY_ADVICE_ROUTE_MIN`: how likely the decisions model must find the best line for it to be served (default
 /// 0.6).
 pub fn decide_min() -> f64 {
-    std::env::var("MEMSTORE_ADVICE_ROUTE_MIN")
+    std::env::var("AMPUP_MEMORY_ADVICE_ROUTE_MIN")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0.6)
@@ -275,37 +275,37 @@ pub async fn decide(
     }
 }
 
-/// `MEMSTORE_ADVICE_FIT_MIN`: how likely the decisions model must find routed advice to be for the very task asked
+/// `AMPUP_MEMORY_ADVICE_FIT_MIN`: how likely the decisions model must find routed advice to be for the very task asked
 /// for it to be served ([`fits`], default 0.5).
 pub fn fit_min() -> f64 {
-    std::env::var("MEMSTORE_ADVICE_FIT_MIN")
+    std::env::var("AMPUP_MEMORY_ADVICE_FIT_MIN")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0.5)
 }
 
-/// `MEMSTORE_ADVICE_WHEN_MIN`: how likely the decisions model must find the request to be in the situation a routed
+/// `AMPUP_MEMORY_ADVICE_WHEN_MIN`: how likely the decisions model must find the request to be in the situation a routed
 /// note's `When` describes for the note to be served ([`fits`], default 0.5).
 pub fn when_min() -> f64 {
-    std::env::var("MEMSTORE_ADVICE_WHEN_MIN")
+    std::env::var("AMPUP_MEMORY_ADVICE_WHEN_MIN")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0.5)
 }
 
-/// `MEMSTORE_ADVICE_WITHHOLD_MIN`: how likely the decisions model must find one of a routed note's `Withhold when`
+/// `AMPUP_MEMORY_ADVICE_WITHHOLD_MIN`: how likely the decisions model must find one of a routed note's `Withhold when`
 /// cases to describe the request for the note to be withheld ([`fits`], default 0.5).
 pub fn withhold_min() -> f64 {
-    std::env::var("MEMSTORE_ADVICE_WITHHOLD_MIN")
+    std::env::var("AMPUP_MEMORY_ADVICE_WITHHOLD_MIN")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0.5)
 }
 
-/// `MEMSTORE_ADVICE_ARRIVAL_MIN`: how likely the decisions model must find a note's `When` to be the moment a message
+/// `AMPUP_MEMORY_ADVICE_ARRIVAL_MIN`: how likely the decisions model must find a note's `When` to be the moment a message
 /// from the user arrives for the note to be withheld where no such message comes ([`ARRIVAL_ASK`], default 0.6).
 pub fn arrival_min() -> f64 {
-    std::env::var("MEMSTORE_ADVICE_ARRIVAL_MIN")
+    std::env::var("AMPUP_MEMORY_ADVICE_ARRIVAL_MIN")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0.6)
@@ -651,11 +651,11 @@ pub async fn fits(
     if fit { Fit::Fits } else { Fit::OffTask }
 }
 
-/// How long the chat router has to say whether routed advice fits ([`fits_chat`]): `MEMSTORE_ADVICE_FIT_WAIT_SECS`,
+/// How long the chat router has to say whether routed advice fits ([`fits_chat`]): `AMPUP_MEMORY_ADVICE_FIT_WAIT_SECS`,
 /// default 8. A router reached through a slower transport than an API (a CLI, a queue shared with learning calls)
 /// needs longer, or every fit check times out and nothing is served.
 fn fit_chat_wait() -> Duration {
-    wait_secs("MEMSTORE_ADVICE_FIT_WAIT_SECS", 8.0)
+    wait_secs("AMPUP_MEMORY_ADVICE_FIT_WAIT_SECS", 8.0)
 }
 
 /// What the chat router is asked of routed advice ([`fits_chat`]): the questions [`fits`] asks the decisions model.

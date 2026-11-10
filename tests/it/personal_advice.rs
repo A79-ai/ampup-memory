@@ -99,10 +99,10 @@ async fn a_persons_own_advice_is_theirs_alone_and_goes_when_they_do() {
     let dir = tempfile::tempdir().unwrap();
     let url = model().await;
     unsafe {
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
     }
     let store = crate::local_store(&dir.path().join("store")).await;
     let ex = extract::Extractor::from_env().unwrap().unwrap();
@@ -241,10 +241,10 @@ async fn a_round_learns_the_team_and_each_person_apart() {
     let dir = tempfile::tempdir().unwrap();
     let url = model().await;
     unsafe {
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
     }
     let store = crate::local_store(&dir.path().join("store")).await;
     let ex = extract::Extractor::from_env().unwrap().unwrap();
@@ -302,11 +302,11 @@ async fn a_team_note_needs_runs_from_enough_people() {
     let dir = tempfile::tempdir().unwrap();
     let url = model().await;
     unsafe {
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
-        std::env::remove_var("MEMSTORE_ADVICE_EVIDENCE");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
+        std::env::remove_var("AMPUP_MEMORY_ADVICE_EVIDENCE");
     }
     let store = crate::local_store(&dir.path().join("store")).await;
     let ex = extract::Extractor::from_env().unwrap().unwrap();
@@ -361,8 +361,8 @@ async fn a_team_note_needs_runs_from_enough_people() {
     // set to a single person: a team note never rests on fewer than two.
     record(&people[0], 0).await;
     unsafe {
-        std::env::set_var("MEMSTORE_ADVICE_EVIDENCE", "0");
-        std::env::set_var("MEMSTORE_ADVICE_LEARN_PEOPLE", "1");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_EVIDENCE", "0");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_LEARN_PEOPLE", "1");
     }
     let done = memstore::advice::learn(&store, &scope, &ex, &everyone, 3)
         .await
@@ -370,8 +370,8 @@ async fn a_team_note_needs_runs_from_enough_people() {
     assert_eq!((done.notes, done.few_people), (0, 1), "{done:?}");
     assert!(asks(&dave).await.is_none());
     unsafe {
-        std::env::remove_var("MEMSTORE_ADVICE_EVIDENCE");
-        std::env::remove_var("MEMSTORE_ADVICE_LEARN_PEOPLE");
+        std::env::remove_var("AMPUP_MEMORY_ADVICE_EVIDENCE");
+        std::env::remove_var("AMPUP_MEMORY_ADVICE_LEARN_PEOPLE");
     }
 
     // Three people's: the note is written, and readable by the team.

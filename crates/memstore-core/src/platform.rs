@@ -19,7 +19,7 @@ use iceberg_storage_opendal::{OpenDalResolvingStorageFactory, OpenDalStorageFact
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
-/// Build the catalog named by `MEMSTORE_PLATFORM` (gcp | snowflake | databricks | rest | local).
+/// Build the catalog named by `AMPUP_MEMORY_PLATFORM` (gcp | snowflake | databricks | rest | local).
 const SPCS_TOKEN: &str = "/snowflake/session/token";
 
 /// `SNOWFLAKE_PAT`, or the file `SNOWFLAKE_PAT_FILE` names (SPCS mounts secret references as files).
@@ -37,7 +37,7 @@ fn secret(var: &str) -> Option<String> {
 }
 
 pub async fn catalog_from_env() -> Result<Arc<dyn Catalog>> {
-    if env("MEMSTORE_PLATFORM")? == "local" {
+    if env("AMPUP_MEMORY_PLATFORM")? == "local" {
         return Ok(open_from_env().await?.0);
     }
     let (c, lasts) = open_from_env().await?;
@@ -51,7 +51,7 @@ pub async fn catalog_from_env() -> Result<Arc<dyn Catalog>> {
 const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(45 * 60);
 
 /// How long before its token runs out a catalog is opened again, when the token says how long it lasts: past the
-/// minute a cached table handle may still be used after it (`MEMSTORE_HARD_STALENESS_MS`).
+/// minute a cached table handle may still be used after it (`AMPUP_MEMORY_HARD_STALENESS_MS`).
 const BEFORE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// When a catalog opened now is opened again: after [`fresh_for`], or two minutes before its token runs out when the
@@ -100,9 +100,9 @@ impl Fresh {
     }
 }
 
-/// [`FRESH_FOR`], or `MEMSTORE_CATALOG_FRESH_SECS`.
+/// [`FRESH_FOR`], or `AMPUP_MEMORY_CATALOG_FRESH_SECS`.
 fn fresh_for() -> std::time::Duration {
-    std::env::var("MEMSTORE_CATALOG_FRESH_SECS")
+    std::env::var("AMPUP_MEMORY_CATALOG_FRESH_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .map_or(FRESH_FOR, std::time::Duration::from_secs)
@@ -195,15 +195,15 @@ impl Catalog for Fresh {
     }
 }
 
-/// The catalog `MEMSTORE_PLATFORM` names, opened now, and how long its token lasts when the token says.
+/// The catalog `AMPUP_MEMORY_PLATFORM` names, opened now, and how long its token lasts when the token says.
 async fn open_from_env() -> Result<(Arc<dyn Catalog>, Option<std::time::Duration>)> {
-    let platform = env("MEMSTORE_PLATFORM")?;
+    let platform = env("AMPUP_MEMORY_PLATFORM")?;
     if platform == "local" {
         // The local catalog lives in this process's memory: a new one would know none of the tables
         // made so far (a server refreshing its catalog would lose them all). One per warehouse.
         static LOCAL: tokio::sync::Mutex<Option<HashMap<String, Arc<dyn Catalog>>>> =
             tokio::sync::Mutex::const_new(None);
-        let warehouse = env("MEMSTORE_WAREHOUSE")?;
+        let warehouse = env("AMPUP_MEMORY_WAREHOUSE")?;
         let mut held = LOCAL.lock().await;
         let held = held.get_or_insert_with(HashMap::new);
         if let Some(c) = held.get(&warehouse) {
@@ -270,11 +270,11 @@ async fn open_from_env() -> Result<(Arc<dyn Catalog>, Option<std::time::Duration
         )?,
         "rest" => {
             let mut props = HashMap::from([
-                ("uri".into(), env("MEMSTORE_REST_URI")?),
-                ("warehouse".into(), env("MEMSTORE_WAREHOUSE")?),
+                ("uri".into(), env("AMPUP_MEMORY_REST_URI")?),
+                ("warehouse".into(), env("AMPUP_MEMORY_WAREHOUSE")?),
             ]);
             // Extra catalog/storage props as `key=value;key=value` (e.g. credential, s3.endpoint).
-            for kv in std::env::var("MEMSTORE_REST_PROPS")
+            for kv in std::env::var("AMPUP_MEMORY_REST_PROPS")
                 .unwrap_or_default()
                 .split(';')
             {
@@ -284,7 +284,7 @@ async fn open_from_env() -> Result<(Arc<dyn Catalog>, Option<std::time::Duration
             }
             props
         }
-        other => bail!("unknown MEMSTORE_PLATFORM {other}"),
+        other => bail!("unknown AMPUP_MEMORY_PLATFORM {other}"),
     };
     Ok((rest(&platform, props).await?, lasts))
 }
@@ -303,7 +303,7 @@ pub async fn rest(name: &str, props: HashMap<String, String>) -> Result<Arc<dyn 
 }
 
 /// Object-store requests in flight at once in this process, every catalog and table together:
-/// `MEMSTORE_STORAGE_REQUESTS` (default 64). opendal sends every request through one HTTP client whose pool
+/// `AMPUP_MEMORY_STORAGE_REQUESTS` (default 64). opendal sends every request through one HTTP client whose pool
 /// keeps every connection it opens for 90 s, and opens a new one whenever a request finds none idle, so
 /// uncapped the connections grow with the most requests ever in flight. A memory build scanning many tables and
 /// reading episode bodies held about 1,900 per process, and took down the port forwarder in front of its object
@@ -313,7 +313,7 @@ pub async fn rest(name: &str, props: HashMap<String, String>) -> Result<Arc<dyn 
 /// A request waits its turn, first come first served. A permit covers one request, never a reader's or
 /// writer's life, so a scan that is paused between reads holds none.
 static STORAGE_REQUESTS: LazyLock<Semaphore> = LazyLock::new(|| {
-    let n = std::env::var("MEMSTORE_STORAGE_REQUESTS")
+    let n = std::env::var("AMPUP_MEMORY_STORAGE_REQUESTS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n: &usize| n > 0)
@@ -735,7 +735,7 @@ fn own(dir: &std::path::Path) -> Result<std::fs::File> {
             let _ = f.read_to_string(&mut pid);
             let pid = pid.trim();
             anyhow::bail!(
-                "{} is in use by another memstore process{}: stop it first, or run this through it \
+                "{} is in use by another ampup-memory process{}: stop it first, or run this through it \
                  (one process owns a local store at a time)",
                 dir.display(),
                 if pid.is_empty() {
@@ -1154,7 +1154,7 @@ pub async fn cloud_run_verifies_callers() -> Result<(bool, Vec<String>)> {
 ///   read as they are. That trusts Cloud Run IAM, so it's allowed only while `iam_verified` (the caller passes
 ///   what `cloud_run_verifies_callers` last said); otherwise anyone could hand-make one.
 /// - Signature intact (service accounts, BigQuery): Google's tokeninfo checks it, and it must be minted for this
-///   service (`audiences`, from `MEMSTORE_ID_AUDIENCE`), so a token issued for some other app can't be replayed.
+///   service (`audiences`, from `AMPUP_MEMORY_ID_AUDIENCE`), so a token issued for some other app can't be replayed.
 ///
 /// User tokens carry their own client's audience (gcloud's, Claude's), which is why the stripped shape has no
 /// audience check: Cloud Run IAM has already decided they may call.
@@ -1292,10 +1292,10 @@ pub async fn gemini(model: &str, prompt: &str) -> Result<String> {
         .collect())
 }
 
-/// `https://<host><path>`, or a stand-in's in tests: `MEMSTORE_GOOGLE_API` is its base URL (tokeninfo and
+/// `https://<host><path>`, or a stand-in's in tests: `AMPUP_MEMORY_GOOGLE_API` is its base URL (tokeninfo and
 /// Cloud Identity both), and [`google_api_token`] its bearer.
 fn google_api(host: &str, path: &str) -> String {
-    match std::env::var("MEMSTORE_GOOGLE_API") {
+    match std::env::var("AMPUP_MEMORY_GOOGLE_API") {
         Ok(base) => format!("{}{path}", base.trim_end_matches('/')),
         Err(_) => format!("https://{host}{path}"),
     }
@@ -1303,7 +1303,7 @@ fn google_api(host: &str, path: &str) -> String {
 
 /// The service account's token for Google's APIs (`GCP_ACCESS_TOKEN` against a stand-in).
 fn google_api_token() -> Result<String> {
-    match std::env::var("MEMSTORE_GOOGLE_API") {
+    match std::env::var("AMPUP_MEMORY_GOOGLE_API") {
         Ok(_) => gcp_token(),
         Err(_) => metadata_token(),
     }
@@ -1370,11 +1370,11 @@ pub async fn snowflake_caller(user_token: &str, roles: &[String]) -> Result<(Str
         .iter()
         .map(|r| format!(", IS_ROLE_IN_SESSION('{r}')"))
         .collect();
-    // A stand-in SQL API (tests): `MEMSTORE_SNOWFLAKE_API` is its base URL, `MEMSTORE_SPCS_TOKEN_FILE` its token.
+    // A stand-in SQL API (tests): `AMPUP_MEMORY_SNOWFLAKE_API` is its base URL, `AMPUP_MEMORY_SPCS_TOKEN_FILE` its token.
     let token_file =
-        std::env::var("MEMSTORE_SPCS_TOKEN_FILE").unwrap_or_else(|_| SPCS_TOKEN.into());
+        std::env::var("AMPUP_MEMORY_SPCS_TOKEN_FILE").unwrap_or_else(|_| SPCS_TOKEN.into());
     let service_token = std::fs::read_to_string(&token_file).context("SPCS session token")?;
-    let api = match std::env::var("MEMSTORE_SNOWFLAKE_API") {
+    let api = match std::env::var("AMPUP_MEMORY_SNOWFLAKE_API") {
         Ok(base) => base,
         Err(_) => format!("https://{}", env("SNOWFLAKE_HOST")?),
     };

@@ -12,14 +12,14 @@
 //! - `skills/index`: the routing index, one line per skill (when to use it, where its graph is).
 //!
 //! **What compiles.** The sources are source prefixes (`kb:`, `github:`), or `*` for every source: the org's
-//! (or team's) `compile_sources` setting, else the server's `MEMSTORE_COMPILE_SOURCES` ([`sources_for`]).
+//! (or team's) `compile_sources` setting, else the server's `AMPUP_MEMORY_COMPILE_SOURCES` ([`sources_for`]).
 //! Unset, nothing compiles: a compile is the learning model reading every source, so a scope's admins choose
 //! it. No goal is read. The library used to be compiled per goal, from the goal's statement and guidance;
 //! on ORCA-bench, SWE-ContextBench and τ²-bench banking a neutral goal's library served advice as well as the
 //! task's own goal's in our benchmark runs, so the prompt is the neutral one.
 //!
 //! **As episodes come in.** `memstore serve` runs this after extraction, on its own timer
-//! (`MEMSTORE_COMPILE_SECS`, default 60), in every scope that has compile sources and doesn't turn
+//! (`AMPUP_MEMORY_COMPILE_SECS`, default 60), in every scope that has compile sources and doesn't turn
 //! compiling off (`compile: false`). Like an extraction, what it read is recorded in `extractions`, here
 //! under the compiler's id (`compile:<sources hash>:<model>@<prompt hash>`). So each episode is compiled once
 //! per sources, prompt and model: a new episode updates the library, and changed sources or a changed prompt
@@ -29,7 +29,7 @@
 //! does.
 //!
 //! **Per scope.** A scope's org (or team) may set two more ([`options_for`]), each only where it is set: its
-//! batch size (`compile_batch`, sources per round, over `MEMSTORE_COMPILE_BATCH`; a round writes at most 8
+//! batch size (`compile_batch`, sources per round, over `AMPUP_MEMORY_COMPILE_BATCH`; a round writes at most 8
 //! skills, so sources that are each a situation of their own want 8 or fewer), and what its sources are
 //! (`compile_kind`: `errors` has each skill's `when` name the exception and its message as reported). A kind
 //! changes the prompt and so the compiler's id; the batch size doesn't, and a scope that sets neither compiles
@@ -46,9 +46,9 @@
 //! graph that fails validation isn't written: its skill stays, without a graph until the next update.
 //!
 //! The sources are data, not instructions: they go to the model between two lines of a fence it can't
-//! guess, as extraction's text does. Configured with `MEMSTORE_COMPILE`, `_MODEL`, `_URL` and `_KEY` (or
+//! guess, as extraction's text does. Configured with `AMPUP_MEMORY_COMPILE`, `_MODEL`, `_URL` and `_KEY` (or
 //! `_KEY_FILE`), each falling back to extraction's (`crate::extract::Extractor::compile_from_env`), and
-//! `_BATCH`, `_BATCH_CHARS` and `_MAX_TOKENS` for the size of a round (below). `MEMSTORE_AIP_MODEL` puts the
+//! `_BATCH`, `_BATCH_CHARS` and `_MAX_TOKENS` for the size of a round (below). `AMPUP_MEMORY_AIP_MODEL` puts the
 //! AIP graphs on another model of the same backend.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -70,14 +70,14 @@ pub const AIP: &str = "aip/";
 const SOURCE: &str = "compile:skills";
 
 /// The compile sources `scope` has: its org's (or team's) `compile_sources`, else the server's
-/// `MEMSTORE_COMPILE_SOURCES` (comma-separated). None, nothing compiles.
+/// `AMPUP_MEMORY_COMPILE_SOURCES` (comma-separated). None, nothing compiles.
 pub fn sources_for(
     dir: Option<&crate::people::directory::Directory>,
     scope: &Scope,
 ) -> Vec<String> {
     dir.and_then(|d| d.compile_sources(scope))
         .unwrap_or_else(|| {
-            parse_sources(&std::env::var("MEMSTORE_COMPILE_SOURCES").unwrap_or_default())
+            parse_sources(&std::env::var("AMPUP_MEMORY_COMPILE_SOURCES").unwrap_or_default())
         })
 }
 
@@ -86,7 +86,7 @@ pub fn sources_for(
 /// under the same compiler id.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
-    /// Sources per round (`compile_batch`), else the server's `MEMSTORE_COMPILE_BATCH`. Not part of the
+    /// Sources per round (`compile_batch`), else the server's `AMPUP_MEMORY_COMPILE_BATCH`. Not part of the
     /// compiler's id: a new batch size compiles nothing again.
     pub batch: Option<usize>,
     /// What the sources are (`compile_kind`), where the prompt says so. Part of the compiler's id, as the
@@ -143,27 +143,27 @@ fn selects(sources: &[String], source: &str, document: Option<&str>) -> bool {
             .any(|p| p == "*" || source.starts_with(p.as_str()))
 }
 
-/// Sources per model call, and their text in all: `MEMSTORE_COMPILE_BATCH` (default 12; a scope's `compile_batch`
-/// wins, [`Options::batch`]) and `MEMSTORE_COMPILE_BATCH_CHARS` (default 60,000). Rounds run one after another,
+/// Sources per model call, and their text in all: `AMPUP_MEMORY_COMPILE_BATCH` (default 12; a scope's `compile_batch`
+/// wins, [`Options::batch`]) and `AMPUP_MEMORY_COMPILE_BATCH_CHARS` (default 60,000). Rounds run one after another,
 /// since each sees the library the last one left (a round's AIP graphs are compiled while the next round's C2S
 /// runs), so a memory build over a large corpus raises both to make fewer, longer rounds.
 fn batch() -> usize {
-    env_count("MEMSTORE_COMPILE_BATCH", 12)
+    env_count("AMPUP_MEMORY_COMPILE_BATCH", 12)
 }
 fn batch_chars() -> usize {
-    env_count("MEMSTORE_COMPILE_BATCH_CHARS", 60_000)
+    env_count("AMPUP_MEMORY_COMPILE_BATCH_CHARS", 60_000)
 }
-/// The longest reply a library update may write, where the API takes a cap (`MEMSTORE_COMPILE_MAX_TOKENS`,
+/// The longest reply a library update may write, where the API takes a cap (`AMPUP_MEMORY_COMPILE_MAX_TOKENS`,
 /// default 16,000): a bigger round can change more skills at once.
 fn max_tokens() -> u32 {
-    env_count("MEMSTORE_COMPILE_MAX_TOKENS", 16_000) as u32
+    env_count("AMPUP_MEMORY_COMPILE_MAX_TOKENS", 16_000) as u32
 }
 /// The model each skill's AIP graph is compiled with: the one `cx` was given (an org's `aip_model`), else
-/// `MEMSTORE_AIP_MODEL`, on the compile backend; otherwise the compile model. A graph restates one skill, so a
+/// `AMPUP_MEMORY_AIP_MODEL`, on the compile backend; otherwise the compile model. A graph restates one skill, so a
 /// smaller model can write it while another writes the library.
 fn aip_model(cx: &Extractor) -> Option<String> {
     cx.aip_model().map(str::to_string).or_else(|| {
-        std::env::var("MEMSTORE_AIP_MODEL")
+        std::env::var("AMPUP_MEMORY_AIP_MODEL")
             .ok()
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty())
@@ -180,11 +180,11 @@ fn env_count(var: &str, default: usize) -> usize {
 const MAX_SOURCE: usize = 12_000;
 /// Existing skills shown in full with a batch (the closest to its text); the rest by title only.
 const CONTEXT_SKILLS: usize = 8;
-/// AIP compiles in flight at once: `MEMSTORE_COMPILE_PARALLEL` (default 4). Each changed skill's graph is its own
+/// AIP compiles in flight at once: `AMPUP_MEMORY_COMPILE_PARALLEL` (default 4). Each changed skill's graph is its own
 /// call, so a round that changes many skills (a large corpus, big batches) waits on them; more in flight finishes
 /// sooner, up to the API's rate limit.
 fn parallel() -> usize {
-    env_count("MEMSTORE_COMPILE_PARALLEL", 4)
+    env_count("AMPUP_MEMORY_COMPILE_PARALLEL", 4)
 }
 
 const C2S_PROMPT: &str = "You maintain the skill library of an organization's memory: what its documents say \

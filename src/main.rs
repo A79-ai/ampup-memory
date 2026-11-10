@@ -8,26 +8,27 @@ use memstore::{Episode, Fact, Principal, Scope, Store, platform, smoke};
 /// Adaptive Memory Store: facts in the customer's Iceberg catalog, read and written through a
 /// ledger.
 ///
-/// The catalog comes from MEMSTORE_PLATFORM (local | rest | gcp | snowflake | databricks; see the
+/// The catalog comes from AMPUP_MEMORY_PLATFORM (local | rest | gcp | snowflake | databricks; see the
 /// README). A scope is `org`, `org:<org>`, `team:<id>`, `team:<org>/<team>` or `user:<id>`. A reader
 /// is `user` or `user:group,...`.
 ///
 /// The release this was built as (`v0.1.0-rc.7`, from the release workflow), else the crate's version.
-const VERSION: &str = match option_env!("MEMSTORE_RELEASE") {
+const VERSION: &str = match memstore::naming::RELEASE {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
 
 /// People and orgs: `create-org`, `org init`, `create-team`, `invite`, `requests`, `decline`, `join`, `use`. Signed in to a
 /// server they go to it as you; otherwise (or with --direct) they reach the catalog as its owner.
-/// Contexts (server, org, team) live in ~/.memstore, like kubectl's.
+/// Contexts (server, org, team) live in ~/.ampup-memory, like kubectl's.
 #[derive(Parser)]
-#[command(name = "memstore", version = VERSION, propagate_version = true)]
+// Named outright, not from argv[0]: run as `memstore` (the link kept from before the rename), it says the same.
+#[command(name = "ampup-memory", bin_name = "ampup-memory", version = VERSION, propagate_version = true)]
 struct Cli {
     /// Directory commands go to the catalog (as its owner) even when signed in to a server
     #[arg(long, global = true)]
     direct: bool,
-    /// Use this context for one command (also MEMSTORE_CONTEXT)
+    /// Use this context for one command (also AMPUP_MEMORY_CONTEXT)
     #[arg(long, global = true)]
     context: Option<String>,
     #[command(subcommand)]
@@ -163,11 +164,11 @@ enum Cmd {
         /// Groups every caller reads as when the service does not identify callers
         groups: Option<String>,
         /// Run on this machine with no cloud and no Docker: tables, index and catalog under DIR
-        /// (default ~/.memstore), one caller, MCP at /mcp, bound to 127.0.0.1
-        #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "~/.memstore")]
+        /// (default ~/.ampup-memory), one caller, MCP at /mcp, bound to 127.0.0.1
+        #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "~/.ampup-memory")]
         local: Option<String>,
         /// Also serve every workspace side by side, each selected with x-memstore-org or ?org= (also
-        /// MEMSTORE_SERVE_WORKSPACES=1)
+        /// AMPUP_MEMORY_SERVE_WORKSPACES=1)
         #[arg(long)]
         workspaces: bool,
     },
@@ -187,7 +188,7 @@ enum Cmd {
     /// the rows and a checksum as read, as carried over and as committed, and commits nothing unless the new files
     /// hold exactly the rows read. Run again after an interrupted run: it finishes that one's deletes first.
     /// Logs each step (read, write, catch-up, swap, sweep) with its time to stderr. `serve` does this in its
-    /// nightly maintenance window up to MEMSTORE_LEDGER_COMPACT_MAX_FILES data files; past that, run this once
+    /// nightly maintenance window up to AMPUP_MEMORY_LEDGER_COMPACT_MAX_FILES data files; past that, run this once
     CompactLedger {
         /// Report the ledger's files now and what a compaction would leave, writing nothing
         #[arg(long)]
@@ -199,23 +200,23 @@ enum Cmd {
         #[arg(long)]
         local: Option<PathBuf>,
     },
-    /// Register memstore's hooks and MCP server in a coding agent: `memstore hooks install --harness codex`
+    /// Register memstore's hooks and MCP server in a coding agent: `ampup-memory hooks install --harness codex`
     /// (codex, gemini, cursor or copilot; Claude Code installs its plugin). `uninstall` takes them out
     Hooks {
         /// install or uninstall
         action: String,
         #[arg(long)]
         harness: String,
-        /// The memstore server, written into the hooks and MCP entry (MEMSTORE_URL otherwise, read when they run)
+        /// The memstore server, written into the hooks and MCP entry (AMPUP_MEMORY_URL otherwise, read when they run)
         #[arg(long)]
         url: Option<String>,
         /// Say what would change, and change nothing
         #[arg(long)]
         dry_run: bool,
     },
-    /// A coding agent's hook (`memstore hooks install` registers them; the Claude Code plugin too):
+    /// A coding agent's hook (`ampup-memory hooks install` registers them; the Claude Code plugin too):
     /// session-start, prompt, stop, session-end or status, reading the hook's JSON on stdin and talking to
-    /// MEMSTORE_URL; `outcome good|bad [why]` rates the session's run (`/memstore:outcome`). Never fails the
+    /// AMPUP_MEMORY_URL; `outcome good|bad [why]` rates the session's run (`/memstore:outcome`). Never fails the
     /// session: errors go to stderr and it exits 0
     Hook {
         event: String,
@@ -228,8 +229,8 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
-    /// The server's MCP endpoint over stdio, signed in as the CLI is (`memstore join`): for MCP clients
-    /// that start a command, such as the Claude Code plugin. MEMSTORE_URL and MEMSTORE_TOKEN override
+    /// The server's MCP endpoint over stdio, signed in as the CLI is (`ampup-memory join`): for MCP clients
+    /// that start a command, such as the Claude Code plugin. AMPUP_MEMORY_URL and AMPUP_MEMORY_TOKEN override
     Mcp,
     /// Whether this machine's memory works: the server and whether it's up, who is signed in and until when, the
     /// org, what the memory runs there (extraction, compiling, advice and its evidence bar), and how the last hook
@@ -245,13 +246,13 @@ enum Cmd {
     /// sets, no memory), and a redacted summary of its logs (counts by severity, the error and warning lines
     /// with addresses, keys and emails blanked)
     SupportBundle {
-        /// The engine (MEMSTORE_URL otherwise)
-        #[arg(long, env = "MEMSTORE_URL")]
+        /// The engine (AMPUP_MEMORY_URL otherwise)
+        #[arg(long, env = "AMPUP_MEMORY_URL")]
         engine: String,
-        /// The operator's admin key, in a file (the agent's MEMSTORE_AGENT_ADMIN_KEY_FILE)
+        /// The operator's admin key, in a file (the agent's AMPUP_MEMORY_AGENT_ADMIN_KEY_FILE)
         #[arg(long, value_name = "FILE")]
         admin_key_file: Option<PathBuf>,
-        /// Where to write it (default ./memstore-bundle-<time>)
+        /// Where to write it (default ./ampup-memory-bundle-<time>)
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
         /// Read the engine's Cloud Run logs with gcloud: the project, with --region and --service
@@ -270,7 +271,7 @@ enum Cmd {
         since_minutes: u32,
     },
     /// Read the episodes the scope schema's `extract` section names that it hasn't read yet, and commit the
-    /// facts found; with MEMSTORE_EXTRACT_GOAL_BLIND=1, the rest too. MEMSTORE_EXTRACT picks the backend
+    /// facts found; with AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1, the rest too. AMPUP_MEMORY_EXTRACT picks the backend
     /// (default OpenRouter, Claude Haiku 5.5)
     Extract {
         #[arg(default_value = "org")]
@@ -291,8 +292,8 @@ enum Cmd {
     },
     /// Dream over the scope's open facts: end values a newer fact replaced, link facts that say the same thing and
     /// link names of one thing as aliases, per shared audience, weighing only what came in since the last pass.
-    /// Writes only new rows (records, closures, links, aliases), all withdrawable as one actor. MEMSTORE_DREAM
-    /// picks the backend (else MEMSTORE_EXTRACT's; default OpenRouter, Claude Haiku 5.5)
+    /// Writes only new rows (records, closures, links, aliases), all withdrawable as one actor. AMPUP_MEMORY_DREAM
+    /// picks the backend (else AMPUP_MEMORY_EXTRACT's; default OpenRouter, Claude Haiku 5.5)
     Dream {
         #[arg(default_value = "org")]
         scope: String,
@@ -300,7 +301,7 @@ enum Cmd {
         /// JSON lines, and commit nothing
         #[arg(long)]
         dry_run: bool,
-        /// Most model calls this pass (else MEMSTORE_DREAM_CALLS, default 100)
+        /// Most model calls this pass (else AMPUP_MEMORY_DREAM_CALLS, default 100)
         #[arg(long)]
         calls: Option<usize>,
         /// A `serve --local` directory, instead of the catalog the environment names (stop the server first)
@@ -318,12 +319,12 @@ enum Cmd {
         local: Option<PathBuf>,
     },
     /// Compile the scope's skill library and their AIP step graphs (which subsumes corpus-to-skill) from the
-    /// compile sources it hasn't yet, on a branch; `memstore serve` does this on its own as sources come in.
-    /// Uses MEMSTORE_COMPILE (or MEMSTORE_EXTRACT; default OpenRouter, Claude Opus 5.5)
+    /// compile sources it hasn't yet, on a branch; `ampup-memory serve` does this on its own as sources come in.
+    /// Uses AMPUP_MEMORY_COMPILE (or AMPUP_MEMORY_EXTRACT; default OpenRouter, Claude Opus 5.5)
     Compile {
         scope: String,
         /// Source prefixes to compile (`kb:,file:`), or `*` for every source; else the scope's
-        /// `compile_sources` setting, else MEMSTORE_COMPILE_SOURCES
+        /// `compile_sources` setting, else AMPUP_MEMORY_COMPILE_SOURCES
         #[arg(long)]
         sources: Option<String>,
         #[arg(long, default_value = memstore::MAIN)]
@@ -337,8 +338,8 @@ enum Cmd {
     },
     /// Read the history the scope schema's `extract` section names with what the schema offers now: episodes
     /// no version of it read are read whole, those an earlier version read are asked only what was added since.
-    /// Newest first, resumable; a second run reads nothing. Uses MEMSTORE_EXTRACT;
-    /// MEMSTORE_EXTRACT_PRICE=<$/M in>,<$/M out> turns tokens into dollars
+    /// Newest first, resumable; a second run reads nothing. Uses AMPUP_MEMORY_EXTRACT;
+    /// AMPUP_MEMORY_EXTRACT_PRICE=<$/M in>,<$/M out> turns tokens into dollars
     Backfill {
         scope: String,
         /// Count the episodes and estimate tokens and dollars; read nothing
@@ -347,7 +348,7 @@ enum Cmd {
         /// At most this many episodes this run
         #[arg(long, default_value_t = 1000)]
         max_episodes: usize,
-        /// Stop once this many dollars are spent (needs MEMSTORE_EXTRACT_PRICE)
+        /// Stop once this many dollars are spent (needs AMPUP_MEMORY_EXTRACT_PRICE)
         #[arg(long)]
         max_usd: Option<f64>,
         /// A `serve --local` directory, instead of the catalog the environment names (stop the server first)
@@ -371,7 +372,7 @@ enum Cmd {
     /// Runs for advice to learn from: `runs load` records a file of them, scored or not, in one batch
     #[command(subcommand)]
     Runs(RunsCmd),
-    /// The training log (`MEMSTORE_TRAIN_LOG`): every model call kept whole, so a smaller model can be trained on
+    /// The training log (`AMPUP_MEMORY_TRAIN_LOG`): every model call kept whole, so a smaller model can be trained on
     /// it. `sweep` removes what the memory has since forgotten; `export` writes training examples
     #[command(subcommand)]
     TrainLog(TrainLogCmd),
@@ -444,7 +445,7 @@ enum Cmd {
     BackfillQuotes {
         scope: String,
         /// Recompute quotes that are already there
-        #[arg(long, env = "MEMSTORE_BACKFILL_REDO")]
+        #[arg(long, env = "AMPUP_MEMORY_BACKFILL_REDO")]
         redo: bool,
     },
     /// Load the embedding model and embed some text (checks an image's baked-in model)
@@ -452,7 +453,7 @@ enum Cmd {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
     },
-    /// Datasets in GCS (MEMSTORE_DATASETS): list, fetch on demand, publish
+    /// Datasets in GCS (AMPUP_MEMORY_DATASETS): list, fetch on demand, publish
     #[command(subcommand)]
     Dataset(DatasetCmd),
     /// Engine checks (spec M7)
@@ -494,7 +495,7 @@ enum PreflightCmd {
         #[arg(long, value_name = "C0...")]
         vendor_customer_id: Option<String>,
         /// The control plane the agent will reach, for the egress check
-        #[arg(long, env = "MEMSTORE_CONTROL_PLANE_URL")]
+        #[arg(long, env = "AMPUP_MEMORY_CONTROL_PLANE_URL")]
         control_plane: Option<String>,
         /// The image registry host the nodes will pull from, for the egress check
         #[arg(long, value_name = "HOST")]
@@ -506,11 +507,11 @@ enum PreflightCmd {
         /// With --installed: the vendor's cosign public key (PEM), to verify the running image's signature
         #[arg(long, value_name = "FILE", requires = "installed")]
         cosign_key: Option<PathBuf>,
-        /// With --installed: the deployment credential (default ~/.memstore/deployment.json)
+        /// With --installed: the deployment credential (default ~/.ampup-memory/deployment.json)
         #[arg(long, value_name = "FILE", requires = "installed")]
         credential: Option<PathBuf>,
         /// With --installed: where the image signatures live when not beside the image (the agent's
-        /// MEMSTORE_AGENT_SIGNATURE_REPOSITORY)
+        /// AMPUP_MEMORY_AGENT_SIGNATURE_REPOSITORY)
         #[arg(long, value_name = "REPOSITORY", requires = "cosign_key")]
         signature_repository: Option<String>,
         /// With --installed: verify this image (repository@sha256:…) instead of the one the engine runs
@@ -583,7 +584,7 @@ enum DeploymentCmd {
     Enroll {
         control_plane: String,
         token: String,
-        /// Where to keep the credential (MEMSTORE_DEPLOYMENT_CREDENTIAL, else ~/.memstore/deployment.json)
+        /// Where to keep the credential (AMPUP_MEMORY_DEPLOYMENT_CREDENTIAL, else ~/.ampup-memory/deployment.json)
         #[arg(long)]
         credential: Option<PathBuf>,
     },
@@ -607,115 +608,131 @@ enum DeploymentCmd {
 
 #[derive(clap::Args)]
 struct AgentArgs {
-    /// The deployment credential (MEMSTORE_DEPLOYMENT_CREDENTIAL, else ~/.memstore/deployment.json)
+    /// The deployment credential (AMPUP_MEMORY_DEPLOYMENT_CREDENTIAL, else ~/.ampup-memory/deployment.json)
     #[arg(long)]
     credential: Option<PathBuf>,
     /// Where the agent keeps the generation it applied and the actions it ran (default: beside the
     /// telemetry spool, `agent.state.json`)
-    #[arg(long, env = "MEMSTORE_AGENT_STATE")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_STATE")]
     state: Option<PathBuf>,
     /// The engine's telemetry mirror, on a volume shared with it: lets drain_spool and clear_spool act
-    #[arg(long, env = "MEMSTORE_TELEMETRY_MIRROR")]
+    #[arg(long, env = "AMPUP_MEMORY_TELEMETRY_MIRROR")]
     telemetry_mirror: Option<PathBuf>,
     /// The control plane's public key (base64), when the credential doesn't pin it
-    #[arg(long, env = "MEMSTORE_CONTROL_PLANE_KEY")]
+    #[arg(long, env = "AMPUP_MEMORY_CONTROL_PLANE_KEY")]
     control_plane_key: Option<String>,
     /// With no key pinned (credential or --control-plane-key), trust the one /v1/whoami gives on first
     /// use and keep it; its fingerprint is logged for you to check
-    #[arg(long, env = "MEMSTORE_AGENT_TOFU", action = clap::ArgAction::SetTrue,
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_TOFU", action = clap::ArgAction::SetTrue,
           value_parser = clap::builder::BoolishValueParser::new())]
     trust_control_plane_key_on_first_use: bool,
     /// Where the engine runs: kubernetes (cloud-run and snowflake are not built yet)
-    #[arg(long, env = "MEMSTORE_AGENT_TARGET", default_value = "kubernetes")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_TARGET", default_value = "kubernetes")]
     target: String,
     /// The image repository the engine runs from; the control plane names only a tag and a digest
-    #[arg(long, env = "MEMSTORE_AGENT_IMAGE_REPOSITORY")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_IMAGE_REPOSITORY")]
     image_repository: String,
     /// The embeddings backends the control plane may switch the engine to (comma-separated: local, openai,
     /// openrouter). None by default: a switch to an API sends the deployment's text to that vendor
-    #[arg(long, env = "MEMSTORE_AGENT_EMBED_PROVIDERS", value_delimiter = ',')]
+    #[arg(
+        long,
+        env = "AMPUP_MEMORY_AGENT_EMBED_PROVIDERS",
+        value_delimiter = ','
+    )]
     embed_providers: Vec<String>,
     /// Report workload drift, or repair it within maintenance windows (a local operator choice)
     #[arg(
         long,
-        env = "MEMSTORE_AGENT_DRIFT_MODE",
+        env = "AMPUP_MEMORY_AGENT_DRIFT_MODE",
         value_enum,
         default_value = "report"
     )]
     drift_mode: memstore::agent::DriftMode,
     /// The engine's namespace (default: the agent's own)
-    #[arg(long, env = "MEMSTORE_AGENT_NAMESPACE")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_NAMESPACE")]
     namespace: Option<String>,
     /// The engine's Deployment
-    #[arg(long, env = "MEMSTORE_AGENT_DEPLOYMENT", default_value = "memstore")]
+    #[arg(
+        long,
+        env = "AMPUP_MEMORY_AGENT_DEPLOYMENT",
+        default_value = "memstore"
+    )]
     deployment: String,
     /// The engine's container in it
-    #[arg(long, env = "MEMSTORE_AGENT_CONTAINER", default_value = "memstore")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_CONTAINER", default_value = "memstore")]
     container: String,
     /// More Deployments running the same engine (cells), given the same version and flags (comma-separated)
-    #[arg(long, env = "MEMSTORE_AGENT_ALSO_DEPLOYMENTS", value_delimiter = ',')]
+    #[arg(
+        long,
+        env = "AMPUP_MEMORY_AGENT_ALSO_DEPLOYMENTS",
+        value_delimiter = ','
+    )]
     also_deployments: Vec<String>,
     /// The Kubernetes API, instead of the in-cluster one (https, or http to this machine only)
-    #[arg(long, env = "MEMSTORE_AGENT_KUBE_API", hide = true)]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_KUBE_API", hide = true)]
     kube_api: Option<String>,
     /// The engine's health: `/healthz`, or `/telemetry` with --health-token-file (default:
     /// http://<deployment>.<namespace>.svc:8080/healthz)
-    #[arg(long, env = "MEMSTORE_AGENT_HEALTH_URL")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_HEALTH_URL")]
     health_url: Option<String>,
     /// An admin key for --health-url, read from this file
-    #[arg(long, env = "MEMSTORE_AGENT_HEALTH_TOKEN_FILE")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_HEALTH_TOKEN_FILE")]
     health_token_file: Option<PathBuf>,
     /// The engine, for support diagnostics (default: the origin of --health-url)
-    #[arg(long, env = "MEMSTORE_AGENT_ENGINE_URL")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_ENGINE_URL")]
     engine_url: Option<String>,
     /// The operator's admin key for the engine, read from this file: support diagnostics read
     /// /telemetry and /metrics with it, and support sessions are written to the engine's audit with it
-    #[arg(long, env = "MEMSTORE_AGENT_ADMIN_KEY_FILE")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_ADMIN_KEY_FILE")]
     admin_key_file: Option<PathBuf>,
     /// Seconds between looks at an open support session
-    #[arg(long, env = "MEMSTORE_AGENT_SUPPORT_POLL_SECONDS", default_value_t = 5)]
+    #[arg(
+        long,
+        env = "AMPUP_MEMORY_AGENT_SUPPORT_POLL_SECONDS",
+        default_value_t = 5
+    )]
     support_poll_seconds: u64,
     /// Seconds between rounds (each give or take a fifth)
-    #[arg(long, env = "MEMSTORE_AGENT_POLL_SECONDS", default_value_t = 30)]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_POLL_SECONDS", default_value_t = 30)]
     poll_seconds: u64,
     /// Seconds a rollout may take before it is rolled back. Longer than a rollout Kubernetes still counts as
     /// progressing (`progressDeadlineSeconds`, e.g. 900): an engine is ready only once the ledger has
-    /// loaded (minutes cold) and the rest has warmed or `MEMSTORE_READY_TIMEOUT_SECS` (300) has passed, and
+    /// loaded (minutes cold) and the rest has warmed or `AMPUP_MEMORY_READY_TIMEOUT_SECS` (300) has passed, and
     /// a stall is caught as `rollout_stalled` anyway
     #[arg(
         long,
-        env = "MEMSTORE_AGENT_ROLLOUT_TIMEOUT_SECONDS",
+        env = "AMPUP_MEMORY_AGENT_ROLLOUT_TIMEOUT_SECONDS",
         default_value_t = 1200
     )]
     rollout_timeout_seconds: u64,
     /// Seconds a rolled-out engine has to answer healthy before it is rolled back
     #[arg(
         long,
-        env = "MEMSTORE_AGENT_HEALTH_TIMEOUT_SECONDS",
+        env = "AMPUP_MEMORY_AGENT_HEALTH_TIMEOUT_SECONDS",
         default_value_t = 120
     )]
     health_timeout_seconds: u64,
     /// The PEM public key (P-256) an image's cosign signature must verify with before it is run
-    #[arg(long, env = "MEMSTORE_AGENT_COSIGN_KEY")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_COSIGN_KEY")]
     cosign_key: Option<PathBuf>,
     /// With no --cosign-key, run images with no signature check (warned of at start and each upgrade).
     /// Without either, no upgrade is applied
-    #[arg(long, env = "MEMSTORE_AGENT_ALLOW_UNSIGNED", action = clap::ArgAction::SetTrue,
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_ALLOW_UNSIGNED", action = clap::ArgAction::SetTrue,
           value_parser = clap::builder::BoolishValueParser::new())]
     allow_unsigned_images: bool,
     /// How signatures are read from the registry: gcp-metadata, anonymous or none (default:
     /// gcp-metadata for *-docker.pkg.dev and gcr.io, else anonymous)
-    #[arg(long, env = "MEMSTORE_AGENT_REGISTRY_AUTH")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_REGISTRY_AUTH")]
     registry_auth: Option<String>,
     /// The registry's API, instead of https://<the repository's host> (https, or http to this machine)
-    #[arg(long, env = "MEMSTORE_AGENT_REGISTRY_URL", hide = true)]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_REGISTRY_URL", hide = true)]
     registry_url: Option<String>,
     /// The GCE metadata server's host
     #[arg(long, env = "GCE_METADATA_HOST", hide = true)]
     metadata_host: Option<String>,
     /// The repository the images' cosign signatures are in, when they were signed with
     /// COSIGN_REPOSITORY (default: the image repository)
-    #[arg(long, env = "MEMSTORE_AGENT_SIGNATURE_REPOSITORY")]
+    #[arg(long, env = "AMPUP_MEMORY_AGENT_SIGNATURE_REPOSITORY")]
     signature_repository: Option<String>,
     /// One round, then exit
     #[arg(long)]
@@ -993,6 +1010,9 @@ fn jemalloc_stats() -> String {
 }
 
 fn main() -> Result<()> {
+    // The old names (MEMSTORE_*, ~/.memstore) read as the new ones, before anything reads them.
+    // SAFETY: first in main: no other thread runs yet.
+    unsafe { memstore::naming::startup() };
     // Lance scores every index search (keyword, vector, fact and passage lists) on one pool of the CPUs it counts
     // less 2 it holds back for I/O (`LANCE_IO_CORE_RESERVATION`), which memstore's I/O, on its own runtime, doesn't
     // use: 2 threads in a pod limited to 3.5 CPUs, 1 in a smaller one. A search's four to six lists queued for
@@ -1055,7 +1075,7 @@ fn main() -> Result<()> {
 
 /// What to say when no model is configured for extraction (and, through it, aggregation and compiling).
 const NO_MODEL: &str = "set OPENROUTER_API_KEY for the default, OpenRouter with Claude Haiku 5.5 (or the model \
-MEMSTORE_EXTRACT_MODEL names), or set MEMSTORE_EXTRACT (openrouter, openrouter-batch, openai, anthropic, bedrock, vertex or cortex)";
+AMPUP_MEMORY_EXTRACT_MODEL names), or set AMPUP_MEMORY_EXTRACT (openrouter, openrouter-batch, openai, anthropic, bedrock, vertex or cortex)";
 
 /// `memstore qa-log`: the answer log, as JSON lines.
 /// `memstore advice`.
@@ -1114,8 +1134,8 @@ async fn compile(
         anyhow::anyhow!(
             "no compile model: {}",
             NO_MODEL.replacen(
-                "set MEMSTORE_EXTRACT (",
-                "set MEMSTORE_COMPILE or MEMSTORE_EXTRACT (",
+                "set AMPUP_MEMORY_EXTRACT (",
+                "set AMPUP_MEMORY_COMPILE or AMPUP_MEMORY_EXTRACT (",
                 1
             )
         )
@@ -1161,7 +1181,7 @@ async fn compile(
 async fn advice(store: &Store, scope: &str, acl: &[String], min_wrong: usize) -> Result<()> {
     let cx = memstore::extract::Extractor::advice_from_env()?.ok_or_else(|| {
         anyhow::anyhow!(
-            "no model to learn advice with: set MEMSTORE_ADVICE_MODEL (or OPENROUTER_API_KEY)"
+            "no model to learn advice with: set AMPUP_MEMORY_ADVICE_MODEL (or OPENROUTER_API_KEY)"
         )
     })?;
     let done = memstore::advice::learn(store, &Scope::parse(scope)?, &cx, acl, min_wrong).await?;
@@ -1294,12 +1314,12 @@ async fn qa_log(store: &Store, scope: &str) -> Result<()> {
     Ok(())
 }
 
-/// MEMSTORE_EXTRACT_PRICE: dollars per million input and output tokens (`3,15`), if set.
+/// AMPUP_MEMORY_EXTRACT_PRICE: dollars per million input and output tokens (`3,15`), if set.
 fn extract_price() -> Result<Option<(f64, f64)>> {
-    match std::env::var("MEMSTORE_EXTRACT_PRICE") {
+    match std::env::var("AMPUP_MEMORY_EXTRACT_PRICE") {
         Ok(p) if !p.trim().is_empty() => {
             let (i, o) = p.split_once(',').ok_or_else(|| {
-                anyhow::anyhow!("MEMSTORE_EXTRACT_PRICE is <$ per M input>,<$ per M output>")
+                anyhow::anyhow!("AMPUP_MEMORY_EXTRACT_PRICE is <$ per M input>,<$ per M output>")
             })?;
             Ok(Some((i.trim().parse::<f64>()?, o.trim().parse::<f64>()?)))
         }
@@ -1477,7 +1497,7 @@ async fn aggregate(
         return Ok(());
     }
     let ex = memstore::extract::Extractor::from_env()?.ok_or_else(|| anyhow::anyhow!(NO_MODEL))?;
-    let ex = match std::env::var("MEMSTORE_AGGREGATE_MODEL")
+    let ex = match std::env::var("AMPUP_MEMORY_AGGREGATE_MODEL")
         .ok()
         .filter(|m| !m.is_empty())
     {
@@ -1538,7 +1558,7 @@ async fn extract(
         eprintln!(
             "{scope}'s schema on {branch} has no `extract` section, so nothing but its starter documents is extracted{}",
             if on_main {
-                " (an org's admins' set_settings {extract: true}, or MEMSTORE_EXTRACT_GOAL_BLIND=1, extracts without one)"
+                " (an org's admins' set_settings {extract: true}, or AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1, extracts without one)"
             } else {
                 " (goal-blind extraction reads main only)"
             }
@@ -1630,7 +1650,7 @@ fn principal(user: &str) -> Principal {
 }
 
 /// Whether `cmd` builds a memory: what it asks the models is kept in the model-call cache unless
-/// `MEMSTORE_MODEL_CACHE` says otherwise, so building the same memory again (a fresh store of the same inputs, a
+/// `AMPUP_MEMORY_MODEL_CACHE` says otherwise, so building the same memory again (a fresh store of the same inputs, a
 /// rebuild) pays for no call twice. A server serving people keeps none unless told.
 fn builds(cmd: &Cmd) -> bool {
     matches!(
@@ -1857,7 +1877,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             let remove = match action.as_str() {
                 "install" => false,
                 "uninstall" => true,
-                other => anyhow::bail!("memstore hooks install|uninstall, not {other}"),
+                other => anyhow::bail!("ampup-memory hooks install|uninstall, not {other}"),
             };
             let changes = memstore::hook_install::apply(h, url.as_deref(), remove, *dry_run)?;
             let lead = if *dry_run { "would change" } else { "changed" };
@@ -1869,16 +1889,16 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             }
             if !remove
                 && memstore::hook_install::writes_token(h)
-                && std::env::var("MEMSTORE_TOKEN").is_ok()
+                && std::env::var("AMPUP_MEMORY_TOKEN").is_ok()
             {
                 println!(
-                    "note: {} can't read MEMSTORE_TOKEN from the environment, so its MCP entry holds the token",
+                    "note: {} can't read AMPUP_MEMORY_TOKEN from the environment, so its MCP entry holds the token",
                     h.name()
                 );
             }
             if !remove && !changes.is_empty() {
                 println!(
-                    "restart {} to load them; `memstore hook status` checks the server",
+                    "restart {} to load them; `ampup-memory hook status` checks the server",
                     h.name()
                 );
             }
@@ -1898,7 +1918,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
                 Err(e) => Err(e),
             };
             if let Err(e) = r {
-                eprintln!("memstore hook {event}: {e:#}");
+                eprintln!("ampup-memory hook {event}: {e:#}");
             }
             return Ok(());
         }
@@ -1985,7 +2005,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             let report = match report {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("memstore preflight couldn't run: {e:#}");
+                    eprintln!("ampup-memory preflight couldn't run: {e:#}");
                     std::process::exit(3);
                 }
             };
@@ -2015,7 +2035,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&m)?);
             return Ok(());
         }
-        // Fetches the model into MEMSTORE_MODEL_DIR when building an image.
+        // Fetches the model into AMPUP_MEMORY_MODEL_DIR when building an image.
         Cmd::Embed { text } => {
             let v = memstore::search::embed_text(&text.join(" ")).await?;
             println!(
@@ -2433,7 +2453,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             cmd: None,
             scope: None,
             ..
-        }) => anyhow::bail!("memstore index <scope>, or index status|rebuild|verify|list|drop"),
+        }) => anyhow::bail!("ampup-memory index <scope>, or index status|rebuild|verify|list|drop"),
         Cmd::Index(IndexArgs {
             cmd: None,
             scope: Some(scope),
@@ -3027,14 +3047,14 @@ async fn bench(store: &Store, scope: &Scope, n: usize, gap: u64) -> Result<()> {
 /// One warm process for many searches (benchmarks): each input line is
 /// {"id", "scope", "query", "k", "snippet_chars"?, "snippet_episodes"?}; each output line has the
 /// hits, the best-matching passage of the top distinct source episodes, and the time. The searches run as user
-/// `eval` in the groups `MEMSTORE_EVAL_GROUPS` names (comma-separated; none by default).
+/// `eval` in the groups `AMPUP_MEMORY_EVAL_GROUPS` names (comma-separated; none by default).
 async fn search_batch(
     store: &Store,
     input: &std::path::Path,
     output: &std::path::Path,
 ) -> Result<()> {
     use std::io::{BufRead, Write};
-    let groups = std::env::var("MEMSTORE_EVAL_GROUPS").unwrap_or_default();
+    let groups = std::env::var("AMPUP_MEMORY_EVAL_GROUPS").unwrap_or_default();
     let groups: Vec<&str> = groups
         .split(',')
         .map(str::trim)
@@ -3098,7 +3118,7 @@ async fn search_batch(
 }
 
 /// The store of a `serve --local` directory, opened where `serve --local` keeps its parts: the search index under
-/// `DIR/index` and the vectors an index update computes in `DIR/embeddings` (unless MEMSTORE_EMBED_CACHE says
+/// `DIR/index` and the vectors an index update computes in `DIR/embeddings` (unless AMPUP_MEMORY_EMBED_CACHE says
 /// otherwise). Not the default index location (`~/.cache/memstore/index`), which every local store would share:
 /// an index built there for one store was read, and overwritten, as another's.
 async fn local_store(dir: &std::path::Path) -> Result<Store> {
@@ -3115,19 +3135,21 @@ fn on_local(dir: &std::path::Path, catalog: std::sync::Arc<dyn iceberg::Catalog>
 /// the groups given, else `local`; memories shared with `group:local` (or `*`) are theirs.
 async fn serve_local(dir: &str, port: u16, scope: Scope, groups: Vec<String>) -> Result<()> {
     let dir = match dir.strip_prefix("~/") {
+        // The default: the state directory, still ~/.memstore where moving it failed (memstore::naming).
+        Some(memstore::naming::STATE_DIR) => memstore::naming::current_state_dir(),
         Some(rest) => std::path::PathBuf::from(std::env::var("HOME")?).join(rest),
         None => std::path::PathBuf::from(dir),
     };
     // Every request reads as the one local caller, with no sign-in: never reachable from another machine.
     // The bind is fixed below whatever the environment says; a different one asked for is a mistake to report.
-    if let Ok(bind) = std::env::var("MEMSTORE_SERVE_BIND") {
+    if let Ok(bind) = std::env::var("AMPUP_MEMORY_SERVE_BIND") {
         anyhow::ensure!(
             bind == "127.0.0.1",
-            "--local serves without sign-in, so it binds to 127.0.0.1 only (MEMSTORE_SERVE_BIND={bind})"
+            "--local serves without sign-in, so it binds to 127.0.0.1 only (AMPUP_MEMORY_SERVE_BIND={bind})"
         );
     }
     let catalog = memstore::platform::local_dir(&dir).await?;
-    // Unless MEMSTORE_EMBED_CACHE says otherwise, index updates keep the vectors they compute beside the index, so
+    // Unless AMPUP_MEMORY_EMBED_CACHE says otherwise, index updates keep the vectors they compute beside the index, so
     // the same text in another scope, workspace or branch of this store, or a rebuilt index, isn't embedded again.
     memstore::search::embed_cache::default_to(dir.join("embeddings").display().to_string());
     // Its store is a build (a benchmark's, a laptop's): the model calls it makes are kept in the model-call cache
@@ -3138,7 +3160,7 @@ async fn serve_local(dir: &str, port: u16, scope: Scope, groups: Vec<String>) ->
         groups
     };
     eprintln!(
-        "memstore: serving {} from {} on http://127.0.0.1:{port}/mcp (as group:{})",
+        "ampup-memory: serving {} from {} on http://127.0.0.1:{port}/mcp (as group:{})",
         scope.namespace(),
         dir.display(),
         groups.join(", group:")

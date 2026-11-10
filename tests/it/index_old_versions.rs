@@ -43,7 +43,7 @@ async fn an_idle_index_update_drops_old_versions() {
     assert!(before > 4, "{before} versions");
 
     // SAFETY: this test runs alone in its process (`own_process`).
-    unsafe { std::env::set_var("MEMSTORE_INDEX_KEEP_VERSIONS_SECS", "0") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_INDEX_KEEP_VERSIONS_SECS", "0") };
     // Nothing new: the update writes nothing, and the versions no reader is on go.
     assert_eq!(
         memstore::search::update(&store, &scope).await.unwrap(),

@@ -1,4 +1,4 @@
-//! The model-call cache (`MEMSTORE_MODEL_CACHE`): every reply a model gave memstore, kept by the request that asked
+//! The model-call cache (`AMPUP_MEMORY_MODEL_CACHE`): every reply a model gave memstore, kept by the request that asked
 //! for it, so a request is paid for once wherever it is asked again: the same store rebuilt, a fresh store of the
 //! same inputs (another fold, another arm, another machine sharing the location), a build rerun after a version
 //! bump that left the prompts alone. Every call an [`super::Extractor`] makes goes through it: extraction,
@@ -41,7 +41,7 @@ pub static CALLS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     let c = prometheus::IntCounterVec::new(
         prometheus::Opts::new(
             "memstore_model_cache_total",
-            "Model replies memstore got: hit (the model-call cache held it, nothing paid) or miss (the model answered)",
+            "Model replies AmpUp Memory got: hit (the model-call cache held it, nothing paid) or miss (the model answered)",
         ),
         &["result"],
     )
@@ -54,7 +54,7 @@ pub static CALLS: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
 
 static DEFAULT: OnceLock<String> = OnceLock::new();
 
-/// Where the cache lives when `MEMSTORE_MODEL_CACHE` is unset: what a build's command or `serve --local` sets
+/// Where the cache lives when `AMPUP_MEMORY_MODEL_CACHE` is unset: what a build's command or `serve --local` sets
 /// ([`build_location`]) before its first model call. Takes effect only before then.
 pub fn default_to(location: impl Into<String>) {
     let _ = DEFAULT.set(location.into());
@@ -70,7 +70,7 @@ pub fn build_location() -> String {
 }
 
 static CACHE: LazyLock<Option<Cache>> = LazyLock::new(|| {
-    let location = match std::env::var("MEMSTORE_MODEL_CACHE") {
+    let location = match std::env::var("AMPUP_MEMORY_MODEL_CACHE") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => DEFAULT.get()?.clone(),
     };

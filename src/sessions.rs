@@ -7,7 +7,7 @@
 //! A session is an entry of the answer log ([`crate::qa_log`], kind `session`), one row per step, the newest
 //! the session as it stands: its opening context as the question, the harness, its arm, the situations whose
 //! advice it was served (each once) and, in the holdout arm, the ones routed but withheld for comparison
-//! (`MEMSTORE_ADVICE_HOLDOUT`, the share of sessions in it, default 0), the conversation so far, and once
+//! (`AMPUP_MEMORY_ADVICE_HOLDOUT`, the share of sessions in it, default 0), the conversation so far, and once
 //! ended its outcome, its transcript (an episode of the caller's own, readable by them alone, like a run's
 //! trace) and an explicit reward, if given, which advice learns from as it does a run's.
 //!
@@ -18,7 +18,7 @@
 //! candidate evidence: [`evidence`] tallies them per situation, with the outcomes of the sessions in each arm.
 //! A note is served only once its tally ratifies it ([`Tally::ratified`]) against the
 //! scope's evidence bar ([`min_evidence`]: its org's or team's `advice_evidence`, else the server's), except in the
-//! trial arm (`MEMSTORE_ADVICE_TRIAL`, default 0.2 of sessions), whose sessions are where a candidate is tried.
+//! trial arm (`AMPUP_MEMORY_ADVICE_TRIAL`, default 0.2 of sessions), whose sessions are where a candidate is tried.
 //!
 //! Apart from the judge, each tally also counts the outcomes people gave the same sessions ([`checked_outcome`]:
 //! their rating, or whether they accepted or corrected each request), and reports whether the holdout proves the
@@ -72,23 +72,23 @@ fn relay(e: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// Most sessions one person may start in a scope in a day: `MEMSTORE_SESSIONS_PER_DAY`, default 1000.
+/// Most sessions one person may start in a scope in a day: `AMPUP_MEMORY_SESSIONS_PER_DAY`, default 1000.
 fn max_per_day() -> usize {
-    std::env::var("MEMSTORE_SESSIONS_PER_DAY")
+    std::env::var("AMPUP_MEMORY_SESSIONS_PER_DAY")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(1000)
 }
 
-/// The share of new sessions in the holdout arm: `MEMSTORE_ADVICE_HOLDOUT`, 0 to 1, default 0.
+/// The share of new sessions in the holdout arm: `AMPUP_MEMORY_ADVICE_HOLDOUT`, 0 to 1, default 0.
 pub fn holdout_share() -> f64 {
-    share("MEMSTORE_ADVICE_HOLDOUT", 0.0)
+    share("AMPUP_MEMORY_ADVICE_HOLDOUT", 0.0)
 }
 
-/// The share of new sessions in the trial arm, served candidate notes too: `MEMSTORE_ADVICE_TRIAL`, 0 to 1,
+/// The share of new sessions in the trial arm, served candidate notes too: `AMPUP_MEMORY_ADVICE_TRIAL`, 0 to 1,
 /// default 0.2. With the holdout, at most every session.
 pub fn trial_share() -> f64 {
-    share("MEMSTORE_ADVICE_TRIAL", 0.2).min(1.0 - holdout_share())
+    share("AMPUP_MEMORY_ADVICE_TRIAL", 0.2).min(1.0 - holdout_share())
 }
 
 fn share(var: &str, default: f64) -> f64 {
@@ -99,12 +99,12 @@ fn share(var: &str, default: f64) -> f64 {
 }
 
 /// The people a note must have helped before `scope` serves it outside the trial arm: its team's or org's
-/// `advice_evidence` setting (`Directory::advice_evidence`), else the server's `MEMSTORE_ADVICE_EVIDENCE`,
+/// `advice_evidence` setting (`Directory::advice_evidence`), else the server's `AMPUP_MEMORY_ADVICE_EVIDENCE`,
 /// default 3 (0 serves every note).
 pub fn min_evidence(dir: Option<&Directory>, scope: &Scope) -> usize {
     dir.and_then(|d| d.advice_evidence(scope))
         .unwrap_or_else(|| {
-            std::env::var("MEMSTORE_ADVICE_EVIDENCE")
+            std::env::var("AMPUP_MEMORY_ADVICE_EVIDENCE")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(3)
@@ -113,12 +113,12 @@ pub fn min_evidence(dir: Option<&Directory>, scope: &Scope) -> usize {
 
 /// The people whose runs a team note, and each of its items, is learned from in `scope`
 /// ([`crate::advice`]): its team's or org's `advice_learn_people` setting, else the server's
-/// `MEMSTORE_ADVICE_LEARN_PEOPLE`, default 3, never below 2. Apart from [`min_evidence`]: an org that serves every
+/// `AMPUP_MEMORY_ADVICE_LEARN_PEOPLE`, default 3, never below 2. Apart from [`min_evidence`]: an org that serves every
 /// note (0 there) still learns no team note from one person's traces.
 pub fn min_learn_people(dir: Option<&Directory>, scope: &Scope) -> usize {
     dir.and_then(|d| d.advice_learn_people(scope))
         .unwrap_or_else(|| {
-            std::env::var("MEMSTORE_ADVICE_LEARN_PEOPLE")
+            std::env::var("AMPUP_MEMORY_ADVICE_LEARN_PEOPLE")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(3)
@@ -139,23 +139,23 @@ pub async fn evidence_bar(store: &Store, scope: &Scope) -> Result<usize> {
     Ok(min_evidence(Some(&Directory::load(store).await?), scope))
 }
 
-/// How long a session may go without a step before the server ends it: `MEMSTORE_SESSION_IDLE_SECS`, default
+/// How long a session may go without a step before the server ends it: `AMPUP_MEMORY_SESSION_IDLE_SECS`, default
 /// 30 minutes.
 pub fn idle() -> Duration {
     Duration::from_secs(
-        std::env::var("MEMSTORE_SESSION_IDLE_SECS")
+        std::env::var("AMPUP_MEMORY_SESSION_IDLE_SECS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(1_800),
     )
 }
 
-/// How long after a session's last step the sweep waits to judge it: `MEMSTORE_SESSION_JUDGE_WAIT_SECS`, default
+/// How long after a session's last step the sweep waits to judge it: `AMPUP_MEMORY_SESSION_JUDGE_WAIT_SECS`, default
 /// 10 minutes, so what the person did next (their next message, an early PR event) is there for the judge to read
 /// ([`after`]). A session ended idle had its last step the idle time ago ([`idle`]): it is judged at once.
 pub fn judge_wait() -> Duration {
     Duration::from_secs(
-        std::env::var("MEMSTORE_SESSION_JUDGE_WAIT_SECS")
+        std::env::var("AMPUP_MEMORY_SESSION_JUDGE_WAIT_SECS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(600),
@@ -565,7 +565,7 @@ struct Held {
 type Buffer = std::collections::HashMap<(String, String), Held>;
 
 /// Session rows not committed yet, by namespace and id: one per session, its newest. Every session step holds its
-/// row here, and [`flush`] commits them together every `MEMSTORE_SESSION_FLUSH_SECS` (one Iceberg commit per
+/// row here, and [`flush`] commits them together every `AMPUP_MEMORY_SESSION_FLUSH_SECS` (one Iceberg commit per
 /// scope a minute, not one per step, each of which takes seconds on GCS), so no step waits on a commit. Reads
 /// ([`list`], [`find`]) see them over the log. Held in this process: a cell's sessions are served by one, a server
 /// stopping flushes first, and one that dies loses at most the last interval's steps.
@@ -747,10 +747,10 @@ pub async fn name_tasks(
     Ok(counts)
 }
 
-/// How often held session rows are committed: `MEMSTORE_SESSION_FLUSH_SECS`, default 60.
+/// How often held session rows are committed: `AMPUP_MEMORY_SESSION_FLUSH_SECS`, default 60.
 pub fn flush_interval() -> Duration {
     Duration::from_secs(
-        std::env::var("MEMSTORE_SESSION_FLUSH_SECS")
+        std::env::var("AMPUP_MEMORY_SESSION_FLUSH_SECS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .filter(|s| *s > 0)
@@ -1338,7 +1338,7 @@ async fn serve(
 
 /// Whether `source` is a session's conversation so far (`<signed>session:<id>:conversation`): an episode of the
 /// asker's own, written again at every advice step, which the session's end copies into its transcript
-/// (`<signed>session:<id>`). Facts aren't extracted from it unless `MEMSTORE_EXTRACT_CONVERSATIONS` is on
+/// (`<signed>session:<id>`). Facts aren't extracted from it unless `AMPUP_MEMORY_EXTRACT_CONVERSATIONS` is on
 /// ([`crate::extract::typed`]): the transcript is, once the session ends.
 pub fn conversation_so_far(source: &str) -> bool {
     source
@@ -1815,7 +1815,7 @@ pub enum Useful {
 }
 
 /// Whether `advice`, found for the agent's `task` and the end of its `conversation`, is relevant to what it is
-/// doing now and would help it next: a decisions model answers, and advice below `MEMSTORE_ADVICE_USEFUL_MIN`
+/// doing now and would help it next: a decisions model answers, and advice below `AMPUP_MEMORY_ADVICE_USEFUL_MIN`
 /// (0.4) is dropped. With no decisions model, or none that answers, nothing is served: advice no one checked
 /// stays out of the way.
 ///
@@ -1836,7 +1836,7 @@ pub async fn useful(
         return Ok(Useful::No);
     };
     let no_user_message = asked.is_some_and(|a| a.no_user_message);
-    let min = std::env::var("MEMSTORE_ADVICE_USEFUL_MIN")
+    let min = std::env::var("AMPUP_MEMORY_ADVICE_USEFUL_MIN")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(0.4);
@@ -2038,11 +2038,11 @@ pub struct Fired {
     pub text: String,
 }
 
-/// Whether a `block` op is served as one: `MEMSTORE_ADVICE_BLOCK=on`. Off (the default), a block is served
+/// Whether a `block` op is served as one: `AMPUP_MEMORY_ADVICE_BLOCK=on`. Off (the default), a block is served
 /// as an inform: a wrong block costs the agent the call, and the judge that would catch it isn't validated
 /// yet.
 pub fn block_enabled() -> bool {
-    std::env::var("MEMSTORE_ADVICE_BLOCK").is_ok_and(|v| v.trim() == "on")
+    std::env::var("AMPUP_MEMORY_ADVICE_BLOCK").is_ok_and(|v| v.trim() == "on")
 }
 
 /// Whether `tool` hands in the agent's final answer (`claude -p --json-schema`'s StructuredOutput): the run
@@ -3535,9 +3535,9 @@ pub async fn notes_for(
 }
 
 /// Sessions each side of a note's holdout comparison needs, by outcomes people gave, before it can prove the note
-/// ([`Tally::proven`]): `MEMSTORE_ADVICE_PROOF_SESSIONS`, default 5, at least 1.
+/// ([`Tally::proven`]): `AMPUP_MEMORY_ADVICE_PROOF_SESSIONS`, default 5, at least 1.
 pub fn proof_sessions() -> usize {
-    std::env::var("MEMSTORE_ADVICE_PROOF_SESSIONS")
+    std::env::var("AMPUP_MEMORY_ADVICE_PROOF_SESSIONS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(5)

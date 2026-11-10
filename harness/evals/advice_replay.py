@@ -1,15 +1,15 @@
 """Replays real Claude Code sessions through the memstore hooks and records what each hook would have put in the
 agent's context: the advice a session gets, when it gets it, and how long the server took.
 
-A session's transcript is fed to `memstore-client hook <event>` one event at a time, as Claude Code would have fired
+A session's transcript is fed to `ampup-memory-client hook <event>` one event at a time, as Claude Code would have fired
 them (start, each prompt, each tool call before and after, each turn's end, the end), with the transcript file
 growing to what the agent had seen at that moment. Gaps between events keep their real length up to `--max-gap`
 seconds, so a call the hook ran on in a copy of itself has the time it had in the session to land; the hooks'
 ask-again marker is aged by the whole real gap, so a step's end asks as often as it did live.
 
-Nothing is remembered: MEMSTORE_CAPTURE=off, which the hooks send as `keep: false` so the server keeps nothing the
+Nothing is remembered: AMPUP_MEMORY_CAPTURE=off, which the hooks send as `keep: false` so the server keeps nothing the
 replayed prompts say either (a server older than that keeps them as the signed-in user's notes: don't replay against
-one). The session id is new. Use the server and org the hook client is signed in to (`memstore-client doctor`).
+one). The session id is new. Use the server and org the hook client is signed in to (`ampup-memory-client doctor`).
 
     python3 harness/evals/advice_replay.py list ~/.claude/projects/-Users-me-myrepo/*.jsonl
     python3 harness/evals/advice_replay.py run --out runs/advice.jsonl SESSION.jsonl ...
@@ -19,7 +19,7 @@ one). The session id is new. Use the server and org the hook client is signed in
 import argparse, datetime, json, os, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CLIENT = os.path.join(HERE, '..', '..', 'target', 'debug', 'memstore-client')
+CLIENT = os.path.join(HERE, '..', '..', 'target', 'debug', 'ampup-memory-client')
 STEP_ENDS = ['git commit', 'git push', 'gh pr create', 'cargo test', 'cargo build', 'pytest', 'npm test',
              'npm run build', 'pnpm test', 'go test', 'make test']
 
@@ -128,8 +128,9 @@ def replay(path, out, max_gap):
     entries, evs = events(lines)
     cwd = next((e.get('cwd') for e in entries if e.get('cwd')), os.getcwd())
     tmp = tempfile.mkdtemp(prefix='advice-replay-')
-    env = dict(os.environ, TMPDIR=tmp, MEMSTORE_CAPTURE='off')
+    env = dict(os.environ, TMPDIR=tmp, AMPUP_MEMORY_CAPTURE='off')
     env.pop('MEMSTORE_HOOK_DETACHED', None)
+    env.pop('AMPUP_MEMORY_HOOK_DETACHED', None)
     sid = f'replay-{os.path.basename(path)[:8]}-{int(time.time())}'
     tp = os.path.join(tmp, 'transcript.jsonl')
     marks = os.path.join(tmp, 'memstore-hooks')

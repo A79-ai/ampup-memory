@@ -7,5 +7,5 @@
 RUST_MIN_STACK = "33554432"
 # Tests and `cargo run` embed with the local model, whatever API keys the machine carries, so the
 # suite never calls an embeddings API (src/search/embed.rs: an OpenRouter or OpenAI key otherwise picks that API). Set
-# MEMSTORE_EMBED to choose otherwise; the built binary has no such pin.
-MEMSTORE_EMBED = "local"
+# AMPUP_MEMORY_EMBED to choose otherwise; the built binary has no such pin.
+AMPUP_MEMORY_EMBED = "local"

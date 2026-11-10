@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Fact, Principal, Scope, Store};
 
 /// The keyword-searched fields of a fact, each with its own inverted index, and the BM25F weight it has in a
-/// search (`MEMSTORE_RANK_W_<FIELD>`): what a fact says counts most, then whom it is about, its quote, and the
+/// search (`AMPUP_MEMORY_RANK_W_<FIELD>`): what a fact says counts most, then whom it is about, its quote, and the
 /// predicate least. Lance needs every weight at least 1, so the weights are these ratios scaled up.
 pub const FTS_FIELDS: [(&str, &str, f32); 5] = [
     ("t_value", "VALUE", 1.0),
@@ -132,11 +132,11 @@ pub fn vec_index(rows: usize) -> lance::index::vector::VectorIndexParams {
 }
 /// What Lance names the index [`vec_index`] builds; a part whose vector index is another kind is rebuilt.
 pub const VEC_INDEX_KIND: &str = "IVF_SQ";
-/// IVF partitions a vector search probes (`MEMSTORE_INDEX_NPROBES`): all of them. Measured on a copy of a production
+/// IVF partitions a vector search probes (`AMPUP_MEMORY_INDEX_NPROBES`): all of them. Measured on a copy of a production
 /// 868k facts with 38 real asks and 200 facts as queries: 40 ms, and 0.97 of the exact top 15 (0.99 of the top
 /// 300); probing 320 of 931 partitions took 15 ms but kept 0.935 of an ask's top 15.
 const NPROBES: usize = 1 << 20;
-/// When set (`MEMSTORE_INDEX_REFINE`), a vector search ranks this many times the rows asked for by their
+/// When set (`AMPUP_MEMORY_INDEX_REFINE`), a vector search ranks this many times the rows asked for by their
 /// one-byte vectors, then those again by their full vectors: exact top 15 (1.00), but each search then reads
 /// that many rows from object storage (about 1 s for 600 from GCS), so it is off.
 const REFINE: u32 = 0;
@@ -288,10 +288,10 @@ impl Key<'_> {
     }
 }
 
-/// Default index location: `MEMSTORE_INDEX_URI` (a local path, `gs://…` or `s3://…`), else
+/// Default index location: `AMPUP_MEMORY_INDEX_URI` (a local path, `gs://…` or `s3://…`), else
 /// `~/.cache/memstore/index`. A store can override it (see `Store::with_index_base`).
 pub fn default_index_base() -> String {
-    std::env::var("MEMSTORE_INDEX_URI").unwrap_or_else(|_| {
+    std::env::var("AMPUP_MEMORY_INDEX_URI").unwrap_or_else(|_| {
         format!(
             "{}/.cache/memstore/index",
             std::env::var("HOME").unwrap_or_else(|_| ".".into())
@@ -896,7 +896,7 @@ async fn load_index(base: &str, scope: &Scope) -> Result<OpenIndex> {
 }
 
 /// Load a part's keyword postings into the index cache, as one read of every file at once
-/// (`MEMSTORE_INDEX_PREWARM=0` leaves them to the searches). A keyword search loads the postings it needs a
+/// (`AMPUP_MEMORY_INDEX_PREWARM=0` leaves them to the searches). A keyword search loads the postings it needs a
 /// term, field and file at a time, so on a part an update or merge just rewrote a long query waited for one
 /// object-storage round trip after another (a production deployment's facts: 10 to 30 s); loaded here, while reads still use the
 /// index they have, it takes 20 to 40 ms. Parts already loaded return at once. Best effort: what doesn't load is
@@ -1067,9 +1067,9 @@ pub fn in_list(keys: &[String]) -> String {
     format!("data_file IN ({list})")
 }
 
-/// An index setting from `MEMSTORE_INDEX_<name>`, else `default`.
+/// An index setting from `AMPUP_MEMORY_INDEX_<name>`, else `default`.
 /// The one Lance session every index dataset in this process opens with, so its index and metadata caches
-/// are bounded once: `MEMSTORE_INDEX_CACHE_BYTES` (default 1 GiB) and `MEMSTORE_INDEX_METADATA_BYTES`
+/// are bounded once: `AMPUP_MEMORY_INDEX_CACHE_BYTES` (default 1 GiB) and `AMPUP_MEMORY_INDEX_METADATA_BYTES`
 /// (default 256 MiB). Opened on its own, each dataset got a session of its own, of up to 6 GiB and 1 GiB:
 /// with every scope's index held open, a server's memory had no bound, and an 8 GiB pod was
 /// OOM-killed once a production deployment's indexes grew. The index cache keeps half its room for what was just read
@@ -1091,7 +1091,7 @@ fn new_session() -> Arc<lance::session::Session> {
     ))
 }
 
-/// The shared session's bounds (`MEMSTORE_INDEX_CACHE_BYTES`, `MEMSTORE_INDEX_METADATA_BYTES`): 1 GiB of index
+/// The shared session's bounds (`AMPUP_MEMORY_INDEX_CACHE_BYTES`, `AMPUP_MEMORY_INDEX_METADATA_BYTES`): 1 GiB of index
 /// cache and 256 MiB of metadata, or a tenth and a fortieth of the container's memory if those are less
 /// (`crate::metrics::sized`).
 pub fn session_budget() -> (usize, usize) {
@@ -1233,7 +1233,7 @@ fn text_hash(text: &str) -> [u8; 16] {
     Sha256::digest(text.as_bytes())[..16].try_into().unwrap()
 }
 
-/// The most bytes of embeddings searched without a vector index that reads keep (`MEMSTORE_INDEX_FLAT_BYTES`,
+/// The most bytes of embeddings searched without a vector index that reads keep (`AMPUP_MEMORY_INDEX_FLAT_BYTES`,
 /// see `rows::nearest_flat`): 1 GiB, or a tenth of the container's memory if that is less.
 pub fn flat_budget() -> usize {
     static BUDGET: std::sync::LazyLock<usize> =
@@ -1287,7 +1287,7 @@ pub(crate) async fn open_ds(uri: &str) -> lance::Result<Dataset> {
 }
 
 pub(crate) fn index_knob(name: &str, default: usize) -> usize {
-    std::env::var(format!("MEMSTORE_INDEX_{name}"))
+    std::env::var(format!("AMPUP_MEMORY_INDEX_{name}"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
@@ -1325,7 +1325,7 @@ fn transient(e: &anyhow::Error) -> bool {
 }
 
 /// Run an index write (`what`, for the log) again while it fails transiently ([`transient`]), up to
-/// `MEMSTORE_INDEX_RETRIES` (default 5) more times, waiting 2 s, then twice as long each time up to a minute.
+/// `AMPUP_MEMORY_INDEX_RETRIES` (default 5) more times, waiting 2 s, then twice as long each time up to a minute.
 /// Each write it runs commits whole or not at all (a Lance commit), so running one again is safe.
 pub(crate) async fn retrying<T, F, Fut>(what: &str, mut write: F) -> Result<T>
 where
@@ -1482,8 +1482,8 @@ pub enum Tidy {
 
 /// Keeps an index part quick to search as updates add to it. Every update appends a few small files and a
 /// delta to each of its indexes, and a search reads all of them (a production deployment's passages: 20 deltas over 247
-/// files, 15 s a search). Past `MEMSTORE_INDEX_MAX_FRAGMENTS` files (32) they are compacted into few, and an
-/// index past `MEMSTORE_INDEX_MAX_DELTAS` deltas (4) has its deltas merged. A merge keeps the vector index's
+/// files, 15 s a search). Past `AMPUP_MEMORY_INDEX_MAX_FRAGMENTS` files (32) they are compacted into few, and an
+/// index past `AMPUP_MEMORY_INDEX_MAX_DELTAS` deltas (4) has its deltas merged. A merge keeps the vector index's
 /// partitions (no training, unlike a rebuild) and compaction runs one task at a time, so neither needs the
 /// memory a rebuild does.
 ///
@@ -1732,7 +1732,7 @@ pub(crate) async fn drop_duplicates(ds: &mut Dataset, key: &[&str]) -> Result<us
 }
 
 /// Deletes the versions of an index part that stopped being current more than
-/// `MEMSTORE_INDEX_KEEP_VERSIONS_SECS` ago (an hour), and the files only they used: every update leaves one
+/// `AMPUP_MEMORY_INDEX_KEEP_VERSIONS_SECS` ago (an hour), and the files only they used: every update leaves one
 /// behind, with the index files a compaction or merge replaced (a production facts index: 942 versions, 94
 /// GB of index files over 2 GB of rows). A reader is pinned to the version of `part` its index manifest (in
 /// `dir`) names, and reopens as the manifest moves on: every version a record of the last hour names, or the
@@ -1830,7 +1830,7 @@ fn progress_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Rows a chunk of an update writes: `MEMSTORE_INDEX_CHUNK_ROWS`, default 5,000.
+/// Rows a chunk of an update writes: `AMPUP_MEMORY_INDEX_CHUNK_ROWS`, default 5,000.
 pub(crate) fn chunk_rows() -> usize {
     index_knob("CHUNK_ROWS", 5_000).max(1)
 }
@@ -2640,7 +2640,7 @@ impl PreparedCandidates {
 mod candidate_tests;
 
 /// Fact rows read from index parts (see [`rows`]): about 4 KB each with the embedding (on a production deployment), so at
-/// most a few hundred MB. `MEMSTORE_INDEX_FACT_ROWS` overrides.
+/// most a few hundred MB. `AMPUP_MEMORY_INDEX_FACT_ROWS` overrides.
 const FACT_ROWS_MAX: usize = 100_000;
 
 static FACT_ROWS: std::sync::LazyLock<rows::RowCache<FactRow>> =
@@ -2671,7 +2671,7 @@ fn decode_rows(b: &RecordBatch) -> Result<Vec<FactRow>> {
 /// Fact rows read by an entity's, a key's or some facts' ids ([`keyed`] scans, [`key_lookup`]), without the
 /// embedding: a search's groups read every fact of their entities, thousands for a big deal, and the embedding,
 /// which only ranking uses, is most of a row (a few KB of about 4). About 1 KB each, so at most a few hundred MB.
-/// `MEMSTORE_INDEX_KEYED_ROWS` overrides.
+/// `AMPUP_MEMORY_INDEX_KEYED_ROWS` overrides.
 const KEYED_ROWS_MAX: usize = 200_000;
 
 static KEYED_ROWS: std::sync::LazyLock<rows::RowCache<FactRow>> =
@@ -2907,7 +2907,7 @@ pub struct Hit {
     pub group: Vec<Fact>,
 }
 
-/// Facts a grouped hit brings at most (see [`Rank::group`]); `MEMSTORE_RANK_GROUP` overrides.
+/// Facts a grouped hit brings at most (see [`Rank::group`]); `AMPUP_MEMORY_RANK_GROUP` overrides.
 pub const GROUP: usize = 4;
 
 pub fn terms(s: &str) -> HashSet<String> {
@@ -2973,14 +2973,14 @@ pub fn fact_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
-/// Distinct terms a fact search's keyword list searches at most (`MEMSTORE_RANK_MAX_TERMS`, default 64): of a
+/// Distinct terms a fact search's keyword list searches at most (`AMPUP_MEMORY_RANK_MAX_TERMS`, default 64): of a
 /// longer query, the ones the fewest facts hold ([`fewest`]).
 fn max_terms() -> usize {
     (knob("MAX_TERMS", 64.0) as usize).max(1)
 }
 
 /// The rows a fact search's keyword list may reach, as a multiple of the facts its index holds
-/// (`MEMSTORE_RANK_TERM_ROWS`, default 1.5): its terms' rows, summed over the terms and the fields ([`fewest`]).
+/// (`AMPUP_MEMORY_RANK_TERM_ROWS`, default 1.5): its terms' rows, summed over the terms and the fields ([`fewest`]).
 /// On the relevance set (126 judged queries as asked, and the same inside long prompts as the hook trims
 /// them), 2 and 1.5 changed no ranking of a query as asked, and 1.5 raised the trimmed prompts' R@8 from
 /// 0.290 to 0.295 and MRR from 0.361 to 0.376; 1 lowered R@8 to 0.286, and 0.5 to 0.245. On a production deployment's facts,
@@ -3104,8 +3104,8 @@ async fn term_rows(ds: &Dataset, cols: &[&str], terms: &[String]) -> Result<Vec<
 
 /// The keyword queries a fact search runs, each its own ranked list, and how much it weighs in a fact's
 /// keyword score: BM25F over the fields ([`FTS_FIELDS`]) with any of the terms, the same with all of them
-/// (`MEMSTORE_RANK_AND`), and neighbouring terms as phrases (one word between allowed) in the value or quote
-/// (`MEMSTORE_RANK_PHRASE`). A [`Rank::classic`] search runs the one any-terms query, over the subject, predicate
+/// (`AMPUP_MEMORY_RANK_AND`), and neighbouring terms as phrases (one word between allowed) in the value or quote
+/// (`AMPUP_MEMORY_RANK_PHRASE`). A [`Rank::classic`] search runs the one any-terms query, over the subject, predicate
 /// and value alike, as BM25 over their text together did before the current ranking.
 fn keyword_queries(
     terms: &[String],
@@ -3241,12 +3241,12 @@ pub const FETCH_MULTIPLE: usize = 20;
 pub const MAX_FETCH: usize = 20_000;
 /// Fact search ranks a pool of this many index rows per ranked list, however many hits are asked for, so
 /// a search's first hits are the same at every `k` (growing only while too few are visible). Set by
-/// `MEMSTORE_RANK_POOL`.
+/// `AMPUP_MEMORY_RANK_POOL`.
 pub const FACT_POOL: usize = 300;
 
-/// A ranking knob from `MEMSTORE_RANK_<name>`, else `default` (for experiments; the defaults are measured).
+/// A ranking knob from `AMPUP_MEMORY_RANK_<name>`, else `default` (for experiments; the defaults are measured).
 pub fn knob(name: &str, default: f32) -> f32 {
-    std::env::var(format!("MEMSTORE_RANK_{name}"))
+    std::env::var(format!("AMPUP_MEMORY_RANK_{name}"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
@@ -3306,7 +3306,7 @@ pub async fn search_with(
     }
 }
 
-/// A fact search taking this many ms logs its phases, as a passage search does (`MEMSTORE_RANK_SLOW_MS`).
+/// A fact search taking this many ms logs its phases, as a passage search does (`AMPUP_MEMORY_RANK_SLOW_MS`).
 const SLOW_FACT_MS: f32 = 1_000.0;
 
 /// A fact search's phases, logged when it ends slow however it ends: each phase's end in ms since the start, and
@@ -3389,7 +3389,7 @@ async fn ranked(
         searched: Default::default(),
     };
     // The time the query names, its relative words ("last year") read as of the day it was asked, else the
-    // search's date (`as_of`), else today. `MEMSTORE_RANK_TIME=0` ignores it.
+    // search's date (`as_of`), else today. `AMPUP_MEMORY_RANK_TIME=0` ignores it.
     let today = asked_on
         .or_else(|| {
             rank.as_of
@@ -3815,7 +3815,7 @@ async fn ranked(
     }
     // Fuse the keyword and vector signals. Each is a fact's keyword score (BM25F, see `keyword_queries`) and
     // its cosine similarity (1 - d/2 for unit vectors at squared L2 distance d), optionally scaled by recency
-    // (`MEMSTORE_RANK_RECENCY`, off by default: the time a query names is the time term, below).
+    // (`AMPUP_MEMORY_RANK_RECENCY`, off by default: the time a query names is the time term, below).
     let recency = rank.classic || knob("RECENCY", 0.0) > 0.0;
     for h in out.iter_mut() {
         h.recency = match recency {

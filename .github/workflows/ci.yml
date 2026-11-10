@@ -36,6 +36,9 @@ jobs:
           target: clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # Settings are read by their new names (AMPUP_MEMORY_*): startup maps the old ones (MEMSTORE_*).
+      - name: No setting read by its old name
+        run: .github/scripts/old-env-names.sh
       # One test binary (tests/it): a file directly in tests/ would build and link a binary of its own, and a
       # file in tests/it/ without its `mod` line in tests/it/main.rs would never run.
       - name: Test files are modules of tests/it
@@ -112,12 +115,12 @@ jobs:
       # Every test, run at once, one process per test (.config/nextest.toml). The crate has no doctests (its doc
       # code blocks are text and json; Cargo.toml turns them off for cargo test too). The REST catalog flows skip
       # here: catalog-nightly.yml runs them against a local Iceberg REST catalog.
-      # MEMSTORE_CHECK_PLAN: every table refresh that reads only the manifests appended since the last one is
+      # AMPUP_MEMORY_CHECK_PLAN: every table refresh that reads only the manifests appended since the last one is
       # checked against a full plan of the table, so a divergence fails the test that hit it.
       - name: Test
         run: cargo nextest run --locked --profile ci
         env:
-          MEMSTORE_CHECK_PLAN: "1"
+          AMPUP_MEMORY_CHECK_PLAN: "1"
 
   # The BYOC / BYOVPC IAM templates (deploy/iam) and the GCP module (deploy/gcp/terraform): format, validate, the
   # offline plan tests that check what the vendor's role may and may not do, and every AWS action against AWS's

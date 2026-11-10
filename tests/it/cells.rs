@@ -33,17 +33,20 @@ impl Drop for Server {
 
 async fn serve(dir: &std::path::Path, port: u16, env: &[(&str, String)]) -> Server {
     let models = format!("{}/.cache/memstore/models", std::env::var("HOME").unwrap());
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_memstore"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ampup-memory"));
     cmd.env("HOME", dir.with_extension("home"))
         .env(
-            "MEMSTORE_MODEL_DIR",
-            std::env::var("MEMSTORE_MODEL_DIR").unwrap_or(models),
+            "AMPUP_MEMORY_MODEL_DIR",
+            std::env::var("AMPUP_MEMORY_MODEL_DIR").unwrap_or(models),
         )
         .args(["serve", "--local"])
         .arg(dir)
         .args(["org", &port.to_string()])
+        .env_remove("AMPUP_MEMORY_CALLER_IDENTITY")
         .env_remove("MEMSTORE_CALLER_IDENTITY")
+        .env_remove("AMPUP_MEMORY_SERVE_BIND")
         .env_remove("MEMSTORE_SERVE_BIND")
+        .env_remove("AMPUP_MEMORY_PLATFORM")
         .env_remove("MEMSTORE_PLATFORM")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
@@ -100,11 +103,11 @@ async fn the_default_cell_forwards_another_cells_org_and_never_serves_it_when_th
         port,
         &[
             (
-                "MEMSTORE_CELL_MAP",
+                "AMPUP_MEMORY_CELL_MAP",
                 r#"{"acme": "acme", "gone": "gone"}"#.into(),
             ),
             (
-                "MEMSTORE_CELL_URLS",
+                "AMPUP_MEMORY_CELL_URLS",
                 format!(
                     r#"{{"acme": "http://127.0.0.1:{cell}", "gone": "http://127.0.0.1:{}"}}"#,
                     free_port()
@@ -197,8 +200,11 @@ async fn another_cells_org_is_never_opened_here_and_its_delete_and_forget_are_it
         free_port()
     );
     unsafe {
-        std::env::set_var("MEMSTORE_CELL_MAP", r#"{"acme": "acme", "gone": "gone"}"#);
-        std::env::set_var("MEMSTORE_CELL_URLS", urls);
+        std::env::set_var(
+            "AMPUP_MEMORY_CELL_MAP",
+            r#"{"acme": "acme", "gone": "gone"}"#,
+        );
+        std::env::set_var("AMPUP_MEMORY_CELL_URLS", urls);
     }
     let dir = tempfile::tempdir().unwrap();
     let catalog = platform::local(&format!("file://{}", dir.path().display()))
@@ -307,7 +313,12 @@ async fn another_cells_org_is_never_opened_here_and_its_delete_and_forget_are_it
 #[tokio::test]
 async fn a_cells_servers_keep_a_writer_lease_of_their_own() {
     let dir = tempfile::tempdir().unwrap();
-    let _server = serve(dir.path(), free_port(), &[("MEMSTORE_CELL", "acme".into())]).await;
+    let _server = serve(
+        dir.path(),
+        free_port(),
+        &[("AMPUP_MEMORY_CELL", "acme".into())],
+    )
+    .await;
     let found = |name: &str| {
         walkdir(dir.path())
             .iter()

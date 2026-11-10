@@ -72,7 +72,7 @@ async fn start_auth(auth: TokenAuth, disabled_file: Option<std::path::PathBuf>) 
 }
 
 /// A server on `store`'s catalog: another server beside one already running there (as during a rolling
-/// deploy), when `store` is that one's. `team_csv`: its own team csv (`MEMSTORE_TEAM_CSV`).
+/// deploy), when `store` is that one's. `team_csv`: its own team csv (`AMPUP_MEMORY_TEAM_CSV`).
 async fn serve_on(
     store: Store,
     auth: TokenAuth,
@@ -842,7 +842,7 @@ async fn a_deprovisioned_user_is_refused_at_once_and_stays_refused_after_a_resta
         .await
         .0
     };
-    // Within the directory's staleness bound (MEMSTORE_MAX_STALENESS_MS, 1s), never later.
+    // Within the directory's staleness bound (AMPUP_MEMORY_MAX_STALENESS_MS, 1s), never later.
     let settles = async |e: &Env, token: &str, want: u16| {
         let t = Instant::now();
         while status_on(e, token).await != want {
@@ -1614,11 +1614,11 @@ async fn a_dream_reads_and_changes_only_what_its_audience_may_read() {
     }
     let (url, asked) = eager_model().await;
     unsafe {
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_DREAM", "openai");
-        std::env::set_var("MEMSTORE_DREAM_URL", &url);
-        std::env::set_var("MEMSTORE_DREAM_KEY", "stand-in");
-        std::env::set_var("MEMSTORE_DREAM_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_DREAM", "openai");
+        std::env::set_var("AMPUP_MEMORY_DREAM_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_DREAM_KEY", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_DREAM_MODEL", "stand-in");
     }
     let env = start().await;
     let (eng, sales) = ("group:o1.eng", "group:o1.sales");
@@ -1885,8 +1885,8 @@ async fn a_conflict_reaches_only_readers_of_both_facts_and_goes_with_either() {
     }
     // The server extracts nothing itself: the test runs extraction, against the stand-in.
     unsafe {
-        std::env::set_var("MEMSTORE_EXTRACT", "off");
-        std::env::set_var("MEMSTORE_CONFLICTS", "1");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "off");
+        std::env::set_var("AMPUP_MEMORY_CONFLICTS", "1");
     }
     let env = start().await;
     let (url, asked) = stand_in_model(|prompt| {
@@ -1910,12 +1910,12 @@ async fn a_conflict_reaches_only_readers_of_both_facts_and_goes_with_either() {
     })
     .await;
     unsafe {
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_KEY", "stand-in");
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
-        std::env::set_var("MEMSTORE_EXTRACT_GOAL_BLIND", "1");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_KEY", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_GOAL_BLIND", "1");
     }
     let (eng, sales) = ("group:o1.eng", "group:o1.sales");
     // Each note's one fact is extracted from it, oldest first.

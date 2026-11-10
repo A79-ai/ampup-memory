@@ -1,4 +1,4 @@
-//! The cache budget (`MEMSTORE_CACHE_BYTES`): past it, the least recently read scope is dropped from memory as a
+//! The cache budget (`AMPUP_MEMORY_CACHE_BYTES`): past it, the least recently read scope is dropped from memory as a
 //! whole, and reads of it still answer, loading it again. Two scopes on a local catalog, a budget of one byte:
 //! reading the second drops the first, reading the first again gives the same facts, and a write to the dropped
 //! scope is seen by the next read.
@@ -46,7 +46,7 @@ async fn the_least_recently_read_scope_is_dropped_and_loaded_again() {
     };
     // No limit: a store that reads both scopes holds both.
     // SAFETY: this test runs alone in its process (`own_process`).
-    unsafe { std::env::set_var("MEMSTORE_CACHE_BYTES", "0") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_CACHE_BYTES", "0") };
     let dir0 = tempfile::tempdir().unwrap();
     let unbounded = seeded(dir0.path()).await;
     assert_eq!(values(&unbounded, &a).await, ["open"]);
@@ -55,7 +55,7 @@ async fn the_least_recently_read_scope_is_dropped_and_loaded_again() {
     assert!(both > 0, "reading the scopes fills the cache");
 
     // A budget of one byte: a store that reads a, then b, keeps only b.
-    unsafe { std::env::set_var("MEMSTORE_CACHE_BYTES", "1") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_CACHE_BYTES", "1") };
     let dir = tempfile::tempdir().unwrap();
     let store = seeded(dir.path()).await;
     assert_eq!(values(&store, &a).await, ["open"]);

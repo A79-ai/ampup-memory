@@ -20,9 +20,9 @@ def kinds(text):
         k.append('advice')
     if 'What this user told you before' in text:
         k.append('remembered')
-    if 'From the team memory (memstore), facts' in text or 'that may bear on this' in text:
+    if 'From the team memory (AmpUp Memory), facts' in text or 'From the team memory (memstore), facts' in text or 'that may bear on this' in text:
         k.append('facts')
-    if text.startswith('memstore session:') and len(text) < 300:
+    if text.startswith(('AmpUp Memory session:', 'memstore session:')) and len(text) < 300:
         k.append('session-line')
     return k or ['other']
 

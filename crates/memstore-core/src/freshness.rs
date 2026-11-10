@@ -29,12 +29,12 @@ use crate::query::schema::{Schema, ValueType, parse_time};
 const DAY_US: i64 = 86_400_000_000;
 
 /// The environment variable that turns marks on for every scope that doesn't set `freshness` itself.
-pub const ENV: &str = "MEMSTORE_FRESHNESS";
+pub const ENV: &str = "AMPUP_MEMORY_FRESHNESS";
 
-/// Which kinds of mark reads give where marks are on (`MEMSTORE_FRESHNESS_MARKS=later,overdue,stale`): `later` and
+/// Which kinds of mark reads give where marks are on (`AMPUP_MEMORY_FRESHNESS_MARKS=later,overdue,stale`): `later` and
 /// `overdue` unless it says. `stale` is asked for by name: on LongMemEval it
 /// marked most facts a reader sees, said nothing their dates don't, and cost answers.
-pub const KINDS_ENV: &str = "MEMSTORE_FRESHNESS_MARKS";
+pub const KINDS_ENV: &str = "AMPUP_MEMORY_FRESHNESS_MARKS";
 
 /// How much of a newer value a `later` mark quotes.
 const LATER_CHARS: usize = 160;
@@ -124,7 +124,7 @@ pub fn day(us: i64) -> String {
         .unwrap_or_else(|| us.to_string())
 }
 
-/// Whether the environment turns marks on (`MEMSTORE_FRESHNESS=1`, `true` or `on`) where no setting says.
+/// Whether the environment turns marks on (`AMPUP_MEMORY_FRESHNESS=1`, `true` or `on`) where no setting says.
 pub fn from_env() -> bool {
     std::env::var(ENV).is_ok_and(|v| {
         matches!(

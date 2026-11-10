@@ -236,18 +236,18 @@ async fn a_notes_lessons_are_traced_item_by_item_across_its_versions() {
     let url = model(seen.clone()).await;
     // SAFETY: this test runs alone in its process (`own_process`).
     unsafe {
-        std::env::set_var("MEMSTORE_DECIDE", "off");
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_SESSION_FLUSH_SECS", "1");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE", "openrouter");
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE_URL", &url);
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE_KEY", "stand-in");
-        std::env::set_var("MEMSTORE_ADVICE_EVIDENCE", "0");
+        std::env::set_var("AMPUP_MEMORY_DECIDE", "off");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_SESSION_FLUSH_SECS", "1");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE", "openrouter");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE_KEY", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_EVIDENCE", "0");
         // Judged as soon as it ends, not once what the person did next could be seen.
-        std::env::set_var("MEMSTORE_SESSION_JUDGE_WAIT_SECS", "0");
+        std::env::set_var("AMPUP_MEMORY_SESSION_JUDGE_WAIT_SECS", "0");
     }
     let issuer = start_idp().await;
     let dir = tempfile::tempdir().unwrap();

@@ -3,8 +3,8 @@
 //! namespace of an org that isn't this process's cell's ([`OtherCell`]), and the search indexes refuse the same
 //! ([`check_namespace`]): whatever the call path, another cell's memory is never read, written or loaded here.
 //!
-//! - `MEMSTORE_CELL`: this process's cell (default `default`).
-//! - `MEMSTORE_CELL_MAP`: JSON, org to cell (`{"acme": "acme"}`); an org not named is the default cell's.
+//! - `AMPUP_MEMORY_CELL`: this process's cell (default `default`).
+//! - `AMPUP_MEMORY_CELL_MAP`: JSON, org to cell (`{"acme": "acme"}`); an org not named is the default cell's.
 //!
 //! Without a map (one cell, the CLI, a laptop) every org is this cell's and nothing is refused. The system
 //! namespace (the directory, the ledger, the audit) and a person's own scope (`memory_user_*`) are every cell's.
@@ -25,14 +25,14 @@ struct Cells {
 }
 
 static CELLS: LazyLock<Cells> = LazyLock::new(|| {
-    let me = std::env::var("MEMSTORE_CELL")
+    let me = std::env::var("AMPUP_MEMORY_CELL")
         .ok()
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
         .unwrap_or_else(|| DEFAULT.into());
-    let map = match std::env::var("MEMSTORE_CELL_MAP") {
+    let map = match std::env::var("AMPUP_MEMORY_CELL_MAP") {
         Ok(v) if !v.trim().is_empty() => serde_json::from_str(&v)
-            .unwrap_or_else(|e| panic!("MEMSTORE_CELL_MAP is a JSON object of strings: {e}")),
+            .unwrap_or_else(|e| panic!("AMPUP_MEMORY_CELL_MAP is a JSON object of strings: {e}")),
         _ => HashMap::new(),
     };
     Cells { me, map }

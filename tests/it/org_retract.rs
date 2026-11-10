@@ -1,5 +1,5 @@
 //! `/retract` in an org's memory, end to end: a real `memstore serve` over HTTP on a local catalog, every caller
-//! selecting an org (`MEMSTORE_DIRECTORY=required`), two orgs (`acme`, admin alice and member bob, and `globex`),
+//! selecting an org (`AMPUP_MEMORY_DIRECTORY=required`), two orgs (`acme`, admin alice and member bob, and `globex`),
 //! each with its connector's `ingest` key.
 //!
 //! The rule (`/retract`): it acts in the org the request selects, as reads do. The operator's admin key and the

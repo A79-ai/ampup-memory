@@ -1,6 +1,6 @@
 //! Advice curation: what keeps learned notes ([`crate::advice`]) from rotting as runs come in, where a scope turns it
 //! on (`set_settings {settings: {advice_curation: true}}`, a team's over its org's, else the server's
-//! `MEMSTORE_ADVICE_CURATION`; off by default until its A/B passes). It runs inside each learn, so on the advice
+//! `AMPUP_MEMORY_ADVICE_CURATION`; off by default until its A/B passes). It runs inside each learn, so on the advice
 //! timer's 10-minute round:
 //!
 //! 1. **Retired by reward, not by a model's opinion.** A note stops being served (withheld: its documents stay, and
@@ -15,7 +15,7 @@
 //!    found of each item (helped, or redundant: the agent would have done it anyway). Apart from the editor, every
 //!    learn drops the items the judge kept finding redundant, with no model call, and cuts an edited note to its
 //!    budget (`crate::advice`'s `curb`): the shrink guard measures an edit from the note without them. A note nobody
-//!    was served or routed to in the last `MEMSTORE_ADVICE_EDIT_IDLE_DAYS` (14) isn't updated until somebody is
+//!    was served or routed to in the last `AMPUP_MEMORY_ADVICE_EDIT_IDLE_DAYS` (14) isn't updated until somebody is
 //!    (`learn_advice {force: true}` updates it anyway): most of what learning spends is this editor's read.
 //! 3. **Near-duplicate situations merged.** Situations the learning model finds are the same task ([`MERGE_PROMPT`])
 //!    are merged into one, every run of each moving with it; the merged one's name stays as an alias, so a task
@@ -29,7 +29,7 @@
 //! **Which rewards count toward retiring.** Only the ones somebody gave: a recorder's `reward_run` (a benchmark's
 //! verifier, a CI job, a reviewer), a reward its agent gave at `end_session`, and a person's rating of an answer. A
 //! reward the judge gave (its reason starting `judged: `, `crate::qa_log::JUDGED`) doesn't, unless
-//! `MEMSTORE_ADVICE_RETIRE_JUDGED=on`: it is a model's opinion that nothing has checked against outcomes known
+//! `AMPUP_MEMORY_ADVICE_RETIRE_JUDGED=on`: it is a model's opinion that nothing has checked against outcomes known
 //! otherwise, and a session's judge is shown the notes served in it, so its verdict on a served session isn't
 //! independent of the serving it would be judging.
 
@@ -66,9 +66,9 @@ fn env_on(var: &str) -> bool {
     })
 }
 
-/// Whether the environment turns curation on (`MEMSTORE_ADVICE_CURATION=on`) where no setting says.
+/// Whether the environment turns curation on (`AMPUP_MEMORY_ADVICE_CURATION=on`) where no setting says.
 pub fn from_env() -> bool {
-    env_on("MEMSTORE_ADVICE_CURATION")
+    env_on("AMPUP_MEMORY_ADVICE_CURATION")
 }
 
 /// Whether advice in `scope` is curated: its team's `advice_curation` setting, else its org's, else
@@ -80,16 +80,16 @@ pub async fn on(store: &crate::Store, scope: &crate::Scope) -> bool {
     }
 }
 
-/// Whether judged rewards count toward retiring a note: `MEMSTORE_ADVICE_RETIRE_JUDGED=on` (off by default; the
+/// Whether judged rewards count toward retiring a note: `AMPUP_MEMORY_ADVICE_RETIRE_JUDGED=on` (off by default; the
 /// module's doc says why).
 pub fn counts_judged() -> bool {
-    env_on("MEMSTORE_ADVICE_RETIRE_JUDGED")
+    env_on("AMPUP_MEMORY_ADVICE_RETIRE_JUDGED")
 }
 
 /// The runs each side needs, with a reward that counts, before a note may be withheld:
-/// `MEMSTORE_ADVICE_RETIRE_MIN`, default 8.
+/// `AMPUP_MEMORY_ADVICE_RETIRE_MIN`, default 8.
 pub fn retire_min() -> usize {
-    std::env::var("MEMSTORE_ADVICE_RETIRE_MIN")
+    std::env::var("AMPUP_MEMORY_ADVICE_RETIRE_MIN")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(8usize)
@@ -97,9 +97,9 @@ pub fn retire_min() -> usize {
 }
 
 /// How much lower (in mean reward, -1 to 1) a note's served runs must score than its situation's other runs before
-/// it is withheld: `MEMSTORE_ADVICE_RETIRE_MARGIN`, default 0.2 (10 points of success rate with rewards of ±1).
+/// it is withheld: `AMPUP_MEMORY_ADVICE_RETIRE_MARGIN`, default 0.2 (10 points of success rate with rewards of ±1).
 pub fn retire_margin() -> f64 {
-    std::env::var("MEMSTORE_ADVICE_RETIRE_MARGIN")
+    std::env::var("AMPUP_MEMORY_ADVICE_RETIRE_MARGIN")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|m| m.is_finite())

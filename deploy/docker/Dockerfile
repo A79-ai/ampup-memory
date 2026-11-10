@@ -1,7 +1,7 @@
 # The engine image, compiled from source with the repo root as the context:
 #   docker build -f deploy/docker/Dockerfile -t memstore .
 # cargo-chef keeps the dependency build in its own layer (the `deps` target), so with a layer cache a source
-# change recompiles only memstore. The embedding model is baked in, so the image needs no egress to fetch it.
+# change recompiles only ampup-memory. The embedding model is baked in, so the image needs no egress to fetch it.
 # Unlike deploy/spcs/Dockerfile (which packages a binary built elsewhere) the runtime has a shell (busybox),
 # for jobs that run a script.
 # trixie, not bookworm: ort's prebuilt ONNX Runtime needs GCC 13+'s libstdc++.
@@ -23,16 +23,18 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 FROM deps AS build
 COPY . .
-RUN cargo build --release && strip target/release/memstore
+RUN cargo build --release && strip target/release/ampup-memory
 # The embedding model, baked in as for SPCS (hf-hub cache layout; -L turns its symlinks into files).
-RUN MEMSTORE_MODEL_DIR=/fetch target/release/memstore embed warmup >/dev/null \
+RUN AMPUP_MEMORY_MODEL_DIR=/fetch target/release/ampup-memory embed warmup >/dev/null \
     && cp -rL /fetch /models && find /models -name '*.lock' -delete
 
 FROM cgr.dev/chainguard/glibc-dynamic:latest-dev
-COPY --from=build /src/target/release/memstore /usr/local/bin/memstore
+COPY --from=build /src/target/release/ampup-memory /usr/local/bin/ampup-memory
+# The command's name before the rename, kept: a Deployment's `command` (or a script) that names memstore still runs it.
+RUN ln -s ampup-memory /usr/local/bin/memstore
 COPY --from=build /models /models
-# The licenses of what the image holds: memstore's, the crates and ONNX Runtime it links, and the model.
+# The licenses of what the image holds: AmpUp Memory's, the crates and ONNX Runtime it links, and the model.
 COPY --from=build /src/LICENSE /src/NOTICE /src/THIRD-PARTY-NOTICES.txt /usr/share/doc/memstore/
-ENV MEMSTORE_MODEL_DIR=/models
+ENV AMPUP_MEMORY_MODEL_DIR=/models
 USER nonroot
-ENTRYPOINT ["/usr/local/bin/memstore"]
+ENTRYPOINT ["/usr/local/bin/ampup-memory"]

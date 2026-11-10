@@ -2,7 +2,7 @@
 //! want, kept the way kubectl keeps clusters and namespaces. `config.json` holds named **contexts**
 //! (a server, an org, a team) and the current one; `credentials.json` holds one sign-in per server, plus
 //! one per org that signs people in through its own identity provider.
-//! Both live in `MEMSTORE_CONFIG_DIR` (default `~/.memstore`), readable by you only.
+//! Both live in `AMPUP_MEMORY_CONFIG_DIR` (default `~/.ampup-memory`; once `~/.memstore`, moved there on first run), readable by you only.
 //!
 //! Signing in is the MCP authorization flow (the one Claude and other MCP clients run when they connect):
 //! read the server's protected-resource metadata (RFC 9728) for its identity provider, read the provider's
@@ -26,15 +26,15 @@ use sha2::Digest;
 pub const KEYS: [&str; 4] = ["server", "org", "team", "user"];
 
 pub fn config_dir() -> PathBuf {
-    match std::env::var("MEMSTORE_CONFIG_DIR") {
+    match std::env::var("AMPUP_MEMORY_CONFIG_DIR") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".memstore"),
+        _ => crate::naming::current_state_dir(),
     }
 }
 
 static CONTEXT_OVERRIDE: OnceLock<String> = OnceLock::new();
 
-/// `--context` (or `MEMSTORE_CONTEXT`): use this context for one command instead of the current one.
+/// `--context` (or `AMPUP_MEMORY_CONTEXT`): use this context for one command instead of the current one.
 pub fn override_context(name: &str) {
     let _ = CONTEXT_OVERRIDE.set(name.to_string());
 }
@@ -131,13 +131,13 @@ impl Config {
         write_private("config.json", &serde_json::to_string_pretty(self)?)
     }
 
-    /// The context in use: `--context`, else `MEMSTORE_CONTEXT`, else the current one.
+    /// The context in use: `--context`, else `AMPUP_MEMORY_CONTEXT`, else the current one.
     pub fn current_name(&self) -> Option<String> {
         CONTEXT_OVERRIDE
             .get()
             .cloned()
             .or_else(|| {
-                std::env::var("MEMSTORE_CONTEXT")
+                std::env::var("AMPUP_MEMORY_CONTEXT")
                     .ok()
                     .filter(|c| !c.is_empty())
             })
@@ -168,7 +168,7 @@ impl Config {
     pub fn use_context(&mut self, name: &str) -> Result<()> {
         anyhow::ensure!(
             self.contexts.contains_key(name),
-            "no context {name} (memstore config get-contexts)"
+            "no context {name} (ampup-memory config get-contexts)"
         );
         self.current = Some(name.into());
         Ok(())
@@ -350,7 +350,7 @@ pub struct LoginOptions {
     /// Sign in to the org's Auth0 Organization (`organization=`: its enterprise connection, its groups)
     /// rather than as yourself, for the directory to say which orgs are yours.
     pub sso: bool,
-    /// The loopback port the provider redirects to; else `MEMSTORE_LOGIN_PORT`, the port the server names,
+    /// The loopback port the provider redirects to; else `AMPUP_MEMORY_LOGIN_PORT`, the port the server names,
     /// or any free one.
     pub port: Option<u16>,
 }
@@ -418,13 +418,13 @@ pub async fn login(server: Option<&str>, opts: &LoginOptions) -> Result<Credenti
     // The Auth0 Organization (`org_…`) the server says the org's sign-ins go into.
     let mut organization: Option<String> = None;
     let mut port = opts.port.or_else(|| {
-        std::env::var("MEMSTORE_LOGIN_PORT")
+        std::env::var("AMPUP_MEMORY_LOGIN_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
     });
     if issuer.is_none() || client_id.is_none() {
         let server = server.context(
-            "no server to ask how to sign in: pass --server (or `memstore config set server <url>`), or --issuer and --client-id",
+            "no server to ask how to sign in: pass --server (or `ampup-memory config set server <url>`), or --issuer and --client-id",
         )?;
         let query = opts
             .org
@@ -695,7 +695,7 @@ fn wait_for_code(listener: std::net::TcpListener, state: &str) -> Result<String>
             ),
             (Some(c), Some(s), None) if s == state => (
                 Ok(c.clone()),
-                "Signed in to memstore. You can close this tab.",
+                "Signed in to AmpUp Memory. You can close this tab.",
             ),
             _ => (
                 Err(anyhow::anyhow!("sign-in answer doesn't match this request")),
@@ -715,9 +715,9 @@ fn wait_for_code(listener: std::net::TcpListener, state: &str) -> Result<String>
 /// A request to the context's server as the signed-in user, selecting the context's org and team.
 pub async fn call(method: &str, path: &str, body: Option<Value>) -> Result<Value> {
     let ctx = Config::load()?.context();
-    let server = ctx
-        .get("server")
-        .context("no server: `memstore join <url>`, or `memstore config set server <url>`")?;
+    let server = ctx.get("server").context(
+        "no server: `ampup-memory join <url>`, or `ampup-memory config set server <url>`",
+    )?;
     call_on(server, ctx.get("org"), ctx.get("team"), method, path, body).await
 }
 
@@ -928,9 +928,12 @@ pub fn sign_in_hint() -> &'static str {
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
     {
-        Some(n) if n.starts_with("memstore-client") => {
-            "`memstore-client join <server> --org <org>`"
+        Some(n)
+            if n.starts_with(crate::naming::CLIENT_BIN)
+                || n.starts_with(crate::naming::OLD_CLIENT_BIN) =>
+        {
+            "`ampup-memory-client join <server> --org <org>`"
         }
-        _ => "`memstore auth login`",
+        _ => "`ampup-memory auth login`",
     }
 }

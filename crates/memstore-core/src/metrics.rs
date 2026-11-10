@@ -7,7 +7,7 @@
 //! leaks nothing an operator's dashboard shouldn't hold and the series count stays bounded (by the
 //! routes times the statuses, the reasons, and the directory's orgs times four roles).
 //!
-//! `/metrics` is served on its own port (`MEMSTORE_METRICS_PORT`, bound like the public port), or on
+//! `/metrics` is served on its own port (`AMPUP_MEMORY_METRICS_PORT`, bound like the public port), or on
 //! the public port to the operator's admin key only: never to anyone else.
 
 use prometheus::{
@@ -275,7 +275,7 @@ pub static EXPIRED_KEY_REFUSALS: std::sync::LazyLock<IntCounter> = std::sync::La
     .unwrap()
 });
 
-/// 1 while the keys file (`MEMSTORE_API_KEYS`) as it is now can't be read or doesn't parse: the server keeps
+/// 1 while the keys file (`AMPUP_MEMORY_API_KEYS`) as it is now can't be read or doesn't parse: the server keeps
 /// the keys it last read, so a key removed from the file since still works here. 0 once the file reads again.
 pub static KEYS_FILE_FAILING: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
     IntGauge::new(
@@ -295,7 +295,7 @@ pub static KEYS_FILE_RELOADS: std::sync::LazyLock<IntCounter> = std::sync::LazyL
 });
 
 /// 1 while this server holds the writer lease (does the background writing: extraction, summarising, index
-/// updates), else 0; 1 too with `MEMSTORE_WRITER_LEASE=off`. Summed over a catalog's servers it is 1: 0 for
+/// updates), else 0; 1 too with `AMPUP_MEMORY_WRITER_LEASE=off`. Summed over a catalog's servers it is 1: 0 for
 /// longer than a minute means nothing is extracted or indexed anywhere.
 pub static WRITER_LEASE_HELD: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
     IntGauge::new(
@@ -373,32 +373,32 @@ pub static LEDGER_COMPACTION_FAILURES: std::sync::LazyLock<IntCounter> = std::sy
 );
 
 /// 1 while the ledger holds more data files than the timer compacts in one run
-/// (`MEMSTORE_LEDGER_COMPACT_MAX_FILES`): an operator runs `memstore compact-ledger` once.
+/// (`AMPUP_MEMORY_LEDGER_COMPACT_MAX_FILES`): an operator runs `memstore compact-ledger` once.
 pub static LEDGER_COMPACTION_CLI_NEEDED: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(
     || {
         IntGauge::new(
             "memstore_ledger_compaction_cli_needed",
-            "1 while the ledger holds more data files than the timer compacts (run memstore compact-ledger once)",
+            "1 while the ledger holds more data files than the timer compacts (run ampup-memory compact-ledger once)",
         )
         .unwrap()
     },
 );
 
-/// Bytes of decoded table rows the store's cache holds, the system tables aside: what `MEMSTORE_CACHE_BYTES`
+/// Bytes of decoded table rows the store's cache holds, the system tables aside: what `AMPUP_MEMORY_CACHE_BYTES`
 /// caps. Set after each cold load of a table.
 pub static CACHE_BYTES: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
     IntGauge::new(
         "memstore_cache_bytes",
-        "Bytes of decoded table rows the cache holds (MEMSTORE_CACHE_BYTES caps it)",
+        "Bytes of decoded table rows the cache holds (AMPUP_MEMORY_CACHE_BYTES caps it)",
     )
     .unwrap()
 });
 
-/// The memory this process may use, in bytes: `MEMSTORE_MEMORY_BYTES`, else its container's limit (cgroup v2
+/// The memory this process may use, in bytes: `AMPUP_MEMORY_MEMORY_BYTES`, else its container's limit (cgroup v2
 /// `memory.max`, v1 `memory.limit_in_bytes`); none where neither sets one.
 pub fn memory_limit() -> Option<u64> {
     static LIMIT: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
-        if let Some(n) = std::env::var("MEMSTORE_MEMORY_BYTES")
+        if let Some(n) = std::env::var("AMPUP_MEMORY_MEMORY_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
         {

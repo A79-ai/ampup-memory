@@ -33,17 +33,20 @@ fn home_of(dir: &std::path::Path) -> std::path::PathBuf {
 
 async fn serve_local(dir: &std::path::Path, port: u16, env: &[(&str, &str)]) -> Server {
     let models = format!("{}/.cache/memstore/models", std::env::var("HOME").unwrap());
-    let child = Command::new(env!("CARGO_BIN_EXE_memstore"))
+    let child = Command::new(env!("CARGO_BIN_EXE_ampup-memory"))
         .env("HOME", home_of(dir))
         .env(
-            "MEMSTORE_MODEL_DIR",
-            std::env::var("MEMSTORE_MODEL_DIR").unwrap_or(models),
+            "AMPUP_MEMORY_MODEL_DIR",
+            std::env::var("AMPUP_MEMORY_MODEL_DIR").unwrap_or(models),
         )
         .args(["serve", "--local"])
         .arg(dir)
         .args(["org", &port.to_string()])
+        .env_remove("AMPUP_MEMORY_CALLER_IDENTITY")
         .env_remove("MEMSTORE_CALLER_IDENTITY")
+        .env_remove("AMPUP_MEMORY_SERVE_BIND")
         .env_remove("MEMSTORE_SERVE_BIND")
+        .env_remove("AMPUP_MEMORY_PLATFORM")
         .env_remove("MEMSTORE_PLATFORM")
         .envs(env.iter().copied())
         .stdout(Stdio::null())
@@ -107,11 +110,11 @@ async fn remember(dir: &std::path::Path, entity: &str, value: &str) {
 #[tokio::test]
 async fn a_local_server_refuses_to_listen_beyond_this_machine() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_memstore"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ampup-memory"))
         .args(["serve", "--local"])
         .arg(dir.path())
         .args(["org", &free_port().to_string()])
-        .env("MEMSTORE_SERVE_BIND", "0.0.0.0")
+        .env("AMPUP_MEMORY_SERVE_BIND", "0.0.0.0")
         .output()
         .unwrap();
     assert!(
@@ -179,7 +182,7 @@ async fn tool(port: u16, name: &str, args: Value) -> (String, bool) {
 async fn a_session_whose_run_kept_no_transcript_is_not_one_of_the_days_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    let _server = serve_local(dir.path(), port, &[("MEMSTORE_SESSIONS_PER_DAY", "2")]).await;
+    let _server = serve_local(dir.path(), port, &[("AMPUP_MEMORY_SESSIONS_PER_DAY", "2")]).await;
     // A harness's session, opened by its end (as by its first step).
     let end = |sid: &'static str, discard: bool| async move {
         tool(

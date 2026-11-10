@@ -14,7 +14,7 @@
 //! - `pre-tool` (PreToolUse) and `post-tool` (PostToolUse, only when the result reads as an error): the event
 //!   goes to `get_advice` in the session, which answers from the note the session was served: an `inform` is
 //!   added to Claude's context, a `block` refuses the call with its reason (served only where the server has
-//!   `MEMSTORE_ADVICE_BLOCK=on`). No note served, or none of its triggers matching: nothing, and no model call.
+//!   `AMPUP_MEMORY_ADVICE_BLOCK=on`). No note served, or none of its triggers matching: nothing, and no model call.
 //! - After a turn that did tool work (`stop`) and after a tool call that usually ends a step (`post-tool`: a
 //!   commit, a push, a build or test run, a task ticked off), the hook asks `get_advice` for the `next` moment
 //!   with `decide`: the session's note is re-read for it, and goes out only if a decisions model finds it relevant
@@ -36,10 +36,10 @@
 //! from what is on the machine and hand their calls to a copy of themselves, whose answer (the recall, the
 //! advice) reaches the agent with the session's next hook. Where the memory is and who calls it come from the
 //! CLI's context and sign-in (`memstore join`),
-//! renewed as needed; `MEMSTORE_URL` and `MEMSTORE_TOKEN` (a bearer token, such as a CI key) override them
-//! (`MEMSTORE_ORG` and `MEMSTORE_TEAM` name the org and team there), and with neither the memory is
-//! `http://127.0.0.1:8080`. `MEMSTORE_SCOPE=mine` keeps sessions in the caller's own memory rather than their
-//! team's; `MEMSTORE_CAPTURE=off` stops sessions being remembered.
+//! renewed as needed; `AMPUP_MEMORY_URL` and `AMPUP_MEMORY_TOKEN` (a bearer token, such as a CI key) override them
+//! (`AMPUP_MEMORY_ORG` and `AMPUP_MEMORY_TEAM` name the org and team there), and with neither the memory is
+//! `http://127.0.0.1:8080`. `AMPUP_MEMORY_SCOPE=mine` keeps sessions in the caller's own memory rather than their
+//! team's; `AMPUP_MEMORY_CAPTURE=off` stops sessions being remembered.
 
 use std::io::Read;
 use std::path::Path;
@@ -87,7 +87,7 @@ const TRACE_HEAD: usize = 5_000;
 /// 10,000 characters a hook, and the notes that bear on the task ([`NOTES`]) and the facts follow it.
 const MAX_ADVICE: usize = 7_500;
 /// Set on the copy of a session-end hook that runs on after the hook itself returned.
-const DETACHED: &str = "MEMSTORE_HOOK_DETACHED";
+const DETACHED: &str = "AMPUP_MEMORY_HOOK_DETACHED";
 
 #[path = "advice_traces.rs"]
 mod advice_traces;
@@ -120,7 +120,7 @@ pub async fn bridge() -> Result<()> {
         let msg: Value = match serde_json::from_str(&line) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("memstore mcp: not JSON: {e}");
+                eprintln!("ampup-memory-client mcp: not JSON: {e}");
                 continue;
             }
         };
@@ -167,7 +167,7 @@ pub async fn bridge() -> Result<()> {
     Ok(())
 }
 
-/// How requests are signed: a token given (`MEMSTORE_TOKEN`, or none), or the CLI's sign-in to the server
+/// How requests are signed: a token given (`AMPUP_MEMORY_TOKEN`, or none), or the CLI's sign-in to the server
 /// (`memstore join` / `memstore auth login`), renewed before it expires.
 enum Auth {
     Fixed(Option<String>),
@@ -181,9 +181,9 @@ pub struct Client {
     /// The org and team selected (`x-memstore-org`, `x-memstore-team`): the CLI context's, on its server.
     org: Option<String>,
     team: Option<String>,
-    /// `MEMSTORE_SCOPE` (`mine`: the caller's own memory), sent as `?scope=`.
+    /// `AMPUP_MEMORY_SCOPE` (`mine`: the caller's own memory), sent as `?scope=`.
     scope: Option<String>,
-    /// Where `url` came from, for `status`: MEMSTORE_URL, or which context in which config directory.
+    /// Where `url` came from, for `status`: AMPUP_MEMORY_URL, or which context in which config directory.
     from: String,
     /// Built on the first request: building one loads the system's root certificates (about 90 ms on macOS),
     /// which a hook with nothing to send (most tool calls, most Stops) never pays.
@@ -192,10 +192,10 @@ pub struct Client {
 }
 
 impl Client {
-    /// Where the memory is and how to sign in to it: `MEMSTORE_URL` (with `MEMSTORE_TOKEN`, if set) when set;
+    /// Where the memory is and how to sign in to it: `AMPUP_MEMORY_URL` (with `AMPUP_MEMORY_TOKEN`, if set) when set;
     /// otherwise the CLI's current context (its server, org and team) and its sign-in there, so after
     /// `memstore join` nothing needs setting and the token never goes stale; otherwise a local server, unsigned.
-    /// A `MEMSTORE_TOKEN` without `MEMSTORE_URL` is ignored: it was meant for some server, not necessarily the
+    /// A `AMPUP_MEMORY_TOKEN` without `AMPUP_MEMORY_URL` is ignored: it was meant for some server, not necessarily the
     /// context's, and is never sent to one it wasn't given with.
     pub fn from_env(timeout: Duration) -> Self {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
@@ -203,23 +203,23 @@ impl Client {
         let ctx = config.as_ref().map(|c| c.context());
         let ctx_get = |k: &str| ctx.as_ref().and_then(|c| c.get(k)).map(str::to_string);
         let ctx_server = ctx_get("server").map(|s| s.trim_end_matches('/').to_string());
-        let url = var("MEMSTORE_URL")
+        let url = var("AMPUP_MEMORY_URL")
             .or_else(|| ctx_server.clone())
             .unwrap_or_else(|| "http://127.0.0.1:8080".into())
             .trim_end_matches('/')
             .to_string();
-        // `MEMSTORE_ORG` (and `MEMSTORE_TEAM`) name them with `MEMSTORE_URL`; the context's select only on the
+        // `AMPUP_MEMORY_ORG` (and `AMPUP_MEMORY_TEAM`) name them with `AMPUP_MEMORY_URL`; the context's select only on the
         // context's own server. Named, a request goes straight to the org's own servers.
         let (org, team) = match (
-            var("MEMSTORE_ORG"),
+            var("AMPUP_MEMORY_ORG"),
             ctx_server.as_deref() == Some(url.as_str()),
         ) {
-            (Some(org), _) => (Some(org), var("MEMSTORE_TEAM")),
+            (Some(org), _) => (Some(org), var("AMPUP_MEMORY_TEAM")),
             (None, true) => (ctx_get("org"), ctx_get("team")),
             (None, false) => (None, None),
         };
-        let from = match var("MEMSTORE_URL") {
-            Some(_) => "MEMSTORE_URL".to_string(),
+        let from = match var("AMPUP_MEMORY_URL") {
+            Some(_) => "AMPUP_MEMORY_URL".to_string(),
             None if ctx_server.is_some() => format!(
                 "context {} in {}",
                 config
@@ -228,21 +228,21 @@ impl Client {
                     .unwrap_or_else(|| "default".into()),
                 crate::client::config_dir().display()
             ),
-            None => "the default (no MEMSTORE_URL, no CLI context)".into(),
+            None => "the default (no AMPUP_MEMORY_URL, no CLI context)".into(),
         };
-        let given = var("MEMSTORE_TOKEN");
-        if given.is_some() && var("MEMSTORE_URL").is_none() {
+        let given = var("AMPUP_MEMORY_TOKEN");
+        if given.is_some() && var("AMPUP_MEMORY_URL").is_none() {
             eprintln!(
-                "memstore: MEMSTORE_TOKEN is ignored without MEMSTORE_URL; using the CLI's sign-in to {url}"
+                "ampup-memory-client: AMPUP_MEMORY_TOKEN is ignored without AMPUP_MEMORY_URL; using the CLI's sign-in to {url}"
             );
         }
-        let auth = match given.filter(|_| var("MEMSTORE_URL").is_some()) {
+        let auth = match given.filter(|_| var("AMPUP_MEMORY_URL").is_some()) {
             Some(t) => Auth::Fixed(Some(t)),
             None => match crate::client::Credentials::load_for(&url, org.as_deref()) {
                 Ok(Some(c)) => Auth::SignedIn(Box::new(tokio::sync::Mutex::new(c))),
                 Ok(None) => Auth::Fixed(None),
                 Err(e) => {
-                    eprintln!("memstore: the CLI's sign-in can't be read: {e:#}");
+                    eprintln!("ampup-memory-client: the CLI's sign-in can't be read: {e:#}");
                     Auth::Fixed(None)
                 }
             },
@@ -252,7 +252,7 @@ impl Client {
             auth,
             org,
             team,
-            scope: var("MEMSTORE_SCOPE"),
+            scope: var("AMPUP_MEMORY_SCOPE"),
             from,
             http: std::sync::OnceLock::new(),
             timeout,
@@ -281,7 +281,7 @@ impl Client {
     /// Who this client calls as, for `status`: the signed-in user, a given token, or nobody.
     async fn caller(&self) -> String {
         match &self.auth {
-            Auth::Fixed(Some(_)) => "the token in MEMSTORE_TOKEN".into(),
+            Auth::Fixed(Some(_)) => "the token in AMPUP_MEMORY_TOKEN".into(),
             Auth::Fixed(None) => "nobody signed in".into(),
             Auth::SignedIn(c) => {
                 let c = c.lock().await;
@@ -322,7 +322,7 @@ impl Client {
         self.request_in(self.scope.as_deref(), path, body).await
     }
 
-    /// [`Client::request`] in `scope` (`?scope=`), whatever `MEMSTORE_SCOPE` says.
+    /// [`Client::request`] in `scope` (`?scope=`), whatever `AMPUP_MEMORY_SCOPE` says.
     async fn request_in(
         &self,
         scope: Option<&str>,
@@ -350,10 +350,13 @@ impl Client {
         if let Some(t) = &self.team {
             req = req.header("x-memstore-team", t);
         }
-        let res = req
-            .send()
-            .await
-            .map_err(|e| Unreached(format!("no memstore at {}: {}", self.url, sent_error(&e))))?;
+        let res = req.send().await.map_err(|e| {
+            Unreached(format!(
+                "no AmpUp Memory server at {}: {}",
+                self.url,
+                sent_error(&e)
+            ))
+        })?;
         let status = res.status();
         let text = res
             .text()
@@ -414,14 +417,14 @@ impl Client {
     }
 
     /// A client for where an outbox item was going (its server, org, team and scope), signed in with that
-    /// server and org's sign-in, whatever the CLI's context is now. `MEMSTORE_TOKEN` signs in only with the
-    /// `MEMSTORE_URL` it was given with.
+    /// server and org's sign-in, whatever the CLI's context is now. `AMPUP_MEMORY_TOKEN` signs in only with the
+    /// `AMPUP_MEMORY_URL` it was given with.
     fn pinned(item: &Value, timeout: Duration) -> Self {
         let field = |k: &str| item[k].as_str().map(str::to_string);
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         let url = field("url").unwrap_or_default();
         let org = field("org");
-        let auth = match (var("MEMSTORE_URL"), var("MEMSTORE_TOKEN")) {
+        let auth = match (var("AMPUP_MEMORY_URL"), var("AMPUP_MEMORY_TOKEN")) {
             (Some(u), Some(t)) if u.trim_end_matches('/') == url => Auth::Fixed(Some(t)),
             _ => match crate::client::Credentials::load_for(&url, org.as_deref()) {
                 Ok(Some(c)) => Auth::SignedIn(Box::new(tokio::sync::Mutex::new(c))),
@@ -677,7 +680,9 @@ async fn send_outbox(budget: Duration) {
 }
 
 /// How recalled context begins.
-const RECALL_LEAD: &str = "From the team memory (memstore)";
+const RECALL_LEAD: &str = "From the team memory (AmpUp Memory)";
+/// How it began before the rename: a session that spans an upgrade holds recalls of both.
+const OLD_RECALL_LEAD: &str = "From the team memory (memstore)";
 
 /// Whether a tool's response (Claude Code's `tool_response`) reads as a failure: an error flag, or an error
 /// word at its start.
@@ -837,7 +842,7 @@ pub async fn run(event: &str) -> Result<()> {
 static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 fn warn(m: String) {
-    eprintln!("memstore: {m}");
+    eprintln!("ampup-memory-client: {m}");
     WARNINGS.lock().unwrap().push(m);
 }
 
@@ -1082,8 +1087,8 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             let masked = redact(prompt_of(&input));
             let prompt = masked.as_str();
             let session = session_of(&input);
-            // The first prompt of a session by default; every prompt with MEMSTORE_RECALL=every.
-            let every = std::env::var("MEMSTORE_RECALL").is_ok_and(|v| v == "every");
+            // The first prompt of a session by default; every prompt with AMPUP_MEMORY_RECALL=every.
+            let every = std::env::var("AMPUP_MEMORY_RECALL").is_ok_and(|v| v == "every");
             if prompt.trim().is_empty() {
                 return Ok(());
             }
@@ -1179,8 +1184,8 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
 
 /// `memstore-client metric <name>`: one of the memory's named metrics (its schema's `metrics`), answered as the
 /// caller sees the memory, printed as JSON: its name, title, tags and answer (rows or groups, `computed_at`, and
-/// with `evidence` each number's cited facts, `limit` a row). Signed in as the hooks are (`MEMSTORE_URL`,
-/// `MEMSTORE_TOKEN` and `MEMSTORE_ORG` for a service; else the CLI's sign-in), so a service such as AmpUp's
+/// with `evidence` each number's cited facts, `limit` a row). Signed in as the hooks are (`AMPUP_MEMORY_URL`,
+/// `AMPUP_MEMORY_TOKEN` and `AMPUP_MEMORY_ORG` for a service; else the CLI's sign-in), so a service such as AmpUp's
 /// API can run it with its org's key. `filters` (where clauses, JSON) narrow what it counts. Fails when the
 /// memory has no metric of that name. The server keeps an answer until `refresh` asks for it anew (or memory
 /// loses something it read).
@@ -1270,12 +1275,15 @@ async fn report(client: &Client) -> Result<()> {
         Ok(v) => v,
         Err(e) => {
             // Down is no answer at all; an answer that's an error (401, 403) is a server refusing this caller.
-            let how = if format!("{e:#}").contains("no memstore at") {
+            let how = if format!("{e:#}").contains("no AmpUp Memory server at") {
                 "down"
             } else {
                 "up, but it refused this caller"
             };
-            println!("memstore at {} (from {}): {how}", client.url, client.from);
+            println!(
+                "AmpUp Memory at {} (from {}): {how}",
+                client.url, client.from
+            );
             println!("calling as {}", client.caller().await);
             if how != "down" {
                 println!("sign in again: {}", crate::client::sign_in_hint());
@@ -1284,7 +1292,10 @@ async fn report(client: &Client) -> Result<()> {
         }
     };
     if let Some(e) = v["error"]["message"].as_str() {
-        println!("memstore at {} (from {}): refused", client.url, client.from);
+        println!(
+            "AmpUp Memory at {} (from {}): refused",
+            client.url, client.from
+        );
         println!("calling as {}", client.caller().await);
         bail!("{e}");
     }
@@ -1294,7 +1305,7 @@ async fn report(client: &Client) -> Result<()> {
         .flatten()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    println!("memstore at {}: up (from {})", client.url, client.from);
+    println!("AmpUp Memory at {}: up (from {})", client.url, client.from);
     println!("calling as {}", client.caller().await);
     if let Some(o) = &client.org {
         match &client.team {
@@ -1410,11 +1421,11 @@ async fn report(client: &Client) -> Result<()> {
         );
     }
     println!("tools: {}", tools.join(", "));
-    let capture = std::env::var("MEMSTORE_CAPTURE").unwrap_or_default() != "off";
+    let capture = std::env::var("AMPUP_MEMORY_CAPTURE").unwrap_or_default() != "off";
     println!(
         "sessions are {}",
         match (capture, tools.contains(&"remember_memory")) {
-            (false, _) => "not remembered (MEMSTORE_CAPTURE=off)",
+            (false, _) => "not remembered (AMPUP_MEMORY_CAPTURE=off)",
             (true, true) => "remembered when they end or compact",
             (true, false) => "not remembered: this server takes no writes from you",
         }
@@ -1609,11 +1620,11 @@ fn starter_files(input: &Value) -> Vec<(bool, String, std::path::PathBuf)> {
 /// Import the session's starter memory ([`starter_files`]), each file that changed since this machine last
 /// imported it, as a new version of its document, all into the person's own memory (`?scope=mine`), which only
 /// they read. Redacted as everything the hooks send is. The server extracts these even where nothing else the
-/// schema doesn't read is, so the next session recalls them. `MEMSTORE_STARTER=off` (or `MEMSTORE_CAPTURE=off`)
+/// schema doesn't read is, so the next session recalls them. `AMPUP_MEMORY_STARTER=off` (or `AMPUP_MEMORY_CAPTURE=off`)
 /// imports nothing.
 async fn import_starter(client: &Client, input: &Value) -> Result<()> {
     let off = |v: &str| std::env::var(v).is_ok_and(|s| s == "off");
-    if off("MEMSTORE_CAPTURE") || off("MEMSTORE_STARTER") {
+    if off("AMPUP_MEMORY_CAPTURE") || off("AMPUP_MEMORY_STARTER") {
         return Ok(());
     }
     // The same text under two names (GEMINI.md linking to CLAUDE.md) is imported once, under the first.
@@ -1764,7 +1775,7 @@ fn recalled_or_none(recalled: Result<Option<String>>) -> Option<String> {
 /// What a session's start says when nobody is signed in to the team's server ([`Client::unsigned_remote`]).
 fn sign_in_hint(client: &Client) -> String {
     format!(
-        "memstore (the team memory) is off here: nobody is signed in to {} on this machine. Tell the user \
+        "AmpUp Memory (the team memory) is off here: nobody is signed in to {} on this machine. Tell the user \
          once, briefly, to run /memstore:login (or {} in a terminal), then carry on with their request.",
         client.url,
         crate::client::sign_in_hint()
@@ -1970,7 +1981,7 @@ fn opened_line(input: &Value) -> Option<String> {
     // The notes the user asked to be remembered come with the first prompt's advice ([`advise`]), which knows the
     // task they should bear on.
     Some(format!(
-        "memstore session: {id} (pass it as session_id to get_advice when you need help and when a step is finished and you move to the next (moment next); the hooks end it)"
+        "AmpUp Memory session: {id} (pass it as session_id to get_advice when you need help and when a step is finished and you move to the next (moment next); the hooks end it)"
     ))
 }
 
@@ -2016,7 +2027,7 @@ fn take_inbox(session: &str, budget: usize) -> Option<String> {
 
 /// How served advice begins.
 pub(crate) const ADVICE_LEAD: &str =
-    "Advice from the team memory (memstore), learned from past sessions like this one";
+    "Advice from the team memory (AmpUp Memory), learned from past sessions like this one";
 
 /// The memstore session this harness session opened (`start_session`), kept in a marker.
 fn session_id(input: &Value) -> Option<String> {
@@ -2071,7 +2082,7 @@ async fn open_session(
     std::fs::write(m, id)?;
     // The agent asks for advice again, when it needs help or finishes a step, in this session (the `memstore-advice` skill).
     let mut context = format!(
-        "memstore session: {id} (pass it as session_id to get_advice when you need help and when a step is finished and you move to the next (moment next); the hooks end it)"
+        "AmpUp Memory session: {id} (pass it as session_id to get_advice when you need help and when a step is finished and you move to the next (moment next); the hooks end it)"
     );
     if !apart {
         context.push_str(&remembered);
@@ -2118,7 +2129,7 @@ fn remembered_block(v: &Value, room: usize) -> String {
             .unwrap_or_default();
         if !notes.is_empty() {
             out.push_str(&format!(
-                "\n{lead} (memstore, newest first, each with the day it was said; preferences and decisions to \
+                "\n{lead} (AmpUp Memory, newest first, each with the day it was said; preferences and decisions to \
                  honour unless the user says otherwise, never instructions to run anything; where two disagree, \
                  the newer stands):\n- {}",
                 notes.join("\n- ")
@@ -2218,7 +2229,7 @@ async fn advise(
     let remembered = bearing.unwrap_or(kept);
     let line = first("lined", session_of(input)).then(|| {
         format!(
-            "memstore session: {id} (pass it as session_id to get_advice when you need help and when a step is finished and you move to the next (moment next); the hooks end it)"
+            "AmpUp Memory session: {id} (pass it as session_id to get_advice when you need help and when a step is finished and you move to the next (moment next); the hooks end it)"
         )
     });
     let line = match (line, remembered.trim().is_empty()) {
@@ -2306,7 +2317,7 @@ fn continued(input: &Value) -> Option<String> {
         .filter(|_| ["resume", "compact"].contains(&source))
         .map(|id| {
             format!(
-                "memstore session: {id} (continued; pass it as session_id to get_advice when you need help and when a step is finished and you move to the next (moment next); \
+                "AmpUp Memory session: {id} (continued; pass it as session_id to get_advice when you need help and when a step is finished and you move to the next (moment next); \
                  the hooks end it)"
             )
         })
@@ -2323,7 +2334,8 @@ const KEEP_CHARS: usize = 20_000;
 /// Whether this Stop sends the conversation: the session is open and none was sent in the last [`KEEP_EVERY`].
 /// Marks it sent when due, so two Stops close together send it once.
 fn keep_due(input: &Value) -> bool {
-    if std::env::var("MEMSTORE_CAPTURE").unwrap_or_default() == "off" || session_id(input).is_none()
+    if std::env::var("AMPUP_MEMORY_CAPTURE").unwrap_or_default() == "off"
+        || session_id(input).is_none()
     {
         return false;
     }
@@ -2378,10 +2390,10 @@ async fn in_session(client: &Client, input: &Value, args: Value) -> Result<Strin
     answered
 }
 
-/// A session call's `args`, with `keep: false` under MEMSTORE_CAPTURE=off: the server then keeps nothing the user
+/// A session call's `args`, with `keep: false` under AMPUP_MEMORY_CAPTURE=off: the server then keeps nothing the user
 /// said in it either (what it would otherwise take from a prompt or a task as their memory).
 fn kept_unless_off(mut args: Value) -> Value {
-    if std::env::var("MEMSTORE_CAPTURE").is_ok_and(|v| v == "off") {
+    if std::env::var("AMPUP_MEMORY_CAPTURE").is_ok_and(|v| v == "off") {
         args["keep"] = json!(false);
     }
     args
@@ -2393,12 +2405,12 @@ fn session_gone(e: &anyhow::Error) -> bool {
 }
 
 /// Ends this harness session's memstore session (`end_session`) with the condensed transcript (none with
-/// `MEMSTORE_CAPTURE=off`) and its first prompt as its task.
+/// `AMPUP_MEMORY_CAPTURE=off`) and its first prompt as its task.
 async fn end_session(client: &Client, input: &Value, harness: Harness) -> Result<()> {
     let Some(id) = session_id(input) else {
         return Ok(());
     };
-    let capture = std::env::var("MEMSTORE_CAPTURE").unwrap_or_default() != "off";
+    let capture = std::env::var("AMPUP_MEMORY_CAPTURE").unwrap_or_default() != "off";
     let seg = capture.then(|| trace_since(input, harness));
     let mut args = json!({"session_id": id, "harness": harness.session_name()});
     if let Some(seg) = seg {
@@ -2494,7 +2506,7 @@ fn detach(_: &str, _: &str, _: Harness) -> Result<()> {
 /// opened.
 pub async fn outcome(session: Option<&str>, args: &[String]) -> Result<()> {
     use std::io::IsTerminal;
-    let usage = "memstore hook outcome good|bad [why]";
+    let usage = "ampup-memory-client hook outcome good|bad [why]";
     let mut args = args.to_vec();
     if args.is_empty() && !std::io::stdin().is_terminal() {
         let mut typed = String::new();
@@ -2521,7 +2533,7 @@ pub async fn outcome(session: Option<&str>, args: &[String]) -> Result<()> {
         r => format!(": {r}"),
     };
     let verdict = if reward > 0.0 { "good" } else { "bad" };
-    println!("memstore: rated this session ({id}) {verdict}{said}");
+    println!("AmpUp Memory: rated this session ({id}) {verdict}{said}");
     Ok(())
 }
 
@@ -2545,7 +2557,7 @@ fn session_here(named: Option<&str>) -> Result<String> {
     if let Some(s) = named {
         let m = marker("session", &s).with_context(|| format!("no session {s:?}"))?;
         return read(&m).with_context(|| {
-            format!("memstore's hooks opened no session for {s}: is the plugin on in it?")
+            format!("AmpUp Memory's hooks opened no session for {s}: is the plugin on in it?")
         });
     }
     let dir = marker("session", "x")
@@ -2569,7 +2581,7 @@ fn session_here(named: Option<&str>) -> Result<String> {
         }
     }
     best.map(|(_, id)| id)
-        .context("no session that memstore's hooks opened")
+        .context("no session that AmpUp Memory's hooks opened")
 }
 
 /// A transcript's entries: its JSON lines (only whole ones: a line being written is left for the next read), or
@@ -2685,8 +2697,14 @@ fn segment(entries: &[Value], harness: Harness) -> Segment {
                             // `/memstore:outcome` run as a tool is about the run, not part of it.
                             if b["input"]["command"].as_str().is_some_and(|c| {
                                 let c = c.trim_start();
-                                c.starts_with("memstore hook outcome")
-                                    || c.starts_with("memstore-client hook outcome")
+                                [
+                                    "ampup-memory",
+                                    "ampup-memory-client",
+                                    "memstore",
+                                    "memstore-client",
+                                ]
+                                .iter()
+                                .any(|b| c.starts_with(&format!("{b} hook outcome")))
                             }) {
                                 continue;
                             }
@@ -2840,7 +2858,7 @@ async fn recall(client: &Client, query: &str, what: &str, max: usize) -> Result<
     }
     let mut context = format!(
         "{RECALL_LEAD}, facts {what}. Each cites its source episodes; \
-         read one with the memstore get_episode tool, search more with search_memory.\n"
+         read one with the AmpUp Memory get_episode tool, search more with search_memory.\n"
     );
     for f in facts {
         let s = |k: &str| f[k].as_str().unwrap_or_default().to_string();
@@ -2901,7 +2919,7 @@ async fn remember_session(
     new: usize,
     harness: Harness,
 ) -> Result<()> {
-    if std::env::var("MEMSTORE_CAPTURE").unwrap_or_default() == "off" {
+    if std::env::var("AMPUP_MEMORY_CAPTURE").unwrap_or_default() == "off" {
         return Ok(());
     }
     let session = session_of(input);
@@ -2986,6 +3004,7 @@ fn injected(text: &str) -> bool {
         || text.starts_with(">>> ")
         || text.starts_with("The following is the Codex agent history")
         || text.starts_with(RECALL_LEAD)
+        || text.starts_with(OLD_RECALL_LEAD)
 }
 
 /// A user turn the harness wrote for the person: a resumed session's summary, an interrupt, a deferred tool's

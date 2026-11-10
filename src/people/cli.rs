@@ -48,8 +48,8 @@ pub enum PeopleCmd {
     },
     /// Give people access: they become members of the org (and the team), and sign in with that email
     Invite(InviteArgs),
-    /// Who asked to join the org (`memstore join` as someone the org doesn't hold yet) and waits for an admin:
-    /// `memstore invite --email <email>` lets them in, `memstore decline` turns them away
+    /// Who asked to join the org (`ampup-memory join` as someone the org doesn't hold yet) and waits for an admin:
+    /// `ampup-memory invite --email <email>` lets them in, `ampup-memory decline` turns them away
     Requests {
         #[arg(long)]
         org: Option<String>,
@@ -77,8 +77,8 @@ pub enum PeopleCmd {
     },
     /// Set this machine up for a team's memory in one go: sign in (as `join`, unless already signed in to that
     /// org there), then install memstore in every coding agent found here (Claude Code's plugin; the hooks and
-    /// the `memstore mcp` server for Codex, Gemini, Cursor and Copilot, signed in as the CLI is: no URL or token
-    /// is written anywhere), then check it all (`memstore doctor`)
+    /// the `ampup-memory mcp` server for Codex, Gemini, Cursor and Copilot, signed in as the CLI is: no URL or token
+    /// is written anywhere), then check it all (`ampup-memory doctor`)
     Setup {
         server: String,
         #[arg(long)]
@@ -253,7 +253,7 @@ pub enum OrgCmd {
         /// source ("" unsets them)
         #[arg(long)]
         compile_sources: Option<String>,
-        /// Sources per compile round (default: the server's MEMSTORE_COMPILE_BATCH, 12; 0 unsets it)
+        /// Sources per compile round (default: the server's AMPUP_MEMORY_COMPILE_BATCH, 12; 0 unsets it)
         #[arg(long)]
         compile_batch: Option<usize>,
         /// What the compile sources are: errors (error reports: each skill's when names the exception and its
@@ -267,17 +267,17 @@ pub enum OrgCmd {
         #[arg(long)]
         advice_procedures: Option<bool>,
         /// The people a learned note must have helped before it is served outside the trial arm (default: the
-        /// server's MEMSTORE_ADVICE_EVIDENCE, else 3; 0 serves every note)
+        /// server's AMPUP_MEMORY_ADVICE_EVIDENCE, else 3; 0 serves every note)
         #[arg(long)]
         advice_evidence: Option<usize>,
         /// The people a team note learned from runs, and each of its items, must come from (default: the server's
-        /// MEMSTORE_ADVICE_LEARN_PEOPLE, else 3; never below 2)
+        /// AMPUP_MEMORY_ADVICE_LEARN_PEOPLE, else 3; never below 2)
         #[arg(long)]
         advice_learn_people: Option<usize>,
         /// The rewarded runs or sessions each person's own advice waits for, where fewer than the server's bars:
         /// their map after this many new ones, a note at this many runs, rewritten after this many new ones, and
         /// learned right after their session ends rewarded (1 to 10; 0 unsets it; default: the server's
-        /// MEMSTORE_ADVICE_PERSONAL_RUNS, unset)
+        /// AMPUP_MEMORY_ADVICE_PERSONAL_RUNS, unset)
         #[arg(long)]
         advice_personal_runs: Option<usize>,
         /// How advice routes over the skills compiled from documents: fallback (default: only where no kind of
@@ -304,7 +304,7 @@ pub enum OrgCmd {
         /// The model each skill's AIP graph is compiled with (e.g. anthropic/claude-haiku-5.5)
         #[arg(long)]
         aip_model: Option<String>,
-        /// Keep the scope's model calls whole in the server's training log (MEMSTORE_TRAIN_LOG), to train the org's
+        /// Keep the scope's model calls whole in the server's training log (AMPUP_MEMORY_TRAIN_LOG), to train the org's
         /// own models from (the operator only; default false)
         #[arg(long)]
         train_log: Option<bool>,
@@ -317,15 +317,15 @@ pub enum OrgCmd {
         #[arg(long)]
         classic_ranking: Option<bool>,
         /// Mark what the schema says has gone stale on read: values past their predicate's freshness_days, and
-        /// plans whose date has passed while still pending (default: the server's MEMSTORE_FRESHNESS, off)
+        /// plans whose date has passed while still pending (default: the server's AMPUP_MEMORY_FRESHNESS, off)
         #[arg(long)]
         freshness: Option<bool>,
         /// Keep facts that disagree apart: reconcile may record a new fact as in conflict with a known one instead
-        /// of ending it, and reads mark the other value beside it (default: the server's MEMSTORE_CONFLICTS, off)
+        /// of ending it, and reads mark the other value beside it (default: the server's AMPUP_MEMORY_CONFLICTS, off)
         #[arg(long)]
         conflicts: Option<bool>,
         /// Curate learned advice: withhold a note whose served runs do worse than the rest, change notes by small
-        /// edits, merge situations that are the same task (default false, or the server's MEMSTORE_ADVICE_CURATION)
+        /// edits, merge situations that are the same task (default false, or the server's AMPUP_MEMORY_ADVICE_CURATION)
         #[arg(long)]
         advice_curation: Option<bool>,
         /// Route advice for sessions a program runs (a harness named `:sdk`: `claude -p`, an SDK run) (default
@@ -333,16 +333,16 @@ pub enum OrgCmd {
         #[arg(long)]
         advice_automated: Option<bool>,
         /// Fold each person's own notes into one deduplicated, capped profile that start_session hands them with
-        /// their newest few notes, instead of their newest 20 alone (default: the server's MEMSTORE_PROFILE, off)
+        /// their newest few notes, instead of their newest 20 alone (default: the server's AMPUP_MEMORY_PROFILE, off)
         #[arg(long)]
         profile: Option<bool>,
         /// Have the plugin's hooks keep each session's whole transcript, tool calls and results included, as its
-        /// author's own episode, readable by them alone (default: the server's MEMSTORE_TRANSCRIPTS, off)
+        /// author's own episode, readable by them alone (default: the server's AMPUP_MEMORY_TRANSCRIPTS, off)
         #[arg(long)]
         transcripts: Option<bool>,
         /// How the MCP instructions and the session tools' descriptions read: default (the session's call order)
         /// or purpose (what memory is for and when it helps, no fixed procedure) ("" unsets it; default: the
-        /// server's MEMSTORE_INSTRUCTIONS)
+        /// server's AMPUP_MEMORY_INSTRUCTIONS)
         #[arg(long)]
         instructions: Option<String>,
         /// Other scopes of the org its readers also search, comma-separated (team:<org>/<team>; "" unsets them;
@@ -350,7 +350,7 @@ pub enum OrgCmd {
         #[arg(long)]
         reads: Option<String>,
         /// Delete from storage in the nightly maintenance window what the org's sources deleted and what aged past
-        /// its retention, once hidden for MEMSTORE_PURGE_GRACE (7 days) (default false)
+        /// its retention, once hidden for AMPUP_MEMORY_PURGE_GRACE (7 days) (default false)
         #[arg(long)]
         purge: Option<bool>,
         /// Whether the org's admins may read each person's activity: their questions, answers and what each
@@ -453,7 +453,7 @@ pub enum TeamCmd {
     },
     /// Pilot from a csv (`email,name,manager,role,team`), no IdP: print each person's closure
     Check { csv: PathBuf },
-    /// Pilot: issue one API key per person into the keys file (`MEMSTORE_API_KEYS`), printing each once
+    /// Pilot: issue one API key per person into the keys file (`AMPUP_MEMORY_API_KEYS`), printing each once
     Keys {
         csv: PathBuf,
         /// JSON rows; created if missing
@@ -470,8 +470,8 @@ pub enum TeamCmd {
         csv: PathBuf,
         /// The server, e.g. http://127.0.0.1:8080
         url: String,
-        /// An admin API key (or MEMSTORE_ADMIN_KEY)
-        #[arg(long, env = "MEMSTORE_ADMIN_KEY")]
+        /// An admin API key (or AMPUP_MEMORY_ADMIN_KEY)
+        #[arg(long, env = "AMPUP_MEMORY_ADMIN_KEY")]
         key: String,
     },
 }
@@ -506,7 +506,7 @@ pub enum IdentityCmd {
 
 #[derive(Subcommand)]
 pub enum KeysCmd {
-    /// Issue an API key into the keys file (`MEMSTORE_API_KEYS`, created if missing), printing it once
+    /// Issue an API key into the keys file (`AMPUP_MEMORY_API_KEYS`, created if missing), printing it once
     New {
         keys_file: PathBuf,
         /// The user the key acts as (an email, or `svc:<name>` for a service)
@@ -533,15 +533,15 @@ pub enum UsersCmd {
         /// The server, e.g. http://127.0.0.1:8080
         url: String,
         user: String,
-        /// An admin API key (or MEMSTORE_ADMIN_KEY)
-        #[arg(long, env = "MEMSTORE_ADMIN_KEY", hide_env_values = true)]
+        /// An admin API key (or AMPUP_MEMORY_ADMIN_KEY)
+        #[arg(long, env = "AMPUP_MEMORY_ADMIN_KEY", hide_env_values = true)]
         key: String,
     },
     /// Let a disabled user back in
     Enable {
         url: String,
         user: String,
-        #[arg(long, env = "MEMSTORE_ADMIN_KEY", hide_env_values = true)]
+        #[arg(long, env = "AMPUP_MEMORY_ADMIN_KEY", hide_env_values = true)]
         key: String,
     },
     /// Forget a person: remove them from the org and its teams, and delete what they wrote there
@@ -572,7 +572,7 @@ pub enum AclCmd {
         /// One episode
         #[arg(long)]
         episode: Option<String>,
-        #[arg(long, env = "MEMSTORE_ADMIN_KEY", hide_env_values = true)]
+        #[arg(long, env = "AMPUP_MEMORY_ADMIN_KEY", hide_env_values = true)]
         key: String,
     },
 }
@@ -584,7 +584,7 @@ pub enum AuthCmd {
         #[arg(long)]
         server: Option<String>,
         /// Sign in with an API key instead (service callers, CI, a platform admin)
-        #[arg(long, env = "MEMSTORE_API_KEY", hide_env_values = true)]
+        #[arg(long, env = "AMPUP_MEMORY_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
         /// The identity provider, when the server doesn't publish it (e.g. https://accounts.google.com)
         #[arg(long)]
@@ -592,13 +592,13 @@ pub enum AuthCmd {
         #[arg(long)]
         client_id: Option<String>,
         /// Only for providers that give public (installed-app) clients one, like Google
-        #[arg(long, env = "MEMSTORE_OIDC_CLIENT_SECRET", hide_env_values = true)]
+        #[arg(long, env = "AMPUP_MEMORY_OIDC_CLIENT_SECRET", hide_env_values = true)]
         client_secret: Option<String>,
         /// Print the sign-in URL instead of opening a browser
         #[arg(long)]
         no_browser: bool,
         /// The loopback port the provider redirects to (http://127.0.0.1:<port>/callback), for providers that
-        /// only take registered redirect URIs; else MEMSTORE_LOGIN_PORT, the server's, or any free port
+        /// only take registered redirect URIs; else AMPUP_MEMORY_LOGIN_PORT, the server's, or any free port
         #[arg(long)]
         port: Option<u16>,
     },
@@ -661,7 +661,7 @@ pub struct SetupArgs {
     #[arg(long)]
     pub confidential_client: bool,
     /// A public client's secret, for providers that give installed apps one (Google): the secret (the
-    /// server seals it with its MEMSTORE_SECRET_KEY) or env:MEMSTORE_IDP_SECRET_<NAME> (that server
+    /// server seals it with its AMPUP_MEMORY_SECRET_KEY) or env:AMPUP_MEMORY_IDP_SECRET_<NAME> (that server
     /// variable). Needs --public-client
     #[arg(long)]
     pub client_secret: Option<String>,
@@ -743,7 +743,7 @@ pub enum ApikeyCmd {
         #[arg(long)]
         org: Option<String>,
     },
-    /// Move file keys (`MEMSTORE_API_KEYS`, `memstore keys new`) into the directory as the org's (or
+    /// Move file keys (`AMPUP_MEMORY_API_KEYS`, `ampup-memory keys new`) into the directory as the org's (or
     /// --team's) keys: same key, same holder, no more rights. The operator imports from the keys file
     /// (--from, through a server that has it, or --direct); a key's holder imports their own (--self,
     /// signed in with it). Admin keys and keys holding groups are refused; only sha256s are read
@@ -919,7 +919,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 ctx.set("org", Some(org))?;
                 config.put_context(org, ctx);
                 config.save()?;
-                println!("Switched to context {org}. Next: memstore org init");
+                println!("Switched to context {org}. Next: ampup-memory org init");
             }
         }
         PeopleCmd::CreateTeam { team, org } | PeopleCmd::Team(TeamCmd::Create { team, org }) => {
@@ -933,7 +933,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             )
             .await?;
             println!(
-                "Next: memstore invite --email <email> --team {team}; memstore use {org}/{team}"
+                "Next: ampup-memory invite --email <email> --team {team}; ampup-memory use {org}/{team}"
             );
         }
         PeopleCmd::Invite(a) => invite(&to, a).await?,
@@ -953,7 +953,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                     println!("{user}  asked {when}");
                 }
                 println!(
-                    "\nmemstore invite --org {org} --email <email> lets them in; memstore decline --org {org} --email <email> turns them away"
+                    "\nampup-memory invite --org {org} --email <email> lets them in; ampup-memory decline --org {org} --email <email> turns them away"
                 );
             }
         }
@@ -1408,9 +1408,9 @@ async fn apikey(to: &Target<'_>, cmd: &ApikeyCmd) -> Result<()> {
                 return Ok(());
             }
             println!("\nUse it:");
-            println!("  memstore auth login --server {server} --api-key {key}");
+            println!("  ampup-memory auth login --server {server} --api-key {key}");
             println!(
-                "  claude mcp add --transport http memstore '{server}/mcp?{query}' --header 'Authorization: Bearer {key}'"
+                "  claude mcp add --transport http ampup-memory '{server}/mcp?{query}' --header 'Authorization: Bearer {key}'"
             );
         }
         ApikeyCmd::List { org } => {
@@ -1468,7 +1468,7 @@ async fn apikey(to: &Target<'_>, cmd: &ApikeyCmd) -> Result<()> {
             }
             anyhow::ensure!(
                 !(*self_import && to.store.is_some()),
-                "--self goes to the server that has your key, signed in with it: memstore auth login --server <url> --api-key <key>"
+                "--self goes to the server that has your key, signed in with it: ampup-memory auth login --server <url> --api-key <key>"
             );
             let change = Change::ImportKeys {
                 org: org_of(org)?,
@@ -1480,7 +1480,7 @@ async fn apikey(to: &Target<'_>, cmd: &ApikeyCmd) -> Result<()> {
             let done = to.change(change, *dry_run).await?;
             if !dry_run && !done.is_empty() {
                 println!(
-                    "\nThe same keys work as before, now as the directory's: revoke them with `memstore apikey revoke`. Remove them from the keys file when the server next restarts."
+                    "\nThe same keys work as before, now as the directory's: revoke them with `ampup-memory apikey revoke`. Remove them from the keys file when the server next restarts."
                 );
             }
         }
@@ -1543,7 +1543,7 @@ async fn audit(
             let server = Config::load()?
                 .context()
                 .get("server")
-                .context("no server: `memstore join <url>`, or `memstore config set server <url>`")?
+                .context("no server: `ampup-memory join <url>`, or `ampup-memory config set server <url>`")?
                 .to_string();
             // As the org's own sign-in, if there is one.
             let body = match org {
@@ -1648,7 +1648,7 @@ fn write_keys(path: &PathBuf, rows: &[Value]) -> Result<()> {
 
 /// `memstore keys` writes a keys file, which servers read only when they start: deprecated for
 /// everything but admin keys, which no directory key can stand for.
-const KEYS_DEPRECATED: &str = "deprecated: keys files are read only when the server starts; use `memstore apikey create|revoke` (an org's or team's key, working from its next request), and `memstore apikey import` to move existing file keys. Only admin keys still belong here.";
+const KEYS_DEPRECATED: &str = "deprecated: keys files are read only when the server starts; use `ampup-memory apikey create|revoke` (an org's or team's key, working from its next request), and `ampup-memory apikey import` to move existing file keys. Only admin keys still belong here.";
 
 fn keys(cmd: &KeysCmd) -> Result<()> {
     eprintln!("{KEYS_DEPRECATED}");
@@ -1897,7 +1897,7 @@ impl Target<'_> {
     async fn put_schema(&self, org: &str, schema: &str, dry_run: bool) -> Result<()> {
         anyhow::ensure!(
             self.store.is_none(),
-            "org set-schema goes through a server: for a catalog, `memstore schema set org:{org} {schema}`"
+            "org set-schema goes through a server: for a catalog, `ampup-memory schema set org:{org} {schema}`"
         );
         let s = crate::query::schema::Schema::load(schema)?;
         let v = client::call(
@@ -1947,19 +1947,19 @@ impl Target<'_> {
     }
 }
 
-/// sha256 of the keys in this machine's keys file (`MEMSTORE_API_KEYS`), if it names one: what a key made with
+/// sha256 of the keys in this machine's keys file (`AMPUP_MEMORY_API_KEYS`), if it names one: what a key made with
 /// --direct may not be. A keys file named but unreadable refuses the change, rather than skipping the check.
 fn direct_file_keys() -> Result<std::collections::BTreeSet<String>> {
-    let Some(path) = std::env::var("MEMSTORE_API_KEYS")
+    let Some(path) = std::env::var("AMPUP_MEMORY_API_KEYS")
         .ok()
         .filter(|p| !p.is_empty())
     else {
         return Ok(Default::default());
     };
     let text =
-        std::fs::read_to_string(&path).with_context(|| format!("MEMSTORE_API_KEYS {path}"))?;
+        std::fs::read_to_string(&path).with_context(|| format!("AMPUP_MEMORY_API_KEYS {path}"))?;
     Ok(directory::parse_file_keys(&text)
-        .with_context(|| format!("MEMSTORE_API_KEYS {path}"))?
+        .with_context(|| format!("AMPUP_MEMORY_API_KEYS {path}"))?
         .into_iter()
         .map(|k| k.sha256.to_ascii_lowercase())
         .collect())
@@ -2024,11 +2024,11 @@ async fn invite(to: &Target<'_>, a: &InviteArgs) -> Result<()> {
         .unwrap_or_else(|| "<server url>".into());
     let team = a.team.as_deref();
     println!(
-        "  memstore join {server} --org {org}{}",
+        "  ampup-memory join {server} --org {org}{}",
         team.map(|t| format!(" --team {t}")).unwrap_or_default()
     );
     println!(
-        "  claude mcp add --transport http memstore '{server}/mcp?org={org}{}'",
+        "  claude mcp add --transport http ampup-memory '{server}/mcp?org={org}{}'",
         team.map(|t| format!("&team={t}")).unwrap_or_default()
     );
     Ok(())
@@ -2078,7 +2078,7 @@ async fn set_up_machine(
     };
     match (dry, signed_in) {
         (true, true) => println!("signed in to {server} already: would keep it"),
-        (true, false) => println!("would sign in to {server} (memstore join)"),
+        (true, false) => println!("would sign in to {server} (ampup-memory join)"),
         (false, true) => {
             let mut ctx = Context::default();
             ctx.set("server", Some(server))?;
@@ -2108,7 +2108,7 @@ async fn set_up_machine(
     if dry {
         return Ok(());
     }
-    println!("restart each agent to load memstore. Checking:");
+    println!("restart each agent to load AmpUp Memory. Checking:");
     crate::hook::doctor().await
 }
 
@@ -2268,19 +2268,19 @@ async fn init(to: &Target<'_>, a: &InitArgs) -> Result<()> {
         profile.instructions(&org)
     );
     println!("\nNext:");
-    println!("  memstore invite --email <email> [--team <team>]   # or --file people.csv");
+    println!("  ampup-memory invite --email <email> [--team <team>]   # or --file people.csv");
     for s in &profile.sources {
         let how = match s.as_str() {
             "slack" => "export channels, or have the AmpUp writer stream them",
             "github" => "issues and PRs through a GitHub export",
             "email" | "calls" | "crm" => {
-                "load through your warehouse (memstore load / the SQL remember procedure)"
+                "load through your warehouse (ampup-memory load / the SQL remember procedure)"
             }
-            _ => "memstore ingest, or memstore load for a directory of episodes",
+            _ => "ampup-memory ingest, or ampup-memory load for a directory of episodes",
         };
         println!("  {s}: {how}");
     }
-    println!("  claude mcp add --transport http memstore '{server}/mcp?org={org}'");
+    println!("  claude mcp add --transport http ampup-memory '{server}/mcp?org={org}'");
     Ok(())
 }
 
@@ -2323,7 +2323,7 @@ async fn auth(to: &Target<'_>, a: &AuthCmd) -> Result<()> {
                 println!("Signed in for {o}: this sign-in counts in {o} only");
             }
             if config.get("org").is_none() {
-                println!("Choose your memory: memstore use <org> (or <org>/<team>)");
+                println!("Choose your memory: ampup-memory use <org> (or <org>/<team>)");
             }
         }
         AuthCmd::Logout => {
@@ -2354,7 +2354,7 @@ async fn auth(to: &Target<'_>, a: &AuthCmd) -> Result<()> {
         },
         AuthCmd::PrintToken => {
             let mut c =
-                Credentials::load(None)?.context("not signed in: run `memstore auth login`")?;
+                Credentials::load(None)?.context("not signed in: run `ampup-memory auth login`")?;
             println!("{}", c.bearer().await?);
         }
         AuthCmd::Setup(s) => setup(to, s).await?,
@@ -2411,7 +2411,7 @@ async fn setup(to: &Target<'_>, a: &SetupArgs) -> Result<()> {
         };
         anyhow::ensure!(
             !a.client_ids.is_empty(),
-            "--client-id: the client registered with {kind} for memstore"
+            "--client-id: the client registered with {kind} for AmpUp Memory"
         );
         // With no secret and nothing said, the CLI's client signs in with PKCE alone: a public client.
         let client_type = match (a.public_client, a.confidential_client, &a.client_secret) {
@@ -2445,14 +2445,14 @@ async fn setup(to: &Target<'_>, a: &SetupArgs) -> Result<()> {
         )
         .await?;
         if !a.test {
-            println!("Members sign in with: memstore auth login (with org {org} selected)");
-            println!("Try it first: memstore auth setup --org {org} --test");
+            println!("Members sign in with: ampup-memory auth login (with org {org} selected)");
+            println!("Try it first: ampup-memory auth setup --org {org} --test");
         }
     }
     if a.test {
         let server = Config::load()?
             .get("server")
-            .context("--test signs in to the server: memstore config set server <url>")?;
+            .context("--test signs in to the server: ampup-memory config set server <url>")?;
         let opts = client::LoginOptions {
             no_browser: a.no_browser,
             org: Some(org.clone()),

@@ -7,7 +7,7 @@ set -uo pipefail
 # Many concurrent writers each hold HTTP connection pools; the default 1024 open files is
 # not enough (the concurrent-commits check hits EMFILE on stock Ubuntu).
 ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
-B=./target/release/memstore
+B=./target/release/ampup-memory
 C=corpora
 N=${M7_EPISODES:-1000000}
 mkdir -p reports "$C"
@@ -42,7 +42,7 @@ with_rss() {
 eval_corpus() { # episodes, label
   local n=$1 dir="$C/c$1"
   [ -f "$dir/manifest.json" ] || $B gen 42 "$n" "$dir" >/dev/null || return 1
-  export MEMSTORE_INDEX_URI="$PWD/$C/index-m7-$n"; rm -rf "$MEMSTORE_INDEX_URI"
+  export AMPUP_MEMORY_INDEX_URI="$PWD/$C/index-m7-$n"; rm -rf "$AMPUP_MEMORY_INDEX_URI"
   stack_reset || { echo "stack failed"; return 1; }
   local t=$SECONDS
   $B load "$dir" 50000 questions || return 1
@@ -75,7 +75,7 @@ source_acl() { $B check source-acl "$C/c$N" "${M7_ACL_SAMPLE:-2000}" 42; }
 # Rebuild time: rebuild every derived index of the loaded corpus from the facts
 # tables into an empty location. Pass: projects to under 24 hours.
 rebuild_time() {
-  export MEMSTORE_INDEX_URI="$PWD/$C/index-m7-rebuild"; rm -rf "$MEMSTORE_INDEX_URI"
+  export AMPUP_MEMORY_INDEX_URI="$PWD/$C/index-m7-rebuild"; rm -rf "$AMPUP_MEMORY_INDEX_URI"
   local t=$SECONDS
   for s in $(scopes_of "$C/c$N"); do $B index "$s" >/dev/null || return 1; done
   local secs=$((SECONDS - t))

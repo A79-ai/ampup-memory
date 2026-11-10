@@ -132,12 +132,12 @@ async fn compile_settings_change_only_the_scopes_that_set_them() {
     let url = model(seen.clone()).await;
     // SAFETY: this test runs alone in its process (`own_process`).
     unsafe {
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_COMPILE", "openai");
-        std::env::set_var("MEMSTORE_COMPILE_URL", &url);
-        std::env::set_var("MEMSTORE_COMPILE_MODEL", "qwen/qwen3.7-plus");
-        std::env::remove_var("MEMSTORE_COMPILE_BATCH");
-        std::env::remove_var("MEMSTORE_AIP_MODEL");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_COMPILE", "openai");
+        std::env::set_var("AMPUP_MEMORY_COMPILE_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_COMPILE_MODEL", "qwen/qwen3.7-plus");
+        std::env::remove_var("AMPUP_MEMORY_COMPILE_BATCH");
+        std::env::remove_var("AMPUP_MEMORY_AIP_MODEL");
     }
     let cx = memstore::extract::Extractor::compile_from_env()
         .unwrap()

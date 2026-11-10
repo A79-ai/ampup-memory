@@ -94,7 +94,7 @@ publish = false
 doctest = false
 
 [[bin]]
-name = "memstore"
+name = "ampup-memory"
 path = "src/main.rs"
 test = false
 

@@ -162,7 +162,7 @@ pub struct ClosureStore {
     /// The pilot team csv's closures by email (`crate::people::team`) in force, under every caller's token
     /// groups and the edits: [`Self::team_of`] the two sources below.
     team: Mutex<HashMap<String, Vec<String>>>,
-    /// This server's team csv (`MEMSTORE_TEAM_CSV`), read at start.
+    /// This server's team csv (`AMPUP_MEMORY_TEAM_CSV`), read at start.
     team_file: Mutex<Option<HashMap<String, Vec<String>>>>,
     /// The team csv last pushed to the directory (`POST /team`, `team.csv`), until a clear.
     team_pushed: Mutex<Option<HashMap<String, Vec<String>>>>,
@@ -314,7 +314,7 @@ impl ClosureStore {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
-    /// This server's own team csv's closures (`MEMSTORE_TEAM_CSV`, emails already normalized).
+    /// This server's own team csv's closures (`AMPUP_MEMORY_TEAM_CSV`, emails already normalized).
     pub fn set_team(&self, closures: HashMap<String, Vec<String>>) {
         *self.team_file.lock().unwrap() = Some(closures);
         self.recompute_team();
@@ -328,7 +328,7 @@ impl ClosureStore {
     }
 }
 
-/// The team closures in force from a server's own csv (`MEMSTORE_TEAM_CSV`) and the one pushed to the
+/// The team closures in force from a server's own csv (`AMPUP_MEMORY_TEAM_CSV`) and the one pushed to the
 /// directory (`POST /team`, until `DELETE /team` clears it). Either alone is the team. With both, the team is
 /// the people both list, each with the groups the pushed csv (the later word, a reorg) gives them: someone
 /// taken out of either (a leaver removed from the config file after a push, or from a push while the file

@@ -6,7 +6,7 @@
 //!   retention policy, a retraction, an ACL narrowed until no one the episode was shared with can read it), none of
 //!   which know of the log, so the sweep asks the memory, as each of the episode's original readers, whether it can
 //!   still be read, and the answer log whether the run still exists. A server with a log runs it every
-//!   `MEMSTORE_TRAIN_LOG_SWEEP_SECS` (default 3600) and after the operations that remove a person's memory.
+//!   `AMPUP_MEMORY_TRAIN_LOG_SWEEP_SECS` (default 3600) and after the operations that remove a person's memory.
 //! - **The export** writes a scope's calls as JSON lines, one training example each: `messages` (the prompt, then the
 //!   reply the model should give) and `meta` (the call, what it read, the caller's outcomes, what later came of it,
 //!   and a `split`). It keeps a call only if its reply was whole, usable and parsed as its role requires, its caller's
@@ -53,10 +53,10 @@ async fn episode_alive(store: &Store, scope: &Scope, id: &str, acl: &[String]) -
     Ok(false)
 }
 
-/// How many days a call that read nothing the memory can forget is kept (`MEMSTORE_TRAIN_LOG_UNTRACKED_DAYS`,
+/// How many days a call that read nothing the memory can forget is kept (`AMPUP_MEMORY_TRAIN_LOG_UNTRACKED_DAYS`,
 /// default 30).
 fn untracked_days() -> i64 {
-    std::env::var("MEMSTORE_TRAIN_LOG_UNTRACKED_DAYS")
+    std::env::var("AMPUP_MEMORY_TRAIN_LOG_UNTRACKED_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30)

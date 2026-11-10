@@ -43,9 +43,9 @@ const MAX_ANSWER: usize = 20_000;
 /// Most fact ids one answer may cite.
 const MAX_CITED: usize = 100;
 /// Most entries (answers, runs, ratings and rewards) one person may log in a scope in a day:
-/// `MEMSTORE_LOG_PER_DAY`, default 1000.
+/// `AMPUP_MEMORY_LOG_PER_DAY`, default 1000.
 fn max_per_day() -> usize {
-    std::env::var("MEMSTORE_LOG_PER_DAY")
+    std::env::var("AMPUP_MEMORY_LOG_PER_DAY")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(1_000)
@@ -405,10 +405,10 @@ pub async fn runs_cap(store: &Store, scope: &Scope, who: &Principal, adding: usi
     Ok(())
 }
 
-/// Most runs one person may record in a scope in a day: `MEMSTORE_RUNS_PER_DAY`, default 100. An agent that
+/// Most runs one person may record in a scope in a day: `AMPUP_MEMORY_RUNS_PER_DAY`, default 100. An agent that
 /// records every run it makes, for advice to learn from (`crate::advice`), needs more.
 fn max_runs_per_day() -> usize {
-    std::env::var("MEMSTORE_RUNS_PER_DAY")
+    std::env::var("AMPUP_MEMORY_RUNS_PER_DAY")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(100)

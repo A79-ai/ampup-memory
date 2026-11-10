@@ -122,13 +122,13 @@ def prepare(args):
 def environment(root, store):
     # Carry executable/library paths, but no inherited model or cloud configuration.
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("MEMSTORE_", "OPENROUTER_", "OPENAI_", "ANTHROPIC_", "SENTRY_"))}
-    env.update(MEMSTORE_EMBED="local", MEMSTORE_INDEX_URI=str(store / "index"),
-               MEMSTORE_EMBED_CACHE=str(root / "embeddings"),
-               MEMSTORE_CONFIG_DIR=str(root / "config"), MEMSTORE_EXTRACT="off",
-               MEMSTORE_COMPILE="off", MEMSTORE_ADVICE_LEARN="off", MEMSTORE_DREAM="off",
-               MEMSTORE_MAINTAIN_SECS="0", MEMSTORE_KEEP_WARM_SECS="0",
-               MEMSTORE_CATALOG_REFRESH_SECS="86400", LANCE_CPU_THREADS="2")
+           if not k.startswith(("AMPUP_MEMORY_", "MEMSTORE_", "OPENROUTER_", "OPENAI_", "ANTHROPIC_", "SENTRY_"))}
+    env.update(AMPUP_MEMORY_EMBED="local", AMPUP_MEMORY_INDEX_URI=str(store / "index"),
+               AMPUP_MEMORY_EMBED_CACHE=str(root / "embeddings"),
+               AMPUP_MEMORY_CONFIG_DIR=str(root / "config"), AMPUP_MEMORY_EXTRACT="off",
+               AMPUP_MEMORY_COMPILE="off", AMPUP_MEMORY_ADVICE_LEARN="off", AMPUP_MEMORY_DREAM="off",
+               AMPUP_MEMORY_MAINTAIN_SECS="0", AMPUP_MEMORY_KEEP_WARM_SECS="0",
+               AMPUP_MEMORY_CATALOG_REFRESH_SECS="86400", LANCE_CPU_THREADS="2")
     return env
 
 
@@ -142,7 +142,7 @@ class Server:
     def __init__(self, binary, store, root, log):
         self.port = free_port()
         env = environment(root, store)
-        env["MEMSTORE_METRICS_PORT"] = str(free_port())
+        env["AMPUP_MEMORY_METRICS_PORT"] = str(free_port())
         self.log = log.open("w")
         self.process = subprocess.Popen([str(binary), "serve", "--local", str(store),
                                          "org", str(self.port)], env=env,

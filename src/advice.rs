@@ -52,7 +52,7 @@
 //!
 //! [`get`] serves them (MCP `get_advice`, `POST /advice`). The routing model reads one line per kind of task the
 //! caller may be advised on: each situation with a note or linked procedures, and each AIP skill no such situation
-//! links (so a scope with skills and no runs yet is served its procedures); above `MEMSTORE_ADVICE_ROUTE_SHORTLIST`
+//! links (so a scope with skills and no runs yet is served its procedures); above `AMPUP_MEMORY_ADVICE_ROUTE_SHORTLIST`
 //! lines (60), only those that rank best for the question by keyword and embedding ([`crate::advice_route`]). The
 //! decisions model weighs the situations first, all of them, and the compiled skills only where none fits, unless
 //! the scope's `advice_skills` says otherwise ([`Skills`]). It
@@ -116,10 +116,10 @@
 //! succeeded 64% of the time (94) against the holdout's 67% (18), while the judge before this credited a note in
 //! 61 of the 94; the most served note ran 5,043 characters where one item did the work.
 //!
-//! Learning uses a strong model: `MEMSTORE_ADVICE_MODEL`, else Claude Opus 5.5, on the backend `MEMSTORE_ADVICE`
+//! Learning uses a strong model: `AMPUP_MEMORY_ADVICE_MODEL`, else Claude Opus 5.5, on the backend `AMPUP_MEMORY_ADVICE`
 //! names (else compile's, then extraction's: [`Extractor::advice_from_env`]). Routing uses a small one, on every
-//! call: `MEMSTORE_ADVICE_ROUTE_MODEL`, else Claude Haiku 5.5, on extraction's backend
-//! ([`Extractor::route_from_env`]); learning reflects long runs with it too (`MEMSTORE_ADVICE_REFLECT=off` doesn't).
+//! call: `AMPUP_MEMORY_ADVICE_ROUTE_MODEL`, else Claude Haiku 5.5, on extraction's backend
+//! ([`Extractor::route_from_env`]); learning reflects long runs with it too (`AMPUP_MEMORY_ADVICE_REFLECT=off` doesn't).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -610,9 +610,9 @@ const KINDS: [&str; 9] = [
 /// items from failures, corrections and the team's own knowledge, generic practice left out, within [`NOTE_BUDGET`].
 const NOTE_FORMAT: &str = "kinds-3-budgeted";
 
-/// Days a `[state]` item is served after it was written (`MEMSTORE_ADVICE_STATE_DAYS`, default 7).
+/// Days a `[state]` item is served after it was written (`AMPUP_MEMORY_ADVICE_STATE_DAYS`, default 7).
 fn state_days() -> i64 {
-    std::env::var("MEMSTORE_ADVICE_STATE_DAYS")
+    std::env::var("AMPUP_MEMORY_ADVICE_STATE_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(7)
@@ -671,9 +671,10 @@ static REFLECTED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, String>>>
     std::sync::LazyLock::new(Default::default);
 
 /// Whether learning reflects long runs before writing notes from them ([`reflect`]):
-/// `MEMSTORE_ADVICE_REFLECT=off` turns it off.
+/// `AMPUP_MEMORY_ADVICE_REFLECT=off` turns it off.
 fn reflects() -> bool {
-    !std::env::var("MEMSTORE_ADVICE_REFLECT").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"))
+    !std::env::var("AMPUP_MEMORY_ADVICE_REFLECT")
+        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"))
 }
 
 /// The map: categories and their situations, which run went where, and what each note was written from.
@@ -738,10 +739,10 @@ struct Written {
     format: String,
 }
 
-/// Days a note may go unserved and unrouted before learning stops updating it (`MEMSTORE_ADVICE_EDIT_IDLE_DAYS`,
+/// Days a note may go unserved and unrouted before learning stops updating it (`AMPUP_MEMORY_ADVICE_EDIT_IDLE_DAYS`,
 /// default 14; `0` updates every note whose runs changed, as before).
 fn edit_idle_days() -> i64 {
-    std::env::var("MEMSTORE_ADVICE_EDIT_IDLE_DAYS")
+    std::env::var("AMPUP_MEMORY_ADVICE_EDIT_IDLE_DAYS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(14)
@@ -766,11 +767,11 @@ async fn used_since(store: &Store, scope: &Scope, since: i64) -> Result<BTreeSet
     Ok(out)
 }
 
-/// New runs a situation needs before its note is rewritten (`MEMSTORE_ADVICE_NOTE_MIN_NEW`, default 5), and new
+/// New runs a situation needs before its note is rewritten (`AMPUP_MEMORY_ADVICE_NOTE_MIN_NEW`, default 5), and new
 /// wrong runs, which say more ([`NOTE_MIN_WRONG`]). A rewrite is one long call to the learning model, the
 /// strongest, so it waits for enough new evidence to change the note.
 fn note_min_new() -> usize {
-    std::env::var("MEMSTORE_ADVICE_NOTE_MIN_NEW")
+    std::env::var("AMPUP_MEMORY_ADVICE_NOTE_MIN_NEW")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(5)
@@ -779,9 +780,9 @@ fn note_min_new() -> usize {
 const NOTE_MIN_WRONG: usize = 2;
 
 /// Right runs a situation without enough wrong ones needs for a note of how it's done
-/// (`MEMSTORE_ADVICE_MIN_RIGHT`, default 4): a procedure seen working that often, never one run's.
+/// (`AMPUP_MEMORY_ADVICE_MIN_RIGHT`, default 4): a procedure seen working that often, never one run's.
 fn min_right() -> usize {
-    std::env::var("MEMSTORE_ADVICE_MIN_RIGHT")
+    std::env::var("AMPUP_MEMORY_ADVICE_MIN_RIGHT")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(4)
@@ -806,7 +807,7 @@ fn rewrite(
 
 /// The rewarded runs or sessions a person's own advice waits for in `scope`, where it asks for fewer than the
 /// server's bars (`advice_personal_runs`, a team's over its org's, else the server's
-/// `MEMSTORE_ADVICE_PERSONAL_RUNS`): their map once they have that many new ones, a note at that many runs, and a
+/// `AMPUP_MEMORY_ADVICE_PERSONAL_RUNS`): their map once they have that many new ones, a note at that many runs, and a
 /// note written again after that many new ones, each bar lowered to it, never raised. None where neither says.
 pub async fn personal_runs(store: &Store, scope: &Scope) -> Option<usize> {
     match store.directory().await {
@@ -815,9 +816,9 @@ pub async fn personal_runs(store: &Store, scope: &Scope) -> Option<usize> {
     }
 }
 
-/// The server's `MEMSTORE_ADVICE_PERSONAL_RUNS`, where no team or org setting says ([`personal_runs`]).
+/// The server's `AMPUP_MEMORY_ADVICE_PERSONAL_RUNS`, where no team or org setting says ([`personal_runs`]).
 pub fn personal_runs_from_env() -> Option<usize> {
-    std::env::var("MEMSTORE_ADVICE_PERSONAL_RUNS")
+    std::env::var("AMPUP_MEMORY_ADVICE_PERSONAL_RUNS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .filter(|n| *n > 0)
@@ -1007,7 +1008,7 @@ pub struct Learned {
     /// from what at least that many people did, so no note holds one person's private traces. A note written
     /// before is taken out of the map.
     pub few_people: usize,
-    /// Notes whose runs changed, but not yet enough to rewrite them (`MEMSTORE_ADVICE_NOTE_MIN_NEW`).
+    /// Notes whose runs changed, but not yet enough to rewrite them (`AMPUP_MEMORY_ADVICE_NOTE_MIN_NEW`).
     pub waiting: usize,
     /// Notes the advisor model refused or answered without the sections.
     pub dropped: usize,
@@ -1039,7 +1040,7 @@ pub struct Learned {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub malformed: usize,
     /// Notes with new runs left as they were because nobody was served or routed to them lately
-    /// (`MEMSTORE_ADVICE_EDIT_IDLE_DAYS`).
+    /// (`AMPUP_MEMORY_ADVICE_EDIT_IDLE_DAYS`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub idle: usize,
     /// What curating did, where the scope curates advice ([`crate::advice_curate`]).
@@ -1213,9 +1214,9 @@ impl Format {
         }
     }
 
-    /// `MEMSTORE_ADVICE_FORMAT`: `notes` (the default) or `checklist`.
+    /// `AMPUP_MEMORY_ADVICE_FORMAT`: `notes` (the default) or `checklist`.
     pub fn from_env() -> Format {
-        std::env::var("MEMSTORE_ADVICE_FORMAT")
+        std::env::var("AMPUP_MEMORY_ADVICE_FORMAT")
             .ok()
             .and_then(|f| Format::parse(&f))
             .unwrap_or_default()
@@ -3579,7 +3580,7 @@ pub struct Pass {
     /// Notes, by key, written again whole now whatever changed: to mend one ([`malformed`]), or to write one under
     /// rules that changed since.
     pub rewrite: BTreeSet<String>,
-    /// Every note whose runs changed is updated, served lately or not (`MEMSTORE_ADVICE_EDIT_IDLE_DAYS`).
+    /// Every note whose runs changed is updated, served lately or not (`AMPUP_MEMORY_ADVICE_EDIT_IDLE_DAYS`).
     pub force: bool,
 }
 
@@ -4584,7 +4585,7 @@ pub struct Advised {
     pub note: bool,
     /// The skills the text holds, in its order: the note's, then each procedure served in full.
     pub skills: Vec<Skill>,
-    /// How the routing call was shortlisted, when it had more lines than `MEMSTORE_ADVICE_ROUTE_SHORTLIST`.
+    /// How the routing call was shortlisted, when it had more lines than `AMPUP_MEMORY_ADVICE_ROUTE_SHORTLIST`.
     pub shortlist: Option<crate::advice_route::Shortlist>,
     /// The scope it was served from, when that is another scope the caller reads ([`get_across`]).
     pub scope: Option<String>,

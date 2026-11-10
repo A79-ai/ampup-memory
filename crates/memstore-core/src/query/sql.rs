@@ -45,8 +45,8 @@ fn limits() -> (Duration, usize) {
                 .unwrap_or(d)
         };
         (
-            Duration::from_secs(n("MEMSTORE_SQL_METRIC_SECS", 30)),
-            n("MEMSTORE_SQL_METRIC_MB", 512) as usize * 1024 * 1024,
+            Duration::from_secs(n("AMPUP_MEMORY_SQL_METRIC_SECS", 30)),
+            n("AMPUP_MEMORY_SQL_METRIC_MB", 512) as usize * 1024 * 1024,
         )
     });
     *L

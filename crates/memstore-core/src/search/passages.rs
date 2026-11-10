@@ -153,8 +153,8 @@ impl PassageFilter {
     }
 }
 
-/// The chunking a store starts with, as (bytes, overlap): `MEMSTORE_CHUNK_BYTES` and
-/// `MEMSTORE_CHUNK_OVERLAP`, else [`CHUNK_BYTES`] and [`OVERLAP_BYTES`].
+/// The chunking a store starts with, as (bytes, overlap): `AMPUP_MEMORY_CHUNK_BYTES` and
+/// `AMPUP_MEMORY_CHUNK_OVERLAP`, else [`CHUNK_BYTES`] and [`OVERLAP_BYTES`].
 pub fn default_chunking() -> (usize, usize) {
     let var = |k: &str, d: usize| {
         std::env::var(k)
@@ -163,8 +163,8 @@ pub fn default_chunking() -> (usize, usize) {
             .filter(|&n: &usize| n > 0)
             .unwrap_or(d)
     };
-    let bytes = var("MEMSTORE_CHUNK_BYTES", CHUNK_BYTES).max(100);
-    let overlap = std::env::var("MEMSTORE_CHUNK_OVERLAP")
+    let bytes = var("AMPUP_MEMORY_CHUNK_BYTES", CHUNK_BYTES).max(100);
+    let overlap = std::env::var("AMPUP_MEMORY_CHUNK_OVERLAP")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(OVERLAP_BYTES)
@@ -459,7 +459,7 @@ const COLUMNS: &[&str] = &[
 ];
 
 /// Passage rows read from the index (see `search::rows`), with their data file: a chunk of text each (about
-/// 1 KB), so at most some tens of MB. `MEMSTORE_INDEX_PASSAGE_ROWS` overrides.
+/// 1 KB), so at most some tens of MB. `AMPUP_MEMORY_INDEX_PASSAGE_ROWS` overrides.
 const ROWS_MAX: usize = 50_000;
 
 static ROWS: std::sync::LazyLock<search::rows::RowCache<(String, Passage)>> =
@@ -1169,7 +1169,7 @@ pub async fn search(
     let q_terms = query_terms(text, extra);
     let mut fts: Vec<String> = q_terms.iter().cloned().collect();
     fts.sort_unstable();
-    // Of a longer query, the keyword list searches the `MEMSTORE_RANK_PASSAGE_MAX_TERMS` (default 256) terms
+    // Of a longer query, the keyword list searches the `AMPUP_MEMORY_RANK_PASSAGE_MAX_TERMS` (default 256) terms
     // the fewest passages hold ([`search::fewest`]), as a fact search does its 64: on a busy production pod, where
     // agents searched with prompts of 900 words and more, passage lists took 1.4 s at the median and up to
     // 11 s, and a 400-word query's took half as long at 256 terms. Fewer cost relevance: at 64, whole prompts

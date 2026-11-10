@@ -1,7 +1,7 @@
 name: Catalog nightly
 
 # The replica, offboarding and isolation flows on a real Iceberg REST catalog over object storage, with two
-# `memstore serve` processes (tests/it/rest_catalog.rs). The fixture is tests/fixtures/rest-catalog (Apache
+# `ampup-memory serve` processes (tests/it/rest_catalog.rs). The fixture is tests/fixtures/rest-catalog (Apache
 # Iceberg's REST fixture and MinIO, public images run with docker compose on the runner): no cloud account and no
 # secrets. ci.yml runs the rest of the suite, where these tests skip.
 on:

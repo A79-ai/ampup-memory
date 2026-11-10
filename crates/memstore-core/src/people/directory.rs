@@ -24,7 +24,7 @@
 //! a connector that feeds memory can't be used to read it back. A `recorder` key does nothing as itself: it
 //! records runs and asks advice for a member of its org (or team) that it names ([`Directory::holds_member`]).
 //!
-//! Keys an operator kept in a keys file (`MEMSTORE_API_KEYS`, `memstore keys new`) move here with
+//! Keys an operator kept in a keys file (`AMPUP_MEMORY_API_KEYS`, `memstore keys new`) move here with
 //! `memstore apikey import`: each file row becomes a directory key with the same sha256, so its holder
 //! keeps using the same key, and with no more than it had (an admin key, or one holding groups, is
 //! refused rather than narrowed in silence or widened). Once a file key is in the directory, the
@@ -80,7 +80,7 @@ const MAX_READS: usize = 8;
 /// The most sources one compile round may take (`Settings::compile_batch`).
 const MAX_COMPILE_BATCH: usize = 100;
 /// The most rewarded runs `advice_personal_runs` may name: the server's own bar for a person's first map
-/// (`MEMSTORE_ADVICE_MIN_NEW`) is 10 by default, and the setting only ever lowers bars.
+/// (`AMPUP_MEMORY_ADVICE_MIN_NEW`) is 10 by default, and the setting only ever lowers bars.
 const MAX_PERSONAL_RUNS: usize = 10;
 /// What a scope's compile sources may be said to be (`Settings::compile_kind`); `""` unsets it.
 pub const COMPILE_KINDS: &[&str] = &["", "errors"];
@@ -412,7 +412,7 @@ pub struct Org {
     )]
     pub provider: Option<Provider>,
     /// The Auth0 Organization (`org_…`) whose sign-ins through the platform's Auth0 tenant count here
-    /// (`MEMSTORE_AUTH0_ISSUER`). Set by the operator only; one Auth0 Organization is one org's.
+    /// (`AMPUP_MEMORY_AUTH0_ISSUER`). Set by the operator only; one Auth0 Organization is one org's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth0_org: Option<String>,
     /// Email domains whose verified addresses join the org without an invite, each with the team they
@@ -595,7 +595,7 @@ pub struct KeySources {
     pub sources: Vec<String>,
 }
 
-/// One row of a keys file (`MEMSTORE_API_KEYS`, `memstore keys new`), as `memstore apikey import` reads
+/// One row of a keys file (`AMPUP_MEMORY_API_KEYS`, `memstore keys new`), as `memstore apikey import` reads
 /// it: only the key's sha256, never the key.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FileKey {
@@ -609,7 +609,7 @@ pub struct FileKey {
 }
 
 /// A keys file's rows: a JSON list of `{id, sha256, user, groups, admin}` (the keys file and
-/// `MEMSTORE_API_KEYS` are the same format), or `{"keys": [...]}`.
+/// `AMPUP_MEMORY_API_KEYS` are the same format), or `{"keys": [...]}`.
 pub fn parse_file_keys(text: &str) -> Result<Vec<FileKey>> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -653,7 +653,7 @@ pub struct Provider {
     pub client_type: Option<ClientType>,
     /// The CLI client's secret, for public clients the provider gives one anyway (Google's installed
     /// apps): handed to anyone who asks how to sign in, but never kept in the directory, which anyone who
-    /// can read the bucket reads. It is stored as `env:MEMSTORE_IDP_SECRET_<NAME>` or `sealed:…` (see
+    /// can read the bucket reads. It is stored as `env:AMPUP_MEMORY_IDP_SECRET_<NAME>` or `sealed:…` (see
     /// [`crate::auth::secret`]); events written before that may hold it in plain text, which still works
     /// and `memstore identity check` flags. A confidential client's secret is refused: it is never served.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -749,7 +749,7 @@ pub struct SignIn {
     /// That Organization (the token's `org_id`).
     pub auth0_org: Option<String>,
     /// Signed in through the platform's Auth0 tenant for the operators' Organization
-    /// (`MEMSTORE_AUTH0_OPERATORS_ORG`): they manage orgs (create them, bind them to Auth0, set their
+    /// (`AMPUP_MEMORY_AUTH0_OPERATORS_ORG`): they manage orgs (create them, bind them to Auth0, set their
     /// admins and members, see every org) and nothing else: [`Change::operators`].
     pub operator: bool,
 }
@@ -828,12 +828,12 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compile: Option<bool>,
     /// The sources the scope's skill library is compiled from: source prefixes (`kb:`, `github:`), or `*` for
-    /// every source. Unset, nothing is compiled (or what the server's `MEMSTORE_COMPILE_SOURCES` names): a
+    /// every source. Unset, nothing is compiled (or what the server's `AMPUP_MEMORY_COMPILE_SOURCES` names): a
     /// compile is the learning model reading every source, so it is chosen, never on by default. An empty
     /// list unsets it, back to the org's (or the server's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compile_sources: Option<Vec<String>>,
-    /// Sources per compile round in the scope, instead of the server's `MEMSTORE_COMPILE_BATCH` (12). A round
+    /// Sources per compile round in the scope, instead of the server's `AMPUP_MEMORY_COMPILE_BATCH` (12). A round
     /// writes at most 8 skills, so where each source is a situation of its own (an error report) a batch of 8 or
     /// fewer leaves none without its skill. It doesn't change the compiler's id: nothing compiles again. 0 unsets
     /// it, back to the org's (or the server's).
@@ -855,23 +855,23 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice_procedures: Option<bool>,
     /// The people a note learned from runs must have helped (each by their latest judged session) before it is
-    /// served outside the trial arm (`crate::sessions`), over the server's `MEMSTORE_ADVICE_EVIDENCE`. 0 serves
+    /// served outside the trial arm (`crate::sessions`), over the server's `AMPUP_MEMORY_ADVICE_EVIDENCE`. 0 serves
     /// every note: where agents ask outside sessions (a review bot's `POST /advice`), no session ever judges one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice_evidence: Option<usize>,
     /// The people whose runs a team note learned from runs must come from, and each of its items (by the runs it
-    /// cites), over the server's `MEMSTORE_ADVICE_LEARN_PEOPLE` (3): so no team note holds one person's private
+    /// cites), over the server's `AMPUP_MEMORY_ADVICE_LEARN_PEOPLE` (3): so no team note holds one person's private
     /// traces, or one person's preference as the team's. Never below 2 (`crate::advice`); a person's own notes are
     /// learned from that person alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice_learn_people: Option<usize>,
     /// The rewarded runs or sessions each person's own advice waits for in the scope (`crate::advice_loop`), where
     /// that is fewer than the server's bars: a person's map is learned once they have this many new ones (instead
-    /// of `MEMSTORE_ADVICE_MIN_NEW`, 10), a situation of theirs gets a note at this many runs (instead of 2 that
+    /// of `AMPUP_MEMORY_ADVICE_MIN_NEW`, 10), a situation of theirs gets a note at this many runs (instead of 2 that
     /// went wrong or 4 that went right), and their note is written again after this many new runs (instead of
-    /// `MEMSTORE_ADVICE_NOTE_MIN_NEW`, 5, or 2 wrong); and it is learned right after a session of theirs ends
+    /// `AMPUP_MEMORY_ADVICE_NOTE_MIN_NEW`, 5, or 2 wrong); and it is learned right after a session of theirs ends
     /// rewarded, instead of at the advice timer's next round. A bar already lower stays. The team's notes are
-    /// untouched. 1 to 10; 0 unsets it, back to the org's (or the server's `MEMSTORE_ADVICE_PERSONAL_RUNS`).
+    /// untouched. 1 to 10; 0 unsets it, back to the org's (or the server's `AMPUP_MEMORY_ADVICE_PERSONAL_RUNS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice_personal_runs: Option<usize>,
     /// How advice routes over the skills compiled from the scope's documents (`crate::advice`): `fallback` (the
@@ -899,21 +899,21 @@ pub struct Settings {
     /// Whether the engine reads every episode of the scope no goal extracts for facts, goal-blind
     /// (`crate::extract`): what the team remembers (its Claude Code sessions, notes) becomes facts with no schema naming it
     /// set up, which `search_memory` then finds with the episode cited. A model call per episode. On unless set
-    /// false; `MEMSTORE_EXTRACT_GOAL_BLIND=1` turns it on everywhere, whatever the settings say.
+    /// false; `AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1` turns it on everywhere, whatever the settings say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extract: Option<bool>,
     /// The model the scope's episodes are extracted with, on the server's extraction backend, instead of the
-    /// server's (`MEMSTORE_EXTRACT_MODEL`). The operator's to set: a model spends the platform's budget.
+    /// server's (`AMPUP_MEMORY_EXTRACT_MODEL`). The operator's to set: a model spends the platform's budget.
     /// Empty: back to the server's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extract_model: Option<String>,
-    /// The model skill libraries are compiled with, on the compile backend (`MEMSTORE_COMPILE_MODEL`).
+    /// The model skill libraries are compiled with, on the compile backend (`AMPUP_MEMORY_COMPILE_MODEL`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compile_model: Option<String>,
-    /// The model each skill's AIP graph is compiled with, on the compile backend (`MEMSTORE_AIP_MODEL`).
+    /// The model each skill's AIP graph is compiled with, on the compile backend (`AMPUP_MEMORY_AIP_MODEL`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aip_model: Option<String>,
-    /// Whether the server's training log (`MEMSTORE_TRAIN_LOG`) keeps the scope's model calls whole, prompts and
+    /// Whether the server's training log (`AMPUP_MEMORY_TRAIN_LOG`) keeps the scope's model calls whole, prompts and
     /// replies, to train the org's own models from. The text of the org's memory, so the operator's to set, and off
     /// unless set true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -936,19 +936,19 @@ pub struct Settings {
     /// stated again within its predicate's `freshness_days` reads "as of <date>, not confirmed since", and a plan
     /// date that has passed while its entity is still pending reads overdue, in `search_memory`, `/search`,
     /// `query_memory`'s entity cards and facts, and the brief. Nothing is dropped or ranked differently. Unset,
-    /// the server's `MEMSTORE_FRESHNESS` decides (off by default).
+    /// the server's `AMPUP_MEMORY_FRESHNESS` decides (off by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<bool>,
     /// Whether the scope keeps facts that disagree apart (`crate::conflicts`): write-time reconcile may record a
     /// new fact as in conflict with a known one instead of ending it, and a value another fact disagrees with reads
     /// `conflict: "<other value>" (<source>, <date>)` beside it, in `search_memory`, `/search`, `query_memory`'s
-    /// entity cards and facts, and the brief. Unset, the server's `MEMSTORE_CONFLICTS` decides (off by default).
+    /// entity cards and facts, and the brief. Unset, the server's `AMPUP_MEMORY_CONFLICTS` decides (off by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflicts: Option<bool>,
     /// Whether the scope's learned advice is curated as it is learned (`crate::advice`'s curation): a note whose
     /// served runs do worse than the rest of its situation's is withheld (kept, served to no one), a note changes
     /// by small edits instead of being rewritten whole (an update dropping more than a quarter of it is refused),
-    /// and situations that are the same task are merged. Unset, the server's `MEMSTORE_ADVICE_CURATION` decides
+    /// and situations that are the same task are merged. Unset, the server's `AMPUP_MEMORY_ADVICE_CURATION` decides
     /// (off by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice_curation: Option<bool>,
@@ -960,7 +960,7 @@ pub struct Settings {
     pub advice_automated: Option<bool>,
     /// Whether each person's own notes in the scope are folded into one deduplicated, capped profile (the newer
     /// note winning where two disagree), which `start_session` hands them with their newest few notes instead of
-    /// only their newest 20 (`memstore::profile`). Unset, the server's `MEMSTORE_PROFILE` decides (off by default).
+    /// only their newest 20 (`memstore::profile`). Unset, the server's `AMPUP_MEMORY_PROFILE` decides (off by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<bool>,
     /// Whether the plugin's hooks keep each coding agent session's whole transcript (prompts, answers, every tool
@@ -968,14 +968,14 @@ pub struct Settings {
     /// later pass can check what was noted against what actually ran (`memstore::transcripts`). Never extracted,
     /// searched or read for the team; forgetting, retention and offboarding remove it as any of their episodes.
     /// Tool output can hold anything the session read, customers' data too, so off unless set true. Unset, the
-    /// server's `MEMSTORE_TRANSCRIPTS` decides (off by default).
+    /// server's `AMPUP_MEMORY_TRANSCRIPTS` decides (off by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcripts: Option<bool>,
     /// How the MCP `initialize` instructions and the descriptions of `start_session`, `get_advice`, `end_session`
     /// and `remember_memory` read: `default`, the session's call order (start_session first, get_advice when a
     /// task starts, remember_memory in the turn a preference is stated, end_session last); `purpose`, what memory
     /// is for and when it helps, with no fixed procedure, the judgment left to the agent. The tools, their
-    /// arguments and permissions are the same either way. Unset (`""`), the server's `MEMSTORE_INSTRUCTIONS`
+    /// arguments and permissions are the same either way. Unset (`""`), the server's `AMPUP_MEMORY_INSTRUCTIONS`
     /// decides (`default` unless set).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
@@ -989,7 +989,7 @@ pub struct Settings {
     pub reads: Option<Vec<String>>,
     /// Whether `serve`'s nightly maintenance window deletes from storage what the scope's sources deleted
     /// (`POST /retract`) and what aged past its retention policy, once hidden for longer than the server's
-    /// `MEMSTORE_PURGE_GRACE` (7 days): the episodes, their bodies, the facts citing them and what hangs off those,
+    /// `AMPUP_MEMORY_PURGE_GRACE` (7 days): the episodes, their bodies, the facts citing them and what hangs off those,
     /// left out of the same rewrite that compacts each table, as `memstore org purge` does on request. Reads hide
     /// all of it already; this takes it out of the files. What it deletes can't be brought back by loosening the
     /// policy (and the store's own soft delete, where it has one, keeps it only as long as that lasts). Off unless
@@ -1338,7 +1338,7 @@ pub struct Snapshot {
     /// µs since the epoch.
     pub taken_at: i64,
     pub actor: String,
-    /// What vouches for it: a seal under the server's `MEMSTORE_SECRET_KEY` over its format, extent,
+    /// What vouches for it: a seal under the server's `AMPUP_MEMORY_SECRET_KEY` over its format, extent,
     /// digest and state ([`Snapshot::sealed`]). None: written by a server without the key, or before
     /// snapshots were sealed. A snapshot this server can't vouch for is checked against the log.
     pub seal: Option<String>,
@@ -1497,7 +1497,7 @@ pub struct Directory {
     #[serde(skip)]
     pub closure_edits: BTreeMap<String, ClosureEdit>,
     /// The pilot team csv last pushed (`team.csv`; none: never pushed, or cleared since). Where a server has
-    /// its own csv too (`MEMSTORE_TEAM_CSV`), only people both list hold team groups (this csv's)
+    /// its own csv too (`AMPUP_MEMORY_TEAM_CSV`), only people both list hold team groups (this csv's)
     /// ([`crate::auth::acl::team_of`]).
     #[serde(skip)]
     pub team_csv: Option<String>,
@@ -1773,7 +1773,7 @@ impl Directory {
     }
 
     /// The directory as of its last change: the newest snapshot this server knows plus the changes
-    /// after it (see [`Store::directory`]), at most `MEMSTORE_MAX_STALENESS_MS` behind other servers.
+    /// after it (see [`Store::directory`]), at most `AMPUP_MEMORY_MAX_STALENESS_MS` behind other servers.
     pub async fn load(store: &Store) -> Result<Self> {
         Ok(store.directory().await?.dir.clone())
     }
@@ -2160,7 +2160,7 @@ impl Directory {
 
     /// The people a learned note must have helped before `scope` serves it outside the trial arm
     /// (`crate::sessions::min_evidence`): its team's `advice_evidence` setting, else its org's; none (the server's
-    /// `MEMSTORE_ADVICE_EVIDENCE`) where neither sets it, or in a scope the directory doesn't hold.
+    /// `AMPUP_MEMORY_ADVICE_EVIDENCE`) where neither sets it, or in a scope the directory doesn't hold.
     pub fn advice_evidence(&self, scope: &crate::Scope) -> Option<usize> {
         let org = scope.org_name().and_then(|o| self.orgs.get(o))?;
         let team = match scope {
@@ -2194,7 +2194,7 @@ impl Directory {
     }
 
     /// The rewarded runs each person's own advice waits for in `scope` (`Settings::advice_personal_runs`): its
-    /// team's setting, else its org's (0 is unset), else `default` (the server's `MEMSTORE_ADVICE_PERSONAL_RUNS`),
+    /// team's setting, else its org's (0 is unset), else `default` (the server's `AMPUP_MEMORY_ADVICE_PERSONAL_RUNS`),
     /// which a scope the directory doesn't hold also gets. None: the server's own bars.
     pub fn advice_personal_runs(
         &self,
@@ -2277,21 +2277,21 @@ impl Directory {
     }
 
     /// Whether reads in `scope` mark stale facts and passed plans (`Settings::freshness`): its team's setting,
-    /// else its org's, else the server's `MEMSTORE_FRESHNESS` (off unless set), which a scope the directory
+    /// else its org's, else the server's `AMPUP_MEMORY_FRESHNESS` (off unless set), which a scope the directory
     /// doesn't hold also gets.
     pub fn marks_freshness(&self, scope: &crate::Scope) -> bool {
         self.setting(scope, |s| s.freshness, crate::freshness::from_env())
     }
 
     /// Whether `scope` keeps facts that disagree apart and its reads mark them (`Settings::conflicts`): its team's
-    /// setting, else its org's, else the server's `MEMSTORE_CONFLICTS` (off unless set), which a scope the
+    /// setting, else its org's, else the server's `AMPUP_MEMORY_CONFLICTS` (off unless set), which a scope the
     /// directory doesn't hold also gets.
     pub fn marks_conflicts(&self, scope: &crate::Scope) -> bool {
         self.setting(scope, |s| s.conflicts, crate::conflicts::from_env())
     }
 
     /// Whether advice in `scope` is curated as it is learned (`Settings::advice_curation`): its team's setting,
-    /// else its org's, else `default` (the server's `MEMSTORE_ADVICE_CURATION`), which a scope the directory
+    /// else its org's, else `default` (the server's `AMPUP_MEMORY_ADVICE_CURATION`), which a scope the directory
     /// doesn't hold also gets.
     pub fn curates_advice(&self, scope: &crate::Scope, default: bool) -> bool {
         self.setting(scope, |s| s.advice_curation, default)
@@ -2304,17 +2304,17 @@ impl Directory {
     }
 
     /// Whether `scope` folds each person's notes into a profile and hands it at a session's start
-    /// (`Settings::profile`): its team's setting, else its org's, else the server's `MEMSTORE_PROFILE` (off unless
+    /// (`Settings::profile`): its team's setting, else its org's, else the server's `AMPUP_MEMORY_PROFILE` (off unless
     /// set, [`profiles_from_env`]), which a scope the directory doesn't hold also gets.
     pub fn folds_profiles(&self, scope: &crate::Scope) -> bool {
         self.setting(scope, |s| s.profile, profiles_from_env())
     }
 
     /// Whether the hooks keep `scope`'s sessions' whole transcripts (`Settings::transcripts`): its team's setting,
-    /// else its org's, else the server's `MEMSTORE_TRANSCRIPTS` (off unless set), which a scope the directory
+    /// else its org's, else the server's `AMPUP_MEMORY_TRANSCRIPTS` (off unless set), which a scope the directory
     /// doesn't hold also gets.
     pub fn keeps_transcripts(&self, scope: &crate::Scope) -> bool {
-        let env = std::env::var("MEMSTORE_TRANSCRIPTS").is_ok_and(|v| {
+        let env = std::env::var("AMPUP_MEMORY_TRANSCRIPTS").is_ok_and(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "on" | "yes"
@@ -2325,7 +2325,7 @@ impl Directory {
 
     /// Whether `scope`'s agents are told what memory is for rather than when to call each tool
     /// (`Settings::instructions` `purpose`): its team's setting, else its org's (`""` is unset), else the server's
-    /// `MEMSTORE_INSTRUCTIONS` ([`purpose_from_env`]), which a scope the directory doesn't hold also gets.
+    /// `AMPUP_MEMORY_INSTRUCTIONS` ([`purpose_from_env`]), which a scope the directory doesn't hold also gets.
     pub fn purpose_instructions(&self, scope: &crate::Scope) -> bool {
         self.team_or_org(scope, |s| s.instructions.clone().filter(|k| !k.is_empty()))
             .map_or_else(purpose_from_env, |k| k == "purpose")
@@ -2512,7 +2512,7 @@ impl Directory {
             }
             if self.orgs.contains_key(&org) && !self.vouched(&org, via) && via.key.is_none() {
                 anyhow::bail!(
-                    "org {org} takes sign-ins through its own identity provider only: memstore auth login (with org {org} selected); a service uses one of the org's keys (memstore apikey create)"
+                    "org {org} takes sign-ins through its own identity provider only: ampup-memory auth login (with org {org} selected); a service uses one of the org's keys (ampup-memory apikey create)"
                 );
             }
             anyhow::bail!("{user} is not a member of org {org}");
@@ -2548,7 +2548,7 @@ pub struct Actor {
     /// sha256 of the file keys the server checked an import's rows against, and found them to be.
     pub vouched_keys: BTreeSet<String>,
     /// sha256 (hex, lower-case) of every file key the actor's process holds: the server's keys file, or the
-    /// catalog owner's (`MEMSTORE_API_KEYS`, with --direct). None of them may become a directory key.
+    /// catalog owner's (`AMPUP_MEMORY_API_KEYS`, with --direct). None of them may become a directory key.
     pub file_keys: BTreeSet<String>,
 }
 
@@ -3086,7 +3086,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             });
         if !superuser && !holder {
             refuse!(
-                "{me} may not import file keys: only the operator (an admin key, or the catalog's owner with --direct) or the key's own holder (`memstore apikey import --self`, signed in with that key) may"
+                "{me} may not import file keys: only the operator (an admin key, or the catalog's owner with --direct) or the key's own holder (`ampup-memory apikey import --self`, signed in with that key) may"
             );
         }
     }
@@ -3125,7 +3125,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         }
         if dir.purging.contains(org_name) {
             refuse!(
-                "{org_name} was deleted and its memory isn't purged yet: finish that first (memstore workspace delete {org_name} --confirm {org_name})"
+                "{org_name} was deleted and its memory isn't purged yet: finish that first (ampup-memory workspace delete {org_name} --confirm {org_name})"
             );
         }
         return Ok(vec![
@@ -3157,7 +3157,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         // Its old memory may still be in the catalog: a new org of that name must never read it.
         if dir.purging.contains(org_name) {
             refuse!(
-                "org {org_name} was deleted and its memory isn't purged yet: finish that first (memstore org delete {org_name} --confirm {org_name})"
+                "org {org_name} was deleted and its memory isn't purged yet: finish that first (ampup-memory org delete {org_name} --confirm {org_name})"
             );
         }
         let mut out = vec![ev("org.create")];
@@ -3537,7 +3537,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 && crate::auth::secret::stored(s) == crate::auth::secret::Stored::Plain
             {
                 refuse!(
-                    "the client secret goes into the directory sealed or as env:MEMSTORE_IDP_SECRET_<NAME>, never in plain text"
+                    "the client secret goes into the directory sealed or as env:AMPUP_MEMORY_IDP_SECRET_<NAME>, never in plain text"
                 );
             }
             // A client is one org's: sharing it would let one org's sign-ins count in another.
@@ -3614,7 +3614,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         Change::MapGroup { group, team, .. } => {
             let Some(p) = &org.provider else {
                 refuse!(
-                    "groups come from the org's own identity provider: connect one first (memstore auth setup)"
+                    "groups come from the org's own identity provider: connect one first (ampup-memory auth setup)"
                 );
             };
             if p.kind == "google" {
@@ -3667,7 +3667,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             let prefix = crate::auth::KEY_PREFIX;
             if !key.0.starts_with(prefix) || key.0.len() < prefix.len() + 32 {
                 refuse!(
-                    "a key is {prefix} and 32 or more characters after it, as `memstore apikey create` makes it"
+                    "a key is {prefix} and 32 or more characters after it, as `ampup-memory apikey create` makes it"
                 );
             }
             let sha256 = key.sha256();
@@ -3744,7 +3744,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         } => {
             if matches!(role, KeyRole::Directory | KeyRole::Recorder) {
                 refuse!(
-                    "a file key is imported as a reader, writer or ingest key, never a {} key (make one with `memstore apikey create --role {}`)",
+                    "a file key is imported as a reader, writer or ingest key, never a {} key (make one with `ampup-memory apikey create --role {}`)",
                     role.as_str(),
                     role.as_str()
                 );
@@ -3789,7 +3789,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 if !reaches {
                     if org.provider.as_ref().is_some_and(|p| p.required) {
                         refuse!(
-                            "file key {id}: org {org_name} takes sign-ins through its own identity provider only, so file keys don't reach it, and an import would read more than the key does; an admin of {org_name} makes the service a key instead (memstore apikey create)"
+                            "file key {id}: org {org_name} takes sign-ins through its own identity provider only, so file keys don't reach it, and an import would read more than the key does; an admin of {org_name} makes the service a key instead (ampup-memory apikey create)"
                         );
                     }
                     refuse!(
@@ -4016,10 +4016,10 @@ pub fn parse_members(text: &str) -> Result<Vec<SyncMember>> {
     Ok(out)
 }
 
-/// Whether the server's `MEMSTORE_PROFILE` (`1`, `true`, `on` or `yes`) turns profiles on where no team or org
+/// Whether the server's `AMPUP_MEMORY_PROFILE` (`1`, `true`, `on` or `yes`) turns profiles on where no team or org
 /// setting says (`Settings::profile`).
 pub fn profiles_from_env() -> bool {
-    std::env::var("MEMSTORE_PROFILE").is_ok_and(|v| {
+    std::env::var("AMPUP_MEMORY_PROFILE").is_ok_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "on" | "yes"
@@ -4027,8 +4027,9 @@ pub fn profiles_from_env() -> bool {
     })
 }
 
-/// Whether the server's `MEMSTORE_INSTRUCTIONS=purpose` tells agents what memory is for rather than when to call
+/// Whether the server's `AMPUP_MEMORY_INSTRUCTIONS=purpose` tells agents what memory is for rather than when to call
 /// each tool, where no team or org setting says (`Settings::instructions`).
 pub fn purpose_from_env() -> bool {
-    std::env::var("MEMSTORE_INSTRUCTIONS").is_ok_and(|v| v.trim().eq_ignore_ascii_case("purpose"))
+    std::env::var("AMPUP_MEMORY_INSTRUCTIONS")
+        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("purpose"))
 }

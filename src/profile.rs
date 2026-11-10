@@ -28,7 +28,7 @@
 //! - **Cadence**: right after a person's [`FOLD_AT`]th note the profile hasn't read, else once a day for any. A fold
 //!   makes at most [`FOLD_CALLS`] model calls of at most [`FOLD_BATCH`] notes; a failed call leaves the profile as
 //!   it was, and that person's profile isn't folded again for an hour.
-//! - **Off by default**: the team or org setting `profile` (`set_settings`), else the server's `MEMSTORE_PROFILE`.
+//! - **Off by default**: the team or org setting `profile` (`set_settings`), else the server's `AMPUP_MEMORY_PROFILE`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
@@ -139,13 +139,13 @@ impl Profile {
     }
 }
 
-/// Whether the environment turns profiles on (`MEMSTORE_PROFILE=1`, `true` or `on`) where no setting says.
+/// Whether the environment turns profiles on (`AMPUP_MEMORY_PROFILE=1`, `true` or `on`) where no setting says.
 pub fn from_env() -> bool {
     crate::people::directory::profiles_from_env()
 }
 
 /// Whether `scope` folds and hands profiles: its team's `profile` setting, else its org's, else the server's
-/// `MEMSTORE_PROFILE`. Off unless one of them turns it on.
+/// `AMPUP_MEMORY_PROFILE`. Off unless one of them turns it on.
 pub async fn on(store: &Store, scope: &Scope) -> bool {
     match store.directory().await {
         Ok(d) => d.dir.folds_profiles(scope),
@@ -153,14 +153,14 @@ pub async fn on(store: &Store, scope: &Scope) -> bool {
     }
 }
 
-/// The model profiles are folded with: the one the server keeps what users say with (`MEMSTORE_ADVICE_ROUTE`, else
-/// extraction's backend, a small model), or `MEMSTORE_PROFILE_MODEL` on that backend.
+/// The model profiles are folded with: the one the server keeps what users say with (`AMPUP_MEMORY_ADVICE_ROUTE`, else
+/// extraction's backend, a small model), or `AMPUP_MEMORY_PROFILE_MODEL` on that backend.
 pub fn model() -> Result<Option<Extractor>> {
     let Some(m) = Extractor::route_from_env()? else {
         return Ok(None);
     };
     Ok(Some(
-        match std::env::var("MEMSTORE_PROFILE_MODEL")
+        match std::env::var("AMPUP_MEMORY_PROFILE_MODEL")
             .ok()
             .filter(|v| !v.trim().is_empty())
         {
@@ -837,7 +837,7 @@ pub fn noted(store: Store, scope: Scope, author: String, one_caller: bool) {
 }
 
 /// The profiles in `scope` that are due, folded (at most [`SWEEP_FOLDS`] per pass; the server's session sweep makes
-/// a pass a minute, `MEMSTORE_SESSION_SWEEP_SECS`): a person's with [`FOLD_AT`] new notes, or any new note and no
+/// a pass a minute, `AMPUP_MEMORY_SESSION_SWEEP_SECS`): a person's with [`FOLD_AT`] new notes, or any new note and no
 /// fold for a day (none yet: a note a day old), or a note it cites gone. Nothing where the scope doesn't fold
 /// profiles or there is no model. How many were folded.
 pub async fn sweep(store: &Store, scope: &Scope, one_caller: bool) -> Result<usize> {

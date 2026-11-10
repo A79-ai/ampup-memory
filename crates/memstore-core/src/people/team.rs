@@ -3,7 +3,7 @@
 //! (`group:team.sales`), a role (`group:role.ae`) or one person and their management chain
 //! (`group:chain.amy@x.com`: Amy, her manager, their manager, up to the top). A manager sees what their
 //! reports' chain entries grant and nothing a sibling team wrote. The CSV is loaded at start
-//! (`MEMSTORE_TEAM_CSV`) and replaced whole by an admin `POST /team`; `memstore team check` shows what
+//! (`AMPUP_MEMORY_TEAM_CSV`) and replaced whole by an admin `POST /team`; `memstore team check` shows what
 //! each person would hold, and `memstore team keys` issues one API key per person to paste into a client.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -202,7 +202,7 @@ pub fn new_key() -> String {
 /// Newly issued (email, key) pairs, and every key row to write.
 pub type IssuedKeys = (Vec<(String, String)>, Vec<Value>);
 
-/// Issue one API key per person in `team` and add them to the keys file's rows (`MEMSTORE_API_KEYS`
+/// Issue one API key per person in `team` and add them to the keys file's rows (`AMPUP_MEMORY_API_KEYS`
 /// format), replacing any earlier row whose id is that email. `only` limits it to those people;
 /// otherwise everyone without a row gets one, and `rotate` re-issues for everyone. Returns the new rows'
 /// (email, key) pairs and the full rows to write.

@@ -160,15 +160,15 @@ async fn advice_routes_over_the_scopes_a_scope_reads_as_the_caller_may_read_them
     let model = router(seen.clone()).await;
     // SAFETY: this test runs alone in its process (`own_process`).
     unsafe {
-        std::env::set_var("MEMSTORE_DECIDE", "off");
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE", "openrouter");
+        std::env::set_var("AMPUP_MEMORY_DECIDE", "off");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE", "openrouter");
         std::env::set_var(
-            "MEMSTORE_ADVICE_ROUTE_URL",
+            "AMPUP_MEMORY_ADVICE_ROUTE_URL",
             format!("http://127.0.0.1:{model}/v1"),
         );
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE_KEY", "stand-in");
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_ADVICE_EVIDENCE", "3");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE_KEY", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_EVIDENCE", "3");
     }
     let issuer = start_idp().await;
     let dir = tempfile::tempdir().unwrap();

@@ -45,13 +45,12 @@ pub struct Credential {
 }
 
 impl Credential {
-    /// `MEMSTORE_DEPLOYMENT_CREDENTIAL`, else `~/.memstore/deployment.json`.
+    /// `AMPUP_MEMORY_DEPLOYMENT_CREDENTIAL`, else `~/.ampup-memory/deployment.json`.
     pub fn default_path() -> PathBuf {
-        if let Ok(p) = std::env::var("MEMSTORE_DEPLOYMENT_CREDENTIAL") {
+        if let Ok(p) = std::env::var("AMPUP_MEMORY_DEPLOYMENT_CREDENTIAL") {
             return p.into();
         }
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        Path::new(&home).join(".memstore").join("deployment.json")
+        crate::naming::current_state_dir().join("deployment.json")
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -317,7 +316,7 @@ pub async fn rotate(path: &Path) -> Result<()> {
     let pending = path.with_extension("rotating");
     anyhow::ensure!(
         !pending.exists(),
-        "an earlier rotation stopped part way: {} holds its new key. If `memstore deployment whoami --credential {}` answers, move it over {}; otherwise remove it",
+        "an earlier rotation stopped part way: {} holds its new key. If `ampup-memory deployment whoami --credential {}` answers, move it over {}; otherwise remove it",
         pending.display(),
         pending.display(),
         path.display()

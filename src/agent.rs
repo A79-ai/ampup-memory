@@ -5,7 +5,7 @@
 //! `GET /v1/desired` (a generation: an image tag and digest, feature flags, and the customer's policy)
 //! and `GET /v1/actions` (lane B's allowlist), both as signed requests from [`crate::deployment`]. It acts
 //! only on what the control plane's own Ed25519 key signed: the key is pinned (at enrollment, or by
-//! `MEMSTORE_CONTROL_PLANE_KEY`; trusting whoami's on first use is an explicit opt-in), each payload must name this deployment, be at most
+//! `AMPUP_MEMORY_CONTROL_PLANE_KEY`; trusting whoami's on first use is an explicit opt-in), each payload must name this deployment, be at most
 //! ten minutes old, and never take the deployment back a generation.
 //!
 //! What it may change is fixed here, not by the control plane: the image repository is the agent's own
@@ -150,7 +150,10 @@ pub struct Embedding {
     pub dims: Option<u32>,
 }
 
-/// The variables an [`Embedding`] is passed in.
+/// The variables an [`Embedding`] is passed in. These, and the flags' (`MEMSTORE_FLAG_*`), keep memstore's names:
+/// they are what the engine's container holds whatever image it runs (one from before the rename reads only
+/// these), and what deploy/agent/k8s/agent.yaml's admission policy lets the agent change. The engine reads them
+/// as `AMPUP_MEMORY_*` (memstore_client::naming).
 pub const EMBED_VARS: [&str; 3] = [
     "MEMSTORE_EMBED",
     "MEMSTORE_EMBED_MODEL",
@@ -1033,15 +1036,15 @@ pub struct Config {
     /// The engine's telemetry mirror, when the agent shares its volume: `drain_spool` and `clear_spool`
     /// act on the spool beside it. Without it they are refused as unsupported.
     pub telemetry_mirror: Option<PathBuf>,
-    /// `MEMSTORE_CONTROL_PLANE_KEY`.
+    /// `AMPUP_MEMORY_CONTROL_PLANE_KEY`.
     pub control_plane_key: Option<String>,
-    /// With no key pinned, take the one `/v1/whoami` gives and keep it (`MEMSTORE_AGENT_TOFU=1`). Off:
+    /// With no key pinned, take the one `/v1/whoami` gives and keep it (`AMPUP_MEMORY_AGENT_TOFU=1`). Off:
     /// the agent refuses to start without a pinned key.
     pub trust_on_first_use: bool,
     pub image_repository: String,
-    /// The embeddings backends the control plane may choose (`MEMSTORE_AGENT_EMBED_PROVIDERS`). Empty, as by
+    /// The embeddings backends the control plane may choose (`AMPUP_MEMORY_AGENT_EMBED_PROVIDERS`). Empty, as by
     /// default: it may choose none, since a switch to an API sends the deployment's text to that vendor (and
-    /// `MEMSTORE_EMBED_KEY`, which names no vendor, with it).
+    /// `AMPUP_MEMORY_EMBED_KEY`, which names no vendor, with it).
     pub embed_providers: Vec<String>,
     /// Report drift by default; repair only when the deployment's operator opts in.
     pub drift_mode: DriftMode,
@@ -1055,13 +1058,13 @@ pub struct Config {
     pub health_timeout: Duration,
     /// How often a rollout and the engine's health are looked at while waiting.
     pub check_every: Duration,
-    /// The key an image's cosign signature must verify with (`MEMSTORE_AGENT_COSIGN_KEY`). Without one,
+    /// The key an image's cosign signature must verify with (`AMPUP_MEMORY_AGENT_COSIGN_KEY`). Without one,
     /// no upgrade is applied, unless [`Config::allow_unsigned_images`].
     pub cosign_key: Option<cosign::PublicKey>,
-    /// Apply images with no signature check when no key is pinned (`MEMSTORE_AGENT_ALLOW_UNSIGNED=1`).
+    /// Apply images with no signature check when no key is pinned (`AMPUP_MEMORY_AGENT_ALLOW_UNSIGNED=1`).
     /// Warned of at start and on each upgrade.
     pub allow_unsigned_images: bool,
-    /// How the registry is read for signatures (`MEMSTORE_AGENT_REGISTRY_AUTH`; default by its host).
+    /// How the registry is read for signatures (`AMPUP_MEMORY_AGENT_REGISTRY_AUTH`; default by its host).
     pub registry_auth: Option<RegistryAuth>,
     /// The registry's API at another address than `https://<host>` (tests, a mirror of the same
     /// repository).
@@ -1069,13 +1072,13 @@ pub struct Config {
     /// The GCE metadata server (`GCE_METADATA_HOST`; default `metadata.google.internal`).
     pub metadata_host: Option<String>,
     /// Where the `sha256-<hex>.sig` signatures are, when cosign kept them apart from the images
-    /// (`COSIGN_REPOSITORY` when signing; `MEMSTORE_AGENT_SIGNATURE_REPOSITORY` here). Default: the image
+    /// (`COSIGN_REPOSITORY` when signing; `AMPUP_MEMORY_AGENT_SIGNATURE_REPOSITORY` here). Default: the image
     /// repository.
     pub signature_repository: Option<String>,
-    /// The engine, for support diagnostics (`MEMSTORE_AGENT_ENGINE_URL`). Default: the origin of
+    /// The engine, for support diagnostics (`AMPUP_MEMORY_AGENT_ENGINE_URL`). Default: the origin of
     /// [`Config::health_url`].
     pub engine_url: Option<String>,
-    /// The operator's admin key for the engine (`MEMSTORE_AGENT_ADMIN_KEY_FILE`): support diagnostics read
+    /// The operator's admin key for the engine (`AMPUP_MEMORY_AGENT_ADMIN_KEY_FILE`): support diagnostics read
     /// `/telemetry` and `/metrics` with it, and support events are written to the engine's audit with it.
     /// Without it, [`Config::health_token`] is used for the reads, and no audit is written.
     pub admin_key: Option<String>,
@@ -1150,7 +1153,7 @@ async fn whoami_key(cred: &Credential) -> Option<String> {
 
 impl Agent {
     /// Load the credential and state, and pin the control plane's key: from the credential (saved at
-    /// enrollment) or `MEMSTORE_CONTROL_PLANE_KEY`. With neither, the agent refuses to start, unless
+    /// enrollment) or `AMPUP_MEMORY_CONTROL_PLANE_KEY`. With neither, the agent refuses to start, unless
     /// the operator opted in to trusting `/v1/whoami`'s key on first use ([`Config::trust_on_first_use`]):
     /// then that key is kept and its fingerprint logged for them to check. Whoami's key must agree with
     /// the pinned one; a different key stops the agent.
@@ -1161,7 +1164,7 @@ impl Agent {
         if let (Some(env), Some(c)) = (&cfg.control_plane_key, &cred.control_plane_key) {
             anyhow::ensure!(
                 env == c,
-                "MEMSTORE_CONTROL_PLANE_KEY ({}) isn't the key pinned in the credential ({})",
+                "AMPUP_MEMORY_CONTROL_PLANE_KEY ({}) isn't the key pinned in the credential ({})",
                 fingerprint(env),
                 fingerprint(c)
             );
@@ -1179,8 +1182,8 @@ impl Agent {
         anyhow::ensure!(
             pinned.is_some() || cfg.trust_on_first_use,
             "no control plane key: the credential doesn't pin one (enrolled before keys were given) and \
-             MEMSTORE_CONTROL_PLANE_KEY isn't set. Set it to the key your control plane publishes, or \
-             re-enroll; --trust-control-plane-key-on-first-use (MEMSTORE_AGENT_TOFU=1) takes the key \
+             AMPUP_MEMORY_CONTROL_PLANE_KEY isn't set. Set it to the key your control plane publishes, or \
+             re-enroll; --trust-control-plane-key-on-first-use (AMPUP_MEMORY_AGENT_TOFU=1) takes the key \
              /v1/whoami gives instead"
         );
         let told = whoami_key(&cred).await;
@@ -1226,12 +1229,12 @@ impl Agent {
                 k.fingerprint()
             ),
             (None, true) => eprintln!(
-                "agent: WARNING: --allow-unsigned-images (MEMSTORE_AGENT_ALLOW_UNSIGNED=1) is on and no cosign \
+                "agent: WARNING: --allow-unsigned-images (AMPUP_MEMORY_AGENT_ALLOW_UNSIGNED=1) is on and no cosign \
                  key is pinned: images the control plane names are run WITHOUT a signature check. Set \
-                 MEMSTORE_AGENT_COSIGN_KEY to your signing key's public key."
+                 AMPUP_MEMORY_AGENT_COSIGN_KEY to your signing key's public key."
             ),
             (None, false) => eprintln!(
-                "agent: no cosign key pinned (MEMSTORE_AGENT_COSIGN_KEY): no upgrade will be applied; \
+                "agent: no cosign key pinned (AMPUP_MEMORY_AGENT_COSIGN_KEY): no upgrade will be applied; \
                  each is reported failed (signature_unverifiable). Actions still run."
             ),
         }
@@ -1503,7 +1506,7 @@ impl Agent {
                 }),
             None if self.cfg.allow_unsigned_images => {
                 eprintln!(
-                    "agent: WARNING: applying {image} WITHOUT a signature check (MEMSTORE_AGENT_ALLOW_UNSIGNED=1)"
+                    "agent: WARNING: applying {image} WITHOUT a signature check (AMPUP_MEMORY_AGENT_ALLOW_UNSIGNED=1)"
                 );
                 Ok(())
             }

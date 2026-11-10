@@ -15,7 +15,7 @@ publish = false
 doctest = false
 
 [[bin]]
-name = "memstore-client"
+name = "ampup-memory-client"
 path = "src/main.rs"
 
 [dependencies]
@@ -28,3 +28,6 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

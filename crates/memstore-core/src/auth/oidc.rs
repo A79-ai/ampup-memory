@@ -29,7 +29,7 @@ impl OidcConfig {
     pub async fn discover(issuer: &str, audiences: Vec<String>) -> Result<Self> {
         anyhow::ensure!(
             !audiences.is_empty(),
-            "an OIDC issuer needs its client ids (MEMSTORE_OIDC_AUDIENCE)"
+            "an OIDC issuer needs its client ids (AMPUP_MEMORY_OIDC_AUDIENCE)"
         );
         Self::discover_issuer(issuer, audiences, FetchPolicy::Trusted).await
     }

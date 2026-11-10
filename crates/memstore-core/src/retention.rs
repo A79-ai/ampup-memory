@@ -6,7 +6,7 @@
 //! An episode past its age is gone for every reader at read time, with the facts citing it, as a
 //! retracted one is: no job has to run for it to go, and it goes the moment it ages out, not at the next
 //! write. Until a purge removes it from storage (`memstore org purge`, or where the org turned it on the nightly
-//! window's scheduled purge, once past `MEMSTORE_PURGE_GRACE` under the policy then and now), loosening the policy
+//! window's scheduled purge, once past `AMPUP_MEMORY_PURGE_GRACE` under the policy then and now), loosening the policy
 //! brings it back.
 
 use anyhow::Result;

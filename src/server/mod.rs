@@ -43,10 +43,10 @@ mod reports;
 mod routing;
 pub mod writer;
 
-/// Rebuild the catalog this often (`MEMSTORE_CATALOG_REFRESH_SECS`, default 300): inside SPCS its session
+/// Rebuild the catalog this often (`AMPUP_MEMORY_CATALOG_REFRESH_SECS`, default 300): inside SPCS its session
 /// token rotates, and catalog and storage tokens expire after about an hour.
 fn catalog_refresh() -> Duration {
-    std::env::var("MEMSTORE_CATALOG_REFRESH_SECS")
+    std::env::var("AMPUP_MEMORY_CATALOG_REFRESH_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .map_or(Duration::from_secs(300), Duration::from_secs)
@@ -68,7 +68,7 @@ pub(crate) const SERVICE_PRINCIPAL: &str = "service caller";
 
 struct State {
     /// The URL callers reach this server at, as sign-in discovery names it (`resource`, `WWW-Authenticate`):
-    /// `MEMSTORE_PUBLIC_URL`, never a request's own `Host` ([`public_url`]).
+    /// `AMPUP_MEMORY_PUBLIC_URL`, never a request's own `Host` ([`public_url`]).
     public_url: String,
     /// See [`Options::loopback_only`].
     loopback_only: bool,
@@ -83,13 +83,13 @@ struct State {
     /// Every caller gets these groups (e.g. the app's audience); with Snowflake caller identity, also the
     /// `role:<NAME>` entries of the ACL roles they hold.
     groups: Vec<String>,
-    /// `MEMSTORE_CALLER_IDENTITY=snowflake`: each request runs as the Snowflake user who made it. On the
+    /// `AMPUP_MEMORY_CALLER_IDENTITY=snowflake`: each request runs as the Snowflake user who made it. On the
     /// public port that's whoever Snowflake's caller token proves (executeAsCaller); requests without one
-    /// are refused. On the internal port (`MEMSTORE_FN_PORT`, reached only by the app's own service
+    /// are refused. On the internal port (`AMPUP_MEMORY_FN_PORT`, reached only by the app's own service
     /// functions) the app's wrappers pass the identity, with `fn_secret` to prove the call is theirs.
-    /// `MEMSTORE_CALLER_IDENTITY=google` (Cloud Run): each request runs as the Google identity in its ID token,
+    /// `AMPUP_MEMORY_CALLER_IDENTITY=google` (Cloud Run): each request runs as the Google identity in its ID token,
     /// which Cloud Run IAM has already checked and Google's tokeninfo confirms. A token of the BigQuery
-    /// connection's service account (`MEMSTORE_BIGQUERY_CALLER`) instead runs as the request's `sessionUser`, the
+    /// connection's service account (`AMPUP_MEMORY_BIGQUERY_CALLER`) instead runs as the request's `sessionUser`, the
     /// user whose query called the remote function.
     /// Unset: one fixed principal with `groups`, as before.
     /// Several, comma-separated (`snowflake,token`): the first whose credential a request carries decides,
@@ -101,8 +101,8 @@ struct State {
     cloud_run_verifies: std::sync::atomic::AtomicBool,
     /// Google identity: this service's own URLs, read with that check; tokens minted for them are ours.
     service_urls: RwLock<Vec<String>>,
-    /// Google identity without `MEMSTORE_BIGQUERY_CALLER`: BigQuery's service agent's subject id, learned once by
-    /// calling `MEMSTORE_WHOAMI_FUNCTION` (a remote function on `/whoami`) with a fresh nonce. The nonce shows in
+    /// Google identity without `AMPUP_MEMORY_BIGQUERY_CALLER`: BigQuery's service agent's subject id, learned once by
+    /// calling `AMPUP_MEMORY_WHOAMI_FUNCTION` (a remote function on `/whoami`) with a fresh nonce. The nonce shows in
     /// BigQuery's job history, so it only counts while that one query runs (`learning`), only from a token without
     /// an email (as BigQuery's are), and only if exactly one subject presented it; otherwise nothing is learned.
     learned_bigquery: RwLock<Option<String>>,
@@ -115,7 +115,7 @@ struct State {
     closures: auth::ClosureStore,
     /// A catalog handed in by the embedder; otherwise each refresh builds one from the environment.
     catalog: Option<Arc<dyn iceberg::Catalog>>,
-    /// Every caller must select an org or team they belong to (`MEMSTORE_DIRECTORY=required`, or
+    /// Every caller must select an org or team they belong to (`AMPUP_MEMORY_DIRECTORY=required`, or
     /// `memstore serve directory`); otherwise a caller who selects none reads `scope`, as before.
     directory_only: bool,
     /// Scopes callers have selected, kept indexed alongside `scope`.
@@ -125,7 +125,7 @@ struct State {
     warmed: std::sync::Mutex<std::collections::BTreeSet<Scope>>,
     /// Orgs' identity providers and service keys as last read from the directory, and when.
     providers: std::sync::Mutex<Option<(std::time::Instant, DirectoryAuth)>>,
-    /// Seals orgs' provider client secrets for the directory, and opens them (`MEMSTORE_SECRET_KEY`).
+    /// Seals orgs' provider client secrets for the directory, and opens them (`AMPUP_MEMORY_SECRET_KEY`).
     secret_key: Option<auth::secret::SecretKey>,
     /// Where `env:` client secrets are looked up: the process environment unless the embedder gave one.
     secret_env: Option<HashMap<String, String>>,
@@ -138,7 +138,7 @@ struct State {
     key_use_due: tokio::sync::Notify,
     /// `/metrics` (`crate::metrics`).
     metrics: Arc<metrics::Metrics>,
-    /// Per-key and per-person token buckets (`MEMSTORE_RATE_LIMIT`), this replica's own.
+    /// Per-key and per-person token buckets (`AMPUP_MEMORY_RATE_LIMIT`), this replica's own.
     limiter: ratelimit::Limiter,
     /// When the last index update that brought every served scope up to date started.
     index_ok: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
@@ -148,7 +148,7 @@ struct State {
     /// What the control plane last said this deployment may do (`crate::telemetry::Limits`): ingestion
     /// and asks stop while it says so. Kept until its next answer that says otherwise.
     limits: RwLock<crate::telemetry::Limits>,
-    /// `MEMSTORE_BYOK=on`: `ask_memory` answers on the customer's own model key, counted as `asks_byok`.
+    /// `AMPUP_MEMORY_BYOK=on`: `ask_memory` answers on the customer's own model key, counted as `asks_byok`.
     byok: bool,
     /// Whether the start's warm-up is done (or gave up at its bound): `/ready` says 200 from then on.
     ready: std::sync::atomic::AtomicBool,
@@ -156,7 +156,7 @@ struct State {
     writer: Arc<writer::Lease>,
     /// What this server says of its non-admin file keys, being retired (`file_keys`).
     file_keys: file_keys::Report,
-    /// What this server does (`MEMSTORE_ROLE`), read once as it starts.
+    /// What this server does (`AMPUP_MEMORY_ROLE`), read once as it starts.
     role: Role,
     /// Scopes from the directory whose tables the background loops' walks ([`ScopeWalk`]) have completed
     /// (`ensure_scope`: a scope written by an older engine may lack a table added since), shared by them.
@@ -168,7 +168,7 @@ struct State {
     /// they are committing lands before the lease goes.
     writing: std::sync::Mutex<Vec<std::sync::Weak<Store>>>,
     /// Stopping (SIGTERM): `/ready` answers 503 so the server is taken out of rotation, while it goes on
-    /// answering for a few seconds (`MEMSTORE_SHUTDOWN_DRAIN_SECS`).
+    /// answering for a few seconds (`AMPUP_MEMORY_SHUTDOWN_DRAIN_SECS`).
     stopping: std::sync::atomic::AtomicBool,
     /// Past the drain (true): each open connection answers the request it is on and closes, an idle one at
     /// once. Every open connection holds a receiver, so the last one closing is seen here.
@@ -176,7 +176,7 @@ struct State {
     /// Why the start's warm-up hasn't succeeded yet (the directory or the served scope failed to load), if
     /// it failed: `/ready` says so.
     warm_error: std::sync::Mutex<Option<String>>,
-    /// This server has its own team csv (`MEMSTORE_TEAM_CSV`).
+    /// This server has its own team csv (`AMPUP_MEMORY_TEAM_CSV`).
     team_file: bool,
 }
 
@@ -290,11 +290,13 @@ async fn flush_key_uses(state: Arc<State>) {
 }
 
 impl State {
-    /// An `env:` client secret's variable, as this server sees it.
+    /// An `env:` client secret's variable, as this server sees it: by its new name, where a reference written
+    /// before the rename names the old one (`MEMSTORE_IDP_SECRET_…`).
     fn secret_var(&self, name: &str) -> Option<String> {
+        let name = crate::naming::env_name(name);
         match &self.secret_env {
-            Some(m) => m.get(name).cloned(),
-            None => auth::secret::process_env(name),
+            Some(m) => m.get(name.as_ref()).cloned(),
+            None => auth::secret::process_env(&name),
         }
     }
 }
@@ -316,7 +318,7 @@ struct DirectoryAuth {
 const PROVIDERS_TTL: Duration = Duration::from_secs(5);
 
 impl State {
-    /// Audiences a signature-intact Google token may be minted for: `MEMSTORE_ID_AUDIENCE` plus this service's URLs.
+    /// Audiences a signature-intact Google token may be minted for: `AMPUP_MEMORY_ID_AUDIENCE` plus this service's URLs.
     fn audiences(&self) -> Vec<String> {
         let mut a = match self.google() {
             Some(Identity::Google { audiences, .. }) => audiences.clone(),
@@ -332,16 +334,16 @@ impl State {
 enum Identity {
     Fixed,
     Snowflake,
-    /// `MEMSTORE_CALLER_IDENTITY=token`: a per-org API key (`msk_...`, service callers) or a signed JWT
-    /// (a user's identity and groups, passed on by the app). Keys come from `MEMSTORE_API_KEYS` (JSON
-    /// rows of `{id, sha256, user, groups, admin}`); JWTs are checked with `MEMSTORE_JWT_SECRET` (HS256)
-    /// or `MEMSTORE_JWT_PUBLIC_KEY` (RS256) against `MEMSTORE_JWT_ISSUER`, `MEMSTORE_JWT_AUDIENCE` and
-    /// the deployment's `MEMSTORE_ORG`.
+    /// `AMPUP_MEMORY_CALLER_IDENTITY=token`: a per-org API key (`msk_...`, service callers) or a signed JWT
+    /// (a user's identity and groups, passed on by the app). Keys come from `AMPUP_MEMORY_API_KEYS` (JSON
+    /// rows of `{id, sha256, user, groups, admin}`); JWTs are checked with `AMPUP_MEMORY_JWT_SECRET` (HS256)
+    /// or `AMPUP_MEMORY_JWT_PUBLIC_KEY` (RS256) against `AMPUP_MEMORY_JWT_ISSUER`, `AMPUP_MEMORY_JWT_AUDIENCE` and
+    /// the deployment's `AMPUP_MEMORY_ORG`.
     Token(auth::TokenAuth),
     Google {
         bigquery: Option<String>,
         audiences: Vec<String>,
-        /// IAP in front of the service (`MEMSTORE_IAP_AUDIENCE`): people arrive with its assertion header.
+        /// IAP in front of the service (`AMPUP_MEMORY_IAP_AUDIENCE`): people arrive with its assertion header.
         iap: Option<auth::Iap>,
     },
 }
@@ -358,32 +360,32 @@ pub struct Options {
     pub listener: Option<std::net::TcpListener>,
     pub catalog: Option<Arc<dyn iceberg::Catalog>>,
     pub token_auth: Option<auth::TokenAuth>,
-    /// Where disabled users are kept across restarts (`MEMSTORE_DISABLED_FILE` otherwise).
+    /// Where disabled users are kept across restarts (`AMPUP_MEMORY_DISABLED_FILE` otherwise).
     pub disabled_file: Option<std::path::PathBuf>,
-    /// Every caller must select an org or team they belong to (`MEMSTORE_DIRECTORY=required` otherwise).
+    /// Every caller must select an org or team they belong to (`AMPUP_MEMORY_DIRECTORY=required` otherwise).
     pub directory_only: bool,
-    /// A pilot team's csv (`MEMSTORE_TEAM_CSV` otherwise): each person's closure comes from it.
+    /// A pilot team's csv (`AMPUP_MEMORY_TEAM_CSV` otherwise): each person's closure comes from it.
     pub team_csv: Option<std::path::PathBuf>,
-    /// The caller-identity sources, as `MEMSTORE_CALLER_IDENTITY` names them (that variable otherwise).
+    /// The caller-identity sources, as `AMPUP_MEMORY_CALLER_IDENTITY` names them (that variable otherwise).
     pub identity: Option<String>,
-    /// The key orgs' provider client secrets are sealed with (`MEMSTORE_SECRET_KEY` otherwise).
+    /// The key orgs' provider client secrets are sealed with (`AMPUP_MEMORY_SECRET_KEY` otherwise).
     pub secret_key: Option<auth::secret::SecretKey>,
-    /// The environment `env:MEMSTORE_IDP_SECRET_…` client secrets are read from (the process's otherwise).
+    /// The environment `env:AMPUP_MEMORY_IDP_SECRET_…` client secrets are read from (the process's otherwise).
     pub secret_env: Option<HashMap<String, String>>,
-    /// How often buffered audit events are written (`MEMSTORE_AUDIT_FLUSH_SECS` otherwise).
+    /// How often buffered audit events are written (`AMPUP_MEMORY_AUDIT_FLUSH_SECS` otherwise).
     pub audit_flush: Option<Duration>,
     /// Stop serving when notified (as on SIGTERM or Ctrl-C otherwise), writing buffered audit events first.
     pub shutdown: Option<Arc<tokio::sync::Notify>>,
-    /// The port `/metrics` is served on to anyone who reaches it (`MEMSTORE_METRICS_PORT` otherwise;
+    /// The port `/metrics` is served on to anyone who reaches it (`AMPUP_MEMORY_METRICS_PORT` otherwise;
     /// neither: `/metrics` is on the public port, to the operator's admin key only).
     pub metrics_port: Option<u16>,
-    /// The per-key and per-person rate limit (`MEMSTORE_RATE_LIMIT` otherwise), e.g. `60/min:120`.
+    /// The per-key and per-person rate limit (`AMPUP_MEMORY_RATE_LIMIT` otherwise), e.g. `60/min:120`.
     pub rate_limit: Option<String>,
-    /// Ingest keys' rate limit (`MEMSTORE_INGEST_RATE_LIMIT` otherwise).
+    /// Ingest keys' rate limit (`AMPUP_MEMORY_INGEST_RATE_LIMIT` otherwise).
     pub ingest_rate_limit: Option<String>,
-    /// Where the search index lives (`MEMSTORE_INDEX_URI` otherwise).
+    /// Where the search index lives (`AMPUP_MEMORY_INDEX_URI` otherwise).
     pub index_base: Option<String>,
-    /// The address to listen on (`MEMSTORE_SERVE_BIND` otherwise, else 127.0.0.1).
+    /// The address to listen on (`AMPUP_MEMORY_SERVE_BIND` otherwise, else 127.0.0.1).
     pub bind: Option<String>,
     /// Answer only requests addressed to this machine by name (`Host` and any `Origin` are 127.0.0.1,
     /// localhost or [::1]), so a web page that rebinds its own domain to 127.0.0.1 can't reach a server
@@ -394,11 +396,11 @@ pub struct Options {
     /// caller is written this way.
     pub writes_here: bool,
     /// The dev loop's server, which identifies no one and listens on 127.0.0.1 only, reads any scope in its
-    /// catalog that a request names with `?scope=` (`MEMSTORE_SERVE_ANY_SCOPE=1` otherwise), so one memory
+    /// catalog that a request names with `?scope=` (`AMPUP_MEMORY_SERVE_ANY_SCOPE=1` otherwise), so one memory
     /// browser sees everything a developer loaded. Refused at start with caller identity or another bind.
     pub any_scope: bool,
     /// A server that identifies no one also serves workspaces ([`crate::workspace`]) side by side
-    /// (`MEMSTORE_SERVE_WORKSPACES=1` otherwise): a request selects one as it would an org (`x-memstore-org`,
+    /// (`AMPUP_MEMORY_SERVE_WORKSPACES=1` otherwise): a request selects one as it would an org (`x-memstore-org`,
     /// `?org=`), and gets that workspace's memory read as the server's groups. Orgs that aren't workspaces
     /// stay out of reach. With caller identity, workspaces are selected through the directory like any org.
     pub workspaces: bool,
@@ -417,8 +419,9 @@ pub async fn serve_with(
     cell::check();
     let role = role().map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
-        !(role == Role::Serve && std::env::var("MEMSTORE_WRITER_LEASE").is_ok_and(|v| v == "off")),
-        "MEMSTORE_ROLE=serve with MEMSTORE_WRITER_LEASE=off: a server that never writes in the background can't \
+        !(role == Role::Serve
+            && std::env::var("AMPUP_MEMORY_WRITER_LEASE").is_ok_and(|v| v == "off")),
+        "AMPUP_MEMORY_ROLE=serve with AMPUP_MEMORY_WRITER_LEASE=off: a server that never writes in the background can't \
          be its catalog's only writer"
     );
     let catalog = options.catalog;
@@ -444,13 +447,13 @@ pub async fn serve_with(
     }
     let spec = options
         .identity
-        .or_else(|| std::env::var("MEMSTORE_CALLER_IDENTITY").ok());
+        .or_else(|| std::env::var("AMPUP_MEMORY_CALLER_IDENTITY").ok());
     let sources = sources_from(spec.as_deref(), options.token_auth).await?;
     // Loopback unless told otherwise: the caller identity header is only trustworthy behind
-    // Snowflake's service-function ingress (a non-public SPCS endpoint sets MEMSTORE_SERVE_BIND).
+    // Snowflake's service-function ingress (a non-public SPCS endpoint sets AMPUP_MEMORY_SERVE_BIND).
     let bind = match options.bind {
         Some(b) => b,
-        None => std::env::var("MEMSTORE_SERVE_BIND").unwrap_or_else(|_| "127.0.0.1".into()),
+        None => std::env::var("AMPUP_MEMORY_SERVE_BIND").unwrap_or_else(|_| "127.0.0.1".into()),
     };
     let shown_port = public
         .as_ref()
@@ -458,15 +461,17 @@ pub async fn serve_with(
         .map_or(port, |a| a.port());
     let token_on = sources.iter().any(|i| matches!(i, Identity::Token(_)));
     let public_url = public_url(&bind, shown_port, token_on)?;
-    let disabled_file = options
-        .disabled_file
-        .or_else(|| std::env::var("MEMSTORE_DISABLED_FILE").ok().map(Into::into));
+    let disabled_file = options.disabled_file.or_else(|| {
+        std::env::var("AMPUP_MEMORY_DISABLED_FILE")
+            .ok()
+            .map(Into::into)
+    });
     let closures = match disabled_file {
         Some(path) => auth::ClosureStore::with_disabled_file(path)?,
         None => {
             if sources.iter().any(|i| matches!(i, Identity::Token(_))) {
                 eprintln!(
-                    "MEMSTORE_DISABLED_FILE is not set: disabled users are forgotten on restart"
+                    "AMPUP_MEMORY_DISABLED_FILE is not set: disabled users are forgotten on restart"
                 );
             }
             Default::default()
@@ -474,11 +479,11 @@ pub async fn serve_with(
     };
     let team_path = options
         .team_csv
-        .or_else(|| std::env::var("MEMSTORE_TEAM_CSV").ok().map(Into::into));
+        .or_else(|| std::env::var("AMPUP_MEMORY_TEAM_CSV").ok().map(Into::into));
     let team_file = team_path.is_some();
     if let Some(path) = team_path {
         let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("MEMSTORE_TEAM_CSV {}", path.display()))?;
+            .with_context(|| format!("AMPUP_MEMORY_TEAM_CSV {}", path.display()))?;
         let team =
             team::Team::parse(&text).with_context(|| format!("team csv {}", path.display()))?;
         eprintln!(
@@ -489,17 +494,17 @@ pub async fn serve_with(
         closures.set_team(team.closures().into_iter().collect());
     }
     let snowflake_callers = sources.iter().any(|i| matches!(i, Identity::Snowflake));
-    let fn_secret = std::env::var("MEMSTORE_FN_SECRET")
+    let fn_secret = std::env::var("AMPUP_MEMORY_FN_SECRET")
         .ok()
         .filter(|s| s.len() >= 16);
     anyhow::ensure!(
-        !snowflake_callers || std::env::var("MEMSTORE_FN_PORT").is_err() || fn_secret.is_some(),
-        "MEMSTORE_FN_PORT needs MEMSTORE_FN_SECRET (16+ chars)"
+        !snowflake_callers || std::env::var("AMPUP_MEMORY_FN_PORT").is_err() || fn_secret.is_some(),
+        "AMPUP_MEMORY_FN_PORT needs AMPUP_MEMORY_FN_SECRET (16+ chars)"
     );
     let limiter = ratelimit::Limiter::configured(options.rate_limit, options.ingest_rate_limit)?;
-    crate::telemetry::DeploymentId::from_env().context("MEMSTORE_DEPLOYMENT_ID")?;
+    crate::telemetry::DeploymentId::from_env().context("AMPUP_MEMORY_DEPLOYMENT_ID")?;
     if let Some(cap) = crate::workspace::deployment_cap()? {
-        eprintln!("memstore: capped at {cap} episodes (MEMSTORE_MAX_EPISODES)");
+        eprintln!("memstore: capped at {cap} episodes (AMPUP_MEMORY_MAX_EPISODES)");
     }
     let metrics = Arc::new(metrics::Metrics::new());
     metrics.register_dir(store.directory_metrics());
@@ -532,10 +537,10 @@ pub async fn serve_with(
     }
     let metrics_port = match options.metrics_port {
         Some(p) => Some(p),
-        None => match std::env::var("MEMSTORE_METRICS_PORT") {
+        None => match std::env::var("AMPUP_MEMORY_METRICS_PORT") {
             Ok(p) => Some(
                 p.parse()
-                    .context("MEMSTORE_METRICS_PORT is a port number")?,
+                    .context("AMPUP_MEMORY_METRICS_PORT is a port number")?,
             ),
             Err(_) => None,
         },
@@ -546,9 +551,9 @@ pub async fn serve_with(
         loopback_only: options.loopback_only,
         writes_here: options.writes_here,
         any_scope: options.any_scope
-            || std::env::var("MEMSTORE_SERVE_ANY_SCOPE").is_ok_and(|v| v == "1"),
+            || std::env::var("AMPUP_MEMORY_SERVE_ANY_SCOPE").is_ok_and(|v| v == "1"),
         workspaces: options.workspaces
-            || std::env::var("MEMSTORE_SERVE_WORKSPACES").is_ok_and(|v| v == "1"),
+            || std::env::var("AMPUP_MEMORY_SERVE_WORKSPACES").is_ok_and(|v| v == "1"),
         store: RwLock::new(store),
         scope,
         groups,
@@ -563,7 +568,7 @@ pub async fn serve_with(
         closures,
         catalog,
         directory_only: options.directory_only
-            || std::env::var("MEMSTORE_DIRECTORY").is_ok_and(|v| v == "required"),
+            || std::env::var("AMPUP_MEMORY_DIRECTORY").is_ok_and(|v| v == "required"),
         served: Default::default(),
         warmed: Default::default(),
         providers: Default::default(),
@@ -619,10 +624,10 @@ pub async fn serve_with(
     // Session rows are committed in batches, never per step (`crate::sessions::flush`).
     tokio::spawn(crate::sessions::flush_every());
     // What this process counts (usage, alert readings), written for whichever process sends telemetry.
-    let usage_persist = match std::env::var("MEMSTORE_USAGE_PERSIST_SECS") {
+    let usage_persist = match std::env::var("AMPUP_MEMORY_USAGE_PERSIST_SECS") {
         Ok(v) => Duration::from_secs(
             v.parse::<u64>()
-                .context("MEMSTORE_USAGE_PERSIST_SECS")?
+                .context("AMPUP_MEMORY_USAGE_PERSIST_SECS")?
                 .max(5),
         ),
         Err(_) => Duration::from_secs(60),
@@ -636,26 +641,26 @@ pub async fn serve_with(
             }
             *state.limits.write().unwrap() = l;
         }
-        let every = match std::env::var("MEMSTORE_TELEMETRY_INTERVAL_SECS") {
+        let every = match std::env::var("AMPUP_MEMORY_TELEMETRY_INTERVAL_SECS") {
             Ok(v) => Duration::from_secs(
                 v.parse::<u64>()
-                    .context("MEMSTORE_TELEMETRY_INTERVAL_SECS")?
+                    .context("AMPUP_MEMORY_TELEMETRY_INTERVAL_SECS")?
                     .max(5),
             ),
             Err(_) => Duration::from_secs(60),
         };
-        let inventory_every = match std::env::var("MEMSTORE_TELEMETRY_INVENTORY_SECS") {
+        let inventory_every = match std::env::var("AMPUP_MEMORY_TELEMETRY_INVENTORY_SECS") {
             Ok(v) => Duration::from_secs(
                 v.parse::<u64>()
-                    .context("MEMSTORE_TELEMETRY_INVENTORY_SECS")?
+                    .context("AMPUP_MEMORY_TELEMETRY_INVENTORY_SECS")?
                     .max(60),
             ),
             Err(_) => Duration::from_secs(3600),
         };
-        let alerts_every = match std::env::var("MEMSTORE_ALERTS_EVAL_SECS") {
+        let alerts_every = match std::env::var("AMPUP_MEMORY_ALERTS_EVAL_SECS") {
             Ok(v) => Duration::from_secs(
                 v.parse::<u64>()
-                    .context("MEMSTORE_ALERTS_EVAL_SECS")?
+                    .context("AMPUP_MEMORY_ALERTS_EVAL_SECS")?
                     .max(crate::alerts::MIN_EVAL_SECS),
             ),
             Err(_) => Duration::from_secs(crate::alerts::EVAL_SECS),
@@ -676,15 +681,15 @@ pub async fn serve_with(
         ));
     }
     // The training log, if there is one, is swept of what the memory forgot by paths that don't know of it
-    // (`crate::train_data`), every `MEMSTORE_TRAIN_LOG_SWEEP_SECS` (default 3600).
+    // (`crate::train_data`), every `AMPUP_MEMORY_TRAIN_LOG_SWEEP_SECS` (default 3600).
     if crate::extract::train_log::enabled() {
         // Only the orgs whose settings say `train_log` are logged: the directory is read before the first request
-        // (an unreadable one logs nobody) and again every `MEMSTORE_TRAIN_LOG_FOLLOW_SECS` (default 30), so a
+        // (an unreadable one logs nobody) and again every `AMPUP_MEMORY_TRAIN_LOG_FOLLOW_SECS` (default 30), so a
         // setting reaches every server soon.
         let store = state.store.read().unwrap().clone();
         follow_train_log(&store).await;
         let st = state.clone();
-        let follow = std::env::var("MEMSTORE_TRAIN_LOG_FOLLOW_SECS")
+        let follow = std::env::var("AMPUP_MEMORY_TRAIN_LOG_FOLLOW_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .map_or(Duration::from_secs(30), Duration::from_secs);
@@ -696,7 +701,7 @@ pub async fn serve_with(
             }
         });
         let st = state.clone();
-        let every = std::env::var("MEMSTORE_TRAIN_LOG_SWEEP_SECS")
+        let every = std::env::var("AMPUP_MEMORY_TRAIN_LOG_SWEEP_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .map_or(Duration::from_secs(3600), Duration::from_secs);
@@ -712,10 +717,10 @@ pub async fn serve_with(
         });
     }
     // Sessions left open end once idle, and ended sessions that were routed advice are judged by the judge model
-    // (`crate::sessions`; a small one, `MEMSTORE_JUDGE_MODEL`), every `MEMSTORE_SESSION_SWEEP_SECS` (default 60).
+    // (`crate::sessions`; a small one, `AMPUP_MEMORY_JUDGE_MODEL`), every `AMPUP_MEMORY_SESSION_SWEEP_SECS` (default 60).
     {
         let st = state.clone();
-        let every = std::env::var("MEMSTORE_SESSION_SWEEP_SECS")
+        let every = std::env::var("AMPUP_MEMORY_SESSION_SWEEP_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .map_or(Duration::from_secs(60), Duration::from_secs);
@@ -803,24 +808,25 @@ pub async fn serve_with(
     // Index updates run in the background, the first one right away: after an index layout
     // change that is a full rebuild (minutes at 100k facts), and until it lands search reads
     // the facts table directly, keyword only, rather than the port staying closed.
-    // Engine extraction (`MEMSTORE_EXTRACT`, by default Claude Haiku 5.5 on OpenRouter): what a scope schema's
+    // Engine extraction (`AMPUP_MEMORY_EXTRACT`, by default Claude Haiku 5.5 on OpenRouter): what a scope schema's
     // `extract` section names turns into facts within a few seconds, read by the model once per episode; the rest
     // too, goal-blind, where that is on.
     let extractor = crate::extract::Extractor::from_env()?;
     if extractor.is_none() {
-        let off = std::env::var("MEMSTORE_EXTRACT").is_ok_and(|v| v.eq_ignore_ascii_case("off"));
+        let off =
+            std::env::var("AMPUP_MEMORY_EXTRACT").is_ok_and(|v| v.eq_ignore_ascii_case("off"));
         eprintln!(
             "{}: nothing is extracted",
             if off {
-                "extraction is off (MEMSTORE_EXTRACT=off)"
+                "extraction is off (AMPUP_MEMORY_EXTRACT=off)"
             } else {
-                "no extraction model (OPENROUTER_API_KEY, or MEMSTORE_EXTRACT)"
+                "no extraction model (OPENROUTER_API_KEY, or AMPUP_MEMORY_EXTRACT)"
             }
         );
     }
     if let Some(ex) = extractor {
         let st = state.clone();
-        let every = std::env::var("MEMSTORE_EXTRACT_SECS")
+        let every = std::env::var("AMPUP_MEMORY_EXTRACT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .map_or(Duration::from_secs(5), Duration::from_secs);
@@ -835,7 +841,7 @@ pub async fn serve_with(
             if crate::extract::goal_blind() {
                 ", and goal-blind for the rest"
             } else {
-                " (MEMSTORE_EXTRACT_GOAL_BLIND=1: the rest too)"
+                " (AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1: the rest too)"
             }
         );
         let agg = summariser(&ex);
@@ -846,7 +852,7 @@ pub async fn serve_with(
         let settled: Arc<std::sync::Mutex<std::collections::BTreeSet<Scope>>> = Default::default();
         // What the goals' facts add up to, for subjects with a full batch or a long wait: a loop of its own, so a
         // long summarising pass never holds up the next episodes' extraction. A scope is summarised once an hour
-        // (`MEMSTORE_AGGREGATE_SECS`), once its extraction has caught up: each subject's summary is a paid model
+        // (`AMPUP_MEMORY_AGGREGATE_SECS`), once its extraction has caught up: each subject's summary is a paid model
         // call per audience, so a failed one waits for the next pass rather than being asked again every few
         // seconds. Checked every minute, so a restart summarises soon after rather than an hour later; what ran
         // in the last hour isn't due again (each subject's last run is in the store). A reader's `get_brief`
@@ -914,17 +920,17 @@ pub async fn serve_with(
                 }
             }
         });
-        // Dreaming (`crate::dream`): off unless MEMSTORE_DREAM_ON names the scopes. Each hour, a scope it names
+        // Dreaming (`crate::dream`): off unless AMPUP_MEMORY_DREAM_ON names the scopes. Each hour, a scope it names
         // whose extraction has caught up releases what its dreams rest on that is gone, and once a day
-        // (`MEMSTORE_DREAM_SECS`), when 200 new facts wait (`MEMSTORE_DREAM_FACTS`), gets a pass within its budget
-        // of model calls (`MEMSTORE_DREAM_CALLS`, `MEMSTORE_DREAM_PARALLEL` at a time). The nightly maintenance window's dream step runs the same step
+        // (`AMPUP_MEMORY_DREAM_SECS`), when 200 new facts wait (`AMPUP_MEMORY_DREAM_FACTS`), gets a pass within its budget
+        // of model calls (`AMPUP_MEMORY_DREAM_CALLS`, `AMPUP_MEMORY_DREAM_PARALLEL` at a time). The nightly maintenance window's dream step runs the same step
         // (`maintenance::dream_step`); the gate is the dreamer's last pass in the ledger, so the two share it.
         match (
             crate::dream::On::from_env(),
             crate::extract::Extractor::dream_from_env()?,
         ) {
             (None, _) => {}
-            (Some(_), None) => eprintln!("dreaming is off: MEMSTORE_DREAM=off"),
+            (Some(_), None) => eprintln!("dreaming is off: AMPUP_MEMORY_DREAM=off"),
             (Some(on), Some(dx)) => {
                 let gate = crate::dream::Gate::from_env()?;
                 eprintln!(
@@ -1082,18 +1088,18 @@ pub async fn serve_with(
     }
     // AIP (`crate::compile`), which subsumes corpus-to-skill: a scope's skills and their AIP graphs follow its
     // compile sources as they come in, compiled once per episode. Only where a scope has compile sources (its
-    // org's or team's `compile_sources`, else `MEMSTORE_COMPILE_SOURCES`); `MEMSTORE_COMPILE=off` turns it off
+    // org's or team's `compile_sources`, else `AMPUP_MEMORY_COMPILE_SOURCES`); `AMPUP_MEMORY_COMPILE=off` turns it off
     // for the server.
     if let Some(cx) = crate::extract::Extractor::compile_from_env()? {
         let st = state.clone();
-        let every = std::env::var("MEMSTORE_COMPILE_SECS")
+        let every = std::env::var("AMPUP_MEMORY_COMPILE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .map_or(Duration::from_secs(60), Duration::from_secs);
         eprintln!(
             "compiling skill libraries and AIP graphs with {}{}{}, where a scope has compile sources",
             cx.model(),
-            std::env::var("MEMSTORE_AIP_MODEL")
+            std::env::var("AMPUP_MEMORY_AIP_MODEL")
                 .ok()
                 .filter(|m| !m.trim().is_empty())
                 .map_or(String::new(), |m| format!(
@@ -1119,7 +1125,7 @@ pub async fn serve_with(
                 let scopes = walk.next(&st, &store).await;
                 // Where a scope has compile sources, but where an org's or a team's admins turned compiling off
                 // (`set_settings`). A scope the directory doesn't hold (a `serve --local` server's own) takes
-                // the server's `MEMSTORE_COMPILE_SOURCES`.
+                // the server's `AMPUP_MEMORY_COMPILE_SOURCES`.
                 let dir = crate::people::directory::Directory::load(&store).await.ok();
                 let scopes: Vec<(Scope, Vec<String>)> = scopes
                     .into_iter()
@@ -1175,7 +1181,7 @@ pub async fn serve_with(
     // once enough rewarded runs are new. It reads every recorder's traces, so only where an org's or a team's
     // admins turned it on (`set_settings {advice}`), and in the own scope of a server that identifies no one,
     // whose operator owns every trace there: its one caller's, and those of each person a request named in
-    // `x-memstore-as` (operator trust), every one of which it learns from. Unless `MEMSTORE_ADVICE_LEARN=off`.
+    // `x-memstore-as` (operator trust), every one of which it learns from. Unless `AMPUP_MEMORY_ADVICE_LEARN=off`.
     if crate::advice_loop::enabled()
         && let Some(cx) = crate::extract::Extractor::advice_from_env()?
     {
@@ -1347,14 +1353,14 @@ pub async fn serve_with(
     }
     // Table maintenance (`Store::maintain_over`): every commit adds an Iceberg snapshot to its table's
     // metadata, and past the catalog's limit on metadata size every write fails, so old snapshots are
-    // expired on a timer: a first round a minute after start, then every `MEMSTORE_MAINTAIN_SECS`
-    // (default 600; 0: never), keeping the newest `MEMSTORE_MAINTAIN_KEEP` (default 10) of a table that
+    // expired on a timer: a first round a minute after start, then every `AMPUP_MEMORY_MAINTAIN_SECS`
+    // (default 600; 0: never), keeping the newest `AMPUP_MEMORY_MAINTAIN_KEEP` (default 10) of a table that
     // holds twice that. Each round also reads the ledger's status for its metrics. Nothing is rewritten here: the
     // ledger's and each scope's summaries' compaction run in the nightly maintenance window (`maintenance`,
-    // `MEMSTORE_MAINTAIN_WINDOW`), which this timer's rounds open.
+    // `AMPUP_MEMORY_MAINTAIN_WINDOW`), which this timer's rounds open.
     let compact = compaction::Config::from_env()?;
     let window = maintenance::Config::from_env()?;
-    let every = std::env::var("MEMSTORE_MAINTAIN_SECS")
+    let every = std::env::var("AMPUP_MEMORY_MAINTAIN_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(600u64);
@@ -1362,7 +1368,7 @@ pub async fn serve_with(
     // both doing the rounds doubled the catalog reads, and the catalog throttles a burst (BigLake's per-minute
     // read quota, spent when a deploy restarts every pod at once).
     if every > 0 && state.role != Role::Serve {
-        let keep = std::env::var("MEMSTORE_MAINTAIN_KEEP")
+        let keep = std::env::var("AMPUP_MEMORY_MAINTAIN_KEEP")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10usize)
@@ -1418,7 +1424,7 @@ pub async fn serve_with(
     // the server before this one meanwhile. What a sign-in needs must have loaded, however long it takes: the
     // directory (who is disabled, read and synced) and the served scope; a failure there is retried and keeps
     // the server unready. The rest (every other scope's tables and indexes) is bounded by
-    // `MEMSTORE_READY_TIMEOUT_SECS`, which counts only slowness: past it the server says it is ready anyway
+    // `AMPUP_MEMORY_READY_TIMEOUT_SECS`, which counts only slowness: past it the server says it is ready anyway
     // (once the first part has loaded) and the warm-up goes on, since a scope that won't warm (an index being
     // rebuilt, an org with a broken table) must not keep a deploy, or a lone server's restart, from serving.
     // Every index search scores on Lance's one CPU pool: its size is the ceiling on searches scoring at once.
@@ -1442,7 +1448,7 @@ pub async fn serve_with(
             match tokio::time::timeout(bound.saturating_sub(started.elapsed()), warming).await {
                 Ok(_) => eprintln!("ready: warmed up in {} ms", started.elapsed().as_millis()),
                 Err(_) => eprintln!(
-                    "ready WITHOUT a full warm-up: still warming after {}s (MEMSTORE_READY_TIMEOUT_SECS); \
+                    "ready WITHOUT a full warm-up: still warming after {}s (AMPUP_MEMORY_READY_TIMEOUT_SECS); \
                      it goes on, and reads load what isn't warm yet",
                     bound.as_secs()
                 ),
@@ -1451,9 +1457,9 @@ pub async fn serve_with(
             tokio::spawn(keep_warm(st));
         });
     }
-    // What holds memory, every MEMSTORE_MEMORY_LOG_SECS (default 30, 0 for never): the process (resident,
+    // What holds memory, every AMPUP_MEMORY_MEMORY_LOG_SECS (default 30, 0 for never): the process (resident,
     // and what the allocator holds against what is live), the store's caches and the search side's.
-    let memory_every = std::env::var("MEMSTORE_MEMORY_LOG_SECS")
+    let memory_every = std::env::var("AMPUP_MEMORY_MEMORY_LOG_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30u64);
@@ -1500,11 +1506,11 @@ pub async fn serve_with(
     anyhow::ensure!(
         !state.any_scope
             || (state.fixed() && ["127.0.0.1", "localhost", "::1"].contains(&bind.as_str())),
-        "MEMSTORE_SERVE_ANY_SCOPE is for a server that identifies no one and listens on 127.0.0.1 only"
+        "AMPUP_MEMORY_SERVE_ANY_SCOPE is for a server that identifies no one and listens on 127.0.0.1 only"
     );
     if let Some(port) = metrics_port {
         // Only `/metrics`, to whoever reaches the port: keep it off the public network (a pod port the
-        // scraper reaches, not the load balancer's). Bound like the public port (`MEMSTORE_SERVE_BIND`).
+        // scraper reaches, not the load balancer's). Bound like the public port (`AMPUP_MEMORY_SERVE_BIND`).
         let listener = tokio::net::TcpListener::bind((bind.as_str(), port)).await?;
         eprintln!("metrics on {bind}:{port}/metrics");
         let state = state.clone();
@@ -1535,7 +1541,7 @@ pub async fn serve_with(
             }
         });
     }
-    if let Some(fn_port) = std::env::var("MEMSTORE_FN_PORT")
+    if let Some(fn_port) = std::env::var("AMPUP_MEMORY_FN_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
     {
@@ -1602,7 +1608,7 @@ pub async fn serve_with(
         let _ = tokio::time::timeout(Duration::from_secs(5), state.writer.release()).await;
     };
     eprintln!(
-        "shutting down: still answering for {}s (MEMSTORE_SHUTDOWN_DRAIN_SECS) while out of rotation",
+        "shutting down: still answering for {}s (AMPUP_MEMORY_SHUTDOWN_DRAIN_SECS) while out of rotation",
         drain.as_secs()
     );
     tokio::select! {
@@ -1610,7 +1616,7 @@ pub async fn serve_with(
         _ = async { tokio::join!(handover, tokio::time::sleep(drain)) } => {}
     }
     // No new connections from here. The requests being answered are answered, up to
-    // MEMSTORE_SHUTDOWN_WAIT_SECS: a search 30 s into a loaded cell ends with its answer, not with a cut
+    // AMPUP_MEMORY_SHUTDOWN_WAIT_SECS: a search 30 s into a loaded cell ends with its answer, not with a cut
     // connection that the proxy in front (another cell, the ingress) turns into a 502 for its caller.
     drop(serving);
     state.closing.send_replace(true);
@@ -1618,7 +1624,7 @@ pub async fn serve_with(
     if open > 0 {
         let wait = shutdown_wait();
         eprintln!(
-            "shutting down: {open} connections finishing their requests (at most {}s, MEMSTORE_SHUTDOWN_WAIT_SECS)",
+            "shutting down: {open} connections finishing their requests (at most {}s, AMPUP_MEMORY_SHUTDOWN_WAIT_SECS)",
             wait.as_secs()
         );
         let started = Instant::now();
@@ -1661,11 +1667,11 @@ async fn flush_buffers(state: &State) {
 }
 
 /// How long a stopping server, past its drain, waits for the requests it is answering:
-/// `MEMSTORE_SHUTDOWN_WAIT_SECS`, default 60 (a search on a loaded cell, an advice call). The wait ends when
+/// `AMPUP_MEMORY_SHUTDOWN_WAIT_SECS`, default 60 (a search on a loaded cell, an advice call). The wait ends when
 /// the last one is answered, so a server with none stops at once.
 fn shutdown_wait() -> Duration {
     Duration::from_secs(
-        std::env::var("MEMSTORE_SHUTDOWN_WAIT_SECS")
+        std::env::var("AMPUP_MEMORY_SHUTDOWN_WAIT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60),
@@ -1673,11 +1679,11 @@ fn shutdown_wait() -> Duration {
 }
 
 /// How long a stopping server goes on answering while out of rotation (`/ready` 503):
-/// `MEMSTORE_SHUTDOWN_DRAIN_SECS`, default 5 (endpoint removal reaches kube-proxy and ingresses in a
+/// `AMPUP_MEMORY_SHUTDOWN_DRAIN_SECS`, default 5 (endpoint removal reaches kube-proxy and ingresses in a
 /// few seconds). A pod spec's `preStop` sleep gives the same, before SIGTERM.
 fn shutdown_drain() -> Duration {
     Duration::from_secs(
-        std::env::var("MEMSTORE_SHUTDOWN_DRAIN_SECS")
+        std::env::var("AMPUP_MEMORY_SHUTDOWN_DRAIN_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5),
@@ -1708,11 +1714,11 @@ async fn ctrl_c() {
     }
 }
 
-/// How long a request (or an MCP tool call) takes before it is logged as slow: `MEMSTORE_SLOW_REQUEST_MS`.
+/// How long a request (or an MCP tool call) takes before it is logged as slow: `AMPUP_MEMORY_SLOW_REQUEST_MS`.
 fn slow_after() -> Duration {
     static SLOW: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
         Duration::from_millis(
-            std::env::var("MEMSTORE_SLOW_REQUEST_MS")
+            std::env::var("AMPUP_MEMORY_SLOW_REQUEST_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1000),
@@ -1878,7 +1884,7 @@ async fn listen(
     }
 }
 
-/// A connection past `MEMSTORE_MAX_CONNECTIONS`: answered 503 and closed, without reading it.
+/// A connection past `AMPUP_MEMORY_MAX_CONNECTIONS`: answered 503 and closed, without reading it.
 async fn too_many_connections(mut conn: tokio::net::TcpStream) {
     use tokio::io::AsyncWriteExt;
     let answer = b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\ncontent-type: application/json\r\n\
@@ -1928,7 +1934,7 @@ impl std::error::Error for NeedsSessionUser {}
 /// A refusal for the audit: the org it is recorded under, the caller, the status and why ([`handle`]'s).
 type Refuse<'a> = dyn Fn(Option<(String, i64)>, &str, u16, audit::Reason) + Sync + 'a;
 
-/// One more request under way for `a` (`MEMSTORE_MAX_IN_FLIGHT_PER_CALLER`), counted by the same id as its rate
+/// One more request under way for `a` (`AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER`), counted by the same id as its rate
 /// limit; when it already has the most a caller may, the 429 that answers it, recorded as a rate limit is.
 async fn begin(
     state: &State,
@@ -2477,70 +2483,70 @@ fn token_principal(state: &State, user: String, token_groups: Vec<String>) -> Pr
     Principal::from_parts(user, groups)
 }
 
-/// `MEMSTORE_CALLER_IDENTITY=token`'s configuration, from the environment.
+/// `AMPUP_MEMORY_CALLER_IDENTITY=token`'s configuration, from the environment.
 async fn token_auth_from_env() -> Result<auth::TokenAuth> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let need = |k: &str| var(k).ok_or_else(|| anyhow::anyhow!("{k} is not set"));
     let keys = match (
-        var("MEMSTORE_JWT_SECRET"),
-        var("MEMSTORE_JWT_PUBLIC_KEY"),
-        var("MEMSTORE_JWT_JWKS_URL"),
+        var("AMPUP_MEMORY_JWT_SECRET"),
+        var("AMPUP_MEMORY_JWT_PUBLIC_KEY"),
+        var("AMPUP_MEMORY_JWT_JWKS_URL"),
     ) {
         (None, None, None) => None,
         (Some(s), None, None) => Some(auth::KeySource::Secret(s)),
         (None, Some(p), None) => Some(auth::KeySource::Pem(p)),
         (None, None, Some(u)) => Some(auth::KeySource::Jwks(u)),
         _ => anyhow::bail!(
-            "set one of MEMSTORE_JWT_SECRET, MEMSTORE_JWT_PUBLIC_KEY, MEMSTORE_JWT_JWKS_URL"
+            "set one of AMPUP_MEMORY_JWT_SECRET, AMPUP_MEMORY_JWT_PUBLIC_KEY, AMPUP_MEMORY_JWT_JWKS_URL"
         ),
     };
     let jwt = match keys {
         None => None,
         Some(keys) => {
             let mut opts = auth::JwtOptions::new(
-                &need("MEMSTORE_JWT_ISSUER")?,
-                &need("MEMSTORE_JWT_AUDIENCE")?,
+                &need("AMPUP_MEMORY_JWT_ISSUER")?,
+                &need("AMPUP_MEMORY_JWT_AUDIENCE")?,
             );
-            // Bound to one org by a claim, unless the issuer has none (`MEMSTORE_JWT_ORG_CLAIM=none`).
-            let claim = var("MEMSTORE_JWT_ORG_CLAIM").unwrap_or_else(|| "org".into());
+            // Bound to one org by a claim, unless the issuer has none (`AMPUP_MEMORY_JWT_ORG_CLAIM=none`).
+            let claim = var("AMPUP_MEMORY_JWT_ORG_CLAIM").unwrap_or_else(|| "org".into());
             if claim != "none" {
-                opts = opts.with_org(&claim, &need("MEMSTORE_ORG")?);
+                opts = opts.with_org(&claim, &need("AMPUP_MEMORY_ORG")?);
             }
-            if let Some(c) = var("MEMSTORE_JWT_GROUPS_CLAIM") {
+            if let Some(c) = var("AMPUP_MEMORY_JWT_GROUPS_CLAIM") {
                 opts.groups_claim = c;
             }
-            if let Some(c) = var("MEMSTORE_JWT_USER_CLAIMS") {
+            if let Some(c) = var("AMPUP_MEMORY_JWT_USER_CLAIMS") {
                 opts.user_claims = c.split(',').map(|c| c.trim().to_string()).collect();
             }
             opts.require_verified_email =
-                var("MEMSTORE_JWT_REQUIRE_VERIFIED_EMAIL").as_deref() != Some("false");
+                var("AMPUP_MEMORY_JWT_REQUIRE_VERIFIED_EMAIL").as_deref() != Some("false");
             Some(auth::JwtConfig::new(keys, opts)?)
         }
     };
     // Read again whenever it changes (`keys_file_watch`): a key taken out of it stops working with no restart.
-    let mut auth = match var("MEMSTORE_API_KEYS") {
+    let mut auth = match var("AMPUP_MEMORY_API_KEYS") {
         Some(path) => auth::TokenAuth::from_keys_file(std::path::Path::new(&path), jwt)?,
         None => auth::TokenAuth::new(None, jwt)?,
     };
-    if var("MEMSTORE_ALLOW_LOCAL_ISSUERS").is_some_and(|v| v == "1") {
+    if var("AMPUP_MEMORY_ALLOW_LOCAL_ISSUERS").is_some_and(|v| v == "1") {
         auth = auth.allow_local_issuers();
     }
-    if let Some(issuer) = var("MEMSTORE_OIDC_ISSUER") {
-        let audiences = crate::split_list(&var("MEMSTORE_OIDC_AUDIENCE").unwrap_or_default());
+    if let Some(issuer) = var("AMPUP_MEMORY_OIDC_ISSUER") {
+        let audiences = crate::split_list(&var("AMPUP_MEMORY_OIDC_AUDIENCE").unwrap_or_default());
         auth = auth.with_oidc(auth::OidcConfig::discover(&issuer, audiences).await?);
     }
     // The platform's Auth0 tenant: unset, its tokens are nobody's. Its other settings without it are a
     // mistake, not a no-op.
-    let client_ids = crate::split_list(&var("MEMSTORE_AUTH0_CLIENT_IDS").unwrap_or_default());
-    let operators = var("MEMSTORE_AUTH0_OPERATORS_ORG");
-    match var("MEMSTORE_AUTH0_ISSUER") {
+    let client_ids = crate::split_list(&var("AMPUP_MEMORY_AUTH0_CLIENT_IDS").unwrap_or_default());
+    let operators = var("AMPUP_MEMORY_AUTH0_OPERATORS_ORG");
+    match var("AMPUP_MEMORY_AUTH0_ISSUER") {
         Some(issuer) => {
-            let local = var("MEMSTORE_ALLOW_LOCAL_ISSUERS").is_some_and(|v| v == "1");
+            let local = var("AMPUP_MEMORY_ALLOW_LOCAL_ISSUERS").is_some_and(|v| v == "1");
             // This deployment as the resource MCP clients ask the tenant for (what the protected-resource
             // metadata names): an access token for it signs in like an ID token for the CLI's client.
             // TODO: confirm with the tenant's owner that resource-audience tokens from dynamically
             // registered clients are wanted on every deployment, not just a staging one.
-            let resources = var("MEMSTORE_PUBLIC_URL")
+            let resources = var("AMPUP_MEMORY_PUBLIC_URL")
                 .map(|u| vec![format!("{}/mcp", u.trim_end_matches('/'))])
                 .unwrap_or_default();
             let auth0 =
@@ -2549,12 +2555,12 @@ async fn token_auth_from_env() -> Result<auth::TokenAuth> {
         }
         None => anyhow::ensure!(
             client_ids.is_empty() && operators.is_none(),
-            "MEMSTORE_AUTH0_CLIENT_IDS and MEMSTORE_AUTH0_OPERATORS_ORG need MEMSTORE_AUTH0_ISSUER"
+            "AMPUP_MEMORY_AUTH0_CLIENT_IDS and AMPUP_MEMORY_AUTH0_OPERATORS_ORG need AMPUP_MEMORY_AUTH0_ISSUER"
         ),
     }
     anyhow::ensure!(
         auth.has_credentials(),
-        "token auth needs MEMSTORE_API_KEYS, a JWT key, MEMSTORE_OIDC_ISSUER or MEMSTORE_AUTH0_ISSUER"
+        "token auth needs AMPUP_MEMORY_API_KEYS, a JWT key, AMPUP_MEMORY_OIDC_ISSUER or AMPUP_MEMORY_AUTH0_ISSUER"
     );
     Ok(auth)
 }
@@ -2571,10 +2577,10 @@ pub struct Check {
 /// What `serve` would make of this environment's caller identity, each part tried the way `serve` tries it
 /// (files read, JWKS fetched, the provider discovered, Cloud Run asked), so a wrong setting shows before a
 /// user is refused.
-const IAP_WITHOUT_GOOGLE: &str = "MEMSTORE_IAP_AUDIENCE is set but MEMSTORE_CALLER_IDENTITY has no `google`: the proxy's header would be ignored";
+const IAP_WITHOUT_GOOGLE: &str = "AMPUP_MEMORY_IAP_AUDIENCE is set but AMPUP_MEMORY_CALLER_IDENTITY has no `google`: the proxy's header would be ignored";
 
 fn iap_set() -> bool {
-    std::env::var("MEMSTORE_IAP_AUDIENCE").is_ok_and(|a| !a.is_empty())
+    std::env::var("AMPUP_MEMORY_IAP_AUDIENCE").is_ok_and(|a| !a.is_empty())
 }
 
 pub async fn identity_check() -> Vec<Check> {
@@ -2591,7 +2597,7 @@ pub async fn identity_check() -> Vec<Check> {
         });
     };
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    let spec = std::env::var("MEMSTORE_CALLER_IDENTITY").ok();
+    let spec = std::env::var("AMPUP_MEMORY_CALLER_IDENTITY").ok();
     let names: Vec<Option<&str>> = match spec.as_deref() {
         None => vec![None],
         Some(s) => s.split(',').map(str::trim).map(Some).collect(),
@@ -2612,7 +2618,7 @@ pub async fn identity_check() -> Vec<Check> {
     }
     if iap_set() && !names.contains(&Some("google")) {
         check(
-            "MEMSTORE_IAP_AUDIENCE",
+            "AMPUP_MEMORY_IAP_AUDIENCE",
             Err(anyhow::anyhow!(IAP_WITHOUT_GOOGLE)),
         );
     }
@@ -2620,7 +2626,7 @@ pub async fn identity_check() -> Vec<Check> {
         match mode {
         None => check(
             "identity",
-            Ok("fixed: MEMSTORE_CALLER_IDENTITY is unset, so every caller is one principal with the \
+            Ok("fixed: AMPUP_MEMORY_CALLER_IDENTITY is unset, so every caller is one principal with the \
                 groups given to `serve` (fine on a laptop, not for a shared server)"
                 .into()),
         ),
@@ -2630,8 +2636,8 @@ pub async fn identity_check() -> Vec<Check> {
                 Ok("snowflake: the caller is the Snowflake user SPCS proves".into()),
             );
             check(
-                "MEMSTORE_FN_SECRET",
-                match var("MEMSTORE_FN_SECRET") {
+                "AMPUP_MEMORY_FN_SECRET",
+                match var("AMPUP_MEMORY_FN_SECRET") {
                     Some(s) if s.len() >= 16 => {
                         Ok("set: the app's wrappers may name callers on the internal port".into())
                     }
@@ -2648,16 +2654,16 @@ pub async fn identity_check() -> Vec<Check> {
                 Ok("google: the caller is the Google identity in the ID token".into()),
             );
             check(
-                "MEMSTORE_ID_AUDIENCE",
-                match var("MEMSTORE_ID_AUDIENCE") {
+                "AMPUP_MEMORY_ID_AUDIENCE",
+                match var("AMPUP_MEMORY_ID_AUDIENCE") {
                     None => Ok("unset: only tokens minted for this service's own URL".into()),
                     Some(a) => Ok(a),
                 },
             );
             match auth::Iap::from_env() {
                 Ok(None) => {}
-                Ok(Some(iap)) => check("MEMSTORE_IAP_AUDIENCE", iap.probe().await),
-                Err(e) => check("MEMSTORE_IAP_AUDIENCE", Err(e)),
+                Ok(Some(iap)) => check("AMPUP_MEMORY_IAP_AUDIENCE", iap.probe().await),
+                Err(e) => check("AMPUP_MEMORY_IAP_AUDIENCE", Err(e)),
             }
             check(
                 "Cloud Run IAM",
@@ -2681,16 +2687,16 @@ pub async fn identity_check() -> Vec<Check> {
                 Err(e) => check("token auth", Err(e)),
                 Ok(auth) => {
                     let (keys, admins) = auth.key_counts();
-                    if let Some(p) = var("MEMSTORE_API_KEYS").filter(|_| keys > admins) {
+                    if let Some(p) = var("AMPUP_MEMORY_API_KEYS").filter(|_| keys > admins) {
                         file_keys = Some(format!(
-                            "{p} holds {} non-admin keys, which are being retired: move them into the directory with `memstore apikey import --org <org> --from {p}` (a server reading through the directory, MEMSTORE_DIRECTORY=required, imports those it can itself)",
+                            "{p} holds {} non-admin keys, which are being retired: move them into the directory with `ampup-memory apikey import --org <org> --from {p}` (a server reading through the directory, AMPUP_MEMORY_DIRECTORY=required, imports those it can itself)",
                             keys - admins
                         ));
                         file_rows = auth.file_key_callers();
                     }
                     check(
-                        "MEMSTORE_API_KEYS",
-                        match var("MEMSTORE_API_KEYS") {
+                        "AMPUP_MEMORY_API_KEYS",
+                        match var("AMPUP_MEMORY_API_KEYS") {
                             None => Ok("unset: no API keys".into()),
                             Some(p) if admins == 0 => Err(anyhow::anyhow!(
                                 "{p}: {keys} keys, none admin: /closure, /acl, /team and creating orgs have no caller"
@@ -2706,7 +2712,7 @@ pub async fn identity_check() -> Vec<Check> {
                         },
                     );
                     check(
-                        "MEMSTORE_OIDC_ISSUER",
+                        "AMPUP_MEMORY_OIDC_ISSUER",
                         match auth.oidc() {
                             None => Ok("unset: no server-wide identity provider (orgs may still connect their own)".into()),
                             Some(o) => Ok(format!(
@@ -2717,7 +2723,7 @@ pub async fn identity_check() -> Vec<Check> {
                         },
                     );
                     check(
-                        "MEMSTORE_AUTH0_ISSUER",
+                        "AMPUP_MEMORY_AUTH0_ISSUER",
                         match auth.auth0() {
                             None => Ok("unset: no sign-in through the platform's Auth0 tenant".into()),
                             Some(a) => Ok(format!(
@@ -2731,17 +2737,17 @@ pub async fn identity_check() -> Vec<Check> {
                 }
             }
             check(
-                "MEMSTORE_DISABLED_FILE",
-                match var("MEMSTORE_DISABLED_FILE") {
+                "AMPUP_MEMORY_DISABLED_FILE",
+                match var("AMPUP_MEMORY_DISABLED_FILE") {
                     None => Err(anyhow::anyhow!(
                         "unset: disabled users are forgotten on restart"
                     )),
                     Some(p) => auth::ClosureStore::with_disabled_file(p.clone().into()).map(|_| p),
                 },
             );
-            if let Some(p) = var("MEMSTORE_TEAM_CSV") {
+            if let Some(p) = var("AMPUP_MEMORY_TEAM_CSV") {
                 check(
-                    "MEMSTORE_TEAM_CSV",
+                    "AMPUP_MEMORY_TEAM_CSV",
                     std::fs::read_to_string(&p)
                         .map_err(|e| anyhow::anyhow!("{p}: {e}"))
                         .and_then(|t| crate::people::team::Team::parse(&t))
@@ -2751,14 +2757,14 @@ pub async fn identity_check() -> Vec<Check> {
         }
         Some(other) => check(
             "identity",
-            Err(anyhow::anyhow!("unknown MEMSTORE_CALLER_IDENTITY {other}")),
+            Err(anyhow::anyhow!("unknown AMPUP_MEMORY_CALLER_IDENTITY {other}")),
         ),
     }
     }
     if let Some(detail) = file_keys {
         // Each key against the directory, as a server here would judge it, less the groups a server gives callers
         // (its `serve` groups, closures pushed while it runs), which only it knows.
-        let dir = match std::env::var("MEMSTORE_PLATFORM") {
+        let dir = match std::env::var("AMPUP_MEMORY_PLATFORM") {
             Ok(_) => match platform::catalog_from_env().await {
                 Ok(c) => crate::people::directory::Directory::load(&Store::new(c))
                     .await
@@ -2769,7 +2775,8 @@ pub async fn identity_check() -> Vec<Check> {
         };
         match dir {
             Some(dir) => {
-                let through = std::env::var("MEMSTORE_DIRECTORY").is_ok_and(|v| v == "required");
+                let through =
+                    std::env::var("AMPUP_MEMORY_DIRECTORY").is_ok_and(|v| v == "required");
                 for (k, f) in file_keys::fates(&dir, file_rows, through, |_| vec![]) {
                     out.push(Check {
                         what: format!("file key {}", k.id),
@@ -2792,7 +2799,7 @@ pub async fn identity_check() -> Vec<Check> {
 }
 
 /// Orgs' provider client secrets as the directory keeps them: each must open (or be in the environment)
-/// here, and none may be in plain text. Only with a catalog configured (`MEMSTORE_PLATFORM`).
+/// here, and none may be in plain text. Only with a catalog configured (`AMPUP_MEMORY_PLATFORM`).
 async fn secrets_check() -> Vec<Check> {
     use auth::secret::{KEY_ENV, SecretKey};
     let mut out = Vec::new();
@@ -2808,7 +2815,7 @@ async fn secrets_check() -> Vec<Check> {
             },
         });
     }
-    if std::env::var("MEMSTORE_PLATFORM").is_err() {
+    if std::env::var("AMPUP_MEMORY_PLATFORM").is_err() {
         return out;
     }
     let dir = match platform::catalog_from_env().await {
@@ -2872,7 +2879,7 @@ async fn secrets_check() -> Vec<Check> {
 }
 
 /// One check per org whose provider has a client secret: it is a reference this server resolves (a
-/// sealed secret that opens with `key`, or an `env:MEMSTORE_IDP_SECRET_…` set here), never plain text in the directory.
+/// sealed secret that opens with `key`, or an `env:AMPUP_MEMORY_IDP_SECRET_…` set here), never plain text in the directory.
 pub fn directory_secrets_check(
     dir: &crate::people::directory::Directory,
     key: Option<&auth::secret::SecretKey>,
@@ -2892,13 +2899,13 @@ pub fn directory_secrets_check(
             Some(ClientType::Public) => None,
             None => Some(format!(
                 "the client type isn't declared, and its secret is handed to anyone who asks how to sign \
-                 in: if the CLI's client is an installed app (Google's), run `memstore auth setup --org {org} \
+                 in: if the CLI's client is an installed app (Google's), run `ampup-memory auth setup --org {org} \
                  ... --public-client` with the secret; if it is confidential, run it with \
                  --confidential-client and no --client-secret (or register a public client for the CLI)"
             )),
             Some(ClientType::Confidential) => Some(format!(
                 "a confidential client's secret is in the directory (it is never handed out): run \
-                 `memstore auth setup --org {org} ... --confidential-client` without --client-secret"
+                 `ampup-memory auth setup --org {org} ... --confidential-client` without --client-secret"
             )),
         };
         if let Some(detail) = kind {
@@ -2912,14 +2919,14 @@ pub fn directory_secrets_check(
         let r = match stored(s) {
             Stored::Plain => Err(anyhow::anyhow!(
                 "stored in plain text in the directory, where anyone who can read the bucket reads it: \
-                 run `memstore auth setup --org {org} ...` again with the secret (sealed with {KEY_ENV}) \
+                 run `ampup-memory auth setup --org {org} ...` again with the secret (sealed with {KEY_ENV}) \
                  or --client-secret env:{ENV_PREFIX}<NAME>"
             )),
             // A name outside the prefix is refused here as it is when signing in: rerun `auth setup`.
             Stored::Env(n) => resolve(org, s, None, env)
                 .map(|_| format!("env:{n}, set here"))
                 .map_err(|e| {
-                    anyhow::anyhow!("{e:#}: run `memstore auth setup --org {org} ...` again")
+                    anyhow::anyhow!("{e:#}: run `ampup-memory auth setup --org {org} ...` again")
                 }),
             Stored::Sealed(_) => {
                 resolve(org, s, key, env).map(|_| format!("sealed; opens with {KEY_ENV}"))
@@ -2935,7 +2942,7 @@ pub fn directory_secrets_check(
     out
 }
 
-/// `MEMSTORE_CALLER_IDENTITY`: one source, or several comma-separated in the order they are tried (the
+/// `AMPUP_MEMORY_CALLER_IDENTITY`: one source, or several comma-separated in the order they are tried (the
 /// platform's gateway for people, then `token` for service callers: `snowflake,token`, `google,token`).
 /// `token_auth` stands in for the `token` source's environment when given (tests, an embedder).
 async fn sources_from(
@@ -2954,7 +2961,7 @@ async fn sources_from(
             // Set but naming nothing is a mistake, not "identify nobody": that would serve everyone as one.
             anyhow::ensure!(
                 !names.is_empty(),
-                "MEMSTORE_CALLER_IDENTITY is set but names no source"
+                "AMPUP_MEMORY_CALLER_IDENTITY is set but names no source"
             );
             names
         }
@@ -2965,7 +2972,7 @@ async fn sources_from(
     for (i, name) in names.iter().enumerate() {
         anyhow::ensure!(
             !names[..i].contains(name),
-            "MEMSTORE_CALLER_IDENTITY names {name} twice"
+            "AMPUP_MEMORY_CALLER_IDENTITY names {name} twice"
         );
         sources.push(match *name {
             // One principal for every request: a single person's machine (`serve --local`).
@@ -2973,9 +2980,9 @@ async fn sources_from(
             "snowflake" => Identity::Snowflake,
             "google" => Identity::Google {
                 iap: auth::Iap::from_env()?,
-                bigquery: std::env::var("MEMSTORE_BIGQUERY_CALLER").ok(),
+                bigquery: std::env::var("AMPUP_MEMORY_BIGQUERY_CALLER").ok(),
                 // This service's URLs, comma-separated: intact tokens must be minted for one of them.
-                audiences: std::env::var("MEMSTORE_ID_AUDIENCE")
+                audiences: std::env::var("AMPUP_MEMORY_ID_AUDIENCE")
                     .unwrap_or_default()
                     .split(',')
                     .map(|a| a.trim().trim_end_matches('/').to_string())
@@ -2986,7 +2993,7 @@ async fn sources_from(
                 Some(a) => a,
                 None => token_auth_from_env().await?,
             }),
-            other => anyhow::bail!("unknown MEMSTORE_CALLER_IDENTITY {other}"),
+            other => anyhow::bail!("unknown AMPUP_MEMORY_CALLER_IDENTITY {other}"),
         });
     }
     if let Some(a) = token_auth {
@@ -3221,7 +3228,7 @@ async fn installation_op(state: &State, actor: &str, body: &[u8]) -> Result<Valu
 /// The caller must hold an admin API key (token identity only).
 async fn require_admin(state: &State, token: Option<&str>) -> Result<String> {
     let Some(auth) = state.token_auth() else {
-        anyhow::bail!("this needs MEMSTORE_CALLER_IDENTITY=token");
+        anyhow::bail!("this needs AMPUP_MEMORY_CALLER_IDENTITY=token");
     };
     let c = auth
         .authenticate(token.ok_or_else(|| anyhow::anyhow!("no token"))?)
@@ -3732,10 +3739,10 @@ fn reserved_document(document: &str) -> bool {
         .any(|p| d.starts_with(p) || d == p.trim_end_matches('/'))
 }
 
-/// How many scopes the background extraction works on at once (`MEMSTORE_EXTRACT_SCOPES`, default 4). Each
+/// How many scopes the background extraction works on at once (`AMPUP_MEMORY_EXTRACT_SCOPES`, default 4). Each
 /// makes its own model calls in parallel, so this multiplies what is in flight at the model's API.
 fn background_parallel() -> Result<usize> {
-    match std::env::var("MEMSTORE_EXTRACT_SCOPES") {
+    match std::env::var("AMPUP_MEMORY_EXTRACT_SCOPES") {
         Err(_) => Ok(4),
         Ok(v) => v
             .trim()
@@ -3743,23 +3750,23 @@ fn background_parallel() -> Result<usize> {
             .ok()
             .filter(|n| *n > 0)
             .ok_or_else(|| {
-                anyhow::anyhow!("MEMSTORE_EXTRACT_SCOPES is a whole number above 0, not {v:?}")
+                anyhow::anyhow!("AMPUP_MEMORY_EXTRACT_SCOPES is a whole number above 0, not {v:?}")
             }),
     }
 }
 
-/// How long the start's warm-up may hold `/ready` at 503: `MEMSTORE_READY_TIMEOUT_SECS`, default 300 (the
+/// How long the start's warm-up may hold `/ready` at 503: `AMPUP_MEMORY_READY_TIMEOUT_SECS`, default 300 (the
 /// ledger alone took two minutes cold on one deployment).
 fn ready_timeout() -> Duration {
     Duration::from_secs(
-        std::env::var("MEMSTORE_READY_TIMEOUT_SECS")
+        std::env::var("AMPUP_MEMORY_READY_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(300),
     )
 }
 
-/// What this server does (`MEMSTORE_ROLE`), so index builds and the rest of the background writing can run
+/// What this server does (`AMPUP_MEMORY_ROLE`), so index builds and the rest of the background writing can run
 /// apart from the servers answering reads: their memory spikes then never land beside a query.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Role {
@@ -3774,28 +3781,28 @@ enum Role {
 }
 
 fn role() -> Result<Role, String> {
-    match std::env::var("MEMSTORE_ROLE").as_deref() {
+    match std::env::var("AMPUP_MEMORY_ROLE").as_deref() {
         Err(_) | Ok("all") => Ok(Role::All),
         Ok("serve") => Ok(Role::Serve),
         Ok("worker") => Ok(Role::Worker),
         Ok(other) => Err(format!(
-            "MEMSTORE_ROLE is {other:?}: it is all (the default), serve or worker"
+            "AMPUP_MEMORY_ROLE is {other:?}: it is all (the default), serve or worker"
         )),
     }
 }
 
 /// The writer lease for this server's catalog (`writer`), or none (this server writes alone) with
-/// `MEMSTORE_WRITER_LEASE=off`: for a catalog no other server shares.
+/// `AMPUP_MEMORY_WRITER_LEASE=off`: for a catalog no other server shares.
 fn writer_lease(role: Role) -> Arc<writer::Lease> {
     if role == Role::Serve {
         eprintln!(
-            "MEMSTORE_ROLE=serve: this server never takes the writer lease; a worker does the background writing and index builds"
+            "AMPUP_MEMORY_ROLE=serve: this server never takes the writer lease; a worker does the background writing and index builds"
         );
         return writer::Lease::reader();
     }
-    if std::env::var("MEMSTORE_WRITER_LEASE").is_ok_and(|v| v == "off") {
+    if std::env::var("AMPUP_MEMORY_WRITER_LEASE").is_ok_and(|v| v == "off") {
         eprintln!(
-            "MEMSTORE_WRITER_LEASE=off: this server does the background writing as the only server on its catalog"
+            "AMPUP_MEMORY_WRITER_LEASE=off: this server does the background writing as the only server on its catalog"
         );
         return writer::Lease::alone();
     }
@@ -3827,7 +3834,7 @@ async fn warm_needed(st: &State) -> Result<()> {
                 .await
                 .context("put the disabled-users file's users in the directory")?;
             eprintln!(
-                "disabled users: {} from MEMSTORE_DISABLED_FILE put in the directory, for every server",
+                "disabled users: {} from AMPUP_MEMORY_DISABLED_FILE put in the directory, for every server",
                 events.len()
             );
         }
@@ -3940,15 +3947,15 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
         .await;
 }
 
-/// How often a server touches the scopes it serves so that a read never finds them cold (`MEMSTORE_KEEP_WARM_SECS`,
-/// default 20, 0 never). A scope's table plan and visibility state are kept for `MEMSTORE_MAX_STALENESS_MS` and
-/// refreshed behind a read, but past `MEMSTORE_HARD_STALENESS_MS` (60 s) a read waits for them: on a busy org that
+/// How often a server touches the scopes it serves so that a read never finds them cold (`AMPUP_MEMORY_KEEP_WARM_SECS`,
+/// default 20, 0 never). A scope's table plan and visibility state are kept for `AMPUP_MEMORY_MAX_STALENESS_MS` and
+/// refreshed behind a read, but past `AMPUP_MEMORY_HARD_STALENESS_MS` (60 s) a read waits for them: on a busy org that
 /// is a catalog walk and the unindexed files read from object storage, 30 s on one production deployment. A scope read now and then
 /// went past 60 s between reads, so its next reader paid for it; touched every 20 s it never does. The scopes
 /// touched are the served one, those the start's warm-up loaded (so a new server, ready when it has warmed, is as
 /// warm for its first caller as the old one was for its last) and those a request has selected since, a few at a time.
 fn keep_warm_every() -> Option<Duration> {
-    let secs = std::env::var("MEMSTORE_KEEP_WARM_SECS")
+    let secs = std::env::var("AMPUP_MEMORY_KEEP_WARM_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(20);
@@ -4008,10 +4015,10 @@ async fn warm_advice(store: &Store, scope: &Scope) {
     }
 }
 
-/// How recently a scope's episodes must have changed for the start to warm it: `MEMSTORE_WARM_DAYS`,
+/// How recently a scope's episodes must have changed for the start to warm it: `AMPUP_MEMORY_WARM_DAYS`,
 /// default 7. The served scope is warmed whatever its age.
 fn warm_days() -> i64 {
-    std::env::var("MEMSTORE_WARM_DAYS")
+    std::env::var("AMPUP_MEMORY_WARM_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(7)
@@ -4276,7 +4283,7 @@ fn ingest_reply(done: Result<Value>) -> (StatusCode, Value) {
 /// re-indexing. Body: `{"user": "...", "add": [...], "remove": [...]}`; both lists empty clears it.
 /// `POST /team` (admin API key): the pilot team csv, replacing the one pushed before. Body: the csv text. Kept
 /// in the directory (`team.csv`), so every server on the catalog takes it; every person's closure follows on
-/// their next request. Where a server has its own csv too (`MEMSTORE_TEAM_CSV`), only the people both list hold
+/// their next request. Where a server has its own csv too (`AMPUP_MEMORY_TEAM_CSV`), only the people both list hold
 /// team groups, the pushed csv's (`auth::acl::team_of`): taking a leaver out of either is enough. Answers
 /// `{"people": n}`; a csv that doesn't parse changes nothing and says why. `DELETE /team` clears the pushed
 /// csv (each server goes back to its own, if any).
@@ -4306,7 +4313,7 @@ async fn set_team(state: &State, token: Option<&str>, body: &[u8], clear: bool) 
     };
     if state.team_file {
         v["note"] = json!(
-            "this server has its own team csv (MEMSTORE_TEAM_CSV) too: only people both csvs list hold team groups"
+            "this server has its own team csv (AMPUP_MEMORY_TEAM_CSV) too: only people both csvs list hold team groups"
         );
     }
     Ok(v)
@@ -4381,7 +4388,7 @@ async fn set_closure(state: &State, token: Option<&str>, body: &[u8]) -> Result<
 }
 
 /// Take the deployment-wide access state (disabled users, closure edits, the team csv) from the directory as
-/// of now (at most `MEMSTORE_MAX_STALENESS_MS` behind other servers): before any sign-in decision, so a user
+/// of now (at most `AMPUP_MEMORY_MAX_STALENESS_MS` behind other servers): before any sign-in decision, so a user
 /// disabled through another server is refused here too. Fails closed: an unreadable directory signs no one in,
 /// and nor does one this engine stops folding short of, at a change of a newer version (a newer engine wrote
 /// it; it may disable someone, and this engine can't tell).
@@ -4637,7 +4644,7 @@ async fn handle(
         .get(hyper::header::ORIGIN)
         .and_then(|v| v.to_str().ok())
     {
-        let allowed = std::env::var("MEMSTORE_ALLOWED_ORIGINS").unwrap_or_default();
+        let allowed = std::env::var("AMPUP_MEMORY_ALLOWED_ORIGINS").unwrap_or_default();
         if !allowed
             .split(',')
             .any(|a| !a.is_empty() && a.trim() == origin)
@@ -4683,7 +4690,7 @@ async fn handle(
         ));
     }
     // Setup asks this once, through a BigQuery remote function, to learn the subject id of BigQuery's service
-    // agent (MEMSTORE_BIGQUERY_CALLER). It only tells a caller who it is.
+    // agent (AMPUP_MEMORY_BIGQUERY_CALLER). It only tells a caller who it is.
     if path == "/whoami" && state.google().is_some() {
         let token = req
             .headers()
@@ -6766,18 +6773,18 @@ fn addressed_to_this_machine(headers: &hyper::HeaderMap) -> bool {
     host_ok && origin_ok
 }
 
-/// The base URL callers reach this server at, for sign-in discovery: `MEMSTORE_PUBLIC_URL`. Never a request's
+/// The base URL callers reach this server at, for sign-in discovery: `AMPUP_MEMORY_PUBLIC_URL`. Never a request's
 /// `Host`, which whoever sends it sets. Required with token auth, but on a loopback address (`serve --local`),
 /// where only this machine reaches the server: there it is `http://127.0.0.1:<port>`.
 fn public_url(bind: &str, port: u16, token_auth: bool) -> Result<String> {
-    if let Some(u) = std::env::var("MEMSTORE_PUBLIC_URL")
+    if let Some(u) = std::env::var("AMPUP_MEMORY_PUBLIC_URL")
         .ok()
         .map(|u| u.trim().trim_end_matches('/').to_string())
         .filter(|u| !u.is_empty())
     {
         anyhow::ensure!(
             u.starts_with("https://") || u.starts_with("http://"),
-            "MEMSTORE_PUBLIC_URL is the URL callers reach this server at, like https://memory.example.com"
+            "AMPUP_MEMORY_PUBLIC_URL is the URL callers reach this server at, like https://memory.example.com"
         );
         return Ok(u);
     }
@@ -6787,10 +6794,10 @@ fn public_url(bind: &str, port: u16, token_auth: bool) -> Result<String> {
         _ => {
             anyhow::ensure!(
                 !token_auth,
-                "token auth needs MEMSTORE_PUBLIC_URL, the URL callers reach this server at (like \
+                "token auth needs AMPUP_MEMORY_PUBLIC_URL, the URL callers reach this server at (like \
                  https://memory.example.com): sign-in clients are told to sign in there, and without it the only \
                  other source is each request's Host header, which the caller sets. Only a server on a loopback \
-                 address (MEMSTORE_SERVE_BIND=127.0.0.1) goes without it"
+                 address (AMPUP_MEMORY_SERVE_BIND=127.0.0.1) goes without it"
             );
             // Nothing is signed in to here: no caller is ever told this URL.
             "127.0.0.1"
@@ -6975,11 +6982,11 @@ async fn protected_resource(state: &State, base: &str, org: Option<&str>) -> Opt
     // Organization, a sign-in into that Organization (the only kind that counts there).
     let auth0_meta = |a: &auth::tokens::Auth0, org: Option<(&str, &str)>| {
         let client_id =
-            var("MEMSTORE_AUTH0_CLI_CLIENT_ID").or_else(|| a.client_ids().first().cloned());
+            var("AMPUP_MEMORY_AUTH0_CLI_CLIENT_ID").or_else(|| a.client_ids().first().cloned());
         let mut m = meta(a.issuer(), client_id, None, org.map(|(o, _)| o));
         m["memstore_auth0_organization"] = json!(org.map(|(_, id)| id));
         if let Some(port) =
-            var("MEMSTORE_AUTH0_CLI_CALLBACK_PORT").and_then(|p| p.parse::<u16>().ok())
+            var("AMPUP_MEMORY_AUTH0_CLI_CALLBACK_PORT").and_then(|p| p.parse::<u16>().ok())
         {
             m["memstore_cli_callback_port"] = json!(port);
         }
@@ -6998,7 +7005,7 @@ async fn protected_resource(state: &State, base: &str, org: Option<&str>) -> Opt
                         .client_secret
                         .as_deref()
                         .filter(|_| p.client_type != Some(ClientType::Confidential));
-                    // The directory holds a reference (env:MEMSTORE_IDP_SECRET_…) or the sealed secret, never the secret.
+                    // The directory holds a reference (env:AMPUP_MEMORY_IDP_SECRET_…) or the sealed secret, never the secret.
                     let secret = served.and_then(|s| {
                         auth::secret::resolve(o, s, state.secret_key.as_ref(), &|n| {
                             state.secret_var(n)
@@ -7028,16 +7035,19 @@ async fn protected_resource(state: &State, base: &str, org: Option<&str>) -> Opt
         // No sign-in of the server's own: the tenant's, where Auth0 asks which Organization.
         return auth.auth0().map(|a| auth0_meta(a, None));
     };
-    let client_id = var("MEMSTORE_OIDC_CLI_CLIENT_ID").or_else(|| oidc.audiences.first().cloned());
+    let client_id =
+        var("AMPUP_MEMORY_OIDC_CLI_CLIENT_ID").or_else(|| oidc.audiences.first().cloned());
     let mut m = meta(
         &oidc.issuer,
         client_id,
-        var("MEMSTORE_OIDC_CLI_CLIENT_SECRET"),
+        var("AMPUP_MEMORY_OIDC_CLI_CLIENT_SECRET"),
         None,
     );
     // For providers that only take registered redirect URIs (Auth0, Okta): the loopback port the CLI's
     // client has registered, `http://127.0.0.1:<port>/callback`. Unset, the CLI takes any free port (RFC 8252).
-    if let Some(port) = var("MEMSTORE_OIDC_CLI_CALLBACK_PORT").and_then(|p| p.parse::<u16>().ok()) {
+    if let Some(port) =
+        var("AMPUP_MEMORY_OIDC_CLI_CALLBACK_PORT").and_then(|p| p.parse::<u16>().ok())
+    {
         m["memstore_cli_callback_port"] = json!(port);
     }
     Some(m)
@@ -7236,7 +7246,7 @@ fn recorder_refusal<'a>(
         if acting_as.is_some() && !state.fixed() && (superuser || via.recorder_key().is_none()) {
             let w = who.map_or("-", |w| w.user());
             let why = format!(
-                "{w} may not act for anyone: x-memstore-as is a recorder key's (memstore apikey create --role recorder)"
+                "{w} may not act for anyone: x-memstore-as is a recorder key's (ampup-memory apikey create --role recorder)"
             );
             eprintln!("refused {path} for {w}: {why}");
             let mine = member_org(state, who, via, sel_org).await;
@@ -7728,7 +7738,7 @@ async fn directory_change(
     }
     // A key's hash is computed here from the key, never taken from the client (see `Change::CreateKey`).
     if req["op"] == "create_key" && req.get("sha256").is_some() {
-        let msg = "a new key's hash is computed by the server: send the key itself (`memstore apikey create`)";
+        let msg = "a new key's hash is computed by the server: send the key itself (`ampup-memory apikey create`)";
         return Err(Refused(msg.into()).into());
     }
     if req["op"] == "audit" && req["operator"] == true {
@@ -7759,7 +7769,7 @@ async fn directory_change(
     if req["op"] == "support_event" {
         // The deployment agent's record of a support session (`crate::agent::support`): appended to the
         // audit, never changed or read back through this op. The operator's admin key alone (the agent
-        // holds it, `MEMSTORE_AGENT_ADMIN_KEY_FILE`): not a person, not a key of any kind.
+        // holds it, `AMPUP_MEMORY_AGENT_ADMIN_KEY_FILE`): not a person, not a key of any kind.
         if !superuser || via.key.is_some() || via.file_key.is_some() || via.person {
             return Err(Refused(format!(
                 "{} may not write support events (only the operator's admin key may)",
@@ -8454,7 +8464,7 @@ async fn directory_change(
             .as_deref()
             .and_then(|sha| state.token_auth()?.file_key(sha));
         let Some(h) = held else {
-            let msg = "--self imports the file key the request is made with: sign in with it (memstore auth login --api-key …)";
+            let msg = "--self imports the file key the request is made with: sign in with it (ampup-memory auth login --api-key …)";
             return Err(Refused(msg.into()).into());
         };
         *keys = vec![crate::people::directory::FileKey {
@@ -8953,13 +8963,13 @@ async fn export_telemetry(
     }
 }
 
-/// `MEMSTORE_BYOK`: `on` when `ask_memory`'s model runs on the customer's own key (its asks cost less),
+/// `AMPUP_MEMORY_BYOK`: `on` when `ask_memory`'s model runs on the customer's own key (its asks cost less),
 /// `off` (the default) otherwise.
 fn byok_from_env() -> Result<bool> {
-    match std::env::var("MEMSTORE_BYOK").as_deref() {
+    match std::env::var("AMPUP_MEMORY_BYOK").as_deref() {
         Err(_) | Ok("off") | Ok("") => Ok(false),
         Ok("on") => Ok(true),
-        Ok(v) => anyhow::bail!("MEMSTORE_BYOK is on or off, not {v}"),
+        Ok(v) => anyhow::bail!("AMPUP_MEMORY_BYOK is on or off, not {v}"),
     }
 }
 
@@ -9904,7 +9914,7 @@ pub(crate) fn best_window_at(chars: &[char], query: &str, n: usize) -> usize {
 enum Writes {
     /// Nowhere: the tool isn't offered.
     No,
-    /// The BigQuery inbox (`MEMSTORE_INBOX_TABLE`); facts are extracted at the next ingest.
+    /// The BigQuery inbox (`AMPUP_MEMORY_INBOX_TABLE`); facts are extracted at the next ingest.
     Inbox,
     /// The selected org's or team's memory, as a source episode.
     Scope,
@@ -9937,7 +9947,7 @@ async fn mcp(
         "initialize" if !may_read => ok(json!({
             "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "memstore", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {"name": crate::naming::MCP_SERVER, "version": env!("CARGO_PKG_VERSION")},
             "instructions": "Memory, write only: remember_memory adds text to it. This key reads nothing.",
         })),
         "initialize" => {
@@ -9977,7 +9987,7 @@ async fn mcp(
             ok(json!({
                 "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "memstore", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": crate::naming::MCP_SERVER, "version": env!("CARGO_PKG_VERSION")},
                 "instructions": instructions,
             }))
         }
@@ -10422,7 +10432,7 @@ async fn mcp(
                         let body = args["body"].as_str().unwrap_or_default();
                         let mine = args["mine"].as_bool() == Some(true);
                         match crate::keep::written(&key, false, body).filter(|_| mine) {
-                            Some(kept) => Ok(format!("already {kept}: memstore kept it from what the user said")),
+                            Some(kept) => Ok(format!("already {kept}: AmpUp Memory kept it from what the user said")),
                             None => remember_here(state, &store, scope, who, &args).await.inspect(|answer| {
                                 crate::keep::wrote(&key, false, body, answer);
                             }),
@@ -10684,28 +10694,30 @@ impl std::fmt::Display for ToolError {
 }
 impl std::error::Error for ToolError {}
 
-/// `MEMSTORE_WHOAMI_FUNCTION`: `project.dataset.function`, a BigQuery remote function (one STRING argument) on
+/// `AMPUP_MEMORY_WHOAMI_FUNCTION`: `project.dataset.function`, a BigQuery remote function (one STRING argument) on
 /// this service's `/whoami`.
 fn whoami_function() -> Option<String> {
-    std::env::var("MEMSTORE_WHOAMI_FUNCTION").ok().filter(|t| {
-        !t.is_empty()
-            && t.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-    })
+    std::env::var("AMPUP_MEMORY_WHOAMI_FUNCTION")
+        .ok()
+        .filter(|t| {
+            !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        })
 }
 
-/// `MEMSTORE_INBOX_TABLE` (GCP: `project.dataset.table` of the BigQuery inbox) turns on `remember_memory`.
+/// `AMPUP_MEMORY_INBOX_TABLE` (GCP: `project.dataset.table` of the BigQuery inbox) turns on `remember_memory`.
 fn inbox_table() -> Option<String> {
-    std::env::var("MEMSTORE_INBOX_TABLE").ok().filter(|t| {
+    std::env::var("AMPUP_MEMORY_INBOX_TABLE").ok().filter(|t| {
         !t.is_empty()
             && t.chars()
                 .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
     })
 }
 
-/// `MEMSTORE_ANSWER_MODEL` (GCP: a Gemini model on Vertex AI) turns on `ask_memory`.
+/// `AMPUP_MEMORY_ANSWER_MODEL` (GCP: a Gemini model on Vertex AI) turns on `ask_memory`.
 fn answer_model() -> Option<String> {
-    std::env::var("MEMSTORE_ANSWER_MODEL").ok().filter(|m| {
+    std::env::var("AMPUP_MEMORY_ANSWER_MODEL").ok().filter(|m| {
         !m.is_empty()
             && m.chars()
                 .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
@@ -10820,7 +10832,7 @@ const ACTING_TOOLS: [&str; 4] = [
 
 /// `search_memory` as the default surface lists it: the query, how many, a period and the next page. Its other
 /// arguments (`as_of`, `format`, `predicates`, `episode_type` and the rest) still work by name, and
-/// `MEMSTORE_MCP_TOOLS=all` lists them; few agents need them, and every turn pays for what is listed.
+/// `AMPUP_MEMORY_MCP_TOOLS=all` lists them; few agents need them, and every turn pays for what is listed.
 fn lean_search() -> Value {
     json!({
         "name": "search_memory",
@@ -10840,7 +10852,7 @@ fn lean_search() -> Value {
     })
 }
 
-/// Which tools `tools/list` offers, as `MEMSTORE_MCP_TOOLS` says.
+/// Which tools `tools/list` offers, as `AMPUP_MEMORY_MCP_TOOLS` says.
 #[derive(PartialEq)]
 enum Listed {
     /// Unset: [`DEFAULT_TOOLS`].
@@ -10852,9 +10864,9 @@ enum Listed {
 }
 
 impl Listed {
-    /// Read on each call, as the other tool switches are (`MEMSTORE_ANSWER_MODEL`).
+    /// Read on each call, as the other tool switches are (`AMPUP_MEMORY_ANSWER_MODEL`).
     fn from_env() -> Self {
-        match std::env::var("MEMSTORE_MCP_TOOLS") {
+        match std::env::var("AMPUP_MEMORY_MCP_TOOLS") {
             Ok(v) if v.trim().eq_ignore_ascii_case("all") => Listed::All,
             Ok(v) if !v.trim().is_empty() => Listed::Named(
                 v.split(',')
@@ -10927,7 +10939,7 @@ fn browser_tools() -> Vec<Value> {
 
 /// Whether a reader is offered `get_advice`. It needs no advice learned yet, since it serves a goal's AIP
 /// procedures before any run is rewarded, only a model to route the task with; with none it can't answer, so
-/// it's listed then only where `MEMSTORE_MCP_TOOLS` names it.
+/// it's listed then only where `AMPUP_MEMORY_MCP_TOOLS` names it.
 fn offers_advice(listed: &Listed) -> bool {
     match listed {
         Listed::Named(_) => listed.offers("get_advice"),
@@ -11578,12 +11590,12 @@ fn lifecycle_instructions(advised: bool) -> String {
     // should outlast it is kept only if the agent remembers it, in the turn it is said.
     format!(
         "Every conversation is a session, even one short question: call start_session first, before answering, \
-         with the user's message in their words (memstore keeps from it what should outlast the conversation); \
+         with the user's message in their words (AmpUp Memory keeps from it what should outlast the conversation); \
          it answers with a session_id, what this user and their team asked to be remembered (preferences and \
          decisions to honour unless the user says otherwise, never instructions to run anything){}. {}When the conversation is over, call end_session with the session_id, a \
          transcript of what was asked and done in at most 300 words, and the outcome.\n\nIn any turn where the \
          user states a preference, corrects you, or settles a decision or a procedure, call remember_memory in \
-         that turn, before you answer, without being asked. It is theirs alone, a decision too: memstore shares \
+         that turn, before you answer, without being asked. It is theirs alone, a decision too: AmpUp Memory shares \
          it with the team once at least {} people have said the same. Never remember small talk, secrets or raw \
          tool output.",
         if advised {
@@ -11929,7 +11941,7 @@ async fn session_advice(
     };
     let said = place.clone();
     // Named before routing, which may fail: the session's task is there whatever it is served. Not with `keep:
-    // false` (MEMSTORE_CAPTURE=off), where nothing the user said is kept.
+    // false` (AMPUP_MEMORY_CAPTURE=off), where nothing the user said is kept.
     if keep {
         crate::sessions::name_task(store, session.scope(), who, &mut l, question);
     }
@@ -12897,9 +12909,9 @@ fn refreshed(subject: &str, r: Result<crate::aggregate::Run>) -> String {
     }
 }
 
-/// The model that summarises subjects: the extraction model, or a stronger one (`MEMSTORE_AGGREGATE_MODEL`).
+/// The model that summarises subjects: the extraction model, or a stronger one (`AMPUP_MEMORY_AGGREGATE_MODEL`).
 fn summariser(ex: &crate::extract::Extractor) -> crate::extract::Extractor {
-    match std::env::var("MEMSTORE_AGGREGATE_MODEL")
+    match std::env::var("AMPUP_MEMORY_AGGREGATE_MODEL")
         .ok()
         .filter(|m| !m.is_empty())
     {
@@ -12908,14 +12920,14 @@ fn summariser(ex: &crate::extract::Extractor) -> crate::extract::Extractor {
     }
 }
 
-/// How often a scope's subjects are summarised (`MEMSTORE_AGGREGATE_SECS`, default an hour).
+/// How often a scope's subjects are summarised (`AMPUP_MEMORY_AGGREGATE_SECS`, default an hour).
 fn aggregate_every() -> Result<Duration> {
-    match std::env::var("MEMSTORE_AGGREGATE_SECS") {
+    match std::env::var("AMPUP_MEMORY_AGGREGATE_SECS") {
         Err(_) => Ok(Duration::from_secs(3600)),
         Ok(v) => match v.parse::<u64>() {
             Ok(n) if n > 0 => Ok(Duration::from_secs(n)),
             _ => anyhow::bail!(
-                "MEMSTORE_AGGREGATE_SECS is a whole number of seconds above 0, not {v:?}"
+                "AMPUP_MEMORY_AGGREGATE_SECS is a whole number of seconds above 0, not {v:?}"
             ),
         },
     }
@@ -13217,7 +13229,7 @@ fn remember_tool(writes: Writes, scope: &Scope) -> Value {
             "Add text to this memory ({scope}) as a source episode: get_episode reads it, and start_session \
              hands the user's own back in later conversations. Call it without being asked when the user states \
              a preference, corrects you, or settles a decision or procedure, in that turn, and when they ask you \
-             to remember something. It is theirs alone (`for` \"me\", the default): memstore shares it with \
+             to remember something. It is theirs alone (`for` \"me\", the default): AmpUp Memory shares it with \
              everyone in {scope} once at least {SHARED_AT} people have said the same. `for` \"team\" is for a \
              document or note that isn't anyone's feedback. Never small talk, secrets or raw tool output.",
             SHARED_AT = crate::keep::SHARED_AT
@@ -13555,7 +13567,7 @@ fn remember_args(args: &Value) -> Result<(&str, &str)> {
         .is_some_and(|s| s.eq_ignore_ascii_case("memstore:"))
     {
         return Err(ToolError(format!(
-            "source {source:?}: sources under memstore: are memstore's own"
+            "source {source:?}: sources under memstore: are AmpUp Memory's own"
         ))
         .into());
     }
@@ -13690,7 +13702,7 @@ fn said_redacted(mut args: Value) -> Value {
 /// [`keep_said`] for session `session_id`, run on after the session call answers: the call never waits for its
 /// model call. What the session kept so far isn't kept again ([`crate::keep::kept_in`]), and what the agent then
 /// remembers of it isn't written twice ([`crate::keep::written`]). Only the session arms call it, each where the
-/// caller writes into the scope. A call with `keep: false` (the hooks' with MEMSTORE_CAPTURE=off) keeps nothing.
+/// caller writes into the scope. A call with `keep: false` (the hooks' with AMPUP_MEMORY_CAPTURE=off) keeps nothing.
 #[allow(clippy::too_many_arguments)]
 fn keep_later(
     state: &Arc<State>,
@@ -13760,7 +13772,7 @@ async fn commit_remembered(
     // What the share pass writes is filed under its own author: no caller writes as it.
     if who.user() == crate::keep::SHARER {
         return Err(ToolError(format!(
-            "{} writes only what memstore shares",
+            "{} writes only what AmpUp Memory shares",
             crate::keep::SHARER
         ))
         .into());

@@ -24,28 +24,28 @@ impl Iap {
     pub fn new(audience: &str, keys_url: &str) -> Result<Self> {
         anyhow::ensure!(
             audience.starts_with("/projects/"),
-            "MEMSTORE_IAP_AUDIENCE is the audience IAP mints, e.g. /projects/123/locations/us-central1/services/memstore"
+            "AMPUP_MEMORY_IAP_AUDIENCE is the audience IAP mints, e.g. /projects/123/locations/us-central1/services/memstore"
         );
         Ok(Iap {
             keys: OidcConfig::with_keys(ISSUER, keys_url, vec![audience.to_string()]),
         })
     }
 
-    /// IAP from the environment: `MEMSTORE_IAP_AUDIENCE` (unset: no IAP), `MEMSTORE_IAP_JWKS_URL` and
-    /// `MEMSTORE_IAP_KEYS_TTL_SECS` (how long its keys are trusted before they are re-read; an hour).
+    /// IAP from the environment: `AMPUP_MEMORY_IAP_AUDIENCE` (unset: no IAP), `AMPUP_MEMORY_IAP_JWKS_URL` and
+    /// `AMPUP_MEMORY_IAP_KEYS_TTL_SECS` (how long its keys are trusted before they are re-read; an hour).
     pub fn from_env() -> Result<Option<Self>> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let Some(aud) = var("MEMSTORE_IAP_AUDIENCE") else {
+        let Some(aud) = var("AMPUP_MEMORY_IAP_AUDIENCE") else {
             return Ok(None);
         };
         let mut iap = Iap::new(
             &aud,
-            &var("MEMSTORE_IAP_JWKS_URL").unwrap_or_else(|| KEYS_URL.into()),
+            &var("AMPUP_MEMORY_IAP_JWKS_URL").unwrap_or_else(|| KEYS_URL.into()),
         )?;
-        if let Some(t) = var("MEMSTORE_IAP_KEYS_TTL_SECS") {
+        if let Some(t) = var("AMPUP_MEMORY_IAP_KEYS_TTL_SECS") {
             let secs: u64 = t
                 .parse()
-                .context("MEMSTORE_IAP_KEYS_TTL_SECS is a number of seconds")?;
+                .context("AMPUP_MEMORY_IAP_KEYS_TTL_SECS is a number of seconds")?;
             iap.keys = iap
                 .keys
                 .with_ttl(std::time::Duration::from_secs(secs.max(1)));

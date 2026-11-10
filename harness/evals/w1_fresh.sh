@@ -8,7 +8,7 @@ scope=$1 url=$2 n=${3:-30} group=${4:-local}
 for i in $(seq "$n"); do
   tok="fresh$(date +%s%N | tail -c 10)x$i"
   t0=$(date +%s%3N)
-  ./target/release/memstore put "$scope" "group:$group" "freshness-probe-$i" note "token $tok written for the freshness eval" >/dev/null
+  ./target/release/ampup-memory put "$scope" "group:$group" "freshness-probe-$i" note "token $tok written for the freshness eval" >/dev/null
   t1=$(date +%s%3N)
   until curl -s -X POST "$url" -d "{\"data\":[[0,\"$tok\",3]]}" | grep -q "$tok"; do
     if [ $(( $(date +%s%3N) - t1 )) -gt 60000 ]; then echo "{\"i\":$i,\"timeout\":true}"; continue 2; fi

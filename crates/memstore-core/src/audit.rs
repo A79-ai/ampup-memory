@@ -34,7 +34,7 @@
 //! or `-`), cleaned ([`clean`]). Text for people is made from the codes when the audit is read.
 //!
 //! The last three kinds are frequent, so a server buffers them in memory ([`Recorder`]) and appends them
-//! to their own table (`memory_system.audit`) in one write every so often (`MEMSTORE_AUDIT_FLUSH_SECS`,
+//! to their own table (`memory_system.audit`) in one write every so often (`AMPUP_MEMORY_AUDIT_FLUSH_SECS`,
 //! default 60), on shutdown, and when an audit is read through it (at most once every [`FORCED_GAP`]: in
 //! between, a read shows what is written plus this server's buffer). Recording never waits on the
 //! catalog and never fails a request: a write that fails is logged and retried with the next one, and
@@ -70,7 +70,7 @@ pub const MAX_READS: usize = 10_000;
 pub const MAX_REFUSED_PER_PROVIDER: usize = 100;
 /// Episode ids one `read` row names at most; its item count says how many there were.
 pub const MAX_READ_IDS: usize = 100;
-/// How often a server writes its buffered events, unless `MEMSTORE_AUDIT_FLUSH_SECS` says otherwise.
+/// How often a server writes its buffered events, unless `AMPUP_MEMORY_AUDIT_FLUSH_SECS` says otherwise.
 pub const DEFAULT_FLUSH: Duration = Duration::from_secs(60);
 /// An audit read makes its server write its buffer at most this often.
 pub const FORCED_GAP: Duration = Duration::from_secs(5);
@@ -946,9 +946,9 @@ impl Recorder {
     }
 }
 
-/// The flush interval: `MEMSTORE_AUDIT_FLUSH_SECS`, else [`DEFAULT_FLUSH`].
+/// The flush interval: `AMPUP_MEMORY_AUDIT_FLUSH_SECS`, else [`DEFAULT_FLUSH`].
 pub fn flush_interval() -> Duration {
-    std::env::var("MEMSTORE_AUDIT_FLUSH_SECS")
+    std::env::var("AMPUP_MEMORY_AUDIT_FLUSH_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|s| *s > 0)

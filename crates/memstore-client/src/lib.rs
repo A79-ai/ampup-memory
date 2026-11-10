@@ -6,6 +6,7 @@ use anyhow::Result;
 
 pub mod client;
 pub mod hook;
+pub mod naming;
 pub mod update;
 
 /// API keys start with this, so a bearer is told from a JWT without trying both.

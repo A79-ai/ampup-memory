@@ -285,7 +285,7 @@ pub struct UsageCounters {
     pub searches: u64,
     /// `ask_memory` answers, on a model key that isn't the customer's own.
     pub asks: u64,
-    /// `ask_memory` answers on the customer's own model key (`MEMSTORE_BYOK=on`).
+    /// `ask_memory` answers on the customer's own model key (`AMPUP_MEMORY_BYOK=on`).
     pub asks_byok: u64,
     /// Episodes ingested through `/ingest`.
     pub ingested_episodes: u64,

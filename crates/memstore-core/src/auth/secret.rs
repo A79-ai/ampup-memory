@@ -1,6 +1,6 @@
 //! Secrets the directory refers to but never holds: an org's identity-provider client secret is stored as
-//! `env:MEMSTORE_IDP_SECRET_<NAME>` (that variable in the server's environment holds it; no other) or `sealed:<base64 nonce+ciphertext>`
-//! (AES-256-GCM under the server's `MEMSTORE_SECRET_KEY`, bound to the org). The directory is an Iceberg
+//! `env:AMPUP_MEMORY_IDP_SECRET_<NAME>` (that variable in the server's environment holds it; no other) or `sealed:<base64 nonce+ciphertext>`
+//! (AES-256-GCM under the server's `AMPUP_MEMORY_SECRET_KEY`, bound to the org). The directory is an Iceberg
 //! table anyone with read access to the bucket can read, so a literal secret never goes into it.
 
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 
 /// The server's key for sealing secrets: 32 bytes, base64 or hex.
-pub const KEY_ENV: &str = "MEMSTORE_SECRET_KEY";
+pub const KEY_ENV: &str = "AMPUP_MEMORY_SECRET_KEY";
 const SEALED: &str = "sealed:";
 const ENV: &str = "env:";
 const NONCE: usize = 12;
@@ -48,7 +48,7 @@ impl SecretKey {
         }
     }
 
-    /// `MEMSTORE_SECRET_KEY`, if set.
+    /// `AMPUP_MEMORY_SECRET_KEY`, if set.
     pub fn from_env() -> Result<Option<Self>> {
         match std::env::var(KEY_ENV).ok().filter(|v| !v.trim().is_empty()) {
             None => Ok(None),
@@ -127,21 +127,31 @@ pub fn stored(s: &str) -> Stored<'_> {
 
 /// The only environment variables an `env:` reference may name. An org's admin sets the reference, and
 /// the secret it resolves to is served to anyone who asks how to sign in to that org: a reference to any
-/// other variable (`MEMSTORE_SECRET_KEY`, cloud credentials) would hand the server's environment out.
-pub const ENV_PREFIX: &str = "MEMSTORE_IDP_SECRET_";
+/// other variable (`AMPUP_MEMORY_SECRET_KEY`, cloud credentials) would hand the server's environment out.
+pub const ENV_PREFIX: &str = "AMPUP_MEMORY_IDP_SECRET_";
 
-fn allowed_env_name(n: &str) -> bool {
-    n.strip_prefix(ENV_PREFIX).is_some_and(|rest| {
-        !rest.is_empty()
-            && rest
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-    })
+/// A reference's variable by its current name: one written before the rename names `MEMSTORE_IDP_SECRET_…`,
+/// which the server's environment holds as `AMPUP_MEMORY_IDP_SECRET_…` (memstore_client::naming), and is held to
+/// the same rules as that name.
+fn current_env_name(n: &str) -> std::borrow::Cow<'_, str> {
+    crate::naming::env_name(n)
 }
 
-/// Whether `n` is one of `org`'s variables: `MEMSTORE_IDP_SECRET_<ORG>`, or that and `__<SUFFIX>` (org
+fn allowed_env_name(n: &str) -> bool {
+    current_env_name(n)
+        .strip_prefix(ENV_PREFIX)
+        .is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        })
+}
+
+/// Whether `n` is one of `org`'s variables: `AMPUP_MEMORY_IDP_SECRET_<ORG>`, or that and `__<SUFFIX>` (org
 /// names hold single underscores only, so no org's name runs into another's).
 fn org_env_name(org: &str, n: &str) -> bool {
+    let n = current_env_name(n);
     let own = format!("{ENV_PREFIX}{}", org.to_ascii_uppercase());
     n == own
         || n.strip_prefix(&own)
@@ -156,7 +166,7 @@ fn env_name_refused(n: &str) -> String {
     )
 }
 
-/// What `secret` (as given to `memstore auth setup`) is stored as: an `env:MEMSTORE_IDP_SECRET_…`
+/// What `secret` (as given to `memstore auth setup`) is stored as: an `env:AMPUP_MEMORY_IDP_SECRET_…`
 /// reference as is, a sealed one if it opens with `key`, a literal sealed with `key`. Without a key, a
 /// literal is refused.
 pub fn protect(context: &str, secret: &str, key: Option<&SecretKey>) -> Result<String, String> {
@@ -196,7 +206,7 @@ pub fn process_env(n: &str) -> Option<String> {
 }
 
 /// The secret a stored value stands for: the environment variable's value (`env` looks it up; only a
-/// `MEMSTORE_IDP_SECRET_…` variable, whatever a row says), the sealed secret opened, or (written before
+/// `AMPUP_MEMORY_IDP_SECRET_…` variable, whatever a row says), the sealed secret opened, or (written before
 /// secrets were kept out of the directory) the value itself.
 pub fn resolve(
     context: &str,
@@ -206,7 +216,7 @@ pub fn resolve(
 ) -> Result<String> {
     match stored(stored_value) {
         Stored::Env(n) if !allowed_env_name(n) => anyhow::bail!(env_name_refused(n)),
-        Stored::Env(n) => env(n)
+        Stored::Env(n) => env(&current_env_name(n))
             .filter(|v| !v.is_empty())
             .with_context(|| format!("{n} is not set in the server's environment")),
         Stored::Sealed(c) => key
@@ -221,6 +231,6 @@ pub fn shown(stored_value: &str) -> String {
     match stored(stored_value) {
         Stored::Env(n) => format!("{ENV}{n}"),
         Stored::Sealed(_) => "set".into(),
-        Stored::Plain => "set, in plain text: run `memstore auth setup` again".into(),
+        Stored::Plain => "set, in plain text: run `ampup-memory auth setup` again".into(),
     }
 }

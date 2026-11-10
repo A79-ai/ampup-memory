@@ -3,7 +3,7 @@
 //!
 //! By default only the episodes the scope schema's `extract` section names are extracted, each with what the
 //! schema declares ([`goals`], goal-oriented extraction). The goal-blind prompt below reads the episodes it doesn't
-//! name only where that is turned on (`set_settings {extract: true}`, or `MEMSTORE_EXTRACT_GOAL_BLIND=1` everywhere,
+//! name only where that is turned on (`set_settings {extract: true}`, or `AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1` everywhere,
 //! [`goal_blind`]). No episode is read by both. Starter documents (a repo's CLAUDE.md and rules, a person's agent
 //! memory files, under [`STARTER`]) are read goal-blind everywhere: they are few and small, and a new team's first
 //! sessions recall them. The engine's own documents (compiled skills, learned advice) are never read ([`typed`]).
@@ -35,23 +35,23 @@
 //! refuses is dropped on its own, so it can't hold up the rest of its batch.
 //!
 //! Configured from the environment:
-//! - `MEMSTORE_EXTRACT`: `openrouter`, `openrouter-batch` (OpenRouter's Batch API, for experiments: half the
+//! - `AMPUP_MEMORY_EXTRACT`: `openrouter`, `openrouter-batch` (OpenRouter's Batch API, for experiments: half the
 //!   price, answers in minutes; [`batch`]), `openai` (any OpenAI-compatible chat API: OpenAI, vLLM, Ollama),
 //!   `anthropic`, `bedrock`, `vertex` or `cortex`, or `off`. Unset: OpenRouter, with `OPENROUTER_API_KEY`; with
 //!   no key, no extraction. OpenRouter runs any model, through the organization's own provider keys where its
 //!   account holds them (BYOK). An OpenRouter model named with its `:batch` suffix goes through the Batch API too.
-//! - `MEMSTORE_EXTRACT_MODEL`: the model (defaults: `anthropic/claude-haiku-5.5` on OpenRouter, `gpt-5-mini`,
+//! - `AMPUP_MEMORY_EXTRACT_MODEL`: the model (defaults: `anthropic/claude-haiku-5.5` on OpenRouter, `gpt-5-mini`,
 //!   `claude-haiku-5-5`, and the rest below).
-//! - `MEMSTORE_EXTRACT_URL`: the API's base URL (defaults to the vendor's).
-//! - `MEMSTORE_EXTRACT_KEY`: the API key; else `OPENAI_API_KEY`, `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY`.
+//! - `AMPUP_MEMORY_EXTRACT_URL`: the API's base URL (defaults to the vendor's).
+//! - `AMPUP_MEMORY_EXTRACT_KEY`: the API key; else `OPENAI_API_KEY`, `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY`.
 //!   None is sent when there is none (a local server).
-//! - `MEMSTORE_EXTRACT_THINKING=off`: Claude models answer without thinking first. Thinking is billed as
+//! - `AMPUP_MEMORY_EXTRACT_THINKING=off`: Claude models answer without thinking first. Thinking is billed as
 //!   output: on 50 trial notes, Haiku 5.5 wrote 1.7k tokens a note with it and 0.7k without, and found 12%
 //!   fewer facts without.
-//! - `MEMSTORE_EXTRACT_PARALLEL`: requests in flight at once (default 8).
-//! - `MEMSTORE_EXTRACT_GOAL_BLIND=1` (or `on`, `true`): also extract the episodes the schema's `extract` section
+//! - `AMPUP_MEMORY_EXTRACT_PARALLEL`: requests in flight at once (default 8).
+//! - `AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1` (or `on`, `true`): also extract the episodes the schema's `extract` section
 //!   doesn't name, with the prompt below. Unset, only what it names (and starter documents) is extracted.
-//! - `MEMSTORE_MODEL_CACHE`: where replies are kept by the request that asked for them, so a request asked again
+//! - `AMPUP_MEMORY_MODEL_CACHE`: where replies are kept by the request that asked for them, so a request asked again
 //!   (a store rebuilt from the same inputs) costs nothing ([`cache`]).
 
 use std::collections::{BTreeMap, HashSet};
@@ -319,22 +319,22 @@ impl std::error::Error for Refused {}
 
 /// Longest text sent in one request; a longer episode is read up to here.
 const MAX_TEXT: usize = 60_000;
-/// Requests in flight at once (`MEMSTORE_EXTRACT_PARALLEL`, default 8): a backlog of thousands of episodes goes
+/// Requests in flight at once (`AMPUP_MEMORY_EXTRACT_PARALLEL`, default 8): a backlog of thousands of episodes goes
 /// faster with more, as far as the provider's rate limit allows.
 pub(crate) static PARALLEL: LazyLock<usize> = LazyLock::new(|| {
-    match std::env::var("MEMSTORE_EXTRACT_PARALLEL") {
+    match std::env::var("AMPUP_MEMORY_EXTRACT_PARALLEL") {
         Err(_) => 8,
         Ok(v) => v.trim().parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
-            eprintln!("MEMSTORE_EXTRACT_PARALLEL is a whole number above 0, not {v:?}: 8 requests in flight");
+            eprintln!("AMPUP_MEMORY_EXTRACT_PARALLEL is a whole number above 0, not {v:?}: 8 requests in flight");
             8
         }),
     }
 });
 
-/// The longest one model request may take, reply included (`MEMSTORE_MODEL_TIMEOUT_SECS`, default 600): a compile
+/// The longest one model request may take, reply included (`AMPUP_MEMORY_MODEL_TIMEOUT_SECS`, default 600): a compile
 /// batch's reply runs to 16,000 tokens and takes minutes; at 120 s one τ²-bench batch was cut off every time.
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    let secs = std::env::var("MEMSTORE_MODEL_TIMEOUT_SECS")
+    let secs = std::env::var("AMPUP_MEMORY_MODEL_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(600);
@@ -371,7 +371,7 @@ pub struct Extractor {
     model: String,
     /// Through OpenRouter's Batch API ([`batch`]) rather than one call at a time.
     batch: bool,
-    /// When it compiles: the model for AIP graphs, over `MEMSTORE_AIP_MODEL` (an org's setting).
+    /// When it compiles: the model for AIP graphs, over `AMPUP_MEMORY_AIP_MODEL` (an org's setting).
     aip_model: Option<String>,
     /// The backend as configured (`openrouter`, `anthropic`, ...; the Batch API is `openrouter`): with the model
     /// and the body, what the model-call cache keeps a reply under ([`cache`]).
@@ -482,45 +482,52 @@ impl Extractor {
     /// The extractor the environment configures, if any.
     pub fn from_env() -> Result<Option<Self>> {
         Self::from_vars(
-            "MEMSTORE_EXTRACT",
+            "AMPUP_MEMORY_EXTRACT",
             |k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()),
             Tier::Small,
         )
     }
 
     /// The model that compiles a scope's skill library and its AIP step graphs (`crate::compile`):
-    /// `MEMSTORE_COMPILE` and its `_MODEL`, `_URL`, `_REGION`, `_KEY` and `_KEY_FILE`, each falling back to the
-    /// extractor's (`MEMSTORE_EXTRACT…`), then to the same default. `MEMSTORE_COMPILE=off` turns compiling off.
+    /// `AMPUP_MEMORY_COMPILE` and its `_MODEL`, `_URL`, `_REGION`, `_KEY` and `_KEY_FILE`, each falling back to the
+    /// extractor's (`AMPUP_MEMORY_EXTRACT…`), then to the same default. `AMPUP_MEMORY_COMPILE=off` turns compiling off.
     pub fn compile_from_env() -> Result<Option<Self>> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         Self::from_vars(
-            "MEMSTORE_COMPILE",
-            |k| var(k).or_else(|| var(&k.replacen("MEMSTORE_COMPILE", "MEMSTORE_EXTRACT", 1))),
+            "AMPUP_MEMORY_COMPILE",
+            |k| {
+                var(k)
+                    .or_else(|| var(&k.replacen("AMPUP_MEMORY_COMPILE", "AMPUP_MEMORY_EXTRACT", 1)))
+            },
             Tier::Strong,
         )
     }
 
     /// The model that learns advice from runs and judges them (`crate::advice`, `crate::advice_loop`):
-    /// `MEMSTORE_ADVICE` and its `_URL`, `_REGION`, `_KEY` and `_KEY_FILE`, each falling back to compile's
-    /// (`MEMSTORE_COMPILE…`), then to the extractor's, so learning stays on the backend and credentials a
-    /// deployment chose. Its model is `MEMSTORE_ADVICE_MODEL` alone, else the backend's strong default (Claude
+    /// `AMPUP_MEMORY_ADVICE` and its `_URL`, `_REGION`, `_KEY` and `_KEY_FILE`, each falling back to compile's
+    /// (`AMPUP_MEMORY_COMPILE…`), then to the extractor's, so learning stays on the backend and credentials a
+    /// deployment chose. Its model is `AMPUP_MEMORY_ADVICE_MODEL` alone, else the backend's strong default (Claude
     /// Opus 5.5 on OpenRouter and Anthropic): learning is a few long calls that need the strongest model, and
-    /// never the small one extraction runs on. `MEMSTORE_ADVICE=off` turns learning off; `MEMSTORE_COMPILE=off`
+    /// never the small one extraction runs on. `AMPUP_MEMORY_ADVICE=off` turns learning off; `AMPUP_MEMORY_COMPILE=off`
     /// turns compiling off alone, so learning skips it for the extractor's backend.
     pub fn advice_from_env() -> Result<Option<Self>> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         Self::from_vars(
-            "MEMSTORE_ADVICE",
+            "AMPUP_MEMORY_ADVICE",
             |k| {
                 var(k).or_else(|| {
-                    (k != "MEMSTORE_ADVICE_MODEL")
+                    (k != "AMPUP_MEMORY_ADVICE_MODEL")
                         .then(|| {
-                            var(&k.replacen("MEMSTORE_ADVICE", "MEMSTORE_COMPILE", 1))
+                            var(&k.replacen("AMPUP_MEMORY_ADVICE", "AMPUP_MEMORY_COMPILE", 1))
                                 .filter(|v| {
-                                    k != "MEMSTORE_ADVICE" || !v.eq_ignore_ascii_case("off")
+                                    k != "AMPUP_MEMORY_ADVICE" || !v.eq_ignore_ascii_case("off")
                                 })
                                 .or_else(|| {
-                                    var(&k.replacen("MEMSTORE_ADVICE", "MEMSTORE_EXTRACT", 1))
+                                    var(&k.replacen(
+                                        "AMPUP_MEMORY_ADVICE",
+                                        "AMPUP_MEMORY_EXTRACT",
+                                        1,
+                                    ))
                                 })
                         })
                         .flatten()
@@ -530,80 +537,20 @@ impl Extractor {
         )
     }
 
-    /// The model a dream judges with (`crate::dream`): `MEMSTORE_DREAM` and its `_MODEL`, `_URL`, `_REGION`, `_KEY`
-    /// and `_KEY_FILE`, each falling back to the extractor's (`MEMSTORE_EXTRACT…`), then to the backend's small
-    /// default (Claude Haiku 5.5 on OpenRouter and Anthropic). `MEMSTORE_DREAM=off` turns dreaming off.
+    /// The model a dream judges with (`crate::dream`): `AMPUP_MEMORY_DREAM` and its `_MODEL`, `_URL`, `_REGION`, `_KEY`
+    /// and `_KEY_FILE`, each falling back to the extractor's (`AMPUP_MEMORY_EXTRACT…`), then to the backend's small
+    /// default (Claude Haiku 5.5 on OpenRouter and Anthropic). `AMPUP_MEMORY_DREAM=off` turns dreaming off.
     pub fn dream_from_env() -> Result<Option<Self>> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         Self::from_vars(
-            "MEMSTORE_DREAM",
+            "AMPUP_MEMORY_DREAM",
             |k| {
-                let v =
-                    var(k).or_else(|| var(&k.replacen("MEMSTORE_DREAM", "MEMSTORE_EXTRACT", 1)));
+                let v = var(k)
+                    .or_else(|| var(&k.replacen("AMPUP_MEMORY_DREAM", "AMPUP_MEMORY_EXTRACT", 1)));
                 // A pass waits on its answers: never through the Batch API, whose answers take minutes.
                 match v {
                     Some(c)
-                        if k == "MEMSTORE_DREAM" && c.eq_ignore_ascii_case("openrouter-batch") =>
-                    {
-                        Some("openrouter".into())
-                    }
-                    v => v,
-                }
-            },
-            Tier::Small,
-        )
-    }
-
-    /// The model that judges how runs and sessions went (`crate::sessions::judge`, `crate::advice_loop::judge`):
-    /// `MEMSTORE_JUDGE` and its `_URL`, `_REGION`, `_KEY` and `_KEY_FILE`, each falling back to advice's, then
-    /// compile's, then extraction's. Its model is `MEMSTORE_JUDGE_MODEL` alone, else the backend's small default
-    /// (Claude Haiku 5.5 on OpenRouter and Anthropic): it reads one session at a time, as many times as there are
-    /// sessions, and says whether advice was applied; it writes no lessons. `MEMSTORE_JUDGE=off` judges nothing;
-    /// `MEMSTORE_COMPILE=off` turns compiling off alone, so the judge skips it.
-    pub fn judge_from_env() -> Result<Option<Self>> {
-        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        Self::from_vars(
-            "MEMSTORE_JUDGE",
-            |k| {
-                var(k).or_else(|| {
-                    (k != "MEMSTORE_JUDGE_MODEL")
-                        .then(|| {
-                            ["MEMSTORE_ADVICE", "MEMSTORE_COMPILE", "MEMSTORE_EXTRACT"]
-                                .iter()
-                                .find_map(|p| {
-                                    var(&k.replacen("MEMSTORE_JUDGE", p, 1)).filter(|v| {
-                                        !(k == "MEMSTORE_JUDGE"
-                                            && *p == "MEMSTORE_COMPILE"
-                                            && v.eq_ignore_ascii_case("off"))
-                                    })
-                                })
-                        })
-                        .flatten()
-                })
-            },
-            Tier::Small,
-        )
-    }
-
-    /// The model that routes a task to its advice (`crate::advice::get`): `MEMSTORE_ADVICE_ROUTE` and its `_URL`,
-    /// `_REGION`, `_KEY` and `_KEY_FILE`, each falling back to the extractor's. Its model is
-    /// `MEMSTORE_ADVICE_ROUTE_MODEL` alone, else the backend's small default (Claude Haiku 5.5 on OpenRouter and
-    /// Anthropic): one short call on every `get_advice`, where latency counts. `MEMSTORE_ADVICE_ROUTE=off` turns
-    /// `get_advice` off.
-    pub fn route_from_env() -> Result<Option<Self>> {
-        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        Self::from_vars(
-            "MEMSTORE_ADVICE_ROUTE",
-            |k| {
-                let v = var(k).or_else(|| {
-                    (k != "MEMSTORE_ADVICE_ROUTE_MODEL")
-                        .then(|| var(&k.replacen("MEMSTORE_ADVICE_ROUTE", "MEMSTORE_EXTRACT", 1)))
-                        .flatten()
-                });
-                // An agent waits on the route: never through the Batch API, whose answers take minutes.
-                match v {
-                    Some(c)
-                        if k == "MEMSTORE_ADVICE_ROUTE"
+                        if k == "AMPUP_MEMORY_DREAM"
                             && c.eq_ignore_ascii_case("openrouter-batch") =>
                     {
                         Some("openrouter".into())
@@ -615,7 +562,74 @@ impl Extractor {
         )
     }
 
-    /// The model `prefix` (`MEMSTORE_EXTRACT`, `MEMSTORE_COMPILE`) and its `_MODEL`, `_URL`, `_REGION`, `_KEY`
+    /// The model that judges how runs and sessions went (`crate::sessions::judge`, `crate::advice_loop::judge`):
+    /// `AMPUP_MEMORY_JUDGE` and its `_URL`, `_REGION`, `_KEY` and `_KEY_FILE`, each falling back to advice's, then
+    /// compile's, then extraction's. Its model is `AMPUP_MEMORY_JUDGE_MODEL` alone, else the backend's small default
+    /// (Claude Haiku 5.5 on OpenRouter and Anthropic): it reads one session at a time, as many times as there are
+    /// sessions, and says whether advice was applied; it writes no lessons. `AMPUP_MEMORY_JUDGE=off` judges nothing;
+    /// `AMPUP_MEMORY_COMPILE=off` turns compiling off alone, so the judge skips it.
+    pub fn judge_from_env() -> Result<Option<Self>> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        Self::from_vars(
+            "AMPUP_MEMORY_JUDGE",
+            |k| {
+                var(k).or_else(|| {
+                    (k != "AMPUP_MEMORY_JUDGE_MODEL")
+                        .then(|| {
+                            [
+                                "AMPUP_MEMORY_ADVICE",
+                                "AMPUP_MEMORY_COMPILE",
+                                "AMPUP_MEMORY_EXTRACT",
+                            ]
+                            .iter()
+                            .find_map(|p| {
+                                var(&k.replacen("AMPUP_MEMORY_JUDGE", p, 1)).filter(|v| {
+                                    !(k == "AMPUP_MEMORY_JUDGE"
+                                        && *p == "AMPUP_MEMORY_COMPILE"
+                                        && v.eq_ignore_ascii_case("off"))
+                                })
+                            })
+                        })
+                        .flatten()
+                })
+            },
+            Tier::Small,
+        )
+    }
+
+    /// The model that routes a task to its advice (`crate::advice::get`): `AMPUP_MEMORY_ADVICE_ROUTE` and its `_URL`,
+    /// `_REGION`, `_KEY` and `_KEY_FILE`, each falling back to the extractor's. Its model is
+    /// `AMPUP_MEMORY_ADVICE_ROUTE_MODEL` alone, else the backend's small default (Claude Haiku 5.5 on OpenRouter and
+    /// Anthropic): one short call on every `get_advice`, where latency counts. `AMPUP_MEMORY_ADVICE_ROUTE=off` turns
+    /// `get_advice` off.
+    pub fn route_from_env() -> Result<Option<Self>> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        Self::from_vars(
+            "AMPUP_MEMORY_ADVICE_ROUTE",
+            |k| {
+                let v = var(k).or_else(|| {
+                    (k != "AMPUP_MEMORY_ADVICE_ROUTE_MODEL")
+                        .then(|| {
+                            var(&k.replacen("AMPUP_MEMORY_ADVICE_ROUTE", "AMPUP_MEMORY_EXTRACT", 1))
+                        })
+                        .flatten()
+                });
+                // An agent waits on the route: never through the Batch API, whose answers take minutes.
+                match v {
+                    Some(c)
+                        if k == "AMPUP_MEMORY_ADVICE_ROUTE"
+                            && c.eq_ignore_ascii_case("openrouter-batch") =>
+                    {
+                        Some("openrouter".into())
+                    }
+                    v => v,
+                }
+            },
+            Tier::Small,
+        )
+    }
+
+    /// The model `prefix` (`AMPUP_MEMORY_EXTRACT`, `AMPUP_MEMORY_COMPILE`) and its `_MODEL`, `_URL`, `_REGION`, `_KEY`
     /// and `_KEY_FILE` name. Unset, OpenRouter (Claude Haiku 5.5, Opus 5.5 to learn, or any model `_MODEL` names) when there is
     /// an OpenRouter key; `off`, none.
     fn from_vars(
@@ -753,7 +767,7 @@ impl Extractor {
         &self.backend
     }
 
-    /// The same, with AIP graphs on `model` (an org's `aip_model`) instead of `MEMSTORE_AIP_MODEL`.
+    /// The same, with AIP graphs on `model` (an org's `aip_model`) instead of `AMPUP_MEMORY_AIP_MODEL`.
     pub fn with_aip_model(&self, model: &str) -> Self {
         Extractor {
             aip_model: Some(model.to_string()),
@@ -948,7 +962,7 @@ impl Extractor {
                     body["temperature"] = json!(0);
                 }
                 // Claude 5 models think before answering unless told not to, and the thinking is billed as
-                // output: `MEMSTORE_EXTRACT_THINKING=off` turns it off.
+                // output: `AMPUP_MEMORY_EXTRACT_THINKING=off` turns it off.
                 if !thinks() {
                     body["thinking"] = json!({"type": "disabled"});
                 }
@@ -1293,7 +1307,7 @@ struct Read {
 static DIRECTORY_READERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Says every caller of this process's server selects their org or team through the directory
-/// (`MEMSTORE_DIRECTORY=required`): the server calls it once it knows.
+/// (`AMPUP_MEMORY_DIRECTORY=required`): the server calls it once it knows.
 pub fn readers_through_directory() {
     DIRECTORY_READERS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1304,7 +1318,7 @@ pub fn readers_through_directory() {
 /// it with only the groups they bring.
 pub(crate) fn readers_hold_org_wide() -> bool {
     DIRECTORY_READERS.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var("MEMSTORE_DIRECTORY").is_ok_and(|v| v == "required")
+        || std::env::var("AMPUP_MEMORY_DIRECTORY").is_ok_and(|v| v == "required")
 }
 
 /// Readers standing in for an ACL, one per entry, each holding only that entry: a fact all of them may
@@ -1813,10 +1827,10 @@ impl Run {
 }
 
 /// Whether the episodes no goal extracts are extracted too, with the goal-blind prompt
-/// (`MEMSTORE_EXTRACT_GOAL_BLIND=1`, or `on`, `true`, `yes`). By default only what a goal that asks for it
+/// (`AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1`, or `on`, `true`, `yes`). By default only what a goal that asks for it
 /// (`extract: true`) reads is extracted.
 pub fn goal_blind() -> bool {
-    std::env::var("MEMSTORE_EXTRACT_GOAL_BLIND").is_ok_and(|v| {
+    std::env::var("AMPUP_MEMORY_EXTRACT_GOAL_BLIND").is_ok_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "1" | "on" | "true" | "yes"
@@ -1824,10 +1838,10 @@ pub fn goal_blind() -> bool {
     })
 }
 
-/// Whether facts are extracted from sessions' conversations so far (`MEMSTORE_EXTRACT_CONVERSATIONS`,
+/// Whether facts are extracted from sessions' conversations so far (`AMPUP_MEMORY_EXTRACT_CONVERSATIONS`,
 /// `on`/`1`/`true`/`yes`; off by default: [`crate::sessions::conversation_so_far`]).
 fn extract_conversations() -> bool {
-    std::env::var("MEMSTORE_EXTRACT_CONVERSATIONS").is_ok_and(|v| {
+    std::env::var("AMPUP_MEMORY_EXTRACT_CONVERSATIONS").is_ok_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "1" | "on" | "true" | "yes"
@@ -1853,7 +1867,7 @@ pub(crate) fn typed(scope: &Scope, ep: &Episode) -> bool {
         if SAID.lock().unwrap().insert(scope.namespace()) {
             eprintln!(
                 "extract {scope}: sessions' conversations so far aren't extracted, their transcripts are once \
-                 they end (the first: source {:?}; MEMSTORE_EXTRACT_CONVERSATIONS=on extracts them)",
+                 they end (the first: source {:?}; AMPUP_MEMORY_EXTRACT_CONVERSATIONS=on extracts them)",
                 ep.source
             );
         }
@@ -2358,9 +2372,9 @@ async fn run_with(
 
 /// An OpenAI reasoning model (`gpt-5…`, `o1…`, `o3…`, `o4…`, also behind a router's `openai/` prefix): it takes
 /// no `temperature`.
-/// Whether the model may think before it answers (`MEMSTORE_EXTRACT_THINKING`, default on).
+/// Whether the model may think before it answers (`AMPUP_MEMORY_EXTRACT_THINKING`, default on).
 fn thinks() -> bool {
-    std::env::var("MEMSTORE_EXTRACT_THINKING").map_or(true, |v| v != "off")
+    std::env::var("AMPUP_MEMORY_EXTRACT_THINKING").map_or(true, |v| v != "off")
 }
 
 /// Models that refused a temperature since the server started.

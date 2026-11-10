@@ -6,7 +6,7 @@ set -uo pipefail
 # Many concurrent writers each hold HTTP connection pools; the default 1024 open files is
 # not enough (the concurrent-commits check hits EMFILE on stock Ubuntu).
 ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
-B=./target/release/memstore
+B=./target/release/ampup-memory
 C=corpora
 mkdir -p reports "$C"
 cargo build --release -q || exit 1
@@ -59,7 +59,7 @@ gold_eval_on_stack() {
 # index catches up, and the index update must drop its stale rows.
 search_after_delete() {
   source harness/env.sh
-  export MEMSTORE_INDEX_URI="$PWD/$C/index-verify"
+  export AMPUP_MEMORY_INDEX_URI="$PWD/$C/index-verify"
   local fact before
   fact=$(grep '"entity":"p000042","predicate":"role"' "$C/c10000/facts.jsonl" | grep '"valid_to":null' | sed -E 's/.*"fact_id":"([^"]+)".*/\1/')
   before=$($B search org anyone p000042 role | head -1)
@@ -72,8 +72,8 @@ search_after_delete() {
 # single-hop, as-of and freshness gold questions, p95 under 200 ms.
 search_on_stack() {
   source harness/env.sh
-  export MEMSTORE_INDEX_URI="$PWD/$C/index-verify"
-  rm -rf "$MEMSTORE_INDEX_URI"
+  export AMPUP_MEMORY_INDEX_URI="$PWD/$C/index-verify"
+  rm -rf "$AMPUP_MEMORY_INDEX_URI"
   $B index org && $B eval "$C/c10000" | python3 -c '
 import json,sys; t=sys.stdin.read(); j=json.loads(t[t.index("{"):t.rindex("}")+1])
 hit, n = j["search_recall_at_10"]; print("recall@10", hit, "/", n, "p95 ms", j["search_p95_ms"])

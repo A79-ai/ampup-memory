@@ -1,8 +1,8 @@
 //! Per-caller rate limits: a token bucket for each service key (by its hash) and each signed-in person
 //! (by the identity the server verified), never for anything a caller merely says.
 //!
-//! `MEMSTORE_RATE_LIMIT` (e.g. `60/min`, or `60/min:120` for a burst of 120; unset or `off`: none) holds
-//! every caller; ingest keys get `MEMSTORE_INGEST_RATE_LIMIT` instead (unset: ten times the first). A
+//! `AMPUP_MEMORY_RATE_LIMIT` (e.g. `60/min`, or `60/min:120` for a burst of 120; unset or `off`: none) holds
+//! every caller; ingest keys get `AMPUP_MEMORY_INGEST_RATE_LIMIT` instead (unset: ten times the first). A
 //! bucket holds `burst` requests and refills at the rate; a request that finds it empty is answered 429
 //! with `Retry-After`.
 //!
@@ -13,14 +13,14 @@
 //! with N replicas a caller gets up to N times the limit.
 //!
 //! Apart from the rate, how much a server takes on at once (`off` lifts a cap):
-//! - `MEMSTORE_MAX_CONNECTIONS` (default 4096): open connections per port. Past it a new connection is answered
+//! - `AMPUP_MEMORY_MAX_CONNECTIONS` (default 4096): open connections per port. Past it a new connection is answered
 //!   503 and closed.
-//! - `MEMSTORE_MAX_IN_FLIGHT` (default 1024): requests being answered at once per port. Past it a request is
+//! - `AMPUP_MEMORY_MAX_IN_FLIGHT` (default 1024): requests being answered at once per port. Past it a request is
 //!   answered 503 with `Retry-After`, before its body is read. The probes (`/ready`, `/health`, `/healthz`) are
 //!   always answered.
-//! - `MEMSTORE_MAX_IN_FLIGHT_PER_CALLER` (default 64): requests one caller (the same key or person as the rate)
+//! - `AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER` (default 64): requests one caller (the same key or person as the rate)
 //!   has under way at once. Past it a request is answered 429 with `Retry-After`, before its body is read.
-//! - `MEMSTORE_HEADER_TIMEOUT_SECS` (default 660): how long a connection may take to send a request's headers,
+//! - `AMPUP_MEMORY_HEADER_TIMEOUT_SECS` (default 660): how long a connection may take to send a request's headers,
 //!   idle ones included. Longer than load balancers keep idle connections to a backend (600 s), so the balancer
 //!   always closes first; a server reached directly can take less.
 
@@ -131,8 +131,8 @@ impl Default for Caps {
 }
 
 impl Caps {
-    /// From `MEMSTORE_MAX_CONNECTIONS`, `MEMSTORE_MAX_IN_FLIGHT`, `MEMSTORE_MAX_IN_FLIGHT_PER_CALLER` and
-    /// `MEMSTORE_HEADER_TIMEOUT_SECS`, each a positive number (`off`: no cap), else the defaults.
+    /// From `AMPUP_MEMORY_MAX_CONNECTIONS`, `AMPUP_MEMORY_MAX_IN_FLIGHT`, `AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER` and
+    /// `AMPUP_MEMORY_HEADER_TIMEOUT_SECS`, each a positive number (`off`: no cap), else the defaults.
     pub fn from_env() -> Result<Caps> {
         let d = Caps::default();
         let cap = |k: &str, default: Option<usize>| -> Result<Option<usize>> {
@@ -148,10 +148,10 @@ impl Caps {
         };
         let secs = d.header_timeout.map(|t| t.as_secs() as usize);
         Ok(Caps {
-            connections: cap("MEMSTORE_MAX_CONNECTIONS", d.connections)?,
-            in_flight: cap("MEMSTORE_MAX_IN_FLIGHT", d.in_flight)?,
-            per_caller: cap("MEMSTORE_MAX_IN_FLIGHT_PER_CALLER", d.per_caller)?,
-            header_timeout: cap("MEMSTORE_HEADER_TIMEOUT_SECS", secs)?
+            connections: cap("AMPUP_MEMORY_MAX_CONNECTIONS", d.connections)?,
+            in_flight: cap("AMPUP_MEMORY_MAX_IN_FLIGHT", d.in_flight)?,
+            per_caller: cap("AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER", d.per_caller)?,
+            header_timeout: cap("AMPUP_MEMORY_HEADER_TIMEOUT_SECS", secs)?
                 .map(|s| Duration::from_secs(s as u64)),
         })
     }
@@ -191,7 +191,7 @@ impl Limiter {
     }
 
     /// Count one more request under way for `who` (the id its bucket has); None when it already has the most
-    /// a caller may (`MEMSTORE_MAX_IN_FLIGHT_PER_CALLER`).
+    /// a caller may (`AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER`).
     pub fn begin(&self, who: &str) -> Option<UnderWay> {
         let mut m = self.under_way.lock().unwrap();
         let n = m.entry(who.to_string()).or_default();
@@ -205,13 +205,13 @@ impl Limiter {
         })
     }
 
-    /// From `MEMSTORE_RATE_LIMIT` and `MEMSTORE_INGEST_RATE_LIMIT` (or the specs given in their place).
+    /// From `AMPUP_MEMORY_RATE_LIMIT` and `AMPUP_MEMORY_INGEST_RATE_LIMIT` (or the specs given in their place).
     pub fn configured(default: Option<String>, ingest: Option<String>) -> Result<Self> {
         let var = |given: Option<String>, k: &str| given.or_else(|| std::env::var(k).ok());
-        let default = Limit::parse(&var(default, "MEMSTORE_RATE_LIMIT").unwrap_or_default())
-            .context("MEMSTORE_RATE_LIMIT")?;
-        let ingest = match var(ingest, "MEMSTORE_INGEST_RATE_LIMIT") {
-            Some(s) => Limit::parse(&s).context("MEMSTORE_INGEST_RATE_LIMIT")?,
+        let default = Limit::parse(&var(default, "AMPUP_MEMORY_RATE_LIMIT").unwrap_or_default())
+            .context("AMPUP_MEMORY_RATE_LIMIT")?;
+        let ingest = match var(ingest, "AMPUP_MEMORY_INGEST_RATE_LIMIT") {
+            Some(s) => Limit::parse(&s).context("AMPUP_MEMORY_INGEST_RATE_LIMIT")?,
             None => default.map(|d| d.times(10.0)),
         };
         if let Some(d) = default {

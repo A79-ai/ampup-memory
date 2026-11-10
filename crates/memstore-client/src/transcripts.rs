@@ -1,7 +1,7 @@
 //! A session's whole transcript, sent as it grows (`memstore::transcripts` keeps it): what the session note and the
 //! end's trace leave out, each tool call's input and its result, so a later pass can check what was noted against
 //! what actually ran. Sent where the scope keeps them (asked once, then remembered for [`OFF_FOR`] where it doesn't),
-//! never with `MEMSTORE_CAPTURE=off`, for Claude Code, Codex and Gemini CLI, whose transcripts carry the tool calls.
+//! never with `AMPUP_MEMORY_CAPTURE=off`, for Claude Code, Codex and Gemini CLI, whose transcripts carry the tool calls.
 //!
 //! Before a compaction, at a Stop (at most every [`super::KEEP_EVERY`]) and at the session's end, the hook sends what
 //! the transcript gained since the last part the memory took (a marker keeps how far that was; without one, the
@@ -389,7 +389,7 @@ pub(super) async fn send(client: &Client, input: &Value, harness: Harness, due: 
     if !matches!(
         harness,
         Harness::ClaudeCode | Harness::Codex | Harness::Gemini
-    ) || std::env::var("MEMSTORE_CAPTURE").unwrap_or_default() == "off"
+    ) || std::env::var("AMPUP_MEMORY_CAPTURE").unwrap_or_default() == "off"
     {
         return Ok(());
     }

@@ -14,13 +14,13 @@
 //!   lost the lease commits nothing; the system tables once a night by the default cell, a scope's in its turn;
 //! - when a table holds more data files than its threshold, or (the ledger and the summaries) its last compaction
 //!   is older than a day (read as of the window's close) and there are files to merge:
-//!   - the ledger: `MEMSTORE_LEDGER_COMPACT_FILES` (500), `_EVERY` (24h), up to `_MAX_FILES` (100,000) and
+//!   - the ledger: `AMPUP_MEMORY_LEDGER_COMPACT_FILES` (500), `_EVERY` (24h), up to `_MAX_FILES` (100,000) and
 //!     `_MAX_BYTES` (1 GiB);
-//!   - each scope's summaries: `MEMSTORE_AGGREGATES_COMPACT_FILES` (200), `_EVERY` (24h), up to `_MAX_FILES` (20,000);
+//!   - each scope's summaries: `AMPUP_MEMORY_AGGREGATES_COMPACT_FILES` (200), `_EVERY` (24h), up to `_MAX_FILES` (20,000);
 //!   - every other table (facts, episodes, quotes, closures, extractions, schemas, retention, retractions, the
 //!     answer log, feedback, summary requests, workspace snapshots; the directory and its snapshots, installations,
-//!     key usage, the audit log and the usage book): `MEMSTORE_COMPACT_FILES` (200), by files alone unless
-//!     `MEMSTORE_COMPACT_EVERY` is set, up to `MEMSTORE_COMPACT_MAX_FILES` (20,000) and `MEMSTORE_COMPACT_MAX_BYTES`
+//!     key usage, the audit log and the usage book): `AMPUP_MEMORY_COMPACT_FILES` (200), by files alone unless
+//!     `AMPUP_MEMORY_COMPACT_EVERY` is set, up to `AMPUP_MEMORY_COMPACT_MAX_FILES` (20,000) and `AMPUP_MEMORY_COMPACT_MAX_BYTES`
 //!     (1 GiB: a rewrite holds the table's rows in memory). The audit log's rows are kept whole: merged, never
 //!     dropped;
 //!   - past a ceiling it is left alone and logged (`"result":"needs_cli"`; the ledger's sets
@@ -28,7 +28,7 @@
 //! - a run interrupted (the server killed, the lease lost) after its swap is finished by the next night's look at
 //!   the table (`"result":"swept"`), and one killed before it committed nothing (its files go with a sweep an hour
 //!   later);
-//! - `MEMSTORE_LEDGER_COMPACT=off`, `MEMSTORE_AGGREGATES_COMPACT=off` and `MEMSTORE_COMPACT=off` turn each off (the
+//! - `AMPUP_MEMORY_LEDGER_COMPACT=off`, `AMPUP_MEMORY_AGGREGATES_COMPACT=off` and `AMPUP_MEMORY_COMPACT=off` turn each off (the
 //!   ledger's metrics are still kept, every maintenance round).
 //!
 //! Each run logs one line, counts only (`ledger compaction: {...}`, `aggregates compaction: {...}` and `table
@@ -46,8 +46,8 @@ use crate::{Scope, Store};
 
 use super::State;
 
-/// When the window compacts a table: `MEMSTORE_LEDGER_COMPACT*` (the ledger), `MEMSTORE_AGGREGATES_COMPACT*` (each
-/// scope's summaries), `MEMSTORE_COMPACT*` (every other table).
+/// When the window compacts a table: `AMPUP_MEMORY_LEDGER_COMPACT*` (the ledger), `AMPUP_MEMORY_AGGREGATES_COMPACT*` (each
+/// scope's summaries), `AMPUP_MEMORY_COMPACT*` (every other table).
 #[derive(Clone, Debug)]
 pub struct Config {
     pub on: bool,
@@ -62,14 +62,14 @@ pub struct Config {
 }
 
 impl Config {
-    /// The ledger's: `MEMSTORE_LEDGER_COMPACT*`. Its ceiling is a day's commits and more: every write is a ledger
+    /// The ledger's: `AMPUP_MEMORY_LEDGER_COMPACT*`. Its ceiling is a day's commits and more: every write is a ledger
     /// commit and a file, a busy deployment's day is thousands (dev: 1,200 to 6,000), and a ceiling under that
     /// (2,000, set when it was compacted hourly) had the window leave it alone every night from then on, 37,000
     /// files that a server's start took minutes to read. A rewrite holds its rows in memory, so 1 GiB at most, as
     /// every other table (dev's 69,000 rows are 105 MB).
     pub fn from_env() -> Result<Self> {
         Self::read(
-            "MEMSTORE_LEDGER_COMPACT",
+            "AMPUP_MEMORY_LEDGER_COMPACT",
             500,
             Some(24 * 3600),
             100_000,
@@ -77,12 +77,12 @@ impl Config {
         )
     }
 
-    /// Each scope's summaries': `MEMSTORE_AGGREGATES_COMPACT*`. Fewer files before a compaction than the
+    /// Each scope's summaries': `AMPUP_MEMORY_AGGREGATES_COMPACT*`. Fewer files before a compaction than the
     /// ledger's (a brief read loads them all, and the table is small), and a higher ceiling: one org's had
     /// 4,800 files and 1.2 GB, which one run in the window merges in minutes.
     pub fn aggregates_from_env() -> Result<Self> {
         Self::read(
-            "MEMSTORE_AGGREGATES_COMPACT",
+            "AMPUP_MEMORY_AGGREGATES_COMPACT",
             200,
             Some(24 * 3600),
             20_000,
@@ -90,12 +90,12 @@ impl Config {
         )
     }
 
-    /// Every other table's, a scope's or the system's: `MEMSTORE_COMPACT*`. By files alone unless
-    /// `MEMSTORE_COMPACT_EVERY` is set: a rewrite of a scope's facts or episodes makes every file new to its search
+    /// Every other table's, a scope's or the system's: `AMPUP_MEMORY_COMPACT*`. By files alone unless
+    /// `AMPUP_MEMORY_COMPACT_EVERY` is set: a rewrite of a scope's facts or episodes makes every file new to its search
     /// indexes, which are then rebuilt, so it isn't done every night for a few files. At most
-    /// `MEMSTORE_COMPACT_MAX_BYTES` (1 GiB) of data files: a rewrite holds the table's rows in memory.
+    /// `AMPUP_MEMORY_COMPACT_MAX_BYTES` (1 GiB) of data files: a rewrite holds the table's rows in memory.
     pub fn tables_from_env() -> Result<Self> {
-        Self::read("MEMSTORE_COMPACT", 200, None, 20_000, Some(1 << 30))
+        Self::read("AMPUP_MEMORY_COMPACT", 200, None, 20_000, Some(1 << 30))
     }
 
     fn read(
@@ -268,13 +268,14 @@ impl Target<'_> {
     fn by_hand(&self) -> String {
         match (self.is_ledger(), self.scope) {
             (true, _) => {
-                "run `memstore compact-ledger` once; the window keeps it small from then on".into()
+                "run `ampup-memory compact-ledger` once; the window keeps it small from then on"
+                    .into()
             }
             (false, Some(s)) if self.is_aggregates() => {
-                format!("run `memstore compact-ledger --aggregates {s}` once")
+                format!("run `ampup-memory compact-ledger --aggregates {s}` once")
             }
             _ => format!(
-                "left as it is: over MEMSTORE_COMPACT_MAX_FILES or MEMSTORE_COMPACT_MAX_BYTES (raise them for a \
+                "left as it is: over AMPUP_MEMORY_COMPACT_MAX_FILES or AMPUP_MEMORY_COMPACT_MAX_BYTES (raise them for a \
                  night to compact {} once)",
                 self.name()
             ),

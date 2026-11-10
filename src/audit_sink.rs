@@ -1,9 +1,9 @@
-//! Where audit events go besides the catalog, for a customer's log pipeline or SIEM: `MEMSTORE_AUDIT_SINK`.
+//! Where audit events go besides the catalog, for a customer's log pipeline or SIEM: `AMPUP_MEMORY_AUDIT_SINK`.
 //!
 //! - `stdout`: one JSON object per line on the server's standard output, for a log shipper that already
 //!   reads the pod's logs;
 //! - `file:<path>`: the same lines appended to a file;
-//! - `https://…`: each flush POSTed as newline-delimited JSON (`MEMSTORE_AUDIT_SINK_TOKEN`, if set, is the
+//! - `https://…`: each flush POSTed as newline-delimited JSON (`AMPUP_MEMORY_AUDIT_SINK_TOKEN`, if set, is the
 //!   bearer token), retried a few times, then dropped and counted.
 //!
 //! A line is the event as the audit view shows it ([`crate::audit::Entry::to_json`]) plus `"source":
@@ -25,7 +25,7 @@ use crate::audit::{Entry, Sink};
 pub static SINK_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
         "memstore_audit_sink_failures_total",
-        "Audit flushes the configured sink (MEMSTORE_AUDIT_SINK) did not take",
+        "Audit flushes the configured sink (AMPUP_MEMORY_AUDIT_SINK) did not take",
     )
     .unwrap()
 });
@@ -40,11 +40,11 @@ enum Dest {
     Https(String, Option<String>),
 }
 
-/// The sink `MEMSTORE_AUDIT_SINK` names, or none when it is unset. A value that is none of the forms above
+/// The sink `AMPUP_MEMORY_AUDIT_SINK` names, or none when it is unset. A value that is none of the forms above
 /// stops the server: an audit destination that silently isn't one is worse than a server that won't start.
 /// Call from inside the runtime.
 pub fn from_env() -> Result<Option<Sink>> {
-    let Ok(v) = std::env::var("MEMSTORE_AUDIT_SINK") else {
+    let Ok(v) = std::env::var("AMPUP_MEMORY_AUDIT_SINK") else {
         return Ok(None);
     };
     let v = v.trim();
@@ -55,11 +55,13 @@ pub fn from_env() -> Result<Option<Sink>> {
             (Some(path), _) if !path.is_empty() => Dest::File(path.to_string()),
             (_, true) => Dest::Https(
                 v.to_string(),
-                std::env::var("MEMSTORE_AUDIT_SINK_TOKEN")
+                std::env::var("AMPUP_MEMORY_AUDIT_SINK_TOKEN")
                     .ok()
                     .filter(|t| !t.is_empty()),
             ),
-            _ => bail!("MEMSTORE_AUDIT_SINK is stdout, file:<path> or an https:// URL, got {v:?}"),
+            _ => bail!(
+                "AMPUP_MEMORY_AUDIT_SINK is stdout, file:<path> or an https:// URL, got {v:?}"
+            ),
         },
     };
     if let Dest::File(path) = &dest {
@@ -67,7 +69,7 @@ pub fn from_env() -> Result<Option<Sink>> {
             .create(true)
             .append(true)
             .open(path)
-            .with_context(|| format!("MEMSTORE_AUDIT_SINK file {path} can't be written"))?;
+            .with_context(|| format!("AMPUP_MEMORY_AUDIT_SINK file {path} can't be written"))?;
     }
     let (tx, rx) = mpsc::channel::<String>(QUEUE);
     tokio::spawn(deliver(dest, rx));

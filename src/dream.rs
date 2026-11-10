@@ -64,16 +64,16 @@
 //! a part is weighed again only once a fact newer than that is committed to it. What a pass leaves (the budget ran
 //! out, a call failed, more pages of a thing than one pass weighs) stays new, and the least recently weighed goes
 //! first: what was never weighed, then the oldest. A share of every pass's calls is kept for names
-//! (`MEMSTORE_DREAM_NAMES`), so aliases are reached whatever the backlog of things.
+//! (`AMPUP_MEMORY_DREAM_NAMES`), so aliases are reached whatever the backlog of things.
 //!
 //! It commits as it goes. A pass commits its decisions in batches ([`Budget::commit_every`] decisions, or
 //! [`Budget::commit_secs`] since the last batch), each with the record of the parts and names it weighed to reach
 //! them, and only those: a pass cut off midway (a deploy replacing its pod, the nightly window's timeout) keeps every
 //! batch committed before, and the next pass goes on after them, weighing nothing twice.
 //!
-//! Gated, capped and undoable. The server runs a pass per scope at most once a day (`MEMSTORE_DREAM_SECS`), once 200
-//! new facts (`MEMSTORE_DREAM_FACTS`) wait, within a budget of model calls ([`Budget`]), and only on the scopes
-//! `MEMSTORE_DREAM_ON` names: off by default. Everything a pass commits, every batch, is one actor,
+//! Gated, capped and undoable. The server runs a pass per scope at most once a day (`AMPUP_MEMORY_DREAM_SECS`), once 200
+//! new facts (`AMPUP_MEMORY_DREAM_FACTS`) wait, within a budget of model calls ([`Budget`]), and only on the scopes
+//! `AMPUP_MEMORY_DREAM_ON` names: off by default. Everything a pass commits, every batch, is one actor,
 //! `dream:<model>@<version>`, and `retract-facts --extractor dream:<model>@<version>` takes back its endings, links,
 //! aliases and records at once. `memstore dream <scope> --dry-run` prints what a pass would do and commits nothing.
 
@@ -253,12 +253,12 @@ impl Default for Budget {
 }
 
 impl Budget {
-    /// `MEMSTORE_DREAM_CALLS` (default 100), `MEMSTORE_DREAM_AUDIENCES` (default 6), `MEMSTORE_DREAM_NAMES`
-    /// (percent, default 25), `MEMSTORE_DREAM_PARALLEL` (default 8), and a batch every `MEMSTORE_DREAM_COMMIT_EVERY`
-    /// decisions (default 100) or `MEMSTORE_DREAM_COMMIT_SECS` (default 120).
+    /// `AMPUP_MEMORY_DREAM_CALLS` (default 100), `AMPUP_MEMORY_DREAM_AUDIENCES` (default 6), `AMPUP_MEMORY_DREAM_NAMES`
+    /// (percent, default 25), `AMPUP_MEMORY_DREAM_PARALLEL` (default 8), and a batch every `AMPUP_MEMORY_DREAM_COMMIT_EVERY`
+    /// decisions (default 100) or `AMPUP_MEMORY_DREAM_COMMIT_SECS` (default 120).
     pub fn from_env() -> Result<Self> {
         let d = Budget::default();
-        let names = match std::env::var("MEMSTORE_DREAM_NAMES") {
+        let names = match std::env::var("AMPUP_MEMORY_DREAM_NAMES") {
             Err(_) => d.names,
             Ok(v) => v
                 .trim()
@@ -267,18 +267,20 @@ impl Budget {
                 .ok()
                 .filter(|n| *n <= 100)
                 .ok_or_else(|| {
-                    anyhow::anyhow!("MEMSTORE_DREAM_NAMES is a percent from 0 to 100, not {v:?}")
+                    anyhow::anyhow!(
+                        "AMPUP_MEMORY_DREAM_NAMES is a percent from 0 to 100, not {v:?}"
+                    )
                 })?,
         };
         Ok(Budget {
-            calls: positive("MEMSTORE_DREAM_CALLS", d.calls)?,
-            audiences: positive("MEMSTORE_DREAM_AUDIENCES", d.audiences)?,
+            calls: positive("AMPUP_MEMORY_DREAM_CALLS", d.calls)?,
+            audiences: positive("AMPUP_MEMORY_DREAM_AUDIENCES", d.audiences)?,
             names,
-            parallel: positive("MEMSTORE_DREAM_PARALLEL", d.parallel)?,
+            parallel: positive("AMPUP_MEMORY_DREAM_PARALLEL", d.parallel)?,
             until: None,
-            commit_every: positive("MEMSTORE_DREAM_COMMIT_EVERY", d.commit_every)?,
+            commit_every: positive("AMPUP_MEMORY_DREAM_COMMIT_EVERY", d.commit_every)?,
             commit_secs: Duration::from_secs(positive(
-                "MEMSTORE_DREAM_COMMIT_SECS",
+                "AMPUP_MEMORY_DREAM_COMMIT_SECS",
                 d.commit_secs.as_secs() as usize,
             )? as u64),
         })
@@ -294,11 +296,11 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// `MEMSTORE_DREAM_SECS` (default a day), `MEMSTORE_DREAM_FACTS` (default 200) and the [`Budget`].
+    /// `AMPUP_MEMORY_DREAM_SECS` (default a day), `AMPUP_MEMORY_DREAM_FACTS` (default 200) and the [`Budget`].
     pub fn from_env() -> Result<Self> {
         Ok(Gate {
-            every: Duration::from_secs(positive("MEMSTORE_DREAM_SECS", 86_400)? as u64),
-            facts: positive("MEMSTORE_DREAM_FACTS", 200)?,
+            every: Duration::from_secs(positive("AMPUP_MEMORY_DREAM_SECS", 86_400)? as u64),
+            facts: positive("AMPUP_MEMORY_DREAM_FACTS", 200)?,
             budget: Budget::from_env()?,
         })
     }
@@ -316,14 +318,14 @@ fn positive(var: &str, default: usize) -> Result<usize> {
     }
 }
 
-/// The scopes the server dreams over: `MEMSTORE_DREAM_ON`, comma-separated scopes (`org:acme`, `team:acme/eng`),
+/// The scopes the server dreams over: `AMPUP_MEMORY_DREAM_ON`, comma-separated scopes (`org:acme`, `team:acme/eng`),
 /// org names (each of its scopes) or `*`. Unset or empty, none: dreaming is off.
 #[derive(Clone, Debug)]
 pub struct On(Vec<String>);
 
 impl On {
     pub fn from_env() -> Option<Self> {
-        let v = std::env::var("MEMSTORE_DREAM_ON").ok()?;
+        let v = std::env::var("AMPUP_MEMORY_DREAM_ON").ok()?;
         let names: Vec<String> = v
             .split(',')
             .map(|s| s.trim().to_string())

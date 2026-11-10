@@ -37,7 +37,7 @@ pub enum FetchPolicy {
     /// The operator configured it (the server's own provider, IAP): read as it is.
     Trusted,
     /// An org's admin named it: vetted, pinned, generic errors. `allow_loopback`
-    /// (`MEMSTORE_ALLOW_LOCAL_ISSUERS`) also lets it be on this machine, over http too.
+    /// (`AMPUP_MEMORY_ALLOW_LOCAL_ISSUERS`) also lets it be on this machine, over http too.
     Vetted { allow_loopback: bool },
 }
 

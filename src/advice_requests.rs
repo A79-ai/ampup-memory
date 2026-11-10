@@ -1,11 +1,11 @@
 //! Advice's admin ops that only the server doing the background writing runs (`hold_advice` and `learn_advice`:
 //! both write the advice map, which a learn rewrites from what it read, so they run where learning does, under its
 //! claim), asked of a server that doesn't. That is every serving pod of a deployment that splits serving from
-//! writing (`MEMSTORE_ROLE=serve`, a cell's pods among them, whose worker holds the cell's lease), and any server while
+//! writing (`AMPUP_MEMORY_ROLE=serve`, a cell's pods among them, whose worker holds the cell's lease), and any server while
 //! the lease is elsewhere. An admin reaches only the serving pods, so the request is queued for the writer instead of
 //! refused: a document of the scope (`advice-requests/<id>`) that no reader reads, committed as `advice:queued:<asker>`.
 //!
-//! The writer looks every [`every`] (`MEMSTORE_ADVICE_REQUESTS_SECS`, default 30) for commits of that actor in the
+//! The writer looks every [`every`] (`AMPUP_MEMORY_ADVICE_REQUESTS_SECS`, default 30) for commits of that actor in the
 //! ledger, which every server reads anyway, so it reads only the scopes a request was queued in. It applies each
 //! request there, oldest first, and marks it applied by giving it to no one (an applied request is gone from the
 //! scope's documents). One that fails is said in the log and marked too, so a request that can't be applied isn't tried
@@ -58,9 +58,9 @@ pub struct Request {
     pub force: bool,
 }
 
-/// How often the writer looks for queued requests: `MEMSTORE_ADVICE_REQUESTS_SECS`, default 30.
+/// How often the writer looks for queued requests: `AMPUP_MEMORY_ADVICE_REQUESTS_SECS`, default 30.
 pub fn every() -> Duration {
-    let secs = std::env::var("MEMSTORE_ADVICE_REQUESTS_SECS")
+    let secs = std::env::var("AMPUP_MEMORY_ADVICE_REQUESTS_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(30);

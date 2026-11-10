@@ -1,8 +1,8 @@
 //! Mail the server sends: an org's admins are told when someone asks to join ([`crate::server::join`]).
 //!
-//! Through Resend (`RESEND_API_KEY`) or MailerSend (`MAILERSEND_API_KEY`), from `MEMSTORE_MAIL_FROM`. With
+//! Through Resend (`RESEND_API_KEY`) or MailerSend (`MAILERSEND_API_KEY`), from `AMPUP_MEMORY_MAIL_FROM`. With
 //! neither key, or no sender, nothing is sent: what would have been mailed is logged, and the request stays
-//! recorded for `memstore requests`. `MEMSTORE_MAIL_URL` sends the provider's request elsewhere (a relay, or a
+//! recorded for `memstore requests`. `AMPUP_MEMORY_MAIL_URL` sends the provider's request elsewhere (a relay, or a
 //! sink when checking locally).
 
 use anyhow::{Context, Result};
@@ -25,7 +25,7 @@ pub struct Mailer {
 /// The sender the environment configures, if it configures one.
 pub fn from_env() -> Option<Mailer> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    let from = var("MEMSTORE_MAIL_FROM")?;
+    let from = var("AMPUP_MEMORY_MAIL_FROM")?;
     let (provider, key) = var("RESEND_API_KEY")
         .map(|k| (Provider::Resend, k))
         .or_else(|| var("MAILERSEND_API_KEY").map(|k| (Provider::MailerSend, k)))?;
@@ -58,7 +58,7 @@ impl Mailer {
                        "text": text, "html": html}),
             ),
         };
-        let url = std::env::var("MEMSTORE_MAIL_URL")
+        let url = std::env::var("AMPUP_MEMORY_MAIL_URL")
             .ok()
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| url.to_string());

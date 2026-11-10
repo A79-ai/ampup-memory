@@ -20,9 +20,9 @@ group = cfg.get('group', 'local')
 corpus = cfg.get('corpus', '')
 
 state = 'corpora/tilt'
-B = './target/release/memstore'
+B = './target/release/ampup-memory'
 # harness/env.sh points the engine at the stack; the index lives apart from ~/.cache/memstore/index.
-engine = '. harness/env.sh && export MEMSTORE_INDEX_URI=$PWD/%s/index && ' % state
+engine = '. harness/env.sh && export AMPUP_MEMORY_INDEX_URI=$PWD/%s/index && ' % state
 os.putenv('PATH', os.getenv('HOME') + '/.cargo/bin:' + os.getenv('PATH'))
 
 docker_compose('harness/docker-compose.yml')
@@ -47,7 +47,7 @@ local_resource(
 # No corpus, nothing is loaded: a dev memory never fills with synthetic data by default (a synthetic one is
 # `memstore gen 42 1000 <dir>`, passed with --corpus).
 if corpus:
-    load_cmd = (engine + 'set -e; C=%s; rm -rf $MEMSTORE_INDEX_URI; ' % corpus +
+    load_cmd = (engine + 'set -e; C=%s; rm -rf $AMPUP_MEMORY_INDEX_URI; ' % corpus +
             B + ' load $C; ' + B + ' index ' + scope)
 else:
     load_cmd = 'echo "no corpus given (tilt up -- --corpus <dir>): nothing loaded"'
@@ -66,7 +66,7 @@ local_resource(
     'serve',
     serve_cmd=engine + 'exec ' + B + ' serve ' + scope + ' ' + port + ' ' + group,
     resource_deps=['load'],
-    deps=['target/release/memstore'],
+    deps=['target/release/ampup-memory'],
     readiness_probe=probe(tcp_socket=tcp_socket_action(int(port))),
     links=[link('http://localhost:%s/mcp' % port, 'MCP')],
     labels=['engine'],

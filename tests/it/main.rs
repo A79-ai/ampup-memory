@@ -5,6 +5,10 @@
 //! A new flow goes in a file here, with a `mod` line below (CI fails a file in `tests/` itself, which would
 //! build a binary of its own, and a file here without its `mod` line, which would never run).
 
+// A test's async block holds the server's request handler, whose layout went past the default query depth (128)
+// on CI's x86_64 build (access_flow's conflict test), as the crate's own did (src/lib.rs).
+#![recursion_limit = "256"]
+
 mod access_flow;
 mod advice_files;
 mod advice_fit;
@@ -38,14 +42,14 @@ mod train_log;
 
 /// Whether the calling test goes on in this process. `cargo test` runs every test of this binary in one
 /// process, so a test that sets process-wide settings (environment variables the server reads, such as
-/// `MEMSTORE_INDEX_URI` or `MEMSTORE_IAP_AUDIENCE`) would hand them to every other test. Such a test calls
+/// `AMPUP_MEMORY_INDEX_URI` or `AMPUP_MEMORY_IAP_AUDIENCE`) would hand them to every other test. Such a test calls
 /// this first: it runs again in a process of its own (this binary, that test only), and here this returns
 /// false once that process passed. In that process, and under nextest (a process per test already), it
 /// returns true.
 ///
 /// `test` is the test's path in this binary: `file::name`.
 pub fn own_process(test: &str) -> bool {
-    const OWN: &str = "MEMSTORE_TEST_OWN_PROCESS";
+    const OWN: &str = "AMPUP_MEMORY_TEST_OWN_PROCESS";
     if std::env::var(OWN).as_deref() == Ok(test)
         || std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test")
     {

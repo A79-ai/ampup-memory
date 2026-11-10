@@ -462,8 +462,8 @@ impl Store {
     /// summary run (its rows share a commit) is read only while it is the newest run of its (goal, subject,
     /// audience) that a reader sees, so a run is kept when it is that for some reader: on any branch now; at any
     /// of the workspace's snapshots; through any live pin (`crate::pins`); or on a page a cursor will still fetch,
-    /// which, as the index keeps its versions (`MEMSTORE_INDEX_KEEP_VERSIONS_SECS`), is honoured for
-    /// `MEMSTORE_AGGREGATES_KEEP_SECS` (an hour): every run recorded since, and the newest before. A row of no commit yet (a pass still writing) is kept.
+    /// which, as the index keeps its versions (`AMPUP_MEMORY_INDEX_KEEP_VERSIONS_SECS`), is honoured for
+    /// `AMPUP_MEMORY_AGGREGATES_KEEP_SECS` (an hour): every run recorded since, and the newest before. A row of no commit yet (a pass still writing) is kept.
     /// The rest are older versions no read reaches.
     async fn aggregates_keep(
         &self,
@@ -498,7 +498,7 @@ impl Store {
                 }
             }
         }
-        let secs = std::env::var("MEMSTORE_AGGREGATES_KEEP_SECS")
+        let secs = std::env::var("AMPUP_MEMORY_AGGREGATES_KEEP_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3_600i64);
@@ -875,9 +875,9 @@ impl Store {
             r.restarts += restarts;
             self.forget_cached(ns, name);
             // Tests: a run killed right after the commit, before the replaced files are deleted.
-            if std::env::var("MEMSTORE_STOP_AFTER_REWRITE").is_ok_and(|t| t == name) {
+            if std::env::var("AMPUP_MEMORY_STOP_AFTER_REWRITE").is_ok_and(|t| t == name) {
                 anyhow::bail!(
-                    "stopped after committing the rewrite of {ns}.{name} (MEMSTORE_STOP_AFTER_REWRITE)"
+                    "stopped after committing the rewrite of {ns}.{name} (AMPUP_MEMORY_STOP_AFTER_REWRITE)"
                 );
             }
             step("sweep: expiring the replaced snapshots, deleting the files only they referenced");
@@ -2241,8 +2241,10 @@ impl Store {
             crate::search::drop_namespace_index(self, ns).await?;
         }
         // Tests: a run killed before this table's rewrite (the episodes': after their bodies went, before their rows).
-        if erasing && std::env::var("MEMSTORE_STOP_BEFORE_REWRITE").is_ok_and(|t| t == name) {
-            anyhow::bail!("stopped before rewriting {ns}.{name} (MEMSTORE_STOP_BEFORE_REWRITE)");
+        if erasing && std::env::var("AMPUP_MEMORY_STOP_BEFORE_REWRITE").is_ok_and(|t| t == name) {
+            anyhow::bail!(
+                "stopped before rewriting {ns}.{name} (AMPUP_MEMORY_STOP_BEFORE_REWRITE)"
+            );
         }
         // A logged answer or feedback citing an episode no longer stored at all (logged while an earlier erasure
         // ran) goes too: what is stored is read once the tables before them are rewritten.

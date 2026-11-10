@@ -247,37 +247,37 @@ pub fn metric_families(text: &str) -> BTreeMap<String, f64> {
 
 /// Variables whose values are shown: closed sets, numbers and model names, never a secret.
 const SHOWN: [&str; 19] = [
-    "MEMSTORE_PLATFORM",
-    "MEMSTORE_CALLER_IDENTITY",
-    "MEMSTORE_EMBED",
-    "MEMSTORE_EMBED_MODEL",
-    "MEMSTORE_EMBED_DIMS",
-    "MEMSTORE_METRICS_PORT",
-    "MEMSTORE_TELEMETRY",
-    "MEMSTORE_TELEMETRY_INTERVAL_SECS",
-    "MEMSTORE_TELEMETRY_INVENTORY_SECS",
-    "MEMSTORE_ALERTS_EVAL_SECS",
-    "MEMSTORE_AUDIT_FLUSH_SECS",
-    "MEMSTORE_CATALOG_REFRESH_SECS",
-    "MEMSTORE_CATALOG_FRESH_SECS",
-    "MEMSTORE_RATE_LIMIT",
-    "MEMSTORE_INGEST_RATE_LIMIT",
-    "MEMSTORE_MAX_STALENESS_MS",
-    "MEMSTORE_HARD_STALENESS_MS",
-    "MEMSTORE_SLOW_REQUEST_MS",
-    "MEMSTORE_MODEL_TIMEOUT_SECS",
+    "AMPUP_MEMORY_PLATFORM",
+    "AMPUP_MEMORY_CALLER_IDENTITY",
+    "AMPUP_MEMORY_EMBED",
+    "AMPUP_MEMORY_EMBED_MODEL",
+    "AMPUP_MEMORY_EMBED_DIMS",
+    "AMPUP_MEMORY_METRICS_PORT",
+    "AMPUP_MEMORY_TELEMETRY",
+    "AMPUP_MEMORY_TELEMETRY_INTERVAL_SECS",
+    "AMPUP_MEMORY_TELEMETRY_INVENTORY_SECS",
+    "AMPUP_MEMORY_ALERTS_EVAL_SECS",
+    "AMPUP_MEMORY_AUDIT_FLUSH_SECS",
+    "AMPUP_MEMORY_CATALOG_REFRESH_SECS",
+    "AMPUP_MEMORY_CATALOG_FRESH_SECS",
+    "AMPUP_MEMORY_RATE_LIMIT",
+    "AMPUP_MEMORY_INGEST_RATE_LIMIT",
+    "AMPUP_MEMORY_MAX_STALENESS_MS",
+    "AMPUP_MEMORY_HARD_STALENESS_MS",
+    "AMPUP_MEMORY_SLOW_REQUEST_MS",
+    "AMPUP_MEMORY_MODEL_TIMEOUT_SECS",
 ];
 
 /// Secrets: always listed, as `set` or `unset`, never their value.
 const SECRETS: [&str; 14] = [
-    "MEMSTORE_ADMIN_KEY",
-    "MEMSTORE_API_KEYS",
-    "MEMSTORE_EMBED_KEY",
-    "MEMSTORE_EMBED_KEY_FILE",
-    "MEMSTORE_JWT_SECRET",
-    "MEMSTORE_SECRET_KEY",
-    "MEMSTORE_FN_SECRET",
-    "MEMSTORE_OIDC_CLIENT_SECRET",
+    "AMPUP_MEMORY_ADMIN_KEY",
+    "AMPUP_MEMORY_API_KEYS",
+    "AMPUP_MEMORY_EMBED_KEY",
+    "AMPUP_MEMORY_EMBED_KEY_FILE",
+    "AMPUP_MEMORY_JWT_SECRET",
+    "AMPUP_MEMORY_SECRET_KEY",
+    "AMPUP_MEMORY_FN_SECRET",
+    "AMPUP_MEMORY_OIDC_CLIENT_SECRET",
     "OPENAI_API_KEY",
     "OPENROUTER_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -286,8 +286,20 @@ const SECRETS: [&str; 14] = [
     "DATABRICKS_CLIENT_SECRET",
 ];
 
+/// Each name as the engine reads it: the container may hold a setting by its old name (`MEMSTORE_X`, read as
+/// `AMPUP_MEMORY_X`), and it is shown, or kept secret, as the new one is.
+fn current(name: &str) -> std::borrow::Cow<'_, str> {
+    crate::naming::env_name(name)
+}
+
+fn secret(name: &str) -> bool {
+    SECRETS.contains(&current(name).as_ref())
+}
+
 fn shown(name: &str) -> bool {
-    SHOWN.contains(&name) || name.starts_with(super::FLAG_PREFIX)
+    let n = current(name);
+    SHOWN.contains(&n.as_ref())
+        || n.starts_with(crate::naming::env_name(super::FLAG_PREFIX).as_ref())
 }
 
 fn safe_value(v: &str) -> bool {
@@ -317,11 +329,15 @@ pub fn config_view(env: &[(String, Option<String>)]) -> Value {
             continue;
         }
         match value.as_deref() {
-            Some(v) if shown(name) && !SECRETS.contains(&name.as_str()) && safe_value(v) => {
+            Some(v) if shown(name) && !secret(name) && safe_value(v) => {
                 values.insert(name.clone(), v.to_string());
                 vars.remove(name);
             }
             _ => {
+                // A secret set by its old name is listed by it, not also as its new name unset.
+                if secret(name) && vars.get(current(name).as_ref()) == Some(&"unset") {
+                    vars.remove(current(name).as_ref());
+                }
                 vars.insert(name.clone(), "set");
             }
         }
@@ -743,5 +759,37 @@ fn outcome_str(o: Outcome) -> &'static str {
         Outcome::Ok => "ok",
         Outcome::Failed => "failed",
         Outcome::Refused => "refused",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A container from before the rename holds its settings by their old names: its secrets stay hidden as
+    /// the new names' would, and its plain settings are shown as theirs are.
+    #[test]
+    fn old_names_are_kept_secret_and_shown_as_the_new() {
+        let env = |n: &str, v: &str| (n.to_string(), Some(v.to_string()));
+        let view = config_view(&[
+            env("MEMSTORE_ADMIN_KEY", "msk_admin_secret"),
+            env("AMPUP_MEMORY_JWT_SECRET", "jwt_secret_value"),
+            env("MEMSTORE_PLATFORM", "gcp"),
+            env("MEMSTORE_FLAG_FAST", "1"),
+            env("AMPUP_MEMORY_FLAG_SLOW", "0"),
+        ]);
+        let vars = &view["variables"];
+        assert_eq!(vars["MEMSTORE_ADMIN_KEY"], "set");
+        assert!(vars.get("AMPUP_MEMORY_ADMIN_KEY").is_none(), "{view}");
+        assert_eq!(vars["AMPUP_MEMORY_JWT_SECRET"], "set");
+        assert_eq!(vars["AMPUP_MEMORY_SECRET_KEY"], "unset");
+        assert_eq!(vars["MEMSTORE_PLATFORM"], "gcp");
+        assert_eq!(vars["MEMSTORE_FLAG_FAST"], "1");
+        assert_eq!(vars["AMPUP_MEMORY_FLAG_SLOW"], "0");
+        let text = view.to_string();
+        assert!(
+            !text.contains("msk_admin_secret") && !text.contains("jwt_secret_value"),
+            "{text}"
+        );
     }
 }

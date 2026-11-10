@@ -134,10 +134,11 @@ async fn admin(s: &str, req: Value) -> Value {
 
 /// The `memstore` binary with its own config dir.
 fn memstore(home: &Path, args: &[&str]) -> (bool, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_memstore"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ampup-memory"))
         .args(args)
+        .env_remove("AMPUP_MEMORY_CALLER_IDENTITY")
         .env_remove("MEMSTORE_CALLER_IDENTITY")
-        .env("MEMSTORE_CONFIG_DIR", home)
+        .env("AMPUP_MEMORY_CONFIG_DIR", home)
         .output()
         .unwrap();
     (
@@ -254,7 +255,7 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     let index_dir = dir.path().join("index");
     std::fs::create_dir_all(&warehouse).unwrap();
     // The index lives under this test's directory, so its files are checked too. Set before any store.
-    unsafe { std::env::set_var("MEMSTORE_INDEX_URI", &index_dir) };
+    unsafe { std::env::set_var("AMPUP_MEMORY_INDEX_URI", &index_dir) };
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =
         |tag: &str| -> Vec<PathBuf> { roots.iter().flat_map(|r| files_with(r, tag)).collect() };
@@ -668,9 +669,9 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
                          "arguments": {"document": "transcripts/claude-code/s-xqaged/00000000"}}});
     let (_, body) = post(&format!("{s}/mcp?org=acme"), &carol, &listing).await;
     assert!(!body.contains("xqscriptfirst"), "{body}");
-    unsafe { std::env::set_var("MEMSTORE_STOP_AFTER_REWRITE", "episodes") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_STOP_AFTER_REWRITE", "episodes") };
     let (ok, out, err) = memstore(&home, &["org", "purge", "acme"]);
-    unsafe { std::env::remove_var("MEMSTORE_STOP_AFTER_REWRITE") };
+    unsafe { std::env::remove_var("AMPUP_MEMORY_STOP_AFTER_REWRITE") };
     assert!(!ok, "the purge should have stopped: {out}{err}");
     let episode_files = |id: &str| -> Vec<PathBuf> {
         in_files(id)
@@ -706,13 +707,13 @@ async fn the_nightly_window_purges_what_aged_out_or_was_deleted_where_the_org_as
     let warehouse = dir.path().join("warehouse");
     let index_dir = dir.path().join("index");
     std::fs::create_dir_all(&warehouse).unwrap();
-    unsafe { std::env::set_var("MEMSTORE_INDEX_URI", &index_dir) };
+    unsafe { std::env::set_var("AMPUP_MEMORY_INDEX_URI", &index_dir) };
     // The window held open, a pass every second; what is purged must have been hidden for 8 seconds first.
     const GRACE: Duration = Duration::from_secs(8);
-    unsafe { std::env::set_var("MEMSTORE_MAINTAIN_WINDOW", "always") };
-    unsafe { std::env::set_var("MEMSTORE_MAINTAIN_SECS", "1") };
-    unsafe { std::env::set_var("MEMSTORE_MAINTAIN_PACE", "0") };
-    unsafe { std::env::set_var("MEMSTORE_PURGE_GRACE", "8s") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_MAINTAIN_WINDOW", "always") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_MAINTAIN_SECS", "1") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_MAINTAIN_PACE", "0") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_PURGE_GRACE", "8s") };
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =
         |tag: &str| -> Vec<PathBuf> { roots.iter().flat_map(|r| files_with(r, tag)).collect() };
@@ -946,21 +947,21 @@ async fn the_nightly_window_purges_the_profile_versions_naming_what_it_purges() 
     let model = crate::isolation::profile_model(String::new(), Default::default()).await;
     // SAFETY: this test runs in a process of its own (`own_process`), before any store or server.
     unsafe {
-        std::env::set_var("MEMSTORE_INDEX_URI", &index_dir);
+        std::env::set_var("AMPUP_MEMORY_INDEX_URI", &index_dir);
         // The window held open, a pass every second; what is purged must have been hidden for 8 seconds first.
-        std::env::set_var("MEMSTORE_MAINTAIN_WINDOW", "always");
-        std::env::set_var("MEMSTORE_MAINTAIN_SECS", "1");
-        std::env::set_var("MEMSTORE_MAINTAIN_PACE", "0");
-        std::env::set_var("MEMSTORE_PURGE_GRACE", "8s");
+        std::env::set_var("AMPUP_MEMORY_MAINTAIN_WINDOW", "always");
+        std::env::set_var("AMPUP_MEMORY_MAINTAIN_SECS", "1");
+        std::env::set_var("AMPUP_MEMORY_MAINTAIN_PACE", "0");
+        std::env::set_var("AMPUP_MEMORY_PURGE_GRACE", "8s");
         // Profiles are swept every second; folds ask the stand-in model.
-        std::env::set_var("MEMSTORE_SESSION_SWEEP_SECS", "1");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &model);
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_KEEP", "off");
+        std::env::set_var("AMPUP_MEMORY_SESSION_SWEEP_SECS", "1");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &model);
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_KEEP", "off");
         // The notes that bear on a session's task are picked by their words, never by a decisions model the
         // machine's keys would reach.
-        std::env::set_var("MEMSTORE_DECIDE", "off");
+        std::env::set_var("AMPUP_MEMORY_DECIDE", "off");
     }
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =
@@ -1155,7 +1156,7 @@ async fn the_nightly_window_purges_the_profile_versions_naming_what_it_purges() 
     // Past the grace, the window's purge deletes both notes' and those versions' bodies and the indexes, and its
     // first try stops there, before the rows go.
     // SAFETY: this test runs in a process of its own (`own_process`); the server reads it only there.
-    unsafe { std::env::set_var("MEMSTORE_STOP_BEFORE_REWRITE", "episodes") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_STOP_BEFORE_REWRITE", "episodes") };
     for t in ["xprofagednote", "xprofdeletednote"] {
         assert!(!in_files(t).is_empty(), "{t} is stored until the purge");
     }
@@ -1182,7 +1183,7 @@ async fn the_nightly_window_purges_the_profile_versions_naming_what_it_purges() 
         "the stopped purge left the rows of the version naming them"
     );
     // SAFETY: as above.
-    unsafe { std::env::remove_var("MEMSTORE_STOP_BEFORE_REWRITE") };
+    unsafe { std::env::remove_var("AMPUP_MEMORY_STOP_BEFORE_REWRITE") };
 
     // The next night's purge finishes: once acme's audit says it went, both notes and every version naming them are
     // in no file.

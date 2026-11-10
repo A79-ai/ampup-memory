@@ -1,4 +1,4 @@
-//! The embedding cache (`MEMSTORE_EMBED_CACHE`): the vectors index updates computed, kept by the text they embed,
+//! The embedding cache (`AMPUP_MEMORY_EMBED_CACHE`): the vectors index updates computed, kept by the text they embed,
 //! so the same text is embedded once wherever it is indexed again: another scope, workspace or branch, a
 //! rebuilt index, a fresh stack loading a kept corpus. An index update looks up each text it has no vector
 //! for, sends only the misses to the model, and writes their vectors back.
@@ -87,14 +87,14 @@ pub fn counts() -> (u64, u64) {
 
 static DEFAULT: OnceLock<String> = OnceLock::new();
 
-/// Where the cache lives when `MEMSTORE_EMBED_CACHE` is unset (`serve --local`: its directory). Takes effect only
+/// Where the cache lives when `AMPUP_MEMORY_EMBED_CACHE` is unset (`serve --local`: its directory). Takes effect only
 /// before the first embedding.
 pub fn default_to(location: impl Into<String>) {
     let _ = DEFAULT.set(location.into());
 }
 
 static CACHE: LazyLock<Option<Cache>> = LazyLock::new(|| {
-    let location = match std::env::var("MEMSTORE_EMBED_CACHE") {
+    let location = match std::env::var("AMPUP_MEMORY_EMBED_CACHE") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => DEFAULT.get()?.clone(),
     };

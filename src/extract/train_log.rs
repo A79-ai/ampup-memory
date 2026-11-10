@@ -1,4 +1,4 @@
-//! The training log (`MEMSTORE_TRAIN_LOG`): every model call memstore makes for a scope, kept whole (the prompt, the
+//! The training log (`AMPUP_MEMORY_TRAIN_LOG`): every model call memstore makes for a scope, kept whole (the prompt, the
 //! reply, what the call cost, what it was for and what it read) with the outcome the caller's own checks gave it, so
 //! a smaller model can later be trained on what the big one did, and scored on what its replies came to. Off unless a
 //! location is named: the log holds the text of the episodes and runs the calls read, so it is the operator's
@@ -26,7 +26,7 @@
 //!   calls are found without reading the log: [`purge_ref`] removes them, and the sweep in `crate::train_data` finds
 //!   the ones whose episode or run is gone by another path (offboarding, retention, a retraction).
 //!   A call that read nothing the memory can forget (the router's question) is marked `untracked` with the day it was
-//!   made, and the sweep removes it after `MEMSTORE_TRAIN_LOG_UNTRACKED_DAYS` (default 30). A record is written only
+//!   made, and the sweep removes it after `AMPUP_MEMORY_TRAIN_LOG_UNTRACKED_DAYS` (default 30). A record is written only
 //!   once all its markers are.
 //! - **Per org.** An org's records sit under its own prefix, so one tenant's data is one prefix to read, hand over or
 //!   delete ([`purge_org`]). A call that names no scope, or an org whose name isn't a plain one (lower-case letters,
@@ -34,7 +34,7 @@
 //! - **Never in the way.** A write is one small object put, as the model-call cache's is, and a failure is logged once
 //!   and costs the call nothing.
 //!
-//! The location is a directory or an object-store URI, as `MEMSTORE_MODEL_CACHE`'s is.
+//! The location is a directory or an object-store URI, as `AMPUP_MEMORY_MODEL_CACHE`'s is.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +61,10 @@ struct Sink {
 }
 
 static SINK: LazyLock<Option<Sink>> = LazyLock::new(|| {
-    let location = std::env::var("MEMSTORE_TRAIN_LOG").ok()?.trim().to_string();
+    let location = std::env::var("AMPUP_MEMORY_TRAIN_LOG")
+        .ok()?
+        .trim()
+        .to_string();
     if location.is_empty() || location.eq_ignore_ascii_case("off") {
         return None;
     }
@@ -466,7 +469,7 @@ pub struct Marker {
 
 fn sink() -> Result<&'static Sink> {
     SINK.as_ref()
-        .context("no training log: MEMSTORE_TRAIN_LOG isn't set")
+        .context("no training log: AMPUP_MEMORY_TRAIN_LOG isn't set")
 }
 
 /// Every object under `prefix`, recursively.

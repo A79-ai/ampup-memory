@@ -251,10 +251,10 @@ async fn advice_lists_a_persons_own_and_the_teams_once_ratified() {
     let dir = tempfile::tempdir().unwrap();
     let url = crate::personal_advice::model().await;
     unsafe {
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
     }
     let store = crate::local_store(&dir.path().join("store")).await;
     let ex = extract::Extractor::from_env().unwrap().unwrap();

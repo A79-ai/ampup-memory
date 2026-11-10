@@ -1,26 +1,28 @@
-//! `memstore-client`: what a person's machine runs to reach a team's memory, without the store and server that
-//! make memstore hundreds of MB. Its commands are memstore's own, at the same names: `join` to sign in, `hook` for
+//! `ampup-memory-client` (once `memstore-client`, still a link to it): what a person's machine runs to reach a
+//! team's memory, without the store and server that make `ampup-memory` hundreds of MB. Its commands are
+//! `ampup-memory`'s own, at the same names: `join` to sign in, `hook` for
 //! a coding agent's hooks, `mcp` for the server's MCP endpoint over stdio, `doctor` to check it all.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use memstore_client::{client, hook, update};
+use memstore_client::{client, hook, naming, update};
 
 /// The release this was built as (`v0.1.0-rc.7`, from the release workflow), else the crate's version: the
 /// plugin compares it with the latest release to keep the client current.
-const VERSION: &str = match option_env!("MEMSTORE_RELEASE") {
+const VERSION: &str = match naming::RELEASE {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
 
 #[derive(Parser)]
 #[command(
-    name = "memstore-client",
+    name = "ampup-memory-client",
+    bin_name = "ampup-memory-client",
     version = VERSION,
-    about = "Reach a team's memstore from this machine"
+    about = "Reach a team's AmpUp Memory from this machine"
 )]
 struct Cli {
-    /// Use this context for one command (also MEMSTORE_CONTEXT)
+    /// Use this context for one command (also AMPUP_MEMORY_CONTEXT)
     #[arg(long, global = true)]
     context: Option<String>,
     #[command(subcommand)]
@@ -56,12 +58,12 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
-    /// The server's MCP endpoint over stdio, signed in as `join` left you. MEMSTORE_URL and MEMSTORE_TOKEN override
+    /// The server's MCP endpoint over stdio, signed in as `join` left you. AMPUP_MEMORY_URL and AMPUP_MEMORY_TOKEN override
     Mcp,
     /// Whether this machine's memory works: the server, who is signed in, the org and how the last hook went
     Doctor,
-    /// One of the memory's named metrics as JSON, answered as you see the memory (MEMSTORE_URL, MEMSTORE_TOKEN
-    /// and MEMSTORE_ORG sign a service in)
+    /// One of the memory's named metrics as JSON, answered as you see the memory (AMPUP_MEMORY_URL, AMPUP_MEMORY_TOKEN
+    /// and AMPUP_MEMORY_ORG sign a service in)
     Metric {
         name: String,
         /// Cite each number: the facts behind it, with their quotes and source episodes
@@ -83,8 +85,17 @@ enum Cmd {
     Update,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // The old names (MEMSTORE_*, ~/.memstore) read as the new ones, before anything reads them.
+    // SAFETY: first in main, before the runtime: no other thread runs yet.
+    unsafe { naming::startup() };
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Some(c) = &cli.context {
         client::override_context(c);
@@ -106,7 +117,8 @@ async fn main() -> Result<()> {
             harness,
             session,
         } => {
-            if event == "session-start" && std::env::var_os("MEMSTORE_HOOK_DETACHED").is_none() {
+            if event == "session-start" && std::env::var_os("AMPUP_MEMORY_HOOK_DETACHED").is_none()
+            {
                 update::in_background(VERSION);
             }
             let r = match hook::Harness::parse(&harness) {
@@ -115,7 +127,7 @@ async fn main() -> Result<()> {
                 Err(e) => Err(e),
             };
             if let Err(e) = r {
-                eprintln!("memstore hook {event}: {e:#}");
+                eprintln!("{} hook {event}: {e:#}", naming::CLIENT_BIN);
             }
             Ok(())
         }

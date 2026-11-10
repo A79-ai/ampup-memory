@@ -9,20 +9,21 @@
 //! leaving out drafts and pre-releases.
 //!
 //! The install is the repository's `install.sh` at the release's tag (the plugin's own copy where a hook names
-//! `CLAUDE_PLUGIN_ROOT`), with `MEMSTORE_INSTALL=client`, which checks the archive's checksum and moves the binary
-//! into place whole. A build that isn't a release (`cargo build`), a pinned `MEMSTORE_VERSION`, or
-//! `MEMSTORE_CLIENT_UPDATE=off` is left as it is.
+//! `CLAUDE_PLUGIN_ROOT`), with `AMPUP_MEMORY_INSTALL=client`, which checks the archive's checksum and moves the binary
+//! into place whole. A build that isn't a release (`cargo build`), a pinned `AMPUP_MEMORY_VERSION`, or
+//! `AMPUP_MEMORY_CLIENT_UPDATE=off` is left as it is.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
 /// Set in the binary a sign-in runs after updating, so it doesn't update again.
-const UPDATED: &str = "MEMSTORE_CLIENT_UPDATED";
+const UPDATED: &str = "AMPUP_MEMORY_CLIENT_UPDATED";
 
-/// The repository whose releases hold the client (`MEMSTORE_CLIENT_REPO`, for a fork).
+/// The repository whose releases hold the client (`AMPUP_MEMORY_CLIENT_REPO`, for a fork).
 fn repo() -> String {
-    std::env::var("MEMSTORE_CLIENT_REPO").unwrap_or_else(|_| "A79-ai/ampup-memory".into())
+    std::env::var("AMPUP_MEMORY_CLIENT_REPO").unwrap_or_else(|_| "A79-ai/ampup-memory".into())
 }
 
 /// The tag prefix of a client release.
@@ -54,8 +55,8 @@ fn newest_client(releases: &serde_json::Value) -> Option<(String, (u64, u64, u64
 fn enabled(current: &str) -> bool {
     current.starts_with('v')
         && !current.contains('-')
-        && std::env::var_os("MEMSTORE_VERSION").is_none()
-        && std::env::var("MEMSTORE_CLIENT_UPDATE").as_deref() != Ok("off")
+        && std::env::var_os("AMPUP_MEMORY_VERSION").is_none()
+        && std::env::var("AMPUP_MEMORY_CLIENT_UPDATE").as_deref() != Ok("off")
         && std::env::var_os(UPDATED).is_none()
 }
 
@@ -73,7 +74,7 @@ fn stamp() -> PathBuf {
 async fn latest() -> Option<(String, (u64, u64, u64))> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent("memstore-client")
+        .user_agent(crate::naming::CLIENT_BIN)
         .build()
         .ok()?;
     let releases: serde_json::Value = http
@@ -105,18 +106,36 @@ fn install(tag: &str, dir: &Path) -> bool {
             repo()
         ),
     };
-    Command::new("sh")
-        .args(["-c", &script])
-        .env("MEMSTORE_VERSION", tag)
-        .env("MEMSTORE_INSTALL", "client")
-        .env("MEMSTORE_REPO", repo())
-        .env("MEMSTORE_CLIENT_REPO", repo())
-        .env("MEMSTORE_INSTALL_DIR", dir)
-        .stdin(Stdio::null())
+    let repo = repo();
+    let mut sh = Command::new("sh");
+    sh.args(["-c", &script]);
+    // By both names: the plugin's copy of install.sh may be from before the rename, and read only the old.
+    for (name, value) in [
+        ("AMPUP_MEMORY_VERSION", OsStr::new(tag)),
+        ("AMPUP_MEMORY_INSTALL", OsStr::new("client")),
+        ("AMPUP_MEMORY_REPO", OsStr::new(&repo)),
+        ("AMPUP_MEMORY_CLIENT_REPO", OsStr::new(&repo)),
+        ("AMPUP_MEMORY_INSTALL_DIR", dir.as_os_str()),
+    ] {
+        sh.env(name, value);
+        sh.env(crate::naming::old_env_name(name).as_ref(), value);
+    }
+    sh.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// The client binary an install left in `dir`: `ampup-memory-client`, with `memstore-client` a link to it, from an
+/// install.sh since the rename; `memstore-client` alone, a file, from one before it (the plugin's older copy, which
+/// installs the release's `memstore-client` archive).
+fn installed(dir: &Path) -> PathBuf {
+    let old = dir.join(crate::naming::OLD_CLIENT_BIN);
+    match std::fs::symlink_metadata(&old) {
+        Ok(m) if m.is_file() => old,
+        _ => dir.join(crate::naming::CLIENT_BIN),
+    }
 }
 
 /// Checks for a newer client release than `current` and installs it over this binary; the binary installed, if it
@@ -136,7 +155,7 @@ pub async fn now(current: &str) -> Option<PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    install(&tag, dir).then(|| dir.join("memstore-client"))
+    install(&tag, dir).then(|| installed(dir))
 }
 
 /// At a session's start: at most hourly, a detached copy of this binary checks and installs (`update`), and the
@@ -175,5 +194,8 @@ pub async fn before_sign_in(current: &str) {
         .env(UPDATED, current)
         .exec();
     // Couldn't run it: carry on with this one.
-    eprintln!("updated memstore-client, but couldn't run it: {err}");
+    eprintln!(
+        "updated {}, but couldn't run it: {err}",
+        crate::naming::CLIENT_BIN
+    );
 }

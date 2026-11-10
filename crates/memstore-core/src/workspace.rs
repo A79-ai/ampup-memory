@@ -13,7 +13,7 @@
 //! - **Limits**: caps on its episodes, facts and index bytes (a commit or index update past one is refused),
 //!   and a time to live, after which it is no longer served and `memstore workspace gc` deletes it.
 //! - **Serving without sign-in**: a server that identifies no one serves workspaces side by side when started
-//!   with `--workspaces` (`MEMSTORE_SERVE_WORKSPACES=1`): a request selects one, and nothing else in the
+//!   with `--workspaces` (`AMPUP_MEMORY_SERVE_WORKSPACES=1`): a request selects one, and nothing else in the
 //!   catalog is reachable that way.
 //!
 //! Arms of an experiment that share their sources are branches of one workspace: load once on main, then
@@ -308,7 +308,7 @@ pub async fn unindexed(store: &Store, snap: &Snapshot) -> Result<Vec<String>> {
             };
             if let Some(g) = gap {
                 out.push(format!(
-                    "{name}: {kind} searches read {g}; the rest from the tables (run `memstore index {name}` before snapshotting)"
+                    "{name}: {kind} searches read {g}; the rest from the tables (run `ampup-memory index {name}` before snapshotting)"
                 ));
             }
         }
@@ -457,7 +457,7 @@ pub async fn index_bytes(store: &Store, ws: &str) -> Result<u64> {
     Ok(n)
 }
 
-/// A write refused because it would pass a cap: the deployment's (`MEMSTORE_MAX_EPISODES`, a trial's)
+/// A write refused because it would pass a cap: the deployment's (`AMPUP_MEMORY_MAX_EPISODES`, a trial's)
 /// or a workspace's. Its message is for the caller: what the cap is, what is there, and what to do.
 #[derive(Debug)]
 pub struct CapReached(pub String);
@@ -514,7 +514,7 @@ impl Drop for CapReservation {
     }
 }
 
-/// Refuse a write that would take the deployment past `MEMSTORE_MAX_EPISODES`; else reserve its room.
+/// Refuse a write that would take the deployment past `AMPUP_MEMORY_MAX_EPISODES`; else reserve its room.
 pub async fn reserve(store: &Store, episodes: usize) -> Result<Option<CapReservation>> {
     let Some(cap) = deployment_cap()? else {
         return Ok(None);
@@ -539,7 +539,7 @@ pub async fn reserve(store: &Store, episodes: usize) -> Result<Option<CapReserva
             "memstore: episode cap {cap} reached: {have} held, a write of {episodes} refused"
         );
         return Err(CapReached(format!(
-            "this deployment is capped at {cap} episodes (MEMSTORE_MAX_EPISODES) and has reached it. Reads still work; raise or remove the cap to write more"
+            "this deployment is capped at {cap} episodes (AMPUP_MEMORY_MAX_EPISODES) and has reached it. Reads still work; raise or remove the cap to write more"
         ))
         .into());
     }
@@ -550,10 +550,10 @@ pub async fn reserve(store: &Store, episodes: usize) -> Result<Option<CapReserva
     }))
 }
 
-/// The most episodes this deployment holds, across every org and team (`MEMSTORE_MAX_EPISODES`; unset:
+/// The most episodes this deployment holds, across every org and team (`AMPUP_MEMORY_MAX_EPISODES`; unset:
 /// no cap). A trial deployment is capped at 1,000.
 pub fn deployment_cap() -> Result<Option<u64>> {
-    match std::env::var("MEMSTORE_MAX_EPISODES") {
+    match std::env::var("AMPUP_MEMORY_MAX_EPISODES") {
         Err(_) => Ok(None),
         Ok(v) => v
             .trim()
@@ -562,7 +562,7 @@ pub fn deployment_cap() -> Result<Option<u64>> {
             .filter(|n| *n > 0)
             .map(Some)
             .ok_or_else(|| {
-                anyhow::anyhow!("MEMSTORE_MAX_EPISODES is a whole number above 0, not {v:?}")
+                anyhow::anyhow!("AMPUP_MEMORY_MAX_EPISODES is a whole number above 0, not {v:?}")
             }),
     }
 }
@@ -582,7 +582,7 @@ impl Store {
     }
 }
 
-/// Refuse a write that would take the deployment past `MEMSTORE_MAX_EPISODES`, or the workspace `scope`
+/// Refuse a write that would take the deployment past `AMPUP_MEMORY_MAX_EPISODES`, or the workspace `scope`
 /// belongs to past its episode or fact cap. Scopes of the default org and of orgs that aren't
 /// workspaces have no workspace cap.
 /// Per capped workspace: one check at a time, and the episodes and facts let through whose commits haven't

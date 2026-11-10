@@ -2,18 +2,23 @@ name: Release
 
 # Two kinds of release, each from its own tags, so a change to one never re-releases the other:
 #
-# - `v*` (the server): the memstore CLI as a GitHub release of this repository, per platform a tarball of memstore
-#   and memstore-client with its checksum, and install.sh, which anyone can run with no sign-in:
+# - `v*` (the server): the ampup-memory CLI as a GitHub release of this repository, per platform a tarball of
+#   ampup-memory and ampup-memory-client with its checksum, and install.sh, which anyone can run with no sign-in:
 #     curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/install.sh | sh
-# - `client-v*` (the client): memstore-client alone (what the Claude Code, Cursor and Codex plugins run, a few MB),
-#   per platform, installed with MEMSTORE_INSTALL=client.
+# - `client-v*` (the client): ampup-memory-client alone (what the Claude Code, Cursor and Codex plugins run, a few
+#   MB), per platform, installed with AMPUP_MEMORY_INSTALL=client.
+#
+# The binaries were memstore and memstore-client before the rename: each archive holds a `memstore` (and
+# `memstore-client`) link to the binary, install.sh makes the same links, and a client release also carries its
+# archive by the old name (`memstore-client-<target>.tar.gz`, the binary in it as `memstore-client`), for a plugin's
+# install.sh from before the rename to update from.
 #
 # Push a tag to release it (git tag v0.1.0 && git push origin v0.1.0); a tag with a `-` in it (v0.2.0-rc.1) is a
 # pre-release. Run it by hand (workflow_dispatch) on a tag to build and publish that tag again: files already on its
 # release are replaced. Only the workflow's own GITHUB_TOKEN is used, and only the publish job may write.
 #
-# Each build is checked as it comes off the runner (.github/scripts/release-check.sh: memstore serves a local store,
-# and memstore-client is its client), and once published, installed with install.sh and checked again.
+# Each build is checked as it comes off the runner (.github/scripts/release-check.sh: ampup-memory serves a local
+# store, and ampup-memory-client is its client), and once published, installed with install.sh and checked again.
 #
 # Every archive carries LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt: the licenses of every crate linked into the
 # binaries, ONNX Runtime's and the embedding model's, kept current by .github/scripts/third-party-notices.sh.
@@ -34,7 +39,7 @@ env:
   CARGO_INCREMENTAL: 0
   # A client this run built and checks never replaces itself with the latest public release midway (its
   # session-start hook would): the release would package the previous one.
-  MEMSTORE_CLIENT_UPDATE: "off"
+  AMPUP_MEMORY_CLIENT_UPDATE: "off"
 
 jobs:
   build:
@@ -62,14 +67,15 @@ jobs:
       - uses: ./.github/actions/rust
         with:
           target: release
-      # Both, for either kind: the check runs memstore-client against memstore. Only this release's kind is packaged.
+      # Both, for either kind: the check runs ampup-memory-client against ampup-memory. Only this release's kind is
+      # packaged.
       - name: Build
         # --version names the release, which the plugin compares with the latest to keep the client current.
         env:
-          MEMSTORE_RELEASE: ${{ steps.kind.outputs.version }}
-        run: cargo build --release --locked --bin memstore --bin memstore-client
+          AMPUP_MEMORY_RELEASE: ${{ steps.kind.outputs.version }}
+        run: cargo build --release --locked --bin ampup-memory --bin ampup-memory-client
       - name: Check the build
-        run: .github/scripts/release-check.sh target/release/memstore target/release/memstore-client
+        run: .github/scripts/release-check.sh target/release/ampup-memory target/release/ampup-memory-client
       # The committed THIRD-PARTY-NOTICES.txt must be what the script makes of this Cargo.lock (a crate under a
       # license about.toml doesn't accept fails it too), checked on the Linux builds; the release publishes nothing
       # unless every build passed.
@@ -87,24 +93,44 @@ jobs:
           KIND: ${{ steps.kind.outputs.kind }}
           TARGET: ${{ matrix.target }}
         run: |
-          strip target/release/memstore target/release/memstore-client
-          # The binaries beside the license, the notice and the third-party notices, all at the archive's top.
+          strip target/release/ampup-memory target/release/ampup-memory-client
+          # The binaries beside the license, the notice and the third-party notices, all at the archive's top, each
+          # binary with a link by its old name (memstore, memstore-client).
           docs=(LICENSE NOTICE THIRD-PARTY-NOTICES.txt)
           for f in "${docs[@]}"; do test -s "$f" || { echo "::error::$f is missing"; exit 1; }; done
+          pkg=$RUNNER_TEMP/pkg
+          mkdir -p "$pkg"
+          if [ "$KIND" = client ]; then bins=(ampup-memory-client); else bins=(ampup-memory ampup-memory-client); fi
+          names=()
+          for b in "${bins[@]}"; do
+            cp "target/release/$b" "$pkg/$b"
+            old=memstore${b#ampup-memory}
+            ln -s "$b" "$pkg/$old"
+            names+=("$b" "$old")
+          done
+          cp "${docs[@]}" "$pkg/"
+          sum() { if command -v sha256sum >/dev/null; then sha256sum "$1" > "$1.sha256"; else shasum -a 256 "$1" > "$1.sha256"; fi; cat "$1.sha256"; }
+          name=ampup-memory; [ "$KIND" = client ] && name=ampup-memory-client
+          asset=$name-$TARGET.tar.gz
+          tar -czf "$asset" -C "$pkg" "${names[@]}" "${docs[@]}"
+          tar -tzvf "$asset"
+          sum "$asset"
+          # The client by its old name too, the binary itself as memstore-client (never a link): what a plugin's
+          # install.sh from before the rename downloads and installs. Dropped with the memstore-client link.
           if [ "$KIND" = client ]; then
+            legacy=$RUNNER_TEMP/legacy
+            mkdir -p "$legacy"
+            cp target/release/ampup-memory-client "$legacy/memstore-client"
             asset=memstore-client-$TARGET.tar.gz
-            tar -czf "$asset" -C target/release memstore-client -C "$GITHUB_WORKSPACE" "${docs[@]}"
-          else
-            asset=memstore-$TARGET.tar.gz
-            tar -czf "$asset" -C target/release memstore memstore-client -C "$GITHUB_WORKSPACE" "${docs[@]}"
+            tar -czf "$asset" -C "$legacy" memstore-client -C "$pkg" "${docs[@]}"
+            sum "$asset"
           fi
-          tar -tzf "$asset"
-          if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256"; else shasum -a 256 "$asset" > "$asset.sha256"; fi
-          cat "$asset.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: memstore-${{ matrix.target }}
-          path: memstore-*${{ matrix.target }}.tar.gz*
+          name: ampup-memory-${{ matrix.target }}
+          path: |
+            ampup-memory-*${{ matrix.target }}.tar.gz*
+            memstore-client-${{ matrix.target }}.tar.gz*
           retention-days: 1 # only carries the build to this run's publish job; the release keeps the files
 
   publish:
@@ -118,7 +144,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
-          pattern: memstore-*
+          pattern: ampup-memory-*
           merge-multiple: true
       - name: Create the release
         env:
@@ -127,8 +153,8 @@ jobs:
           prerelease=""
           case "$GITHUB_REF_NAME" in *-v*-*|v*-*) prerelease="--prerelease" ;; esac
           case "$GITHUB_REF_NAME" in
-            client-v*) title="memstore-client ${GITHUB_REF_NAME#client-}" ;;
-            *) title="memstore $GITHUB_REF_NAME" ;;
+            client-v*) title="ampup-memory-client ${GITHUB_REF_NAME#client-}" ;;
+            *) title="ampup-memory $GITHUB_REF_NAME" ;;
           esac
           if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* install.sh --clobber
@@ -147,28 +173,35 @@ jobs:
     # As a stranger installs it: install.sh from this tag, downloading from this repository's public releases with
     # no token.
     env:
-      MEMSTORE_REPO: ${{ github.repository }}
+      AMPUP_MEMORY_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # A client release is checked against the newest server release, as a user would run them together: no
       # version named, so install.sh picks it.
       - name: Install the server
         env:
-          MEMSTORE_INSTALL_DIR: ${{ runner.temp }}/bin
+          AMPUP_MEMORY_INSTALL_DIR: ${{ runner.temp }}/bin
         run: |
-          case "$GITHUB_REF_NAME" in client-v*) ;; *) export MEMSTORE_VERSION="$GITHUB_REF_NAME" ;; esac
+          case "$GITHUB_REF_NAME" in client-v*) ;; *) export AMPUP_MEMORY_VERSION="$GITHUB_REF_NAME" ;; esac
           sh install.sh
       - name: Install the client alone, as the plugins need
         if: startsWith(github.ref_name, 'client-v')
         env:
-          MEMSTORE_VERSION: ${{ github.ref_name }}
-          MEMSTORE_INSTALL_DIR: ${{ runner.temp }}/client
-          MEMSTORE_INSTALL: client
+          AMPUP_MEMORY_VERSION: ${{ github.ref_name }}
+          AMPUP_MEMORY_INSTALL_DIR: ${{ runner.temp }}/client
+          AMPUP_MEMORY_INSTALL: client
         run: sh install.sh
       - name: Check what it installed
         run: |
-          if [ -x "$RUNNER_TEMP/client/memstore-client" ]; then
-            .github/scripts/release-check.sh "$RUNNER_TEMP/bin/memstore" "$RUNNER_TEMP/client/memstore-client"
+          # The server by its new name, or by its old one where the newest server release is from before the rename;
+          # each check through the old name's link too.
+          server=$RUNNER_TEMP/bin/ampup-memory
+          [ -x "$server" ] || server=$RUNNER_TEMP/bin/memstore
+          if [ -x "$RUNNER_TEMP/client/ampup-memory-client" ]; then
+            client=$RUNNER_TEMP/client
           else
-            .github/scripts/release-check.sh "$RUNNER_TEMP/bin/memstore" "$RUNNER_TEMP/bin/memstore-client"
+            client=$RUNNER_TEMP/bin
           fi
+          test -L "$client/memstore-client"
+          .github/scripts/release-check.sh "$server" "$client/ampup-memory-client"
+          .github/scripts/release-check.sh "$server" "$client/memstore-client"

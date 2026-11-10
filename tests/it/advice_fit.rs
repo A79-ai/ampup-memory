@@ -38,14 +38,14 @@ async fn advice_is_served_only_for_the_very_task_asked() {
     let url = model(seen.clone()).await;
     // SAFETY: this test runs alone in its process (`own_process`).
     unsafe {
-        std::env::set_var("MEMSTORE_DECIDE", "off");
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE", "openrouter");
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE_URL", &url);
-        std::env::set_var("MEMSTORE_ADVICE_ROUTE_KEY", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_DECIDE", "off");
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE", "openrouter");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE_KEY", "stand-in");
     }
     let issuer = start_idp().await;
     let dir = tempfile::tempdir().unwrap();

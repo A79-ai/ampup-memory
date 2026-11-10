@@ -1,13 +1,15 @@
-//! `memstore hooks install --harness <name>`: registers memstore's hooks and MCP server in a coding agent's
-//! user-level config, so its sessions are remembered and what the memory knows is recalled into new ones.
-//! `memstore hooks uninstall --harness <name>` takes them out again.
+//! `ampup-memory hooks install --harness <name>`: registers AmpUp Memory's hooks and MCP server (`ampup-memory`) in a
+//! coding agent's user-level config, so its sessions are remembered and what the memory knows is recalled into new
+//! ones. `ampup-memory hooks uninstall --harness <name>` takes them out again. An install from before the rename
+//! (an MCP server named `memstore`, hooks running `memstore hook …`, `~/.copilot/hooks/memstore.json`) is replaced
+//! by the next install, and removed by an uninstall.
 //!
 //! | harness | hooks file | MCP file | recall |
 //! |---|---|---|---|
 //! | codex | `~/.codex/hooks.json` | `~/.codex/config.toml` | session start; advice and facts at the first prompt |
 //! | gemini | `~/.gemini/settings.json` | the same | session start; advice and facts at the first prompt |
 //! | cursor | `~/.cursor/hooks.json` | `~/.cursor/mcp.json` | session start (Cursor's prompt hook can't add context) |
-//! | copilot | `~/.copilot/hooks/memstore.json` | `~/.copilot/mcp-config.json` | session start (the same) |
+//! | copilot | `~/.copilot/hooks/ampup-memory.json` | `~/.copilot/mcp-config.json` | session start (the same) |
 //!
 //! Every harness records its sessions as runs when they compact or end, as the Claude Code plugin does; its
 //! session-end hook hands the work to a copy of itself, so a harness's short session-end budget never cuts it off.
@@ -15,9 +17,9 @@
 //! Claude Code installs through its plugin (`/plugin install memstore@memstore`) instead.
 //!
 //! Everything else in those files is kept: the installer adds its own entries (every hook command it writes runs
-//! `memstore hook … --harness <name>`, which is how it finds them again) and backs a file up before its first
-//! change (`<file>.memstore-backup`). Installing twice changes nothing. The hooks read `MEMSTORE_URL`,
-//! `MEMSTORE_TOKEN`, `MEMSTORE_ORG`, `MEMSTORE_TEAM` and `MEMSTORE_SCOPE` when they run; `--url` writes the URL
+//! `ampup-memory hook … --harness <name>`, which is how it finds them again, `memstore`'s commands too) and backs a file up before its first
+//! change (`<file>.ampup-memory-backup`). Installing twice changes nothing. The hooks read `AMPUP_MEMORY_URL`,
+//! `AMPUP_MEMORY_TOKEN`, `AMPUP_MEMORY_ORG`, `AMPUP_MEMORY_TEAM` and `AMPUP_MEMORY_SCOPE` when they run; `--url` writes the URL
 //! into the commands and the MCP entry instead, with the org, team and scope set when installing. A token is never written into a file the agent's config already references by env var; where a
 //! harness can't read one from the environment (Gemini, Copilot), the MCP entry carries it, and the installer says so.
 
@@ -48,36 +50,42 @@ fn exe() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| "memstore".into())
+        .unwrap_or_else(|| crate::naming::BIN.into())
 }
 
 /// The hook command for `event`: [`exe`], every part shell-quoted.
 fn command(harness: Harness, event: &str, url: Option<&str>) -> String {
-    let q = |s: &str| shlex::try_quote(s).map_or_else(|_| "memstore".into(), |q| q.into_owned());
+    let q = |s: &str| {
+        shlex::try_quote(s).map_or_else(|_| crate::naming::BIN.into(), |q| q.into_owned())
+    };
     let mut c = format!("{} hook {event} --harness {}", q(&exe()), harness.name());
     if let Some(u) = url {
-        c = format!("MEMSTORE_URL={} {c}", q(u));
+        c = format!("AMPUP_MEMORY_URL={} {c}", q(u));
     }
     c
 }
 
-/// Whether a hook command is one this installer wrote: `[MEMSTORE_URL=… ]…/memstore hook <event> --harness
+/// Whether a hook command is one this installer wrote: `[AMPUP_MEMORY_URL=… ]…/memstore hook <event> --harness
 /// <name>`, exactly. A user's own hook never matches, whatever it mentions.
 fn ours_command(cmd: &str) -> bool {
     let Some(mut words) = shlex::split(cmd) else {
         return false;
     };
-    if words
-        .first()
-        .is_some_and(|w| w.starts_with("MEMSTORE_URL="))
-    {
+    // An older install's commands set the URL by its old name.
+    if words.first().is_some_and(|w| {
+        w.split_once('=')
+            .is_some_and(|(k, _)| crate::naming::env_name(k) == "AMPUP_MEMORY_URL")
+    }) {
         words.remove(0);
     }
     let events = ["session-start", "prompt", "stop", "session-end", "end"];
     words.len() == 5
-        && Path::new(&words[0])
-            .file_name()
-            .is_some_and(|n| n == "memstore")
+        && Path::new(&words[0]).file_name().is_some_and(|n| {
+            n == crate::naming::BIN
+                || n == crate::naming::OLD_BIN
+                || n == crate::naming::CLIENT_BIN
+                || n == crate::naming::OLD_CLIENT_BIN
+        })
         && words[1] == "hook"
         && events.contains(&words[2].as_str())
         && words[3] == "--harness"
@@ -152,9 +160,12 @@ fn write(path: &Path, content: &str, dry: bool, secret: bool) -> Result<bool> {
     if let Some(dir) = path.parent() {
         create_dir(dir)?;
     }
-    let backup = PathBuf::from(format!("{}.memstore-backup", path.display()));
+    let backup = PathBuf::from(format!("{}.ampup-memory-backup", path.display()));
+    // An older install's backup (`.memstore-backup`) is the file as it was first: none is made over it.
+    let old_backup = PathBuf::from(format!("{}.memstore-backup", path.display()));
     if let Some(b) = &before
         && !backup.exists()
+        && !old_backup.exists()
     {
         put(&backup, b, 0o600).with_context(|| format!("back up {}", path.display()))?;
     }
@@ -172,7 +183,7 @@ fn write(path: &Path, content: &str, dry: bool, secret: bool) -> Result<bool> {
 /// half a config, and a token is never readable by others, not even for a moment.
 fn put(path: &Path, content: &str, mode: u32) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = PathBuf::from(format!("{}.memstore-tmp", path.display()));
+    let tmp = PathBuf::from(format!("{}.ampup-memory-tmp", path.display()));
     let _ = std::fs::remove_file(&tmp);
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
@@ -334,19 +345,19 @@ fn prune(doc: &mut Value, key: &str) {
     }
 }
 
-/// The server's MCP endpoint, naming the org and team (`MEMSTORE_ORG`, `MEMSTORE_TEAM`) and scope
-/// (`MEMSTORE_SCOPE`) when set, so the org's own servers answer it.
+/// The server's MCP endpoint, naming the org and team (`AMPUP_MEMORY_ORG`, `AMPUP_MEMORY_TEAM`) and scope
+/// (`AMPUP_MEMORY_SCOPE`) when set, so the org's own servers answer it.
 fn mcp_url(url: Option<&str>) -> String {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let base = url
         .map(String::from)
-        .or_else(|| var("MEMSTORE_URL"))
+        .or_else(|| var("AMPUP_MEMORY_URL"))
         .unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let base = base.trim_end_matches('/');
     let query: Vec<String> = [
-        ("org", "MEMSTORE_ORG"),
-        ("team", "MEMSTORE_TEAM"),
-        ("scope", "MEMSTORE_SCOPE"),
+        ("org", "AMPUP_MEMORY_ORG"),
+        ("team", "AMPUP_MEMORY_TEAM"),
+        ("scope", "AMPUP_MEMORY_SCOPE"),
     ]
     .into_iter()
     .filter_map(|(param, k)| var(k).map(|v| format!("{param}={v}")))
@@ -360,7 +371,7 @@ fn mcp_url(url: Option<&str>) -> String {
 /// How the agent reaches the memory's MCP server.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mcp {
-    /// Over HTTP, at `--url` (else `MEMSTORE_URL`), with `MEMSTORE_TOKEN` where the harness can't read it from
+    /// Over HTTP, at `--url` (else `AMPUP_MEMORY_URL`), with `AMPUP_MEMORY_TOKEN` where the harness can't read it from
     /// the environment.
     Http,
     /// `memstore mcp`, a command the agent starts: it signs in as the CLI does (`memstore join`) and renews the
@@ -390,14 +401,14 @@ pub fn apply_with(
     if let Some(u) = url {
         let p = url::Url::parse(u).with_context(|| format!("--url {u} is not a URL"))?;
         if !matches!(p.scheme(), "http" | "https") || p.host_str().is_none() {
-            bail!("--url is the memstore server, http(s)://host[:port], not {u}");
+            bail!("--url is the AmpUp Memory server, http(s)://host[:port], not {u}");
         }
     }
     let add = match remove {
         true => vec![],
         false => hooks_for(harness, url),
     };
-    let token = std::env::var("MEMSTORE_TOKEN")
+    let token = std::env::var("AMPUP_MEMORY_TOKEN")
         .ok()
         .filter(|t| !t.is_empty() && !signed_in);
     let mut out = vec![];
@@ -412,7 +423,7 @@ pub fn apply_with(
     let verb = if remove { "removed" } else { "added" };
     match harness {
         Harness::ClaudeCode => bail!(
-            "Claude Code installs memstore as a plugin: run /plugin marketplace add {MARKETPLACE_REPO}, then \
+            "Claude Code installs AmpUp Memory as a plugin: run /plugin marketplace add {MARKETPLACE_REPO}, then \
              /plugin install memstore@memstore, in Claude Code"
         ),
         Harness::Codex => {
@@ -421,7 +432,7 @@ pub fn apply_with(
             set_hooks(&mut doc, &add, &path)?;
             let changed = write(&path, &format!("{:#}\n", doc), dry, false)?;
             done(path, changed, &format!("hooks {verb}"));
-            // MCP: a [mcp_servers.memstore] table, its token read from MEMSTORE_TOKEN by Codex itself.
+            // MCP: a [mcp_servers.ampup-memory] table, its token read from AMPUP_MEMORY_TOKEN by Codex itself.
             let path = home.join(".codex/config.toml");
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
@@ -439,7 +450,9 @@ pub fn apply_with(
             let servers = toml["mcp_servers"]
                 .as_table_mut()
                 .context("mcp_servers in config.toml is not a table")?;
-            servers.remove("memstore");
+            for name in SERVER_NAMES {
+                servers.remove(name);
+            }
             if !remove {
                 let mut t = toml_edit::Table::new();
                 if signed_in {
@@ -449,9 +462,9 @@ pub fn apply_with(
                     t["args"] = toml_edit::value(args);
                 } else {
                     t["url"] = toml_edit::value(mcp_url(url));
-                    t["bearer_token_env_var"] = toml_edit::value("MEMSTORE_TOKEN");
+                    t["bearer_token_env_var"] = toml_edit::value(token_var().as_ref());
                 }
-                servers.insert("memstore", toml_edit::Item::Table(t));
+                servers.insert(MCP_SERVER, toml_edit::Item::Table(t));
             }
             let changed = write(&path, &toml.to_string(), dry, false)?;
             done(path, changed, &format!("MCP server {verb}"));
@@ -461,7 +474,7 @@ pub fn apply_with(
             let mut doc = read_json(&path)?;
             set_hooks(&mut doc, &add, &path)?;
             let servers = object_at(&mut doc, "mcpServers", &path)?;
-            servers.remove("memstore");
+            remove_servers(servers);
             if !remove {
                 let mut entry = match signed_in {
                     true => stdio.clone(),
@@ -470,7 +483,7 @@ pub fn apply_with(
                 if let Some(t) = &token {
                     entry["headers"] = json!({"Authorization": format!("Bearer {t}")});
                 }
-                servers.insert("memstore".into(), entry);
+                servers.insert(MCP_SERVER.into(), entry);
             }
             prune(&mut doc, "mcpServers");
             let changed = write(
@@ -493,14 +506,14 @@ pub fn apply_with(
             let path = home.join(".cursor/mcp.json");
             let mut doc = read_json(&path)?;
             let servers = object_at(&mut doc, "mcpServers", &path)?;
-            servers.remove("memstore");
+            remove_servers(servers);
             if !remove {
                 servers.insert(
-                    "memstore".into(),
+                    MCP_SERVER.into(),
                     match signed_in {
                         true => stdio.clone(),
                         false => json!({"url": mcp_url(url),
-                                        "headers": {"Authorization": "Bearer ${env:MEMSTORE_TOKEN}"}}),
+                                        "headers": {"Authorization": format!("Bearer ${{env:{}}}", token_var())}}),
                     },
                 );
             }
@@ -509,8 +522,17 @@ pub fn apply_with(
             done(path, changed, &format!("MCP server {verb}"));
         }
         Harness::Copilot => {
-            // Its own file, so nothing else of the user's is touched.
-            let path = home.join(".copilot/hooks/memstore.json");
+            // Its own file, so nothing else of the user's is touched. An older install's, by memstore's name, goes
+            // either way: Copilot would run both.
+            let old = home.join(".copilot/hooks/memstore.json");
+            if old.exists() {
+                if !dry {
+                    std::fs::remove_file(&old)
+                        .with_context(|| format!("remove {}", old.display()))?;
+                }
+                done(old, true, "hooks removed (an older install's)");
+            }
+            let path = home.join(".copilot/hooks/ampup-memory.json");
             match remove {
                 true if path.exists() => {
                     if !dry {
@@ -530,7 +552,7 @@ pub fn apply_with(
             let path = home.join(".copilot/mcp-config.json");
             let mut doc = read_json(&path)?;
             let servers = object_at(&mut doc, "mcpServers", &path)?;
-            servers.remove("memstore");
+            remove_servers(servers);
             if !remove {
                 let mut entry = match signed_in {
                     true => {
@@ -541,7 +563,7 @@ pub fn apply_with(
                 if let Some(t) = &token {
                     entry["headers"] = json!({"Authorization": format!("Bearer {t}")});
                 }
-                servers.insert("memstore".into(), entry);
+                servers.insert(MCP_SERVER.into(), entry);
             }
             prune(&mut doc, "mcpServers");
             let changed = write(
@@ -556,7 +578,32 @@ pub fn apply_with(
     Ok(out)
 }
 
-/// Whether installing for `harness` writes `MEMSTORE_TOKEN` itself into a file (its MCP config can't read it
+/// The MCP server's entry in each agent's config.
+const MCP_SERVER: &str = crate::naming::MCP_SERVER;
+/// Its entry's names, new and old: an install replaces an older one's entry, an uninstall removes either.
+const SERVER_NAMES: [&str; 3] = [
+    crate::naming::MCP_SERVER,
+    crate::naming::OLD_MCP_SERVERS[0],
+    crate::naming::OLD_MCP_SERVERS[1],
+];
+
+fn remove_servers(servers: &mut serde_json::Map<String, Value>) {
+    for name in SERVER_NAMES {
+        servers.remove(name);
+    }
+}
+
+/// The variable an agent reads the token from: `AMPUP_MEMORY_TOKEN`, or `MEMSTORE_TOKEN` where that is what this
+/// machine sets (the agent reads it itself, so it must be the name its environment has).
+fn token_var() -> std::borrow::Cow<'static, str> {
+    const TOKEN: &str = "AMPUP_MEMORY_TOKEN";
+    match crate::naming::set_by_old_name(TOKEN) {
+        true => crate::naming::old_env_name(TOKEN),
+        false => TOKEN.into(),
+    }
+}
+
+/// Whether installing for `harness` writes `AMPUP_MEMORY_TOKEN` itself into a file (its MCP config can't read it
 /// from the environment).
 pub fn writes_token(harness: Harness) -> bool {
     matches!(harness, Harness::Gemini | Harness::Copilot)

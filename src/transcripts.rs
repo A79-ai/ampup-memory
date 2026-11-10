@@ -3,7 +3,7 @@
 //! A session's note (`<harness>:<repo>:<session>`) holds what was asked, what the agent said and the files it
 //! changed; its end's trace holds each tool call with the start of its result. Neither keeps what the tools
 //! returned, which is what a later pass checks a note against. Where the scope keeps transcripts
-//! (`Settings::transcripts`, else the server's `MEMSTORE_TRANSCRIPTS`; off by default), the plugin's hooks
+//! (`Settings::transcripts`, else the server's `AMPUP_MEMORY_TRANSCRIPTS`; off by default), the plugin's hooks
 //! (`memstore_client::hook`) send each session's transcript as it grows, in parts: `POST /transcripts {harness,
 //! repo, session_id, from, text}`, `text` the entries the transcript gained from entry `from` on (prompts, answers,
 //! each tool call with its input and its result; never thinking), secret-looking words redacted on the machine and

@@ -98,7 +98,7 @@ impl Refusal {
     }
 }
 
-/// How the agent authenticates to the registry (`MEMSTORE_AGENT_REGISTRY_AUTH`).
+/// How the agent authenticates to the registry (`AMPUP_MEMORY_AGENT_REGISTRY_AUTH`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryAuth {
     /// An access token for the pod's Google service account from the GKE metadata server, as a bearer

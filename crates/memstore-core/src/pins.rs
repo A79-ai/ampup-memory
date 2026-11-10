@@ -13,9 +13,9 @@
 //!   snapshot's ([`crate::Store::compact_aggregates`]); snapshot expiry touches Iceberg snapshots, which no pin
 //!   reads (a pin holds ledger commits). Pins don't hold index versions: a pinned read searches the current indexes,
 //!   whose rows are filtered to its commits.
-//! - **A lease.** A pin lives `ttl` (`MEMSTORE_PIN_TTL`, default an hour; a request may ask for up to
-//!   `MEMSTORE_PIN_MAX_TTL`, a day) and is renewed by whoever took it while they still read it, never past
-//!   `MEMSTORE_PIN_MAX_AGE` (7 days) after it was taken. A pin released or past its lease is dead: reads through it
+//! - **A lease.** A pin lives `ttl` (`AMPUP_MEMORY_PIN_TTL`, default an hour; a request may ask for up to
+//!   `AMPUP_MEMORY_PIN_MAX_TTL`, a day) and is renewed by whoever took it while they still read it, never past
+//!   `AMPUP_MEMORY_PIN_MAX_AGE` (7 days) after it was taken. A pin released or past its lease is dead: reads through it
 //!   are refused, and nothing is kept for it any more. So an agent that died blocks no cleanup past its lease.
 //!
 //! Stored per scope, in `<namespace>.pins` (one row per change: taken, renewed, released; the newest row of a pin
@@ -64,7 +64,7 @@ impl Pin {
     }
 }
 
-/// How long pins live: `MEMSTORE_PIN_TTL`, `MEMSTORE_PIN_MAX_TTL`, `MEMSTORE_PIN_MAX_AGE` (seconds).
+/// How long pins live: `AMPUP_MEMORY_PIN_TTL`, `AMPUP_MEMORY_PIN_MAX_TTL`, `AMPUP_MEMORY_PIN_MAX_AGE` (seconds).
 #[derive(Clone, Copy, Debug)]
 pub struct Lease {
     pub ttl: Duration,
@@ -83,10 +83,10 @@ impl Lease {
                     .unwrap_or(d),
             )
         };
-        let max_age = secs("MEMSTORE_PIN_MAX_AGE", 7 * 86_400);
-        let max_ttl = secs("MEMSTORE_PIN_MAX_TTL", 86_400).min(max_age);
+        let max_age = secs("AMPUP_MEMORY_PIN_MAX_AGE", 7 * 86_400);
+        let max_ttl = secs("AMPUP_MEMORY_PIN_MAX_TTL", 86_400).min(max_age);
         Lease {
-            ttl: secs("MEMSTORE_PIN_TTL", 3_600).min(max_ttl),
+            ttl: secs("AMPUP_MEMORY_PIN_TTL", 3_600).min(max_ttl),
             max_ttl,
             max_age,
         }
@@ -182,7 +182,7 @@ impl Store {
     ) -> Result<Pin> {
         let lease = Lease::from_env();
         // The heads as the catalog has them now, not as this server's cache last read them (up to
-        // `MEMSTORE_MAX_STALENESS_MS` behind other writers, longer while refreshes fail): a pin is read for hours,
+        // `AMPUP_MEMORY_MAX_STALENESS_MS` behind other writers, longer while refreshes fail): a pin is read for hours,
         // and must hold every commit made before it was asked for, by any writer.
         let heads = self
             .branch_heads(scope)

@@ -1,4 +1,4 @@
-//! The training log (`MEMSTORE_TRAIN_LOG`) keeps what the memory has forgotten for no longer than the memory does: an
+//! The training log (`AMPUP_MEMORY_TRAIN_LOG`) keeps what the memory has forgotten for no longer than the memory does: an
 //! extraction run against a stand-in model logs every call it makes, and then, per path by which an episode stops
 //! being readable, its calls leave the log (an exported example never holds what the memory has lost):
 //! - `forget` of an episode, before any sweep: the export already leaves it out, and the sweep removes its calls;
@@ -151,12 +151,12 @@ async fn forgotten_memory_leaves_the_training_log() {
     let log = dir.path().join("log");
     let url = model().await;
     unsafe {
-        std::env::set_var("MEMSTORE_TRAIN_LOG", &log);
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
-        std::env::set_var("MEMSTORE_EXTRACT_GOAL_BLIND", "1");
+        std::env::set_var("AMPUP_MEMORY_TRAIN_LOG", &log);
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_GOAL_BLIND", "1");
     }
     assert!(train_log::enabled());
     let store = crate::local_store(&dir.path().join("store")).await;
@@ -286,13 +286,13 @@ async fn advice_calls_are_logged_and_a_notes_outcome_is_joined() {
     let dir = tempfile::tempdir().unwrap();
     let url = model().await;
     unsafe {
-        std::env::set_var("MEMSTORE_TRAIN_LOG", dir.path().join("log"));
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_TRAIN_LOG", dir.path().join("log"));
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
         // One recorder's runs: a team note needs no more people than that here.
-        std::env::set_var("MEMSTORE_ADVICE_EVIDENCE", "0");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_EVIDENCE", "0");
     }
     let store = crate::local_store(&dir.path().join("store")).await;
     let ex = extract::Extractor::from_env().unwrap().unwrap();
@@ -421,7 +421,7 @@ async fn advice_calls_are_logged_and_a_notes_outcome_is_joined() {
     // leaves it for the default 30 days, and removes it where none are kept.
     let done = memstore::train_data::sweep(&store, None).await.unwrap();
     assert_eq!(done.purged, 0, "{done:?}");
-    unsafe { std::env::set_var("MEMSTORE_TRAIN_LOG_UNTRACKED_DAYS", "0") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_TRAIN_LOG_UNTRACKED_DAYS", "0") };
     let done = memstore::train_data::sweep(&store, None).await.unwrap();
     assert!(done.purged >= 1, "{done:?}");
     let calls = train_log::calls(&scope).await.unwrap();
@@ -454,12 +454,12 @@ async fn a_prompt_that_showed_another_episode_goes_with_it() {
     let dir = tempfile::tempdir().unwrap();
     let url = model().await;
     unsafe {
-        std::env::set_var("MEMSTORE_TRAIN_LOG", dir.path().join("log"));
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
-        std::env::set_var("MEMSTORE_EXTRACT_GOAL_BLIND", "1");
+        std::env::set_var("AMPUP_MEMORY_TRAIN_LOG", dir.path().join("log"));
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_GOAL_BLIND", "1");
     }
     let store = crate::local_store(&dir.path().join("store")).await;
     let ex = extract::Extractor::from_env().unwrap().unwrap();
@@ -557,12 +557,12 @@ async fn an_acl_narrowed_since_closes_the_export() {
     let dir = tempfile::tempdir().unwrap();
     let url = model().await;
     unsafe {
-        std::env::set_var("MEMSTORE_TRAIN_LOG", dir.path().join("log"));
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
-        std::env::set_var("MEMSTORE_EXTRACT_GOAL_BLIND", "1");
+        std::env::set_var("AMPUP_MEMORY_TRAIN_LOG", dir.path().join("log"));
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_GOAL_BLIND", "1");
     }
     let store = crate::local_store(&dir.path().join("store")).await;
     let ex = extract::Extractor::from_env().unwrap().unwrap();
@@ -615,12 +615,12 @@ async fn only_an_org_the_operator_turned_on_is_logged() {
     let dir = tempfile::tempdir().unwrap();
     let url = model().await;
     unsafe {
-        std::env::set_var("MEMSTORE_TRAIN_LOG", dir.path().join("log"));
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
-        std::env::set_var("MEMSTORE_EXTRACT_GOAL_BLIND", "1");
+        std::env::set_var("AMPUP_MEMORY_TRAIN_LOG", dir.path().join("log"));
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_GOAL_BLIND", "1");
     }
     let store = crate::local_store(&dir.path().join("store")).await;
     let ex = extract::Extractor::from_env().unwrap().unwrap();
@@ -693,12 +693,12 @@ async fn a_call_that_cannot_be_marked_is_not_logged() {
     let log = dir.path().join("log");
     let url = model().await;
     unsafe {
-        std::env::set_var("MEMSTORE_TRAIN_LOG", &log);
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
-        std::env::set_var("MEMSTORE_EXTRACT_GOAL_BLIND", "1");
+        std::env::set_var("AMPUP_MEMORY_TRAIN_LOG", &log);
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_GOAL_BLIND", "1");
     }
     assert!(train_log::enabled());
     // Where the markers go there is a file, so none can be made.

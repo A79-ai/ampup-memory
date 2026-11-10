@@ -6,7 +6,7 @@
 //! grouped count or a filter on a type then reads them instead of scanning and decoding every fact of the
 //! type again. A value keeps what filters and grouping read (about 150 bytes), not the whole fact.
 //!
-//! `MEMSTORE_VIEW_FACTS` (default 200000) caps the values and entities kept; the least recently used go
+//! `AMPUP_MEMORY_VIEW_FACTS` (default 200000) caps the values and entities kept; the least recently used go
 //! first. 0 keeps none.
 
 use std::collections::{BTreeSet, HashMap};
@@ -239,7 +239,7 @@ static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
 
 fn budget() -> usize {
     static BUDGET: LazyLock<usize> = LazyLock::new(|| {
-        std::env::var("MEMSTORE_VIEW_FACTS")
+        std::env::var("AMPUP_MEMORY_VIEW_FACTS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(200_000)

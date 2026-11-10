@@ -1,7 +1,7 @@
 //! Alerts the engine raises on its own metrics: the telemetry contract's `alerts` channel.
 //!
 //! A server with telemetry on (an enrolled credential, `crate::telemetry::Outbox`) evaluates a fixed set
-//! of rules every `MEMSTORE_ALERTS_EVAL_SECS` (60 by default, 10 at least). The rules read the engine's
+//! of rules every `AMPUP_MEMORY_ALERTS_EVAL_SECS` (60 by default, 10 at least). The rules read the engine's
 //! own metrics and state (request counts and durations, the disks it writes, the directory, the
 //! extraction round, store commits), never data. What leaves is which alert, how bad, since when and how
 //! many evaluations it has held for: an [`AlertEvent`].
@@ -14,7 +14,7 @@
 //! | `directory_blocked` | the directory log holds a change newer than this engine reads | | while it holds |
 //! | `extraction_backlog` | episodes the extraction round finds waiting, above 100 for 15 min | while it holds | |
 //! | `store_commit_failures` | store commits that failed over the last 10 min | 1 or more | more than 5 |
-//! | `advice_slow` | advice routes that took longer than an agent's `get_advice` waits (`MEMSTORE_ADVICE_ASK_WAIT_MS`, 30 s) over the last 10 min | 1 or more | more than 5 |
+//! | `advice_slow` | advice routes that took longer than an agent's `get_advice` waits (`AMPUP_MEMORY_ADVICE_ASK_WAIT_MS`, 30 s) over the last 10 min | 1 or more | more than 5 |
 //! | `key_expiry` | an API key used in the last 7 days expires within 3 days (one issued for 3 days or less is left out: it lapses as it was made to); requests refused for an expired API key over the last 10 min | a key expiring | a key refused |
 //!
 //! An alert fires once its condition held on [`FIRE_AFTER`] evaluations in a row, and resolves once it was
@@ -35,7 +35,7 @@ pub const FIRE_AFTER: u32 = 2;
 pub const RESOLVE_AFTER: u32 = 2;
 /// A firing alert is sent again after this many more evaluations held.
 pub const RESEND_EVERY: u64 = 10;
-/// Seconds between evaluations by default (`MEMSTORE_ALERTS_EVAL_SECS`), and the least it may be set to.
+/// Seconds between evaluations by default (`AMPUP_MEMORY_ALERTS_EVAL_SECS`), and the least it may be set to.
 pub const EVAL_SECS: u64 = 60;
 pub const MIN_EVAL_SECS: u64 = 10;
 
@@ -306,7 +306,7 @@ pub fn written_dirs(mirror: Option<&Path>) -> Vec<PathBuf> {
             None => None,
         }
     };
-    if let Some(w) = std::env::var("MEMSTORE_WAREHOUSE").ok().and_then(local) {
+    if let Some(w) = std::env::var("AMPUP_MEMORY_WAREHOUSE").ok().and_then(local) {
         dirs.push(w);
     }
     if let Some(i) = local(crate::search::default_index_base()) {

@@ -86,7 +86,7 @@ const CATALOG: &[Capability] = &[
 ];
 
 pub fn enabled(args: &Value) -> bool {
-    !std::env::var("MEMSTORE_PUBLIC_CAPABILITIES").is_ok_and(|v| matches!(v.to_lowercase().as_str(), "off" | "false" | "0"))
+    !std::env::var("AMPUP_MEMORY_PUBLIC_CAPABILITIES").is_ok_and(|v| matches!(v.to_lowercase().as_str(), "off" | "false" | "0"))
         && args["public_capabilities"].as_bool() != Some(false)
         && args["notes"].as_bool() != Some(false)
         && args["event"].is_null()

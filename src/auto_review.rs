@@ -28,10 +28,10 @@ pub struct Round {
 /// How sure the model must be that a change should publish for it to publish.
 const APPROVE_AT: f64 = 0.7;
 
-/// How often the server looks for proposals to decide (`MEMSTORE_AUTO_REVIEW_EVERY`, seconds; default 30).
+/// How often the server looks for proposals to decide (`AMPUP_MEMORY_AUTO_REVIEW_EVERY`, seconds; default 30).
 pub fn every() -> std::time::Duration {
     std::time::Duration::from_secs(
-        std::env::var("MEMSTORE_AUTO_REVIEW_EVERY")
+        std::env::var("AMPUP_MEMORY_AUTO_REVIEW_EVERY")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30),

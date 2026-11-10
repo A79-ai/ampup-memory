@@ -22,18 +22,18 @@ static JOBS: LazyLock<Mutex<HashMap<(String, String), Job>>> = LazyLock::new(Def
 /// How long an outcome no call takes is kept: an agent that never asks again leaves nothing behind.
 const KEEP: Duration = Duration::from_secs(3_600);
 
-/// How long an agent's `start_session` waits for its opening advice: `MEMSTORE_ADVICE_WAIT_MS` (default 1,000).
+/// How long an agent's `start_session` waits for its opening advice: `AMPUP_MEMORY_ADVICE_WAIT_MS` (default 1,000).
 /// The agent needs its session id to go on; the advice can follow on its next `get_advice`.
 pub fn wait() -> Duration {
-    millis("MEMSTORE_ADVICE_WAIT_MS", 1_000)
+    millis("AMPUP_MEMORY_ADVICE_WAIT_MS", 1_000)
 }
 
-/// How long an agent's own `get_advice`, all of it, waits for routing: `MEMSTORE_ADVICE_ASK_WAIT_MS` (default
+/// How long an agent's own `get_advice`, all of it, waits for routing: `AMPUP_MEMORY_ADVICE_ASK_WAIT_MS` (default
 /// 30,000). The agent asked for the advice before its work, and a host without hooks (ChatGPT, Codex, Claude
 /// Desktop) has no other way to get it: a second's wait answered nearly every call "still being looked up", as a
 /// route takes 1.5 to 12 s.
 pub fn ask_wait() -> Duration {
-    millis("MEMSTORE_ADVICE_ASK_WAIT_MS", 30_000)
+    millis("AMPUP_MEMORY_ADVICE_ASK_WAIT_MS", 30_000)
 }
 
 fn millis(var: &str, default: u64) -> Duration {
@@ -50,7 +50,7 @@ fn millis(var: &str, default: u64) -> Duration {
 pub static SLOW_ROUTES: LazyLock<prometheus::IntCounter> = LazyLock::new(|| {
     prometheus::IntCounter::new(
         "memstore_advice_slow_routes_total",
-        "Advice routes that took longer than an agent's get_advice waits (MEMSTORE_ADVICE_ASK_WAIT_MS)",
+        "Advice routes that took longer than an agent's get_advice waits (AMPUP_MEMORY_ADVICE_ASK_WAIT_MS)",
     )
     .unwrap()
 });

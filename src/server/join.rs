@@ -5,7 +5,7 @@
 //! that approves it: the person becomes a member, as `memstore invite` makes them. `memstore requests`
 //! lists what waits; `memstore invite` and `memstore decline` answer from a terminal.
 //!
-//! The link is a token this server sealed under its `MEMSTORE_SECRET_KEY`: the org, the person, the admin
+//! The link is a token this server sealed under its `AMPUP_MEMORY_SECRET_KEY`: the org, the person, the admin
 //! it was sent to and when it expires ([`APPROVE_DAYS`]). It opens a page that asks before anything changes
 //! (a GET changes nothing); the page's POST approves, as that admin, through the directory's own checks:
 //! an admin removed since, or a request answered since, approves nothing. Without a secret key, or a
@@ -70,7 +70,7 @@ fn from_url(t: &str) -> String {
 /// The link that lets `admin` approve `user` joining `org`, if this server can make one.
 fn approve_link(state: &State, org: &str, user: &str, at: i64, admin: &str) -> Option<String> {
     let key = state.secret_key.as_ref()?;
-    let base = std::env::var("MEMSTORE_PUBLIC_URL")
+    let base = std::env::var("AMPUP_MEMORY_PUBLIC_URL")
         .ok()
         .filter(|u| !u.trim().is_empty())?;
     let a = Approval {
@@ -93,7 +93,7 @@ fn open_link(state: &State, t: &str) -> Result<Approval> {
     let key = state
         .secret_key
         .as_ref()
-        .context("this server has no MEMSTORE_SECRET_KEY: it made no approval links")?;
+        .context("this server has no AMPUP_MEMORY_SECRET_KEY: it made no approval links")?;
     let plain = key.unseal(CONTEXT, &from_url(t))?;
     let a: Approval = serde_json::from_str(&plain)?;
     anyhow::ensure!(a.exp > now(), "expired");
@@ -101,7 +101,7 @@ fn open_link(state: &State, t: &str) -> Result<Approval> {
 }
 
 /// What a link that doesn't open is told: the same whatever the reason (the log has it).
-const BAD_LINK: &str = "<p>This link doesn't work: it isn't one this server made, or it has expired (a link works for 7 days). Ask the person to request again, or approve from a terminal: <code>memstore requests</code>, then <code>memstore invite</code>.</p>";
+const BAD_LINK: &str = "<p>This link doesn't work: it isn't one this server made, or it has expired (a link works for 7 days). Ask the person to request again, or approve from a terminal: <code>ampup-memory requests</code>, then <code>ampup-memory invite</code>.</p>";
 
 /// Tell `org`'s admins that `user` asked to join: one mail each, with a link that is that admin's to
 /// use. Runs in the background after the request is recorded; a failure is logged, and the request stays
@@ -147,7 +147,7 @@ pub(super) async fn notify(state: Arc<State>, org: String, user: String) {
         })
         .unwrap_or_default();
     let how = format!(
-        "memstore invite --org {org} --email {user} (or memstore decline --org {org} --email {user})"
+        "ampup-memory invite --org {org} --email {user} (or ampup-memory decline --org {org} --email {user})"
     );
     if admins.is_empty() {
         eprintln!(
@@ -157,26 +157,26 @@ pub(super) async fn notify(state: Arc<State>, org: String, user: String) {
     }
     let Some(mailer) = mail::from_env() else {
         eprintln!(
-            "join request: {user} asked to join {org}; no mail is configured (MEMSTORE_MAIL_FROM with RESEND_API_KEY or MAILERSEND_API_KEY), so its admins ({}) weren't emailed: {how}",
+            "join request: {user} asked to join {org}; no mail is configured (AMPUP_MEMORY_MAIL_FROM with RESEND_API_KEY or MAILERSEND_API_KEY), so its admins ({}) weren't emailed: {how}",
             admins.join(", ")
         );
         return;
     };
-    let server = std::env::var("MEMSTORE_PUBLIC_URL").unwrap_or_else(|_| "memstore".into());
-    let subject = format!("{user} asked to join {org} on memstore");
+    let server = std::env::var("AMPUP_MEMORY_PUBLIC_URL").unwrap_or_else(|_| "AmpUp Memory".into());
+    let subject = format!("{user} asked to join {org} on AmpUp Memory");
     // The terminal way, one command a step, each on its own so it copies whole: sign in as an admin, then
     // invite (or decline).
-    let sign_in = format!("memstore join {server} --org {org}");
-    let invite = format!("memstore invite --org {org} --email {user}");
-    let decline = format!("memstore decline --org {org} --email {user}");
+    let sign_in = format!("ampup-memory join {server} --org {org}");
+    let invite = format!("ampup-memory invite --org {org} --email {user}");
+    let decline = format!("ampup-memory decline --org {org} --email {user}");
     for admin in admins {
         let link = approve_link(&state, &org, &user, at, &admin);
         let text = match &link {
             Some(l) => format!(
-                "{user} asked to join {org} on memstore ({server}).\n\nApproving makes them a member: they read and write {org}'s memory as its members do. Approve people you know.\n\nApprove, as {admin}:\n{l}\n\nOr from a terminal:\n\n1. Sign in as an admin of {org}:\n   {sign_in}\n\n2. Let them in:\n   {invite}\n\nOr turn them away (they can ask again tomorrow):\n   {decline}\n\nThe link works for {APPROVE_DAYS} days, for this request only, and only for you."
+                "{user} asked to join {org} on AmpUp Memory ({server}).\n\nApproving makes them a member: they read and write {org}'s memory as its members do. Approve people you know.\n\nApprove, as {admin}:\n{l}\n\nOr from a terminal:\n\n1. Sign in as an admin of {org}:\n   {sign_in}\n\n2. Let them in:\n   {invite}\n\nOr turn them away (they can ask again tomorrow):\n   {decline}\n\nThe link works for {APPROVE_DAYS} days, for this request only, and only for you."
             ),
             None => format!(
-                "{user} asked to join {org} on memstore ({server}).\n\nApproving makes them a member: they read and write {org}'s memory as its members do. Approve people you know.\n\nFrom a terminal:\n\n1. Sign in as an admin of {org}:\n   {sign_in}\n\n2. Let them in:\n   {invite}\n\nOr turn them away (they can ask again tomorrow):\n   {decline}"
+                "{user} asked to join {org} on AmpUp Memory ({server}).\n\nApproving makes them a member: they read and write {org}'s memory as its members do. Approve people you know.\n\nFrom a terminal:\n\n1. Sign in as an admin of {org}:\n   {sign_in}\n\n2. Let them in:\n   {invite}\n\nOr turn them away (they can ask again tomorrow):\n   {decline}"
             ),
         };
         let html = mail_html(MailParts {
@@ -231,7 +231,7 @@ fn mail_html(p: MailParts<'_>) -> String {
         e(p.org)
     ));
     body.push_str(&format!(
-        "<p style=\"{p_style}\">They signed in to memstore at <a href=\"{0}\" style=\"color:#2563eb\">{0}</a> for <b>{1}</b>, which doesn't hold them. Approving makes them a member: they read and write {1}'s memory as its members do. Approve people you know.</p>",
+        "<p style=\"{p_style}\">They signed in to AmpUp Memory at <a href=\"{0}\" style=\"color:#2563eb\">{0}</a> for <b>{1}</b>, which doesn't hold them. Approving makes them a member: they read and write {1}'s memory as its members do. Approve people you know.</p>",
         e(p.server),
         e(p.org)
     ));
@@ -345,14 +345,14 @@ pub(super) fn token_in(query_or_form: &str) -> Option<String> {
 /// `GET /join/approve?t=…`: what the link would do, and a button that does it. Nothing changes here.
 pub(super) fn ask(state: &State, token: Option<&str>) -> Shown {
     let Some(t) = token else {
-        return shown(400, "memstore", "<p>This isn't an approval link.</p>");
+        return shown(400, "AmpUp Memory", "<p>This isn't an approval link.</p>");
     };
     match open_link(state, t) {
         Ok(a) => shown(
             200,
-            "Approve joining memstore",
+            "Approve joining AmpUp Memory",
             &format!(
-                "<p><b>{}</b> asked to join <b>{}</b> on memstore.</p><p>Approving makes them a member: they read and write {}'s memory as its members do. Approve people you know.</p><form method=\"post\" action=\"{APPROVE_PATH}\"><input type=\"hidden\" name=\"t\" value=\"{}\"><button type=\"submit\">Approve, as {}</button></form><p>To turn them away instead, from a terminal: <code>memstore decline --org {} --email {}</code>.</p>",
+                "<p><b>{}</b> asked to join <b>{}</b> on AmpUp Memory.</p><p>Approving makes them a member: they read and write {}'s memory as its members do. Approve people you know.</p><form method=\"post\" action=\"{APPROVE_PATH}\"><input type=\"hidden\" name=\"t\" value=\"{}\"><button type=\"submit\">Approve, as {}</button></form><p>To turn them away instead, from a terminal: <code>ampup-memory decline --org {} --email {}</code>.</p>",
                 mail::esc(&a.user),
                 mail::esc(&a.org),
                 mail::esc(&a.org),
@@ -364,7 +364,7 @@ pub(super) fn ask(state: &State, token: Option<&str>) -> Shown {
         ),
         Err(e) => {
             eprintln!("join request: an approval link didn't open: {e:#}");
-            shown(400, "memstore", BAD_LINK)
+            shown(400, "AmpUp Memory", BAD_LINK)
         }
     }
 }
@@ -372,13 +372,13 @@ pub(super) fn ask(state: &State, token: Option<&str>) -> Shown {
 /// `POST /join/approve` (`t=…`): approve, as the admin the link was sent to, through the directory's checks.
 pub(super) async fn approve(state: &State, token: Option<&str>) -> Shown {
     let Some(t) = token else {
-        return shown(400, "memstore", "<p>This isn't an approval link.</p>");
+        return shown(400, "AmpUp Memory", "<p>This isn't an approval link.</p>");
     };
     let a = match open_link(state, t) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("join request: an approval link didn't open: {e:#}");
-            return shown(400, "memstore", BAD_LINK);
+            return shown(400, "AmpUp Memory", BAD_LINK);
         }
     };
     // A link mailed to an admin disabled since (`user.disable`, which a bearer sign-in would meet at
@@ -390,7 +390,7 @@ pub(super) async fn approve(state: &State, token: Option<&str>) -> Shown {
         );
         return shown(
             403,
-            "memstore",
+            "AmpUp Memory",
             "<p>Not approved: this account is disabled.</p>",
         );
     }
@@ -411,7 +411,7 @@ pub(super) async fn approve(state: &State, token: Option<&str>) -> Shown {
         );
         return shown(
             403,
-            "memstore",
+            "AmpUp Memory",
             "<p>Not approved: this account is disabled.</p>",
         );
     }
@@ -426,7 +426,7 @@ pub(super) async fn approve(state: &State, token: Option<&str>) -> Shown {
     if !waiting {
         return shown(
             409,
-            "memstore",
+            "AmpUp Memory",
             &format!(
                 "<p>This request was answered already: {} is a member of {}, or was turned away.</p>",
                 mail::esc(&a.user),
@@ -468,7 +468,7 @@ pub(super) async fn approve(state: &State, token: Option<&str>) -> Shown {
                 200,
                 "Approved",
                 &format!(
-                    "<p>Done: <b>{}</b> is a member of <b>{}</b>. They sign in with <code>/memstore:login</code> (or <code>memstore join</code>) and memory is on from their next session.</p>",
+                    "<p>Done: <b>{}</b> is a member of <b>{}</b>. They sign in with <code>/memstore:login</code> (or <code>ampup-memory join</code>) and memory is on from their next session.</p>",
                     mail::esc(&a.user),
                     mail::esc(&a.org)
                 ),
@@ -481,7 +481,7 @@ pub(super) async fn approve(state: &State, token: Option<&str>) -> Shown {
             );
             shown(
                 403,
-                "memstore",
+                "AmpUp Memory",
                 &format!("<p>Not approved: {}.</p>", mail::esc(&format!("{e:#}"))),
             )
         }

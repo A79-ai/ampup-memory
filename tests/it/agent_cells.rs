@@ -1,4 +1,4 @@
-//! The deployment agent gives a cell's Deployments (`MEMSTORE_AGENT_ALSO_DEPLOYMENTS`) the same version
+//! The deployment agent gives a cell's Deployments (`AMPUP_MEMORY_AGENT_ALSO_DEPLOYMENTS`) the same version
 //! and flags as the engine's own.
 
 use std::collections::BTreeMap;

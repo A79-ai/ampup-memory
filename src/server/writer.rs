@@ -24,7 +24,7 @@
 //! The lease is reached with the first of these that can write beside the system tables: the ledger table's
 //! own storage credentials (vended per table by Snowflake, Databricks and other REST catalogs, or the ones the
 //! catalog was configured with), taken again every few minutes since they last about an hour; else, only where
-//! the operator named the bucket for it (`MEMSTORE_WRITER_LEASE_IDENTITY_BUCKET`), the server's own identity,
+//! the operator named the bucket for it (`AMPUP_MEMORY_WRITER_LEASE_IDENTITY_BUCKET`), the server's own identity,
 //! built from the location alone (no endpoint or identity setting from the catalog, which could otherwise send
 //! this server's tokens elsewhere). Where neither can (vended credentials and no identity of its own), the
 //! lease lives in the ledger's own directory (`<ledger>/_writer/`). Every server tries the same places in the
@@ -34,7 +34,7 @@
 //! (anything but a local directory, `gs://`, `s3://` or an Azure `abfss://` path) is an error: logged,
 //! `memstore_writer_lease_failing` is 1, and `/ready` answers 503 saying so, rather than every server
 //! writing (or none). Until the lease's location is known (the catalog answers) a server doesn't write.
-//! Only `MEMSTORE_WRITER_LEASE=off` makes a server write without it: for a catalog no other server shares.
+//! Only `AMPUP_MEMORY_WRITER_LEASE=off` makes a server write without it: for a catalog no other server shares.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -82,9 +82,9 @@ struct Place {
 }
 
 pub struct Lease {
-    /// No lease kept: this server writes alone (`MEMSTORE_WRITER_LEASE=off`).
+    /// No lease kept: this server writes alone (`AMPUP_MEMORY_WRITER_LEASE=off`).
     alone: bool,
-    /// Never taken: this server only serves (`MEMSTORE_ROLE=serve`), and the background writing, the index
+    /// Never taken: this server only serves (`AMPUP_MEMORY_ROLE=serve`), and the background writing, the index
     /// builds among it, is a worker's.
     reader: bool,
     held: AtomicBool,
@@ -672,7 +672,7 @@ async fn locate(store: &Store, leaf: &str) -> Result<Located> {
                 Err(e) => refused(e, &system, "the catalog's")?,
             }
             // 2. The same, with this server's own identity (a GKE workload's), only where the operator named
-            // that bucket for it (`MEMSTORE_WRITER_LEASE_IDENTITY_BUCKET`): built from the location alone, never
+            // that bucket for it (`AMPUP_MEMORY_WRITER_LEASE_IDENTITY_BUCKET`): built from the location alone, never
             // the catalog's endpoints or identity settings, so a catalog can't send this server's own tokens
             // anywhere but the bucket the operator named.
             // Its tokens are the client's own, which takes them again itself.
@@ -702,19 +702,19 @@ async fn locate(store: &Store, leaf: &str) -> Result<Located> {
         }
         other => Ok(Located::Never(format!(
             "the system tables are at {other}://, where the writer lease can't be kept (a local directory, gs://, \
-             s3:// or abfss:// only); set MEMSTORE_WRITER_LEASE=off if this is the catalog's only server"
+             s3:// or abfss:// only); set AMPUP_MEMORY_WRITER_LEASE=off if this is the catalog's only server"
         ))),
     }
 }
 
 /// The lease's store at `dir` reached with this server's own identity (application default credentials, the
-/// instance's or workload's), where the operator allows it: `MEMSTORE_WRITER_LEASE_IDENTITY_BUCKET` names, exactly,
+/// instance's or workload's), where the operator allows it: `AMPUP_MEMORY_WRITER_LEASE_IDENTITY_BUCKET` names, exactly,
 /// `dir`'s whole authority: a valid gs/s3 bucket name, or `<filesystem>@<account>.dfs.core.windows.net` over
 /// `abfss` (never plain-http `abfs`). None otherwise. Nothing comes from the catalog: no
 /// endpoint, region or identity-provider setting, so the server's own tokens go only to the store's own
 /// endpoint for that bucket.
 fn identity_operator(dir: &str) -> Result<Option<opendal::Operator>> {
-    let Ok(allowed) = std::env::var("MEMSTORE_WRITER_LEASE_IDENTITY_BUCKET") else {
+    let Ok(allowed) = std::env::var("AMPUP_MEMORY_WRITER_LEASE_IDENTITY_BUCKET") else {
         return Ok(None);
     };
     let allowed = allowed.trim();
@@ -743,7 +743,7 @@ fn identity_operator(dir: &str) -> Result<Option<opendal::Operator>> {
     if !ok || allowed.is_empty() || authority != allowed {
         eprintln!(
             "writer lease: not trying this server's own identity at {scheme}://{authority}: \
-             MEMSTORE_WRITER_LEASE_IDENTITY_BUCKET doesn't name exactly that (a bucket, or <filesystem>@<account>.dfs.core.windows.net over abfss)"
+             AMPUP_MEMORY_WRITER_LEASE_IDENTITY_BUCKET doesn't name exactly that (a bucket, or <filesystem>@<account>.dfs.core.windows.net over abfss)"
         );
         return Ok(None);
     }

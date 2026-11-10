@@ -1973,7 +1973,7 @@ pub async fn backfill(
     // the newest must be the schema as it stands.
     anyhow::ensure!(
         contract(store, scope).await?.is_some(),
-        "{scope}'s schema extracts nothing: give it an `extract` section (memstore schema set) to backfill"
+        "{scope}'s schema extracts nothing: give it an `extract` section (ampup-memory schema set) to backfill"
     );
     let mut schemas: HashMap<u32, Arc<Schema>> = HashMap::new();
     let versions: Vec<Contract> = schema_contracts(store, scope, MAIN)
@@ -1987,7 +1987,7 @@ pub async fn backfill(
     let g = versions[0].clone();
     if opts.max_usd.is_some() && opts.price.is_none() {
         bail!(
-            "a dollar budget needs a price (MEMSTORE_EXTRACT_PRICE=<$ per M input>,<$ per M output>)"
+            "a dollar budget needs a price (AMPUP_MEMORY_EXTRACT_PRICE=<$ per M input>,<$ per M output>)"
         );
     }
     let base = store.schema(scope, MAIN).await?;

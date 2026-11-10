@@ -241,10 +241,11 @@ async fn admin(s: &str, req: Value) -> Value {
 
 /// The `memstore` binary with its own config dir.
 fn memstore(home: &Path, args: &[&str]) -> (bool, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_memstore"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ampup-memory"))
         .args(args)
+        .env_remove("AMPUP_MEMORY_CALLER_IDENTITY")
         .env_remove("MEMSTORE_CALLER_IDENTITY")
-        .env("MEMSTORE_CONFIG_DIR", home)
+        .env("AMPUP_MEMORY_CONFIG_DIR", home)
         .output()
         .unwrap();
     (
@@ -398,22 +399,22 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     let index_dir = dir.path().join("index");
     std::fs::create_dir_all(&warehouse).unwrap();
     // The index lives under this test's directory, so its files are checked too. Set before any store.
-    unsafe { std::env::set_var("MEMSTORE_INDEX_URI", &index_dir) };
+    unsafe { std::env::set_var("AMPUP_MEMORY_INDEX_URI", &index_dir) };
     // Every audit event is also appended to this file as it is flushed (the SIEM sink).
     let sink_file = dir.path().join("audit-sink.ndjson");
     unsafe {
         std::env::set_var(
-            "MEMSTORE_AUDIT_SINK",
+            "AMPUP_MEMORY_AUDIT_SINK",
             format!("file:{}", sink_file.display()),
         )
     };
     // The server's maintenance window, held open, compacts the ledger whenever it holds more than two data files,
     // every second: the forget and the delete below race those compactions, as they would a production server's
     // in the night.
-    unsafe { std::env::set_var("MEMSTORE_MAINTAIN_SECS", "1") };
-    unsafe { std::env::set_var("MEMSTORE_MAINTAIN_WINDOW", "always") };
-    unsafe { std::env::set_var("MEMSTORE_MAINTAIN_PACE", "0") };
-    unsafe { std::env::set_var("MEMSTORE_LEDGER_COMPACT_FILES", "2") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_MAINTAIN_SECS", "1") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_MAINTAIN_WINDOW", "always") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_MAINTAIN_PACE", "0") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_LEDGER_COMPACT_FILES", "2") };
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =
         |tag: &str| -> Vec<PathBuf> { roots.iter().flat_map(|r| files_with(r, tag)).collect() };
@@ -2042,14 +2043,14 @@ async fn a_forgotten_note_leaves_its_owners_profile() {
     let model = crate::isolation::profile_model(String::new(), Default::default()).await;
     // SAFETY: this test runs in a process of its own (`own_process`), before any store or server.
     unsafe {
-        std::env::set_var("MEMSTORE_INDEX_URI", &index_dir);
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &model);
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_KEEP", "off");
+        std::env::set_var("AMPUP_MEMORY_INDEX_URI", &index_dir);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &model);
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_KEEP", "off");
         // The notes that bear on a session's task are picked by their words, never by a decisions model the
         // machine's keys would reach.
-        std::env::set_var("MEMSTORE_DECIDE", "off");
+        std::env::set_var("AMPUP_MEMORY_DECIDE", "off");
     }
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =
@@ -2294,11 +2295,11 @@ async fn a_fold_racing_a_forget_leaves_nothing_of_what_was_forgotten() {
     let model = crate::isolation::gated_profile_model((asked.clone(), gate)).await;
     // SAFETY: this test runs in a process of its own (`own_process`), before any store or server.
     unsafe {
-        std::env::set_var("MEMSTORE_INDEX_URI", &index_dir);
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &model);
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_KEEP", "off");
+        std::env::set_var("AMPUP_MEMORY_INDEX_URI", &index_dir);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &model);
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_KEEP", "off");
     }
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =

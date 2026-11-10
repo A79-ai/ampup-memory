@@ -19,7 +19,7 @@
 //! cargo test --test it rest_catalog::
 //! ```
 //!
-//! Without `MEMSTORE_TEST_REST_URI` each test prints that it was skipped and passes without running. Every
+//! Without `AMPUP_MEMORY_TEST_REST_URI` each test prints that it was skipped and passes without running. Every
 //! test makes orgs and tags of its own, so tests (and runs) share one fixture.
 
 use std::collections::HashMap;
@@ -51,18 +51,18 @@ struct Rest {
     secret: String,
     /// Where this run's search indexes go (`s3://<bucket>/index/<run>`).
     index: String,
-    /// More catalog props, `key=value;...` (`MEMSTORE_TEST_REST_PROPS`: a catalog's credential and scope).
+    /// More catalog props, `key=value;...` (`AMPUP_MEMORY_TEST_REST_PROPS`: a catalog's credential and scope).
     extra: String,
 }
 
 impl Rest {
-    /// The fixture, or None (and the test says it was skipped) without `MEMSTORE_TEST_REST_URI`. Also None
+    /// The fixture, or None (and the test says it was skipped) without `AMPUP_MEMORY_TEST_REST_URI`. Also None
     /// once the test passed in a process of its own (`crate::own_process`): this sets the index's S3 settings
     /// in the environment, which no other test may see.
     fn from_env(test: &str) -> Option<Rest> {
-        let Ok(uri) = std::env::var("MEMSTORE_TEST_REST_URI") else {
+        let Ok(uri) = std::env::var("AMPUP_MEMORY_TEST_REST_URI") else {
             eprintln!(
-                "SKIPPED {test}: MEMSTORE_TEST_REST_URI is not set. Start tests/fixtures/rest-catalog \
+                "SKIPPED {test}: AMPUP_MEMORY_TEST_REST_URI is not set. Start tests/fixtures/rest-catalog \
                  (docker compose) and `source tests/fixtures/rest-catalog/env.sh` to run it."
             );
             return None;
@@ -71,22 +71,25 @@ impl Rest {
             return None;
         }
         let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
-        let bucket = var("MEMSTORE_TEST_S3_BUCKET", "memstore");
+        let bucket = var("AMPUP_MEMORY_TEST_S3_BUCKET", "memstore");
         let rest = Rest {
             uri,
-            warehouse: var("MEMSTORE_TEST_REST_WAREHOUSE", "s3://memstore/warehouse"),
-            s3_endpoint: var("MEMSTORE_TEST_S3_ENDPOINT", "http://localhost:19000"),
+            warehouse: var(
+                "AMPUP_MEMORY_TEST_REST_WAREHOUSE",
+                "s3://memstore/warehouse",
+            ),
+            s3_endpoint: var("AMPUP_MEMORY_TEST_S3_ENDPOINT", "http://localhost:19000"),
             index: format!("s3://{bucket}/index/{}", run_id()),
             bucket,
-            key: var("MEMSTORE_TEST_S3_KEY", "admin"),
-            secret: var("MEMSTORE_TEST_S3_SECRET", "password"),
-            extra: var("MEMSTORE_TEST_REST_PROPS", ""),
+            key: var("AMPUP_MEMORY_TEST_S3_KEY", "admin"),
+            secret: var("AMPUP_MEMORY_TEST_S3_SECRET", "password"),
+            extra: var("AMPUP_MEMORY_TEST_REST_PROPS", ""),
         };
         // The search index (Lance) reads its S3 settings from the environment, in this process and in the
         // servers it starts. Set once, before any store of this process opens an index.
         static ENV: std::sync::Once = std::sync::Once::new();
         ENV.call_once(|| unsafe {
-            std::env::set_var("MEMSTORE_INDEX_URI", &rest.index);
+            std::env::set_var("AMPUP_MEMORY_INDEX_URI", &rest.index);
             std::env::set_var("AWS_ACCESS_KEY_ID", &rest.key);
             std::env::set_var("AWS_SECRET_ACCESS_KEY", &rest.secret);
             std::env::set_var("AWS_REGION", "us-east-1");
@@ -96,7 +99,7 @@ impl Rest {
         Some(rest)
     }
 
-    /// Catalog and storage props besides the address, as `MEMSTORE_REST_PROPS` takes them.
+    /// Catalog and storage props besides the address, as `AMPUP_MEMORY_REST_PROPS` takes them.
     fn storage_props(&self) -> Vec<(String, String)> {
         let mut props: Vec<(String, String)> = [
             ("s3.endpoint", self.s3_endpoint.clone()),
@@ -246,21 +249,23 @@ async fn serve(rest: &Rest, uri: &str, dir: &Path, issuer: &str) -> Server {
         .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
-    let child = Command::new(env!("CARGO_BIN_EXE_memstore"))
+    let child = Command::new(env!("CARGO_BIN_EXE_ampup-memory"))
         .args(["serve", "org", &port.to_string()])
-        .env("MEMSTORE_PLATFORM", "rest")
-        .env("MEMSTORE_REST_URI", uri)
-        .env("MEMSTORE_WAREHOUSE", &rest.warehouse)
-        .env("MEMSTORE_REST_PROPS", props.join(";"))
-        .env("MEMSTORE_CALLER_IDENTITY", "token")
-        .env("MEMSTORE_API_KEYS", keys_file(dir))
-        .env("MEMSTORE_OIDC_ISSUER", issuer)
-        .env("MEMSTORE_OIDC_AUDIENCE", CLIENT_ID)
-        .env("MEMSTORE_ALLOW_LOCAL_ISSUERS", "1")
-        .env("MEMSTORE_DIRECTORY_SNAPSHOT_EVERY", "7")
-        .env("MEMSTORE_AUDIT_FLUSH_SECS", "1")
-        .env("MEMSTORE_CONFIG_DIR", dir)
+        .env("AMPUP_MEMORY_PLATFORM", "rest")
+        .env("AMPUP_MEMORY_REST_URI", uri)
+        .env("AMPUP_MEMORY_WAREHOUSE", &rest.warehouse)
+        .env("AMPUP_MEMORY_REST_PROPS", props.join(";"))
+        .env("AMPUP_MEMORY_CALLER_IDENTITY", "token")
+        .env("AMPUP_MEMORY_API_KEYS", keys_file(dir))
+        .env("AMPUP_MEMORY_OIDC_ISSUER", issuer)
+        .env("AMPUP_MEMORY_OIDC_AUDIENCE", CLIENT_ID)
+        .env("AMPUP_MEMORY_ALLOW_LOCAL_ISSUERS", "1")
+        .env("AMPUP_MEMORY_DIRECTORY_SNAPSHOT_EVERY", "7")
+        .env("AMPUP_MEMORY_AUDIT_FLUSH_SECS", "1")
+        .env("AMPUP_MEMORY_CONFIG_DIR", dir)
+        .env_remove("AMPUP_MEMORY_DISABLED_FILE")
         .env_remove("MEMSTORE_DISABLED_FILE")
+        .env_remove("AMPUP_MEMORY_TEAM_CSV")
         .env_remove("MEMSTORE_TEAM_CSV")
         .stdin(Stdio::null())
         .stdout(out.try_clone().unwrap())

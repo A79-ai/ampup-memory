@@ -5,9 +5,9 @@
 //! The caller names the tools; the model is offered only those of [`READS`] among them, and a call of any other
 //! (one it was not offered, a write) is answered as refused, never run. Every tool runs as the caller, read-only
 //! (`Writes::No`: `get_advice` opens no session), through the same `tools/call` an agent's MCP client reaches, so
-//! its ACLs, metering and limits are those of `/mcp`. The model is the server's own (`MEMSTORE_EXTRACT`, an
+//! its ACLs, metering and limits are those of `/mcp`. The model is the server's own (`AMPUP_MEMORY_EXTRACT`, an
 //! OpenAI-compatible backend), one of [`MODELS`]; a run stops at its tool-call cap or its time budget
-//! (`MEMSTORE_AGENT_BUDGET_SECS`, default 45: under the console's 60 s proxy) with what it has.
+//! (`AMPUP_MEMORY_AGENT_BUDGET_SECS`, default 45: under the console's 60 s proxy) with what it has.
 
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -51,7 +51,7 @@ const TRACE_CHARS: usize = 4_000;
 
 static BUDGET: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(
-        std::env::var("MEMSTORE_AGENT_BUDGET_SECS")
+        std::env::var("AMPUP_MEMORY_AGENT_BUDGET_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(45),

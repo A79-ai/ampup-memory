@@ -1,7 +1,7 @@
 //! Isolation across every read path, end to end. A real `memstore serve` over HTTP on a local catalog holds
 //! two orgs, `acme` (teams `a1`, `a2`) and `globex` (team `b1`), plus the served scope, each with memories
 //! carrying a tag no other scope has. Every caller (signed-in people, org and team service keys, an ingest
-//! key, another org's writer key, the operator's `MEMSTORE_API_KEYS` key) reads through every read path
+//! key, another org's writer key, the operator's `AMPUP_MEMORY_API_KEYS` key) reads through every read path
 //! with every selection, and every answer must hold no tag from outside the scope the caller is entitled to
 //! for that selection, while an entitled caller does see their own.
 //!
@@ -12,9 +12,9 @@
 //! scope (a team key never its org's), and an ingest key reads nothing. A key or a person never falls back
 //! to the served scope; the operator's key, which is in no org, reads only the served scope.
 //!
-//! Not covered: `ask_memory` needs an answer model (`MEMSTORE_ANSWER_MODEL`, Gemini on Vertex AI) and isn't
+//! Not covered: `ask_memory` needs an answer model (`AMPUP_MEMORY_ANSWER_MODEL`, Gemini on Vertex AI) and isn't
 //! offered without one; `/whoami` exists only behind Google sign-in; the internal port's service functions
-//! (`MEMSTORE_FN_PORT`) read the served scope as the app's wrapper names the caller, with no selection.
+//! (`AMPUP_MEMORY_FN_PORT`) read the served scope as the app's wrapper names the caller, with no selection.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -236,7 +236,7 @@ enum Kind {
         team: Option<&'static str>,
         ingest: bool,
     },
-    /// The platform operator's `MEMSTORE_API_KEYS` key: in no org.
+    /// The platform operator's `AMPUP_MEMORY_API_KEYS` key: in no org.
     Operator,
 }
 
@@ -1899,8 +1899,8 @@ async fn an_agent_run_reads_only_what_its_caller_may() {
     let url = agent_model().await;
     // SAFETY: this test runs in a process of its own (`own_process`), before its server starts.
     unsafe {
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
     }
     let issuer = start_idp().await;
     let dir = tempfile::tempdir().unwrap();
@@ -2099,7 +2099,7 @@ async fn agent_model() -> String {
 /// agent's on `/mcp`, the hooks' on `/mcp/hook`); nor an agent run (`/agent/run`) for someone else that asks for it by
 /// id and by key. Carol reads hers: by a start that says what she asked, and by the first ask in a session that
 /// started with nothing asked, whose start hands none.
-/// The server has a BigQuery inbox (`MEMSTORE_INBOX_TABLE`, as a GCP deployment does): the deployment's one inbox,
+/// The server has a BigQuery inbox (`AMPUP_MEMORY_INBOX_TABLE`, as a GCP deployment does): the deployment's one inbox,
 /// drained into the default org's memory, takes the served scope's writes only. What acme's members remember goes
 /// into acme's memory, never the inbox; acme's reader key is refused a write still.
 #[tokio::test(flavor = "multi_thread")]
@@ -2112,15 +2112,15 @@ async fn a_persons_profile_reaches_no_one_else() {
     let url = profile_model(carol_doc.clone(), carol_profile.clone()).await;
     // SAFETY: this test runs in a process of its own (`own_process`), before its server starts.
     unsafe {
-        std::env::set_var("MEMSTORE_EXTRACT", "openai");
-        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
-        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
-        std::env::set_var("MEMSTORE_KEEP", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_KEEP", "off");
         // The notes that bear on a session's task are picked by their words, never by a decisions model the
         // machine's keys would reach.
-        std::env::set_var("MEMSTORE_DECIDE", "off");
+        std::env::set_var("AMPUP_MEMORY_DECIDE", "off");
         // An inbox with no project to reach: a write sent to it fails.
-        std::env::set_var("MEMSTORE_INBOX_TABLE", "project.memstore_api.inbox");
+        std::env::set_var("AMPUP_MEMORY_INBOX_TABLE", "project.memstore_api.inbox");
         std::env::remove_var("GCP_PROJECT");
     }
     let issuer = start_idp().await;

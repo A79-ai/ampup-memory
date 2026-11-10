@@ -27,7 +27,7 @@ pub const SOURCE: &str = "reconcile:";
 /// serve what it records only to readers of both its facts.
 pub const ACL: &str = "user:conflicts@memstore.invalid";
 /// The environment variable that turns conflicts on for every scope that doesn't set `conflicts` itself.
-pub const ENV: &str = "MEMSTORE_CONFLICTS";
+pub const ENV: &str = "AMPUP_MEMORY_CONFLICTS";
 
 /// How much of the other value a mark quotes.
 const VALUE_CHARS: usize = 160;
@@ -66,7 +66,7 @@ impl Conflict {
     }
 }
 
-/// Whether the environment turns conflicts on (`MEMSTORE_CONFLICTS=1`, `true` or `on`) where no setting says.
+/// Whether the environment turns conflicts on (`AMPUP_MEMORY_CONFLICTS=1`, `true` or `on`) where no setting says.
 pub fn from_env() -> bool {
     std::env::var(ENV).is_ok_and(|v| {
         matches!(
