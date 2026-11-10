@@ -2095,7 +2095,10 @@ async fn agent_model() -> String {
 /// else reads Carol's on any path: acme's admin, another member who has a profile of their own, a member of another
 /// team, another org's member, acme's reader key and the operator, by `start_session`, its episode id and its
 /// document key (`get_episode`, `/episode`, `/browse`, `/document`, including the list of documents), passage and
-/// fact search; nor an agent run (`/agent/run`) for someone else that asks for it by id and by key. Carol reads hers.
+/// fact search, nor the first ask for advice in their own session, which hands the notes that bear on its task (an
+/// agent's on `/mcp`, the hooks' on `/mcp/hook`); nor an agent run (`/agent/run`) for someone else that asks for it by
+/// id and by key. Carol reads hers: by a start that says what she asked, and by the first ask in a session that
+/// started with nothing asked, whose start hands none.
 /// The server has a BigQuery inbox (`MEMSTORE_INBOX_TABLE`, as a GCP deployment does): the deployment's one inbox,
 /// drained into the default org's memory, takes the served scope's writes only. What acme's members remember goes
 /// into acme's memory, never the inbox; acme's reader key is refused a write still.
@@ -2113,6 +2116,9 @@ async fn a_persons_profile_reaches_no_one_else() {
         std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
         std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
         std::env::set_var("MEMSTORE_KEEP", "off");
+        // The notes that bear on a session's task are picked by their words, never by a decisions model the
+        // machine's keys would reach.
+        std::env::set_var("MEMSTORE_DECIDE", "off");
         // An inbox with no project to reach: a write sent to it fails.
         std::env::set_var("MEMSTORE_INBOX_TABLE", "project.memstore_api.inbox");
         std::env::remove_var("GCP_PROJECT");
@@ -2239,9 +2245,11 @@ async fn a_persons_profile_reaches_no_one_else() {
     );
     *carol_profile.lock().unwrap() = carol_id.clone();
 
+    // What a session's start or first ask is about: the notes that bear on it are handed.
+    let task = "how should I indent this file, with spaces?";
     // Carol reads her own: by her session's start, its id and its key.
     for (tool, args) in [
-        ("start_session", json!({"harness": "test"})),
+        ("start_session", json!({"harness": "test", "context": task})),
         (
             "get_episode",
             json!({"episode_id": carol_id, "whole": true}),
@@ -2253,6 +2261,41 @@ async fn a_persons_profile_reaches_no_one_else() {
         assert_sees(&format!("carol {tool}"), &text, &["xprofcarol".to_string()]);
         assert_clean(
             &format!("carol {tool}"),
+            &text,
+            &["xprofbob".to_string()],
+            &[],
+        );
+    }
+    // A start with nothing asked hands none of her notes, and says they come with the session's first ask, which
+    // hands them (an agent's ask, and the hooks').
+    for path in ["/mcp", "/mcp/hook"] {
+        let (_, raw) = mcp_call(
+            s,
+            "?org=acme",
+            &carol,
+            "start_session",
+            json!({"harness": "test"}),
+        )
+        .await;
+        let (text, _) = tool_text(&raw);
+        assert!(
+            !text.contains("xprofcarol") && text.contains("remembered_later"),
+            "carol's context-less start: {text}"
+        );
+        let sid = serde_json::from_str::<Value>(&text).unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ask = first_ask(path, &sid, task);
+        let (_, raw) = post(&format!("{s}{path}?org=acme"), &carol, &ask).await;
+        let (text, _) = tool_text(&raw);
+        assert_sees(
+            &format!("carol's first ask on {path}"),
+            &text,
+            &["xprofcarol".to_string()],
+        );
+        assert_clean(
+            &format!("carol's first ask on {path}"),
             &text,
             &["xprofbob".to_string()],
             &[],
@@ -2283,8 +2326,31 @@ async fn a_persons_profile_reaches_no_one_else() {
     let mut checked = 0;
     for (name, bearer, sel) in &others {
         let what = |p: &str| format!("{name} {p}{sel}");
+        // Their own session's first ask (one whose start had nothing asked), an agent's and the hooks'.
+        for path in ["/mcp", "/mcp/hook"] {
+            let (_, raw) =
+                mcp_call(s, sel, bearer, "start_session", json!({"harness": "test"})).await;
+            assert_clean(&what(&format!("{path} start_session")), &raw, &foreign, &[]);
+            let started = serde_json::from_str::<Value>(&tool_text(&raw).0).ok();
+            let Some(sid) = started.as_ref().and_then(|v| v["session_id"].as_str()) else {
+                continue;
+            };
+            let (_, answer) = post(
+                &format!("{s}{path}{sel}"),
+                bearer,
+                &first_ask(path, sid, task),
+            )
+            .await;
+            assert_clean(
+                &what(&format!("{path} first get_advice")),
+                &answer,
+                &foreign,
+                &[],
+            );
+            checked += 1;
+        }
         for (tool, args) in [
-            ("start_session", json!({"harness": "test"})),
+            ("start_session", json!({"harness": "test", "context": task})),
             (
                 "get_episode",
                 json!({"episode_id": carol_id, "whole": true}),
@@ -2342,7 +2408,7 @@ async fn a_persons_profile_reaches_no_one_else() {
         "?org=acme",
         &bob,
         "start_session",
-        json!({"harness": "test"}),
+        json!({"harness": "test", "context": task}),
     )
     .await;
     assert_sees(
@@ -2370,6 +2436,17 @@ async fn a_persons_profile_reaches_no_one_else() {
         checked += 1;
     }
     eprintln!("checked {checked} responses");
+}
+
+/// A session's first ask for advice on `path`: an agent's (`/mcp`), or the hooks' (`/mcp/hook`, `remembered`).
+fn first_ask(path: &str, session_id: &str, task: &str) -> Value {
+    let mut args = json!({"session_id": session_id, "question": task});
+    if path == "/mcp/hook" {
+        args["remembered"] = json!(true);
+        args["max_chars"] = json!(7_500);
+    }
+    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+           "params": {"name": "get_advice", "arguments": args}})
 }
 
 /// A model API (OpenAI-compatible) standing in for both models the profile flow calls: a profile fold adds each note

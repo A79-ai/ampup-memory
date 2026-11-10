@@ -1588,6 +1588,9 @@ struct Asked {
     /// The procedures the session was served with no note (`Served::Procedures`), by situation: they are not
     /// recorded in the session, so the steps of a skill are ranked from here.
     procedures: Vec<(String, String)>,
+    /// Whether its start handed none of the notes its user and their team asked to be remembered (it was opened
+    /// with no context), so its first ask for advice hands the ones that bear on its task ([`owe_notes`]).
+    notes_owed: bool,
 }
 static ASKED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Asked>>> =
     std::sync::LazyLock::new(Default::default);
@@ -1617,6 +1620,7 @@ fn asked_in<R>(scope: &Scope, who: &Principal, id: &str, f: impl FnOnce(&mut Ask
         handed: Default::default(),
         count: 0,
         procedures: vec![],
+        notes_owed: false,
     });
     a.used = std::time::Instant::now();
     f(a)
@@ -1654,6 +1658,17 @@ pub fn new_at_step(scope: &Scope, who: &Principal, id: &str, question: &str) -> 
 /// Whether session `id` may be handed more advice by its hooks: it is under its cap.
 pub fn under_cap(scope: &Scope, who: &Principal, id: &str) -> bool {
     asked_in(scope, who, id, |a| a.count < MAX_HOOK_ADVICE)
+}
+
+/// Notes that session `id` started with no context, so none of its user's notes were handed: its first ask for
+/// advice hands the ones that bear on the task ([`take_notes_owed`]).
+pub fn owe_notes(scope: &Scope, who: &Principal, id: &str) {
+    asked_in(scope, who, id, |a| a.notes_owed = true);
+}
+
+/// Whether session `id`'s notes are still owed (see [`owe_notes`]), and none from here: they are handed once.
+pub fn take_notes_owed(scope: &Scope, who: &Principal, id: &str) -> bool {
+    asked_in(scope, who, id, |a| std::mem::take(&mut a.notes_owed))
 }
 
 /// Notes that `advice` was handed to session `id`'s agent: each of its lines is not handed again.

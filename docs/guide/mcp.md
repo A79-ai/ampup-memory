@@ -18,7 +18,7 @@ The default listing is the loop of a conversation:
 
 | Tool | What it does |
 |---|---|
-| `start_session {context, harness?}` | Opens a session. Answers with a `session_id`, the caller's own notes (`remembered_for_you`), what the team shares (`team_shared`) and any advice for the opening context. Listed where the memory is written. |
+| `start_session {context, harness?}` | Opens a session. Answers with a `session_id`, the caller's own notes that bear on the opening context (`remembered_for_you`), what the team shares that does (`team_shared`), within 1,200 characters, and any advice for it. With no context, no notes: the session's first `get_advice` hands the ones that bear on its task. Listed where the memory is written. |
 | `get_advice {question, session_id?, conversation_so_far?, moment?}` | The skill for this kind of task. Starts `Situation: <key>`. Listed wherever the server has a routing model. Read-only. |
 | `end_session {session_id, transcript?, outcome?, reward?, reason?}` | Closes the session with a transcript of at most 300 words and the outcome. |
 | `search_memory {query, k?, start_date?, end_date?, cursor?}` | Facts and source text about a question, as compact cited text. |

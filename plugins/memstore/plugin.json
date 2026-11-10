@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "memstore",
-  "version": "0.4.11",
+  "version": "0.4.12",
   "description": "Team memory: search what the org's conversations, calls and documents say with their sources, follow the advice learned from past sessions, see where things stand, and remember what lasts.",
   "author": { "name": "AmpUp" },
   "repository": "https://github.com/A79-ai/ampup-memory",

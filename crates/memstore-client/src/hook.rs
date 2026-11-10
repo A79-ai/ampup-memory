@@ -9,7 +9,8 @@
 //!   memstore session is opened for it (`start_session`, memstore's `sessions`).
 //! - `prompt` (UserPromptSubmit): on a session's first prompt, the facts that best match it (a long one's start
 //!   and end, the person's own words before what they pasted) are added, and the advice for it (`get_advice` in
-//!   the session).
+//!   the session) with the notes the user and their team asked to be remembered that bear on it. The start and
+//!   the first prompt add [`BUDGET`] characters at most, in all.
 //! - `pre-tool` (PreToolUse) and `post-tool` (PostToolUse, only when the result reads as an error): the event
 //!   goes to `get_advice` in the session, which answers from the note the session was served: an `inform` is
 //!   added to Claude's context, a `block` refuses the call with its reason (served only where the server has
@@ -55,6 +56,21 @@ const HEAD: usize = 10_000;
 /// Results added to a session's context, and the most characters they take.
 const RECALL: usize = 8;
 const RECALL_CHARS: usize = 4000;
+/// What the hooks add to a session's context at its start and its first prompt, in all: 11,000 characters, about
+/// 2,750 tokens. The repo's facts at the start ([`START_FACTS`]), then the first prompt's, which one hook hands on
+/// ([`CONTEXT_CHARS`]): its advice ([`MAX_ADVICE`]), the notes that bear on its task ([`NOTES`]), the session's line
+/// and the leads ([`LEADS`]), and the facts that match it in what is left. Context added to a session is read in
+/// every turn of it, and a line that doesn't bear on the task is one more to weigh.
+const BUDGET: usize = START_FACTS + CONTEXT_CHARS;
+/// Of [`BUDGET`], the repo's facts at a session's start: they come before the task is known, so they get a small
+/// share (about four facts).
+const START_FACTS: usize = 1_500;
+/// The session's line and the leads of the notes and the advice handed with the first prompt.
+const LEADS: usize = 800;
+/// The notes that bear on the first prompt's task, beside its advice: the server hands them within as many.
+const NOTES: usize = 1_200;
+// The first prompt's advice, notes and leads are handed on by one hook.
+const _: () = assert!(MAX_ADVICE + NOTES + LEADS <= CONTEXT_CHARS);
 /// The most of a prompt its recall searches for ([`query_of`]), and of that its end's share. A whole first prompt
 /// (an eval's instructions and the rows it pasted, a pasted spec, log or meeting) was searched for everything in
 /// it at once: hundreds of keyword terms, seconds a list on a large memory, and one vector for all of it. Four in
@@ -67,8 +83,8 @@ const EVERY: usize = 5;
 /// what advice learning reads.
 const MAX_TRACE: usize = 19_000;
 const TRACE_HEAD: usize = 5_000;
-/// Longest advice added to a session's context: Claude Code takes at most 10,000 characters of added context,
-/// and the recalled facts follow it.
+/// Longest advice added to a session's context (`max_chars`), the first prompt's too: Claude Code takes at most
+/// 10,000 characters a hook, and the notes that bear on the task ([`NOTES`]) and the facts follow it.
 const MAX_ADVICE: usize = 7_500;
 /// Set on the copy of a session-end hook that runs on after the hook itself returned.
 const DETACHED: &str = "MEMSTORE_HOOK_DETACHED";
@@ -913,7 +929,11 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             let mut parts = vec![];
             if event == "session-start" {
                 parts.push(continued(&input));
-                parts.push(git_repo(&input).and_then(|r| claim_or_read("recall", &r, false)));
+                parts.push(
+                    git_repo(&input)
+                        .and_then(|r| claim_or_read("recall", &r, false))
+                        .and_then(|t| within(&t, START_FACTS)),
+                );
             }
             if event == "prompt" {
                 parts.push(opened_line(&input));
@@ -1023,7 +1043,7 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
                 continue_or_open(&client, &input, harness),
                 async {
                     match &repo {
-                        Some(r) => recall(&client, r, &about).await,
+                        Some(r) => recall(&client, r, &about, START_FACTS).await,
                         None => Ok(None),
                     }
                 },
@@ -1071,7 +1091,15 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             let (advised, recalled) =
                 tokio::join!(advise(&client, &input, harness, prompt), async {
                     match recall_now {
-                        true => recall(&client, &query_of(prompt), "that may bear on this").await,
+                        true => {
+                            recall(
+                                &client,
+                                &query_of(prompt),
+                                "that may bear on this",
+                                RECALL_CHARS,
+                            )
+                            .await
+                        }
                         false => Ok(None),
                     }
                 });
@@ -1079,6 +1107,10 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
                 warn(format!("no advice: {e:#}"));
                 None
             });
+            // The first prompt's facts get what the advice and the notes left of the hook's (and the line between).
+            let left = (BUDGET - START_FACTS)
+                .saturating_sub(advised.as_deref().map_or(0, |a| a.chars().count() + 1));
+            let recalled = recalled.map(|r| r.and_then(|t| within(&t, left)));
             say(
                 harness,
                 &input,
@@ -2026,7 +2058,7 @@ async fn open_session(
         .context("start_session answered no session_id")?;
     // What the user asked to be remembered, and what the team shares: the agent never calls start_session under
     // the hooks, so this is the only way it reads them.
-    let remembered = remembered_block(&v);
+    let remembered = remembered_block(&v, NOTES);
     // Opened in a copy (a session's start, which waits for recall alone), no one reads this context: the first
     // prompt that finds the session hands them on ([`advise`]). Kept before the session's id, which it looks for.
     let apart = std::env::var_os(DETACHED).is_some();
@@ -2056,9 +2088,11 @@ async fn open_session(
 }
 
 /// What the user and their team asked to be remembered, from an answer's `remembered_for_you` and `team_shared`,
-/// as context (empty when it holds neither).
-fn remembered_block(v: &Value) -> String {
+/// as context (empty when it holds neither), in `room` characters: the user's own first, newest first, then the
+/// team's, while they fit (the server fits them already; an older one didn't).
+fn remembered_block(v: &Value, room: usize) -> String {
     let mut out = String::new();
+    let mut left = room;
     for (key, lead) in [
         ("remembered_for_you", "What this user told you before"),
         ("team_shared", "What the team shares"),
@@ -2071,6 +2105,14 @@ fn remembered_block(v: &Value) -> String {
                     .filter_map(Value::as_str)
                     .map(|n| n.split_whitespace().collect::<Vec<_>>().join(" "))
                     .filter(|n| !n.is_empty())
+                    .filter(|n| {
+                        let cost = n.chars().count() + 3;
+                        let fits = cost <= left;
+                        if fits {
+                            left -= cost;
+                        }
+                        fits
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -2165,7 +2207,7 @@ async fn advise(
         Ok(t) => match serde_json::from_str::<Value>(&t) {
             Ok(v) if v["text"].is_string() => (
                 Ok(v["text"].as_str().unwrap_or_default().to_string()),
-                Some(remembered_block(&v)),
+                Some(remembered_block(&v, NOTES)),
             ),
             _ => (Ok(t), None),
         },
@@ -2774,15 +2816,15 @@ fn query_of(prompt: &str) -> String {
     shorten_to(&words.join(" "), QUERY_CHARS, QUERY_CHARS - QUERY_TAIL)
 }
 
-/// The results best matching `query`, as context.
-async fn recall(client: &Client, query: &str, what: &str) -> Result<Option<String>> {
+/// The results best matching `query`, as context, in at most `max` characters.
+async fn recall(client: &Client, query: &str, what: &str, max: usize) -> Result<Option<String>> {
     // Facts as JSON, never the compact text: that quotes what others wrote, and a hook's context goes into
     // every prompt unasked. The facts alone, or {hits, passages, note}; a server that answers something else
     // (an error) adds nothing.
     let text = client
         .tool(
             "search_memory",
-            json!({"query": query, "k": RECALL, "max_chars": RECALL_CHARS, "format": "json"}),
+            json!({"query": query, "k": RECALL, "max_chars": max.max(1_000), "format": "json"}),
         )
         .await?;
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
@@ -2829,7 +2871,27 @@ async fn recall(client: &Client, query: &str, what: &str) -> Result<Option<Strin
             json!(one_line(&s("source"), 80))
         ));
     }
-    Ok(Some(context))
+    Ok(within(&context, max))
+}
+
+/// `text` (recalled facts: a lead line, then one line a fact, the facts it brings indented under it) in at most
+/// `max` characters, by whole lines from its start; none when no fact fits. A section's heading with nothing
+/// under it goes too.
+fn within(text: &str, max: usize) -> Option<String> {
+    let mut out: Vec<&str> = vec![];
+    let mut used = 0;
+    for line in text.lines() {
+        let cost = line.chars().count() + 1;
+        if used + cost > max {
+            break;
+        }
+        used += cost;
+        out.push(line);
+    }
+    if out.last().is_some_and(|l| !l.starts_with(['-', ' '])) {
+        out.pop();
+    }
+    (out.len() > 1).then(|| format!("{}\n", out.join("\n")))
 }
 
 /// Remember the session, when it has at least `new` prompts it hadn't when it was last remembered.

@@ -958,6 +958,9 @@ async fn the_nightly_window_purges_the_profile_versions_naming_what_it_purges() 
         std::env::set_var("MEMSTORE_EXTRACT_URL", &model);
         std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
         std::env::set_var("MEMSTORE_KEEP", "off");
+        // The notes that bear on a session's task are picked by their words, never by a decisions model the
+        // machine's keys would reach.
+        std::env::set_var("MEMSTORE_DECIDE", "off");
     }
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =
@@ -1108,11 +1111,21 @@ async fn the_nightly_window_purges_the_profile_versions_naming_what_it_purges() 
         .retract_episodes(&acme, "connector", &AclTarget::Episode(deleted.clone()))
         .await
         .unwrap();
-    // What she is handed holds neither once the server reads past them (its snapshot is up to a second old); the
-    // profile is folded again without them.
+    // What she is handed holds neither once the server reads past them (its snapshot is up to a second old): by a
+    // start with what she asked, and by the first ask of a session whose start had nothing asked. The profile is
+    // folded again without them.
+    let task = "how should I indent this file, with spaces?";
     let t = Instant::now();
     loop {
-        let handed = tool("start_session", json!({"harness": "test"})).await;
+        let handed = tool("start_session", json!({"harness": "test", "context": task})).await;
+        let started = tool("start_session", json!({"harness": "test"})).await;
+        let sid = serde_json::from_str::<Value>(&started).unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let asked = tool("get_advice", json!({"session_id": sid, "question": task})).await;
+        assert!(asked.contains("xprofkeepzero"), "{asked}");
+        let handed = format!("{handed}\n{asked}");
         assert!(handed.contains("xprofkeepzero"), "{handed}");
         if !handed.contains("xprofagednote") && !handed.contains("xprofdeletednote") {
             break;

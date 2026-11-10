@@ -2047,6 +2047,9 @@ async fn a_forgotten_note_leaves_its_owners_profile() {
         std::env::set_var("MEMSTORE_EXTRACT_URL", &model);
         std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
         std::env::set_var("MEMSTORE_KEEP", "off");
+        // The notes that bear on a session's task are picked by their words, never by a decisions model the
+        // machine's keys would reach.
+        std::env::set_var("MEMSTORE_DECIDE", "off");
     }
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =
@@ -2195,7 +2198,29 @@ async fn a_forgotten_note_leaves_its_owners_profile() {
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let handed = tool(&carol, "start_session", json!({"harness": "test"})).await;
+    // What a session's start hands, with what she asked, and its first ask, after a start with nothing asked.
+    let task = "how should I indent this file, with spaces?";
+    let handed = tool(
+        &carol,
+        "start_session",
+        json!({"harness": "test", "context": task}),
+    )
+    .await;
+    assert!(
+        !handed.contains("xpfoldtwo") && handed.contains("xpfoldzero"),
+        "{handed}"
+    );
+    let started = tool(&carol, "start_session", json!({"harness": "test"})).await;
+    let sid = serde_json::from_str::<Value>(&started).unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let handed = tool(
+        &carol,
+        "get_advice",
+        json!({"session_id": sid, "question": task}),
+    )
+    .await;
     assert!(
         !handed.contains("xpfoldtwo") && handed.contains("xpfoldzero"),
         "{handed}"
