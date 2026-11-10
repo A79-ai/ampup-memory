@@ -164,7 +164,8 @@ request is accepted (its CLA and CI checks green, and reviewed):
 
 1. A maintainer brings it into the internal repository as one commit, with you as its author and a
    `Co-authored-by` line for every author of your pull request's commits.
-2. The next sync publishes it to `main` here, as a commit by the sync's bot.
+2. The next sync publishes it to `main` here, as a commit by the sync's bot that keeps your `Co-authored-by` line,
+   so GitHub credits you on it.
 3. The maintainer closes your pull request with a link to that commit.
 
 Your pull request shows as closed rather than merged: that is how every accepted change lands here. A pull
