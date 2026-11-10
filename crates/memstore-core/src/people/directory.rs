@@ -79,6 +79,9 @@ pub const MAX_PENDING: usize = 100;
 const MAX_READS: usize = 8;
 /// The most sources one compile round may take (`Settings::compile_batch`).
 const MAX_COMPILE_BATCH: usize = 100;
+/// The most rewarded runs `advice_personal_runs` may name: the server's own bar for a person's first map
+/// (`MEMSTORE_ADVICE_MIN_NEW`) is 10 by default, and the setting only ever lowers bars.
+const MAX_PERSONAL_RUNS: usize = 10;
 /// What a scope's compile sources may be said to be (`Settings::compile_kind`); `""` unsets it.
 pub const COMPILE_KINDS: &[&str] = &["", "errors"];
 /// How advice routes over a scope's compiled skills (`Settings::advice_skills`); `""` unsets it.
@@ -862,6 +865,15 @@ pub struct Settings {
     /// learned from that person alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice_learn_people: Option<usize>,
+    /// The rewarded runs or sessions each person's own advice waits for in the scope (`crate::advice_loop`), where
+    /// that is fewer than the server's bars: a person's map is learned once they have this many new ones (instead
+    /// of `MEMSTORE_ADVICE_MIN_NEW`, 10), a situation of theirs gets a note at this many runs (instead of 2 that
+    /// went wrong or 4 that went right), and their note is written again after this many new runs (instead of
+    /// `MEMSTORE_ADVICE_NOTE_MIN_NEW`, 5, or 2 wrong); and it is learned right after a session of theirs ends
+    /// rewarded, instead of at the advice timer's next round. A bar already lower stays. The team's notes are
+    /// untouched. 1 to 10; 0 unsets it, back to the org's (or the server's `MEMSTORE_ADVICE_PERSONAL_RUNS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advice_personal_runs: Option<usize>,
     /// How advice routes over the skills compiled from the scope's documents (`crate::advice`): `fallback` (the
     /// default) weighs the kinds of task learned from runs first, every one of them, and the compiled skills only
     /// when none fits; `together` weighs both on one list, as advice did before; `off` never serves a compiled
@@ -1019,6 +1031,7 @@ impl Settings {
             && self.advice_procedures.is_none()
             && self.advice_evidence.is_none()
             && self.advice_learn_people.is_none()
+            && self.advice_personal_runs.is_none()
             && self.advice_skills.is_none()
             && self.advice_learn_exclude.is_none()
             && self.error_leads.is_none()
@@ -1082,6 +1095,9 @@ impl Settings {
         }
         if other.advice_learn_people.is_some() {
             self.advice_learn_people = other.advice_learn_people;
+        }
+        if other.advice_personal_runs.is_some() {
+            self.advice_personal_runs = other.advice_personal_runs;
         }
         if other.advice_skills.is_some() {
             self.advice_skills = other.advice_skills.clone();
@@ -2177,6 +2193,18 @@ impl Directory {
             .or(org.settings.advice_learn_people)
     }
 
+    /// The rewarded runs each person's own advice waits for in `scope` (`Settings::advice_personal_runs`): its
+    /// team's setting, else its org's (0 is unset), else `default` (the server's `MEMSTORE_ADVICE_PERSONAL_RUNS`),
+    /// which a scope the directory doesn't hold also gets. None: the server's own bars.
+    pub fn advice_personal_runs(
+        &self,
+        scope: &crate::Scope,
+        default: Option<usize>,
+    ) -> Option<usize> {
+        self.team_or_org(scope, |s| s.advice_personal_runs.filter(|n| *n > 0))
+            .or(default)
+    }
+
     /// The accounts whose runs teach `scope`'s team notes nothing (`Settings::advice_learn_exclude`), as ACL ids:
     /// its team's list, else its org's; none where neither sets one (an empty list is unset), or in a scope the
     /// directory doesn't hold.
@@ -2758,6 +2786,7 @@ impl Change {
                     && settings.advice_procedures.is_none()
                     && settings.advice_evidence.is_none()
                     && settings.advice_learn_people.is_none()
+                    && settings.advice_personal_runs.is_none()
                     && settings.advice_skills.is_none()
                     && settings.advice_learn_exclude.is_none()
                     && settings.extract.is_none()
@@ -3343,7 +3372,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             if settings.is_empty() {
                 refuse!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>, \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             if let Some(sources) = &settings.compile_sources {
@@ -3376,6 +3405,14 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             {
                 refuse!(
                     "compile_batch is at most {MAX_COMPILE_BATCH} sources a round (0 unsets it)"
+                );
+            }
+            if settings
+                .advice_personal_runs
+                .is_some_and(|n| n > MAX_PERSONAL_RUNS)
+            {
+                refuse!(
+                    "advice_personal_runs is at most {MAX_PERSONAL_RUNS} rewarded runs (0 unsets it): it only lowers the bars a person's own advice waits for"
                 );
             }
             if let Some(k) = &settings.advice_skills

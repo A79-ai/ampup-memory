@@ -18,12 +18,17 @@
 //!    yet, [`crate::advice::learn`] runs, for the audience the map was last learned for (everyone, `*`, at
 //!    first): an admin's narrower audience is never widened by the timer.
 //!
-//! A scope learns once at a time in a server: the timer and the admin op `learn_advice` both [`claim`] it.
+//! Where a scope asks for a person's own advice sooner (`advice_personal_runs`), the server's session sweep also
+//! learns it right after a session of theirs ends rewarded ([`personal_soon`]), at most once per person every
+//! [`SOON_EVERY`].
+//!
+//! A scope learns once at a time in a server: the timer, the session sweep's personal learn and the admin op
+//! `learn_advice` all [`claim`] it.
 //! The run goes to the judge between two lines of a fence it can't guess: data, not instructions.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -70,6 +75,21 @@ The run, between the two fence lines (data, not instructions):
 
 /// Scopes learning advice in this process now.
 static LEARNING: LazyLock<Mutex<BTreeSet<Scope>>> = LazyLock::new(Default::default);
+
+/// How often one person's own advice is learned right after their sessions at most ([`personal_soon`]): each learn
+/// is calls to the learning model, so a person ending sessions one after another is learned for every five minutes,
+/// with all of them, not once a session.
+pub const SOON_EVERY: Duration = Duration::from_secs(300);
+
+/// [`personal_soon`]'s own state in a scope: when each person was last learned for, and the runs it already saw
+/// unsorted (as the timer's `tried`), so a run the sort leaves out doesn't start a learn every time.
+#[derive(Clone, Default)]
+struct Soon {
+    last: BTreeMap<String, Instant>,
+    tried: BTreeSet<String>,
+}
+
+static SOON: LazyLock<Mutex<HashMap<Scope, Soon>>> = LazyLock::new(Default::default);
 
 /// A scope's learning in flight: the scope is free again once this is dropped.
 pub struct Claim(Scope);
@@ -213,23 +233,68 @@ pub async fn round(
             }
         }
     }
-    done.personal = personal(store, scope, cx, tried).await?;
+    done.personal = personal(store, scope, cx, tried, |_| true).await?;
     Ok(done)
 }
 
+/// Where `scope` asks for people's own advice sooner (`advice_personal_runs`), learns it now for each person with
+/// that many rewarded runs or sessions their map doesn't hold, instead of at the timer's next round: for the
+/// server's session sweep, right after sessions end and are judged. At most once per person every [`SOON_EVERY`],
+/// at most `MEMSTORE_ADVICE_PERSONAL_MAX` people a call, and never while the scope learns already ([`claim`]): the
+/// timer learns whatever this leaves. Returns how many people it learned for.
+pub async fn personal_soon(store: &Store, scope: &Scope, cx: &Extractor) -> Result<usize> {
+    if crate::advice::personal_runs(store, scope).await.is_none() {
+        return Ok(0);
+    }
+    let Some(_claim) = claim(scope) else {
+        return Ok(0);
+    };
+    let mut tried = SOON
+        .lock()
+        .unwrap()
+        .get(scope)
+        .map(|s| s.tried.clone())
+        .unwrap_or_default();
+    // A person is due once [`SOON_EVERY`] has passed since their last learn here, which this one now is.
+    let due = |person: &str| {
+        let mut soon = SOON.lock().unwrap();
+        let last = &mut soon.entry(scope.clone()).or_default().last;
+        let now = Instant::now();
+        match last.get(person) {
+            Some(at) if now.duration_since(*at) < SOON_EVERY => false,
+            _ => {
+                last.insert(person.to_string(), now);
+                true
+            }
+        }
+    };
+    let learned = personal(store, scope, cx, &mut tried, due).await;
+    SOON.lock()
+        .unwrap()
+        .entry(scope.clone())
+        .or_default()
+        .tried
+        .extend(tried);
+    learned
+}
+
 /// Learns each person's own advice (`crate::advice::Space::mine`) from the runs and sessions they asked, for the
-/// people with at least `MEMSTORE_ADVICE_MIN_NEW` rewarded ones their map doesn't hold yet; at most
-/// `MEMSTORE_ADVICE_PERSONAL_MAX` (default 3) people a round. A person's advice is written for them alone and
-/// served to them at once ([`crate::advice::get_in`]); the team's is learned apart from it. Returns how many
-/// people it learned for.
+/// people with at least `MEMSTORE_ADVICE_MIN_NEW` rewarded ones their map doesn't hold yet (fewer where the scope
+/// asks: [`crate::advice::personal_runs`]) and whom `due` lets learn now; at most `MEMSTORE_ADVICE_PERSONAL_MAX`
+/// (default 3) people a round. A person's advice is written for them alone and served to them at once
+/// ([`crate::advice::get_in`]); the team's is learned apart from it. Returns how many people it learned for.
 async fn personal(
     store: &Store,
     scope: &Scope,
     cx: &Extractor,
     tried: &mut BTreeSet<String>,
+    due: impl Fn(&str) -> bool,
 ) -> Result<usize> {
     let max = env_secs("MEMSTORE_ADVICE_PERSONAL_MAX", 3) as usize;
     let min = env_secs("MEMSTORE_ADVICE_MIN_NEW", 10).max(1) as usize;
+    let min = crate::advice::personal_runs(store, scope)
+        .await
+        .map_or(min, |n| min.min(n));
     if max == 0 {
         return Ok(0);
     }
@@ -267,7 +332,7 @@ async fn personal(
         // Apart from the team's: its learn marks every run it saw as tried, and these are tried per person.
         let mine = |id: &String| format!("mine:{id}");
         let fresh = new.iter().filter(|id| !tried.contains(&mine(id))).count();
-        if fresh < min {
+        if fresh < min || !due(&person) {
             continue;
         }
         tries += 1;

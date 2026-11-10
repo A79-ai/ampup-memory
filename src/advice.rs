@@ -789,11 +789,38 @@ fn min_right() -> usize {
 }
 
 /// Whether a written note is rewritten now: its procedures changed, or it has enough new backed runs or new backed
-/// wrong runs since it was last written. Runs only a model read never call for one ([`judged`]).
-fn rewrite(was: &Written, backed: usize, backed_wrong: usize, context: &str) -> bool {
+/// wrong runs since it was last written. Runs only a model read never call for one ([`judged`]). `sooner`: a
+/// person's own note where their scope asks for fewer ([`personal_runs`]), which lowers both bars to it.
+fn rewrite(
+    was: &Written,
+    backed: usize,
+    backed_wrong: usize,
+    context: &str,
+    sooner: Option<usize>,
+) -> bool {
+    let bar = |b: usize| sooner.map_or(b, |n| b.min(n));
     was.context != context
-        || backed >= was.backed + note_min_new()
-        || backed_wrong >= was.backed_wrong + NOTE_MIN_WRONG
+        || backed >= was.backed + bar(note_min_new())
+        || backed_wrong >= was.backed_wrong + bar(NOTE_MIN_WRONG)
+}
+
+/// The rewarded runs or sessions a person's own advice waits for in `scope`, where it asks for fewer than the
+/// server's bars (`advice_personal_runs`, a team's over its org's, else the server's
+/// `MEMSTORE_ADVICE_PERSONAL_RUNS`): their map once they have that many new ones, a note at that many runs, and a
+/// note written again after that many new ones, each bar lowered to it, never raised. None where neither says.
+pub async fn personal_runs(store: &Store, scope: &Scope) -> Option<usize> {
+    match store.directory().await {
+        Ok(d) => d.dir.advice_personal_runs(scope, personal_runs_from_env()),
+        Err(_) => personal_runs_from_env(),
+    }
+}
+
+/// The server's `MEMSTORE_ADVICE_PERSONAL_RUNS`, where no team or org setting says ([`personal_runs`]).
+pub fn personal_runs_from_env() -> Option<usize> {
+    std::env::var("MEMSTORE_ADVICE_PERSONAL_RUNS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|n| *n > 0)
 }
 
 /// Why a team situation's runs don't back a note, if they don't: a note rests on a failure an outcome or a person
@@ -3707,9 +3734,16 @@ async fn learn_space(
     let idle_days = edit_idle_days();
     // The notes served or routed to lately ([`used_since`]), read only once a note is found to need an update.
     let mut used: Option<BTreeSet<String>> = None;
+    // A person's own notes, where the scope asks for them sooner ([`personal_runs`]): a note at that many of their
+    // runs, whichever way they went (so one may rest on a single run), written again after that many new ones.
+    let sooner = match space.owner {
+        Some(_) => personal_runs(store, scope).await,
+        None => None,
+    };
+    let bar = |b: usize| sooner.map_or(b, |n| b.min(n));
     for ((c, s), rs) in &groups {
         let wrong = rs.iter().filter(|r| !r.right).count();
-        if wrong < min_wrong.max(1) && rs.len() - wrong < min_right() {
+        if wrong < bar(min_wrong.max(1)) && rs.len() - wrong < bar(min_right()) {
             done.too_few += 1;
             continue;
         }
@@ -3793,7 +3827,7 @@ async fn learn_space(
             Some(_) => (rs.len(), wrong),
         };
         if let Some(was) = map.written.get(&k)
-            && !rewrite(was, backed, backed_wrong, &context)
+            && !rewrite(was, backed, backed_wrong, &context, sooner)
             && !rewriting
         {
             done.waiting += 1;

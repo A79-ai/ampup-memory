@@ -723,6 +723,15 @@ pub async fn serve_with(
             eprintln!("sessions aren't judged: {e:#}");
             None
         });
+        // Where a scope asks for people's own advice sooner (`advice_personal_runs`), it is learned right after
+        // their sessions end rewarded (`crate::advice_loop::personal_soon`), on the learning model.
+        let learn = match crate::advice_loop::enabled() {
+            true => crate::extract::Extractor::advice_from_env().unwrap_or_else(|e| {
+                eprintln!("people's own advice isn't learned after their sessions: {e:#}");
+                None
+            }),
+            false => None,
+        };
         let bg = st.clone();
         bg.background(async move {
             let mut walk = ScopeWalk::default();
@@ -763,6 +772,28 @@ pub async fn serve_with(
                     // People's profiles due a fold: a day since the last, or a note it cites gone.
                     if let Err(e) = crate::profile::sweep(&store, &scope, st.fixed()).await {
                         eprintln!("profile {scope}: {e:#}");
+                    }
+                    // People's own advice, right after their sessions, where the scope learns advice and asks for
+                    // it sooner: in the background, so the sweep never waits on the learning model.
+                    let env = crate::advice::personal_runs_from_env();
+                    let sooner = match &dir {
+                        Some(d) => d.advice_personal_runs(&scope, env),
+                        None => env,
+                    };
+                    if let Some(cx) = learn.as_ref().filter(|_| sooner.is_some())
+                        && ((st.fixed() && scope == st.scope)
+                            || dir.as_ref().is_some_and(|d| d.learns_advice(&scope)))
+                    {
+                        let (store, scope, cx) = (store.clone(), scope.clone(), cx.clone());
+                        st.background(async move {
+                            match crate::advice_loop::personal_soon(&store, &scope, &cx).await {
+                                Ok(0) => {}
+                                Ok(n) => eprintln!(
+                                    "advice {scope}: learned {n} people's own advice after their sessions"
+                                ),
+                                Err(e) => eprintln!("advice {scope}: own advice after sessions: {e:#}"),
+                            }
+                        });
                     }
                 }
             }

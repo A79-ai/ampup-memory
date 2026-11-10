@@ -274,6 +274,12 @@ pub enum OrgCmd {
         /// MEMSTORE_ADVICE_LEARN_PEOPLE, else 3; never below 2)
         #[arg(long)]
         advice_learn_people: Option<usize>,
+        /// The rewarded runs or sessions each person's own advice waits for, where fewer than the server's bars:
+        /// their map after this many new ones, a note at this many runs, rewritten after this many new ones, and
+        /// learned right after their session ends rewarded (1 to 10; 0 unsets it; default: the server's
+        /// MEMSTORE_ADVICE_PERSONAL_RUNS, unset)
+        #[arg(long)]
+        advice_personal_runs: Option<usize>,
         /// How advice routes over the skills compiled from documents: fallback (default: only where no kind of
         /// task learned from runs fits), together (both on one list) or off ("" unsets it)
         #[arg(long)]
@@ -1134,6 +1140,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             advice_procedures,
             advice_evidence,
             advice_learn_people,
+            advice_personal_runs,
             advice_skills,
             advice_learn_exclude,
             error_leads,
@@ -1169,6 +1176,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 advice_procedures: *advice_procedures,
                 advice_evidence: *advice_evidence,
                 advice_learn_people: *advice_learn_people,
+                advice_personal_runs: *advice_personal_runs,
                 advice_skills: advice_skills.clone(),
                 advice_learn_exclude: advice_learn_exclude.as_deref().map(|r| {
                     r.split(',')
