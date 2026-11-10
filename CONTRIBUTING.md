@@ -3,9 +3,39 @@
 Thanks for helping. This file covers building, testing and sending a change. For what AmpUp Memory is and how to
 run it, start with the [README](README.md).
 
-By contributing you agree that your contribution is licensed under the [Apache License 2.0](LICENSE), the
-project's license (section 5 of the license). Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report
-security issues privately, as [SECURITY.md](SECURITY.md) describes, never in a public issue.
+AmpUp Memory is licensed under the [Apache License 2.0](LICENSE). Before we can accept a contribution, each of its
+authors signs our [Contributor License Agreement](#contributor-license-agreement), once. Please follow the
+[Code of Conduct](CODE_OF_CONDUCT.md). Report security issues privately, as [SECURITY.md](SECURITY.md) describes,
+never in a public issue.
+
+## Contributor License Agreement
+
+AmpUp Memory is developed by A79, Inc., the company behind AmpUp. Every author of the commits in a pull request
+signs the [Individual Contributor License Agreement](CLA.md) (CLA), adapted from the Apache Software Foundation's.
+You keep the copyright in your work: the CLA doesn't assign it, it licenses it (and any patent claims your
+contribution needs) to A79, Inc. and to everyone who receives the software it distributes, and it states that the
+work is yours to license.
+
+- **How to sign.** When you open a pull request, the CLA bot checks its commits' authors. If one hasn't signed, it
+  comments with a link to the CLA; each of them signs by posting this comment on the pull request, from their own
+  GitHub account:
+
+  > I have read the CLA Document and I hereby sign the CLA
+
+  The pull request's **CLA** check then turns green, with no new push needed (comment `recheck` if it doesn't).
+  A signature covers all your future contributions, so you sign once. The bot records it (your GitHub username
+  and account id, the pull request and the date) in `signatures/v1/cla.json` on this repository's
+  `cla-signatures` branch.
+- **Commits must be linked to your account.** The bot matches each commit to a GitHub account by its email, so
+  commit with an address [added to your GitHub account](https://docs.github.com/articles/adding-an-email-address-to-your-github-account)
+  (or your `users.noreply.github.com` address).
+- **Contributing for your employer.** If your employer has rights in what you write, as many employment agreements
+  give it, it must agree to your contributing. One way is the
+  [Corporate Contributor License Agreement](CLA-CORPORATE.md), signed by someone who can sign for the company and
+  listing the employees it covers. To sign it, open an issue asking for the Corporate CLA (don't post the signed
+  agreement or anyone's contact details there) and a maintainer will reply with how to send it privately. Its
+  employees still sign the individual CLA on their first pull request.
+- **If the CLA changes,** it gets a new version and a new signatures file, and contributors sign again.
 
 ## What you need
 
@@ -125,6 +155,21 @@ CI fails on any formatting difference or clippy warning.
 - CI (`.github/workflows/ci.yml`) runs fmt, clippy and the test suite on GitHub-hosted runners, with no secrets.
   It must pass before a maintainer merges.
 - Open an issue first for a large change or a new feature, so we can agree on the approach before you build it.
+
+### How an accepted pull request lands
+
+This repository's `main` is generated from AmpUp's internal repository, which it mirrors on every change there: a
+commit to `main` here would be overwritten by the next sync, so nothing is merged here directly. When your pull
+request is accepted (its CLA and CI checks green, and reviewed):
+
+1. A maintainer brings it into the internal repository as one commit, with you as its author and a
+   `Co-authored-by` line for every author of your pull request's commits.
+2. The next sync publishes it to `main` here, as a commit by the sync's bot.
+3. The maintainer closes your pull request with a link to that commit.
+
+Your pull request shows as closed rather than merged: that is how every accepted change lands here. A pull
+request that touches files whose public version is generated (the workflows, the README, `install.sh` among them)
+is carried over by hand, so it may land as a slightly different change; the maintainer says so on it.
 
 ## Releases
 

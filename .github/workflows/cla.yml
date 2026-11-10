@@ -1,0 +1,65 @@
+name: CLA
+
+# Contributors sign the Contributor License Agreement (CLA.md; CLA-CORPORATE.md for an entity) once, by commenting
+# on their pull request:
+#
+#   I have read the CLA Document and I hereby sign the CLA
+#
+# The CLA Assistant action (contributor-assistant/github-action) checks every commit author of a pull request
+# against the signatures, comments on the pull request until they have all signed, and records each signature in
+# signatures/v1/cla.json on the cla-signatures branch of this repository (never on main, which the sync rewrites).
+# The job's check is "CLA": a pull request can be accepted only with it green. A signature by comment re-runs the
+# pull request's last failed check, so it turns green without a new push.
+#
+# pull_request_target runs this file as it is on main, with a token that can write, and never checks out or runs
+# the pull request's code. Maintainers and bots don't sign: the CLA_ALLOWLIST secret holds the maintainers' GitHub
+# usernames, comma-separated (a secret, so the list stays out of the public logs).
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, closed]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  cla:
+    name: CLA
+    # A pull request's events, and a comment on a pull request that signs or asks for a recheck.
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event.issue.pull_request &&
+       (github.event.comment.body == 'recheck' ||
+        contains(github.event.comment.body, 'I have read the CLA Document and I hereby sign the CLA')))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # One run per pull request at a time, so its runs never race to write the signatures file.
+    concurrency:
+      group: cla-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+    # What the action's documentation asks for: to write the signatures file (contents), comment on and lock the
+    # pull request (pull-requests), re-run the failed check after a signature (actions), and statuses.
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-document: https://github.com/${{ github.repository }}/blob/main/CLA.md
+          path-to-signatures: signatures/v1/cla.json
+          branch: cla-signatures
+          allowlist: github-actions[bot],dependabot[bot],${{ secrets.CLA_ALLOWLIST }}
+          signed-commit-message: "$contributorName signed the CLA in $owner/$repo"
+          custom-notsigned-prcomment: >-
+            Thank you for your contribution. Before we can accept it, we ask that $you sign our
+            [Contributor License Agreement](https://github.com/${{ github.repository }}/blob/main/CLA.md): you keep
+            the copyright in your work and license it to A79, Inc., the company behind AmpUp, and to everyone who
+            receives the software. If you contribute for your employer, it may need to sign the
+            [Corporate CLA](https://github.com/${{ github.repository }}/blob/main/CLA-CORPORATE.md) too
+            ([CONTRIBUTING.md](https://github.com/${{ github.repository }}/blob/main/CONTRIBUTING.md#contributor-license-agreement)).
+            To sign, post a comment on this pull request with exactly this text:
+          custom-allsigned-prcomment: All contributors have signed the CLA. Thank you!
