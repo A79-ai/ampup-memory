@@ -36,6 +36,7 @@ mod governance;
 mod join;
 mod lobby;
 pub mod maintenance;
+mod purpose;
 pub mod ratelimit;
 mod reads;
 mod reports;
@@ -9910,7 +9911,12 @@ async fn mcp(
         })),
         "initialize" => {
             let listed = Listed::from_env();
-            let mut instructions = if listed == Listed::Default {
+            let store = state.store.read().unwrap().clone();
+            // What memory is for, with no call order, where the scope asks (`purpose`).
+            let purpose = purpose::asks(&store, scope).await;
+            let mut instructions = if listed == Listed::Default && purpose {
+                purpose::reading(offers_advice(&listed), writes == Writes::Scope)
+            } else if listed == Listed::Default {
                 loop_instructions(offers_advice(&listed), writes == Writes::Scope)
             } else {
                 "Memory: facts extracted from the organization's conversations, documents \
@@ -9923,11 +9929,14 @@ async fn mcp(
             if writes == Writes::Scope {
                 instructions = format!(
                     "{}\n\n{instructions}",
-                    lifecycle_instructions(offers_advice(&listed))
+                    if purpose {
+                        purpose::lifecycle(offers_advice(&listed))
+                    } else {
+                        lifecycle_instructions(offers_advice(&listed))
+                    }
                 );
             }
             // What this org told `memstore org init` it wants from memory.
-            let store = state.store.read().unwrap().clone();
             if let Some(org) = scope.org_name()
                 && let Ok(dir) = crate::people::directory::Directory::load(&store).await
                 && let Some(p) = dir.orgs.get(org).and_then(|o| o.profile.as_ref())
@@ -10048,8 +10057,12 @@ async fn mcp(
                     *t = lean_search();
                 }
             }
-            // Where the org gives each session a branch, the session's writes and reads name it.
             let store = state.store.read().unwrap().clone();
+            // What memory is for, with no call order, where the scope asks (`purpose`).
+            if purpose::asks(&store, scope).await {
+                purpose::describe(tools, scope, writes == Writes::Scope);
+            }
+            // Where the org gives each session a branch, the session's writes and reads name it.
             if let Some(org) = scope.org_name()
                 && store
                     .directory()

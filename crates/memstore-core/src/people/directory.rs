@@ -83,6 +83,8 @@ const MAX_COMPILE_BATCH: usize = 100;
 pub const COMPILE_KINDS: &[&str] = &["", "errors"];
 /// How advice routes over a scope's compiled skills (`Settings::advice_skills`); `""` unsets it.
 pub const ADVICE_SKILLS: &[&str] = &["", "fallback", "together", "off"];
+/// How the MCP instructions and the session tools' descriptions read (`Settings::instructions`); `""` unsets it.
+pub const INSTRUCTIONS: &[&str] = &["", "default", "purpose"];
 
 /// The newest directory change format this engine understands, and the one it writes. Bump it when a
 /// change's meaning changes in a way an older engine would get wrong (a new field it would ignore, a
@@ -957,6 +959,14 @@ pub struct Settings {
     /// server's `MEMSTORE_TRANSCRIPTS` decides (off by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcripts: Option<bool>,
+    /// How the MCP `initialize` instructions and the descriptions of `start_session`, `get_advice`, `end_session`
+    /// and `remember_memory` read: `default`, the session's call order (start_session first, get_advice when a
+    /// task starts, remember_memory in the turn a preference is stated, end_session last); `purpose`, what memory
+    /// is for and when it helps, with no fixed procedure, the judgment left to the agent. The tools, their
+    /// arguments and permissions are the same either way. Unset (`""`), the server's `MEMSTORE_INSTRUCTIONS`
+    /// decides (`default` unless set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// Other scopes of the same org whose memory this scope's readers also search (`team:<org>/<team>`, or
     /// `org:<org>` for a team): the read routes they search through (`/search`, `/episode`, `search_memory`,
     /// `get_episode`) read this scope and these, each hit naming its scope. Writes, extraction, the schema and
@@ -1022,6 +1032,7 @@ impl Settings {
             && self.advice_automated.is_none()
             && self.profile.is_none()
             && self.transcripts.is_none()
+            && self.instructions.is_none()
             && self.reads.is_none()
             && self.purge.is_none()
             && self.activity.is_none()
@@ -1110,6 +1121,9 @@ impl Settings {
         }
         if other.transcripts.is_some() {
             self.transcripts = other.transcripts;
+        }
+        if other.instructions.is_some() {
+            self.instructions = other.instructions;
         }
         if other.reads.is_some() {
             self.reads = other.reads;
@@ -2281,6 +2295,14 @@ impl Directory {
         self.setting(scope, |s| s.transcripts, env)
     }
 
+    /// Whether `scope`'s agents are told what memory is for rather than when to call each tool
+    /// (`Settings::instructions` `purpose`): its team's setting, else its org's (`""` is unset), else the server's
+    /// `MEMSTORE_INSTRUCTIONS` ([`purpose_from_env`]), which a scope the directory doesn't hold also gets.
+    pub fn purpose_instructions(&self, scope: &crate::Scope) -> bool {
+        self.team_or_org(scope, |s| s.instructions.clone().filter(|k| !k.is_empty()))
+            .map_or_else(purpose_from_env, |k| k == "purpose")
+    }
+
     /// The other scopes `scope`'s readers also search (`Settings::reads`), in the order the setting names them:
     /// only the scope's own setting (a team's never comes from its org), only scopes of its own org, never itself,
     /// and only teams the org still has. None in a scope the directory doesn't hold.
@@ -2747,6 +2769,7 @@ impl Change {
                     && settings.purge.is_none()
                     && settings.profile.is_none()
                     && settings.transcripts.is_none()
+                    && settings.instructions.is_none()
                     && settings.activity.is_none()
                     && settings.session_branches.is_none()
                     && settings.auto_review.is_none()
@@ -3320,7 +3343,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             if settings.is_empty() {
                 refuse!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"transcripts\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             if let Some(sources) = &settings.compile_sources {
@@ -3360,6 +3383,13 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             {
                 refuse!(
                     "invalid advice_skills {k:?}: \"fallback\" (compiled skills only where no kind of task learned from runs fits), \"together\" (both on one list), \"off\" (never a compiled skill), or \"\" to unset it"
+                );
+            }
+            if let Some(k) = &settings.instructions
+                && !INSTRUCTIONS.contains(&k.as_str())
+            {
+                refuse!(
+                    "invalid instructions {k:?}: \"default\" (the session's call order), \"purpose\" (what memory is for, no fixed procedure), or \"\" to unset it"
                 );
             }
             if let Some(k) = &settings.compile_kind
@@ -3958,4 +3988,10 @@ pub fn profiles_from_env() -> bool {
             "1" | "true" | "on" | "yes"
         )
     })
+}
+
+/// Whether the server's `MEMSTORE_INSTRUCTIONS=purpose` tells agents what memory is for rather than when to call
+/// each tool, where no team or org setting says (`Settings::instructions`).
+pub fn purpose_from_env() -> bool {
+    std::env::var("MEMSTORE_INSTRUCTIONS").is_ok_and(|v| v.trim().eq_ignore_ascii_case("purpose"))
 }

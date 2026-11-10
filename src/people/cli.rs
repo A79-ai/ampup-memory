@@ -334,6 +334,11 @@ pub enum OrgCmd {
         /// author's own episode, readable by them alone (default: the server's MEMSTORE_TRANSCRIPTS, off)
         #[arg(long)]
         transcripts: Option<bool>,
+        /// How the MCP instructions and the session tools' descriptions read: default (the session's call order)
+        /// or purpose (what memory is for and when it helps, no fixed procedure) ("" unsets it; default: the
+        /// server's MEMSTORE_INSTRUCTIONS)
+        #[arg(long)]
+        instructions: Option<String>,
         /// Other scopes of the org its readers also search, comma-separated (team:<org>/<team>; "" unsets them;
         /// the operator only)
         #[arg(long)]
@@ -1145,6 +1150,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             advice_automated,
             profile,
             transcripts,
+            instructions,
             reads,
             purge,
             activity,
@@ -1185,6 +1191,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 advice_automated: *advice_automated,
                 profile: *profile,
                 transcripts: *transcripts,
+                instructions: instructions.clone(),
                 reads: reads.as_deref().map(|r| {
                     r.split(',')
                         .map(str::trim)
