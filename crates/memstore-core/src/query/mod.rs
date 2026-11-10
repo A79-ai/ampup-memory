@@ -41,6 +41,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
+use crate::conflicts::{self, Conflict};
 use crate::freshness::{self, Mark};
 use crate::search::{Col, Filter, Lit, Op};
 use crate::{Fact, Principal, Session, Store};
@@ -1717,6 +1718,21 @@ impl Exec<'_> {
         Ok(freshness::marks(&schemas, &all, at))
     }
 
+    /// What another fact says against each of `facts` (`crate::conflicts`), under `now` or `as_of` and where the
+    /// scope keeps conflicts, by fact id.
+    async fn conflicts(&self, facts: &[Fact], time: Time) -> Result<HashMap<String, Conflict>> {
+        let valid_at = match time {
+            Time::Now => i64::MAX,
+            Time::AsOf(t) => t,
+            _ => return Ok(HashMap::new()),
+        };
+        if facts.is_empty() || !conflicts::on(self.store, self.session.scope()).await {
+            return Ok(HashMap::new());
+        }
+        let facts: Vec<&Fact> = facts.iter().collect();
+        conflicts::marks(self.store, self.session, self.who, &facts, Some(valid_at)).await
+    }
+
     /// Entity cards: each entity's (selected) values, one-valued as an object, many as a list.
     async fn cards(&self, ids: &[String], q: &Query) -> Result<Vec<Value>> {
         let set: BTreeSet<String> = ids.iter().cloned().collect();
@@ -1744,6 +1760,7 @@ impl Exec<'_> {
         let facts = self.facts_of(&set, preds.as_deref(), q.time).await?;
         // What has gone stale or overdue, said beside the value rather than served as current.
         let marks = self.marks(&facts, q.time, preds.is_none()).await?;
+        let disputed = self.conflicts(&facts, q.time).await?;
         let mut by_entity: BTreeMap<String, Vec<Fact>> = BTreeMap::new();
         for f in facts {
             by_entity.entry(f.entity.clone()).or_default().push(f);
@@ -1786,6 +1803,9 @@ impl Exec<'_> {
                 let mut v = self.json_value(f, q.evidence);
                 if let Some(m) = marks.get(&f.fact_id) {
                     v["freshness"] = m.to_json(&f.predicate);
+                }
+                if let Some(c) = disputed.get(&f.fact_id) {
+                    v["conflict"] = c.to_json();
                 }
                 if self.card(f) == Card::Many {
                     values
@@ -2465,6 +2485,7 @@ impl Exec<'_> {
         let (out, next) = q.page(out);
         let shown: Vec<Fact> = out.iter().map(|(f, _)| f.clone()).collect();
         let marks = self.marks(&shown, q.time, false).await?;
+        let disputed = self.conflicts(&shown, q.time).await?;
         let results: Vec<Value> = out
             .into_iter()
             .map(|(f, score)| {
@@ -2477,6 +2498,9 @@ impl Exec<'_> {
                 }
                 if let Some(m) = marks.get(&f.fact_id) {
                     v["freshness"] = m.to_json(&f.predicate);
+                }
+                if let Some(c) = disputed.get(&f.fact_id) {
+                    v["conflict"] = c.to_json();
                 }
                 v
             })

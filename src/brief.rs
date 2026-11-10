@@ -122,6 +122,18 @@ pub async fn brief(
         }
         false => HashMap::new(),
     };
+    // And what another fact says against one now, where the scope keeps conflicts (`crate::conflicts`).
+    let disputed = match crate::conflicts::on(store, session.scope()).await {
+        true => {
+            let current: Vec<&Fact> = facts
+                .iter()
+                .chain(&cited)
+                .filter(|f| f.valid_to.is_none_or(|t| t > now))
+                .collect();
+            crate::conflicts::marks(store, session, who, &current, Some(now)).await?
+        }
+        false => HashMap::new(),
+    };
     let flags: HashMap<&str, String> = facts
         .iter()
         .chain(&cited)
@@ -133,6 +145,12 @@ pub async fn brief(
                 (Some(s), _) => Some(s.to_string()),
                 (None, Some(m)) => Some(m.note(&f.predicate)),
                 (None, None) => stored.get(f.fact_id.as_str()).map(|s| s.to_string()),
+            };
+            // A conflict is said beside whatever else is.
+            let flag = match (flag, disputed.get(&f.fact_id)) {
+                (Some(fl), Some(c)) => Some(format!("{fl}; {}", c.note())),
+                (None, Some(c)) => Some(c.note()),
+                (fl, None) => fl,
             };
             flag.map(|fl| (f.fact_id.as_str(), fl))
         })

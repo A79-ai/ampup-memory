@@ -1429,10 +1429,10 @@ async fn the_same_text_from_another_source_cannot_take_over_an_episodes_acl() {
     assert!(env.can_read(&amy, &dm.episode_id).await);
 }
 
-/// A model API (OpenAI-compatible) that keeps every prompt it is sent and misbehaves on purpose: asked to tidy facts,
-/// it ends every fact of a thing by every other and calls every pair the same; asked about names, it makes one thing
-/// of every cluster. Only the dream's own rules stand between that and the memory.
-async fn eager_model() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+/// A model API (OpenAI-compatible) that keeps every prompt it is sent and answers each with `reply`.
+async fn stand_in_model(
+    reply: impl Fn(&str) -> String + Send + Sync + 'static,
+) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1440,10 +1440,12 @@ async fn eager_model() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let asked: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
     let log = asked.clone();
+    let reply = Arc::new(reply);
     tokio::spawn(async move {
         loop {
             let (mut conn, _) = listener.accept().await.unwrap();
             let log = log.clone();
+            let reply = reply.clone();
             tokio::spawn(async move {
                 let mut buf = vec![];
                 let mut chunk = [0u8; 8192];
@@ -1469,38 +1471,7 @@ async fn eager_model() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
                     .unwrap_or_default()
                     .to_string();
                 log.lock().unwrap().push(prompt.clone());
-                // The handles a line starts with (`F3 | ...`, `N2 name | ...`, `C1`).
-                let handle = |l: &str, p: char| -> Option<String> {
-                    let h = l.split([' ', '|']).next()?;
-                    (h.len() > 1 && h.starts_with(p) && h[1..].bytes().all(|b| b.is_ascii_digit()))
-                        .then(|| h.to_string())
-                };
-                let reply = if prompt.contains("Find two things") {
-                    let f: Vec<String> = prompt.lines().filter_map(|l| handle(l, 'F')).collect();
-                    let (mut ends, mut same) = (vec![], vec![]);
-                    for a in &f {
-                        for b in f.iter().filter(|b| *b != a) {
-                            ends.push(json!({"old": a, "by": b, "why": "eager"}));
-                            same.push(json!({"keep": a, "dup": b, "why": "eager"}));
-                        }
-                    }
-                    json!({"ends": ends, "same": same}).to_string()
-                } else {
-                    let mut groups: Vec<Vec<String>> = vec![];
-                    for l in prompt.lines() {
-                        if handle(l, 'C').is_some() {
-                            groups.push(vec![]);
-                        } else if let (Some(h), Some(g)) = (handle(l, 'N'), groups.last_mut()) {
-                            g.push(h);
-                        }
-                    }
-                    let aliases: Vec<Value> = groups
-                        .iter()
-                        .filter(|g| g.len() > 1)
-                        .map(|g| json!({"names": g, "main": g[0], "why": "eager"}))
-                        .collect();
-                    json!({ "aliases": aliases }).to_string()
-                };
+                let reply = reply(&prompt);
                 let body = json!({
                     "choices": [{"message": {"content": reply}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": prompt.len() / 4, "completion_tokens": reply.len() / 4}
@@ -1517,6 +1488,48 @@ async fn eager_model() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         }
     });
     (url, asked)
+}
+
+/// The handles a line of a prompt starts with (`F3 | ...`, `N2 name | ...`, `C1`).
+fn handle(l: &str, p: char) -> Option<String> {
+    let h = l.split([' ', '|']).next()?;
+    (h.len() > 1 && h.starts_with(p) && h[1..].bytes().all(|b| b.is_ascii_digit()))
+        .then(|| h.to_string())
+}
+
+/// A model API (OpenAI-compatible) that keeps every prompt it is sent and misbehaves on purpose: asked to tidy facts,
+/// it ends every fact of a thing by every other and calls every pair the same; asked about names, it makes one thing
+/// of every cluster. Only the dream's own rules stand between that and the memory.
+async fn eager_model() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    stand_in_model(|prompt| {
+        if prompt.contains("Find two things") {
+            let f: Vec<String> = prompt.lines().filter_map(|l| handle(l, 'F')).collect();
+            let (mut ends, mut same) = (vec![], vec![]);
+            for a in &f {
+                for b in f.iter().filter(|b| *b != a) {
+                    ends.push(json!({"old": a, "by": b, "why": "eager"}));
+                    same.push(json!({"keep": a, "dup": b, "why": "eager"}));
+                }
+            }
+            json!({"ends": ends, "same": same}).to_string()
+        } else {
+            let mut groups: Vec<Vec<String>> = vec![];
+            for l in prompt.lines() {
+                if handle(l, 'C').is_some() {
+                    groups.push(vec![]);
+                } else if let (Some(h), Some(g)) = (handle(l, 'N'), groups.last_mut()) {
+                    g.push(h);
+                }
+            }
+            let aliases: Vec<Value> = groups
+                .iter()
+                .filter(|g| g.len() > 1)
+                .map(|g| json!({"names": g, "main": g[0], "why": "eager"}))
+                .collect();
+            json!({ "aliases": aliases }).to_string()
+        }
+    })
+    .await
 }
 
 impl Env {
@@ -1854,4 +1867,270 @@ async fn a_dream_reads_and_changes_only_what_its_audience_may_read() {
         .post("/document", Some(&alice), json!({"calls": [["dream/"]]}))
         .await;
     assert_eq!((status, &body["replies"][0]), (200, &json!([])), "{body}");
+}
+
+/// Two facts that disagree (`memstore::conflicts`) reach only a reader of both, and go with either. Acme's EBITDA as
+/// reported reaches the eng team, another value the sales team and another Bob alone; a later note of the eng team's
+/// gives an analyst's estimate, which reconcile, asked by a model that calls every pair a conflict, records as in
+/// conflict with the reported one. The model is never shown the sales team's
+/// value or Bob's own; the record names the two facts and nothing else, and no reader reads it. Each eng reader sees
+/// each value with the other beside it; the sales team and Bob see their own values and nothing of the conflict. Once
+/// the reported figure is narrowed to Alice, Dan (eng) sees the estimate alone; once it is forgotten, Alice does too.
+#[tokio::test]
+async fn a_conflict_reaches_only_readers_of_both_facts_and_goes_with_either() {
+    if !crate::own_process(
+        "access_flow::a_conflict_reaches_only_readers_of_both_facts_and_goes_with_either",
+    ) {
+        return;
+    }
+    // The server extracts nothing itself: the test runs extraction, against the stand-in.
+    unsafe {
+        std::env::set_var("MEMSTORE_EXTRACT", "off");
+        std::env::set_var("MEMSTORE_CONFLICTS", "1");
+    }
+    let env = start().await;
+    let (url, asked) = stand_in_model(|prompt| {
+        if prompt.contains("Known facts:") {
+            let verdicts: Vec<Value> = prompt
+                .lines()
+                .filter_map(|l| handle(l, 'N'))
+                .map(|n| json!({"new": n, "verdict": "conflicts", "existing": "E1"}))
+                .collect();
+            return json!({ "verdicts": verdicts }).to_string();
+        }
+        // An extraction: the text's one fact, the words after its last colon.
+        let lines: Vec<&str> = prompt.lines().collect();
+        let fences: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].starts_with("----- ") && lines[i].ends_with(" -----"))
+            .collect();
+        let text = lines[fences[fences.len() - 2] + 1..fences[fences.len() - 1]].join("\n");
+        let value = text.rsplit(':').next().unwrap().trim();
+        json!({"rows": [{"kind": "issue", "feature": "acme ebitda", "value": value, "quote": text}]})
+            .to_string()
+    })
+    .await;
+    unsafe {
+        std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
+        std::env::set_var("MEMSTORE_EXTRACT", "openai");
+        std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
+        std::env::set_var("MEMSTORE_EXTRACT_KEY", "stand-in");
+        std::env::set_var("MEMSTORE_EXTRACT_MODEL", "stand-in");
+        std::env::set_var("MEMSTORE_EXTRACT_GOAL_BLIND", "1");
+    }
+    let (eng, sales) = ("group:o1.eng", "group:o1.sales");
+    // Each note's one fact is extracted from it, oldest first.
+    let (reported, _) = env
+        .note(
+            "2026-03-02",
+            "acme ebitda as reported: zzreported 235",
+            eng,
+            &[],
+        )
+        .await;
+    env.note(
+        "2026-03-03",
+        "acme ebitda for sales: zzsales 999",
+        sales,
+        &[],
+    )
+    .await;
+    env.note(
+        "2026-03-04",
+        "acme ebitda bob heard: bobsecret 777",
+        "user:bob@x.com",
+        &[],
+    )
+    .await;
+    env.note(
+        "2026-06-10",
+        "acme ebitda as northbeam estimates it: zzestimate 252",
+        eng,
+        &[],
+    )
+    .await;
+    let ex = memstore::extract::Extractor::from_env().unwrap().unwrap();
+    let r = memstore::extract::run(&env.store, &Scope::Org, &ex, 100)
+        .await
+        .unwrap();
+    assert_eq!((r.facts, r.closed, r.conflicts), (4, 0, 1), "{r:?}");
+
+    // What reconcile was shown: the eng team's value, never the sales team's or Bob's.
+    let prompts = asked.lock().unwrap().clone();
+    let shown: Vec<&String> = prompts
+        .iter()
+        .filter(|p| p.contains("Known facts:"))
+        .collect();
+    assert_eq!(shown.len(), 1, "{prompts:?}");
+    assert!(shown[0].contains("zzreported 235"), "{}", shown[0]);
+    assert!(
+        !shown[0].contains("zzsales") && !shown[0].contains("bobsecret"),
+        "another audience's value reached reconcile: {}",
+        shown[0]
+    );
+
+    // The record: the two facts' ids, nothing of what they say, and read by no reader.
+    let records: Vec<Episode> = env
+        .store
+        .current_episodes(&Scope::Org)
+        .await
+        .unwrap()
+        .into_values()
+        .filter(|e| e.source.starts_with(memstore::conflicts::SOURCE))
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let rec = &records[0];
+    assert_eq!(rec.acl, [memstore::conflicts::ACL], "{rec:?}");
+    let bodies = env
+        .store
+        .episode_bodies(&Scope::Org, vec![rec.episode_id.clone()])
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bodies[&rec.episode_id]).to_string();
+    for word in ["zz", "acme", "bobsecret", "ebitda"] {
+        assert!(!body.contains(word), "{word} in {body}");
+    }
+
+    let alice = jwt("alice@x.com", &[ORG, "o1.eng"], ORG, 3600);
+    let dan = jwt("dan@x.com", &[ORG, "o1.eng"], ORG, 3600);
+    let carol = jwt("carol@x.com", &[ORG, "o1.sales"], ORG, 3600);
+    let bob = jwt("bob@x.com", &[ORG], ORG, 3600);
+    // Each value with what the other says, once the server has caught up: (value, the conflicting value).
+    let seen = |token: String| {
+        let env = &env;
+        async move {
+            let (status, body) = env
+                .post(
+                    "/query",
+                    Some(&token),
+                    json!({"calls": [[{"find": "facts", "time": "now", "limit": 50}]]}),
+                )
+                .await;
+            assert_eq!(status, 200, "{body}");
+            let mut out: Vec<(String, String)> = body["replies"][0]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| {
+                    let other = &f["conflict"];
+                    (
+                        f["value"].as_str().unwrap_or_default().to_string(),
+                        other["value"].as_str().unwrap_or("-").to_string(),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        }
+    };
+    let until = |token: &String, want: Vec<(&str, &str)>| {
+        let token = token.clone();
+        let want: Vec<(String, String)> = want
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let seen = &seen;
+        async move {
+            let t = Instant::now();
+            loop {
+                let got = seen(token.clone()).await;
+                if got == want {
+                    return;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(15),
+                    "never caught up: {got:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+    until(
+        &alice,
+        vec![
+            ("zzestimate 252", "zzreported 235"),
+            ("zzreported 235", "zzestimate 252"),
+        ],
+    )
+    .await;
+    until(&carol, vec![("zzsales 999", "-")]).await;
+    until(&bob, vec![("bobsecret 777", "-")]).await;
+    // And the conflict says where and when the other value was stated.
+    let (_, body) = env
+        .post(
+            "/query",
+            Some(&alice),
+            json!({"calls": [[{"find": "facts", "time": "now", "limit": 50}]]}),
+        )
+        .await;
+    let fact = |v: &str| {
+        body["replies"][0]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["value"] == v)
+            .unwrap()
+            .clone()
+    };
+    let (estimate_fact, reported_fact) = (fact("zzestimate 252"), fact("zzreported 235"));
+    assert_eq!(
+        rec.document.as_deref(),
+        Some(
+            format!(
+                "{}{}/{}",
+                memstore::conflicts::PREFIX,
+                reported_fact["evidence"]["fact_id"].as_str().unwrap(),
+                estimate_fact["evidence"]["fact_id"].as_str().unwrap()
+            )
+            .as_str()
+        ),
+        "{rec:?}"
+    );
+    assert_eq!(
+        (
+            &estimate_fact["conflict"]["source"],
+            &estimate_fact["conflict"]["since"]
+        ),
+        (&json!("note:2026-03-02"), &json!("2026-03-02")),
+        "{estimate_fact}"
+    );
+    // No one reads the record itself, by id or by key.
+    for who in [&alice, &dan, &carol, &bob] {
+        assert!(!env.can_read(who, &rec.episode_id).await);
+    }
+    let (status, body) = env
+        .post(
+            "/document",
+            Some(&alice),
+            json!({"calls": [[memstore::conflicts::PREFIX]]}),
+        )
+        .await;
+    assert_eq!((status, &body["replies"][0]), (200, &json!([])), "{body}");
+
+    // A reader who may not read one side sees nothing of the conflict.
+    env.store
+        .change_acl(
+            &Scope::Org,
+            "ops",
+            &memstore::AclTarget::Episode(reported.episode_id.clone()),
+            &["user:alice@x.com".to_string()],
+        )
+        .await
+        .unwrap();
+    until(&dan, vec![("zzestimate 252", "-")]).await;
+    until(
+        &alice,
+        vec![
+            ("zzestimate 252", "zzreported 235"),
+            ("zzreported 235", "zzestimate 252"),
+        ],
+    )
+    .await;
+    // Forgetting one side ends the conflict for everyone.
+    assert!(
+        env.store
+            .forget(&Scope::Org, "writer", &reported.episode_id, |_| true)
+            .await
+            .unwrap()
+    );
+    until(&alice, vec![("zzestimate 252", "-")]).await;
 }

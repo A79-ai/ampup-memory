@@ -498,6 +498,29 @@ impl Reads {
             .collect();
         Ok(freshness::marks(&schemas, &all, at))
     }
+
+    /// What another fact says against each of `facts` (`crate::conflicts`), by fact id, read at `valid_at` as these
+    /// facts were (None, a read over history: nothing), in each scope read: only where the caller's scope keeps
+    /// conflicts, and only of a fact the caller may read too.
+    pub async fn conflicts(
+        &self,
+        store: &Store,
+        who: &Principal,
+        facts: &[&Fact],
+        valid_at: Option<i64>,
+    ) -> Result<HashMap<String, crate::conflicts::Conflict>> {
+        let mut out = HashMap::new();
+        if facts.is_empty()
+            || valid_at.is_none()
+            || !crate::conflicts::on(store, self.own.scope()).await
+        {
+            return Ok(out);
+        }
+        for s in self.sessions() {
+            out.extend(crate::conflicts::marks(store, s, who, facts, valid_at).await?);
+        }
+        Ok(out)
+    }
 }
 
 /// A cursor's pins as its text: each scope's, `~` between (a pin's text is URL-safe base64, which has none).

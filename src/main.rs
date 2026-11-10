@@ -1550,22 +1550,24 @@ async fn extract(
             println!("{line}");
         }
         eprintln!(
-            "{}: dry run, nothing committed: {} episodes would add {} facts and end {}",
+            "{}: dry run, nothing committed: {} episodes would add {} facts, end {} and record {} in conflict",
             ex.id(),
             r.episodes,
             r.facts,
-            r.closed
+            r.closed,
+            r.conflicts
         );
         return Ok(());
     } else {
         memstore::extract::run_on(store, &scope, branch, &ex, limit).await?
     };
     println!(
-        "{}: read {} episodes, {} facts, ended {}, {} failed (retried next run); {}",
+        "{}: read {} episodes, {} facts, ended {}, {} in conflict, {} failed (retried next run); {}",
         ex.id(),
         r.episodes,
         r.facts,
         r.closed,
+        r.conflicts,
         r.failed,
         ex.calls()
     );

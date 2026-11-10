@@ -990,9 +990,9 @@ pub async fn serve_with(
                                 if r.episodes + r.failed > 0 {
                                     // Facts found and every one refused: an error, not a quiet round.
                                     eprintln!(
-                                        "{}extracted {scope}: {} episodes, {} facts ({} refused by the schema), {} failed ({} with the API down)",
+                                        "{}extracted {scope}: {} episodes, {} facts ({} refused by the schema), {} ended, {} in conflict, {} failed ({} with the API down)",
                                         if r.facts == 0 && r.refused > 0 { "ERROR " } else { "" },
-                                        r.episodes, r.facts, r.refused, r.failed, r.unavailable
+                                        r.episodes, r.facts, r.refused, r.closed, r.conflicts, r.failed, r.unavailable
                                     );
                                 }
                                 if r.refused > 0 {
@@ -9661,6 +9661,8 @@ async fn facts(
         .flat_map(|h| std::iter::once(&h.fact).chain(&h.group))
         .collect();
     let marks = reads.marks(store, who, &shown, valid_at, false).await?;
+    // And what another fact says against one, where the scope keeps conflicts (`crate::conflicts`).
+    let conflicts = reads.conflicts(store, who, &shown, valid_at).await?;
     for h in &found {
         let mut v = json!({
             "entity": h.fact.entity, "predicate": h.fact.predicate, "value": h.fact.value,
@@ -9680,6 +9682,9 @@ async fn facts(
         }
         if let Some(m) = marks.get(&h.fact.fact_id) {
             v["freshness"] = m.to_json(&h.fact.predicate);
+        }
+        if let Some(c) = conflicts.get(&h.fact.fact_id) {
+            v["conflict"] = c.to_json();
         }
         for (k, x) in [("unit", &h.fact.unit), ("time_basis", &h.fact.time_basis)] {
             if let Some(x) = x {
@@ -9718,6 +9723,9 @@ async fn facts(
                         });
                         if let Some(m) = marks.get(&f.fact_id) {
                             g["freshness"] = m.to_json(&f.predicate);
+                        }
+                        if let Some(c) = conflicts.get(&f.fact_id) {
+                            g["conflict"] = c.to_json();
                         }
                         g
                     })

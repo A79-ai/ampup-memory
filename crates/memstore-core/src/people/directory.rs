@@ -925,6 +925,12 @@ pub struct Settings {
     /// the server's `MEMSTORE_FRESHNESS` decides (off by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<bool>,
+    /// Whether the scope keeps facts that disagree apart (`crate::conflicts`): write-time reconcile may record a
+    /// new fact as in conflict with a known one instead of ending it, and a value another fact disagrees with reads
+    /// `conflict: "<other value>" (<source>, <date>)` beside it, in `search_memory`, `/search`, `query_memory`'s
+    /// entity cards and facts, and the brief. Unset, the server's `MEMSTORE_CONFLICTS` decides (off by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflicts: Option<bool>,
     /// Whether the scope's learned advice is curated as it is learned (`crate::advice`'s curation): a note whose
     /// served runs do worse than the rest of its situation's is withheld (kept, served to no one), a note changes
     /// by small edits instead of being rewritten whole (an update dropping more than a quarter of it is refused),
@@ -1003,6 +1009,7 @@ impl Settings {
             && self.advice_traces.is_none()
             && self.classic_ranking.is_none()
             && self.freshness.is_none()
+            && self.conflicts.is_none()
             && self.advice_curation.is_none()
             && self.advice_automated.is_none()
             && self.profile.is_none()
@@ -1079,6 +1086,9 @@ impl Settings {
         }
         if other.freshness.is_some() {
             self.freshness = other.freshness;
+        }
+        if other.conflicts.is_some() {
+            self.conflicts = other.conflicts;
         }
         if other.advice_curation.is_some() {
             self.advice_curation = other.advice_curation;
@@ -2219,6 +2229,13 @@ impl Directory {
         self.setting(scope, |s| s.freshness, crate::freshness::from_env())
     }
 
+    /// Whether `scope` keeps facts that disagree apart and its reads mark them (`Settings::conflicts`): its team's
+    /// setting, else its org's, else the server's `MEMSTORE_CONFLICTS` (off unless set), which a scope the
+    /// directory doesn't hold also gets.
+    pub fn marks_conflicts(&self, scope: &crate::Scope) -> bool {
+        self.setting(scope, |s| s.conflicts, crate::conflicts::from_env())
+    }
+
     /// Whether advice in `scope` is curated as it is learned (`Settings::advice_curation`): its team's setting,
     /// else its org's, else `default` (the server's `MEMSTORE_ADVICE_CURATION`), which a scope the directory
     /// doesn't hold also gets.
@@ -2699,6 +2716,7 @@ impl Change {
                     && settings.extract.is_none()
                     && settings.classic_ranking.is_none()
                     && settings.freshness.is_none()
+                    && settings.conflicts.is_none()
                     && settings.advice_curation.is_none()
                     && settings.advice_automated.is_none()
                     && settings.purge.is_none()
@@ -3276,7 +3294,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             if settings.is_empty() {
                 refuse!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             if let Some(sources) = &settings.compile_sources {

@@ -561,7 +561,8 @@ pub(super) async fn search(
     let tallies = reads.tallies(store, who, &shown_facts).await?;
     // What has gone stale or overdue, where the scope asks (`crate::freshness`): said beside the fact. A result
     // holds its entities' every current fact, plans and statuses among them.
-    let marks = {
+    // And what another fact says against one, where the scope keeps conflicts (`crate::conflicts`).
+    let (marks, conflicts) = {
         let all: Vec<&crate::Fact> = window
             .iter()
             .flat_map(|c| {
@@ -571,7 +572,10 @@ pub(super) async fn search(
                     .chain(&rest[c.entity.as_str()])
             })
             .collect();
-        reads.marks(store, who, &all, ask.valid_at, true).await?
+        (
+            reads.marks(store, who, &all, ask.valid_at, true).await?,
+            reads.conflicts(store, who, &all, ask.valid_at).await?,
+        )
     };
     // The scope of each found fact that isn't the caller's own.
     let hit_scope: HashMap<String, String> = hit_scope
@@ -585,6 +589,7 @@ pub(super) async fn search(
         names: &names,
         tallies: &tallies,
         marks: &marks,
+        conflicts: &conflicts,
         words: &words,
         query: ask.query,
         linked: &linked,
@@ -726,6 +731,8 @@ struct Text<'a> {
     tallies: &'a HashMap<String, crate::feedback::Tally>,
     /// What has gone stale or overdue, by fact id (`crate::freshness`).
     marks: &'a HashMap<String, crate::freshness::Mark>,
+    /// What another fact says against one, by fact id (`crate::conflicts`).
+    conflicts: &'a HashMap<String, crate::conflicts::Conflict>,
     words: &'a Words,
     query: &'a str,
     /// Facts a dream linked as duplicates ([`crate::Vis::duplicates`]): the one shown cites the others' sources too.
@@ -881,7 +888,10 @@ impl<'a> Text<'a> {
             let mark = self.marks.get(&f.fact_id);
             let stale = matches!(mark, Some(crate::freshness::Mark::Stale { .. }));
             let tail = self.tail(&[f], if stale { f.valid_from } else { when });
-            let mark = mark.map_or(String::new(), |m| format!(" — {}", m.note(&f.predicate)));
+            let mut mark = mark.map_or(String::new(), |m| format!(" — {}", m.note(&f.predicate)));
+            if let Some(c) = self.conflicts.get(&f.fact_id) {
+                mark.push_str(&format!(" — {}", c.note()));
+            }
             let quote = quote_of(f);
             let cite = crate::cite_json(f);
             let key = (f.predicate.clone(), episode.clone());
@@ -978,6 +988,9 @@ impl<'a> Text<'a> {
             let mut v = self.value(&f.value);
             if let Some(m) = self.marks.get(&f.fact_id) {
                 v = format!("{v} — {}", m.note(&f.predicate));
+            }
+            if let Some(c) = self.conflicts.get(&f.fact_id) {
+                v = format!("{v} — {}", c.note());
             }
             match parts.iter_mut().find(|(p, _)| *p == f.predicate) {
                 Some((_, vs)) if !vs.contains(&v) => vs.push(v),

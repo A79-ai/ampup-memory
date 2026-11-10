@@ -314,6 +314,10 @@ pub enum OrgCmd {
         /// plans whose date has passed while still pending (default: the server's MEMSTORE_FRESHNESS, off)
         #[arg(long)]
         freshness: Option<bool>,
+        /// Keep facts that disagree apart: reconcile may record a new fact as in conflict with a known one instead
+        /// of ending it, and reads mark the other value beside it (default: the server's MEMSTORE_CONFLICTS, off)
+        #[arg(long)]
+        conflicts: Option<bool>,
         /// Curate learned advice: withhold a note whose served runs do worse than the rest, change notes by small
         /// edits, merge situations that are the same task (default false, or the server's MEMSTORE_ADVICE_CURATION)
         #[arg(long)]
@@ -1132,6 +1136,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             advice_traces,
             classic_ranking,
             freshness,
+            conflicts,
             advice_curation,
             advice_automated,
             profile,
@@ -1170,6 +1175,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 advice_traces: *advice_traces,
                 classic_ranking: *classic_ranking,
                 freshness: *freshness,
+                conflicts: *conflicts,
                 advice_curation: *advice_curation,
                 advice_automated: *advice_automated,
                 profile: *profile,

@@ -18,6 +18,7 @@ macro_rules! eprintln {
 pub mod audit;
 pub mod auth;
 pub mod cell;
+pub mod conflicts;
 pub mod episode_types;
 pub mod freshness;
 pub mod governance;
@@ -755,6 +756,9 @@ pub struct Vis {
     closures: HashMap<String, Vec<(i64, String)>>,
     /// The committed merge records ([`MERGE_SOURCE`]): a version one closes lost a merge's conflict.
     merges: HashSet<String>,
+    /// The facts each fact was recorded in conflict with ([`conflicts::PREFIX`]), both ways, whoever reads: a read
+    /// serves one only to a reader who may read both facts ([`conflicts::marks`]).
+    conflicts: HashMap<String, Vec<String>>,
     /// Which committed episodes are versions of a document.
     documents: Documents,
     /// Each committed episode's type (`sales_call`, `slack_thread`, …), as its source names it.
@@ -1007,6 +1011,12 @@ impl Vis {
             .keys()
             .map(|f| (f.clone(), root(&parent, f)))
             .collect()
+    }
+
+    /// The facts `fact_id` was recorded in conflict with ([`conflicts::PREFIX`]), whoever reads: what a reader is
+    /// shown of them is [`conflicts::marks`]'s to decide.
+    pub fn conflicts_of(&self, fact_id: &str) -> &[String] {
+        self.conflicts.get(fact_id).map_or(&[], Vec::as_slice)
     }
 
     /// The documents under `prefix` this reader sees a version of at `at`, sorted.
@@ -1515,6 +1525,33 @@ impl Session {
         who: &Principal,
         ids: &[String],
     ) -> Result<HashMap<String, Episode>> {
+        let mut found = self.episode_sources(store, who, ids).await?;
+        if found.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let bodies = store
+            .episode_bodies(&self.scope, found.keys().cloned().collect())
+            .await?;
+        Ok(bodies
+            .into_iter()
+            .filter_map(|(id, body)| {
+                let (source, occurred_at) = found.remove(&id)?;
+                let mut ep = Episode::new(&source, &body, &[]);
+                ep.episode_id = id.clone();
+                ep.occurred_at = occurred_at;
+                Some((id, ep))
+            })
+            .collect())
+    }
+
+    /// These episodes' sources and when they happened, as (source, occurred_at) by id, for those this session sees
+    /// committed and the principal may read. No body is read.
+    pub async fn episode_sources(
+        &self,
+        store: &Store,
+        who: &Principal,
+        ids: &[String],
+    ) -> Result<HashMap<String, (String, i64)>> {
         let wanted: HashSet<&str> = ids
             .iter()
             .map(String::as_str)
@@ -1551,19 +1588,7 @@ impl Session {
                 }
             }
         }
-        let bodies = store
-            .episode_bodies(&self.scope, found.keys().cloned().collect())
-            .await?;
-        Ok(bodies
-            .into_iter()
-            .filter_map(|(id, body)| {
-                let (source, occurred_at) = found.remove(&id)?;
-                let mut ep = Episode::new(&source, &body, &[]);
-                ep.episode_id = id.clone();
-                ep.occurred_at = occurred_at;
-                Some((id, ep))
-            })
-            .collect())
+        Ok(found)
     }
 
     /// The episodes whose source starts with one of `prefixes` that the principal may read in this session, as
@@ -2901,6 +2926,63 @@ impl Store {
     ) -> Result<String> {
         self.commit_extracted_on(scope, MAIN, actor, facts, extractions, closures, adds)
             .await
+    }
+
+    /// [`Store::commit_extracted`] with the engine's own records of what reconcile found among the facts
+    /// ([`conflicts`]), in the same commit. Where what extraction read waits for its owners, the records follow it
+    /// in a commit of their own: a record names facts, and one whose facts aren't on main says nothing to anyone.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_reconciled(
+        &self,
+        scope: &Scope,
+        actor: &str,
+        facts: &[Fact],
+        extractions: &[Extraction],
+        closures: &[Closure],
+        records: &[Episode],
+        adds: Option<&schema::Schema>,
+    ) -> Result<String> {
+        if records.is_empty() {
+            return self
+                .commit_extracted(scope, actor, facts, extractions, closures, adds)
+                .await;
+        }
+        anyhow::ensure!(!extractions.is_empty(), "nothing extracted");
+        anyhow::ensure!(
+            records
+                .iter()
+                .all(|e| episode_types::engine_source(&e.source)),
+            "only the engine's own documents are committed as what reconcile found"
+        );
+        match self
+            .commit_full(
+                scope,
+                MAIN,
+                actor,
+                records,
+                facts,
+                extractions,
+                closures,
+                adds,
+            )
+            .await
+        {
+            Err(e) if governance::OwnerApprovalRequired::caused(&e) => {
+                let id = Box::pin(self.stage_extracted(
+                    scope,
+                    actor,
+                    facts,
+                    extractions,
+                    closures,
+                    adds,
+                ))
+                .await?;
+                self.commit_full(scope, MAIN, actor, records, &[], &[], &[], None)
+                    .await?;
+                Ok(id)
+            }
+            r => r,
+        }
     }
 
     /// [`Store::commit_extracted`] on `branch`: a schema set on a workspace branch has its facts there.
@@ -5451,6 +5533,7 @@ impl Store {
             let documents = Documents::build(&episodes.rows, &committed);
             let mut kinds = HashMap::new();
             let mut merges = HashSet::new();
+            let mut conflict_records = HashSet::new();
             let replaced_sources: HashSet<&String> = superseded.values().collect();
             let mut source_acls: HashMap<String, Vec<Vec<String>>> = HashMap::new();
             for b in episodes.rows.iter() {
@@ -5469,6 +5552,9 @@ impl Store {
                     if source[i].starts_with(MERGE_SOURCE) {
                         merges.insert(id[i].clone());
                     }
+                    if source[i].starts_with(conflicts::SOURCE) {
+                        conflict_records.insert(id[i].clone());
+                    }
                     if replaced_sources.contains(&source[i]) {
                         source_acls
                             .entry(source[i].clone())
@@ -5477,6 +5563,7 @@ impl Store {
                     }
                 }
             }
+            let conflicts = conflicts::recorded(&documents.versions, &conflict_records);
             let mut latest: HashMap<String, (i64, String)> = HashMap::new();
             for b in quotes.rows.iter() {
                 let (commit, fid, q) = (
@@ -5554,6 +5641,7 @@ impl Store {
                 schemas,
                 closures,
                 merges,
+                conflicts,
                 documents,
                 kinds,
                 retracted,

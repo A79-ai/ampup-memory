@@ -249,9 +249,17 @@ pub fn name_of_source(source: &str) -> Option<&'static str> {
 
 /// Sources the engine writes itself, never a caller: goals from before they were retired (`goal:`), compiled
 /// skills (`compile:`), advice learned from runs (`advice:`) and a dream's record of each decision it made
-/// (`dream:`), and a merge's record of the conflicts it resolved (`merge:`). They are the engine's documents about
-/// the memory, of no episode type, and nothing extracts facts from them.
-pub const ENGINE_SOURCES: [&str; 5] = ["goal:", "compile:", "advice:", "dream:", "merge:"];
+/// (`dream:`), a merge's record of the conflicts it resolved (`merge:`), and reconcile's record of two facts that
+/// disagree (`reconcile:`, [`crate::conflicts`]). They are the engine's documents about the memory, of no episode
+/// type, and nothing extracts facts from them.
+pub const ENGINE_SOURCES: [&str; 6] = [
+    "goal:",
+    "compile:",
+    "advice:",
+    "dream:",
+    "merge:",
+    crate::conflicts::SOURCE,
+];
 
 /// Whether `source` is one the engine writes itself ([`ENGINE_SOURCES`]).
 pub fn engine_source(source: &str) -> bool {
