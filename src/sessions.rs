@@ -49,9 +49,16 @@ const MAX_TRANSCRIPT: usize = 20_000;
 /// Longest outcome kept, in characters.
 const MAX_OUTCOME: usize = 2_000;
 /// The most of a transcript the judge reads (its start, with the task, and its end), and the start of each note.
-const JUDGE_TRANSCRIPT: usize = 12_000;
-const JUDGE_START: usize = 4_000;
+/// A kept transcript ([`MAX_TRANSCRIPT`], with its header) is read whole: with its middle left out, the judge
+/// called a session unclear for the part it wasn't shown.
+const JUDGE_TRANSCRIPT: usize = 24_000;
+const JUDGE_START: usize = 6_000;
 const JUDGE_NOTE: usize = 3_000;
+/// The most of the person's next message the judge reads ([`after`]).
+const JUDGE_NEXT: usize = 1_500;
+/// The most of a session's requests the judge grades one by one, and the start of each it is shown.
+const JUDGE_REQUESTS: usize = 20;
+const JUDGE_REQUEST: usize = 200;
 
 fn refuse(m: String) -> anyhow::Error {
     Refused(m).into()
@@ -140,6 +147,18 @@ pub fn idle() -> Duration {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(1_800),
+    )
+}
+
+/// How long after a session's last step the sweep waits to judge it: `MEMSTORE_SESSION_JUDGE_WAIT_SECS`, default
+/// 10 minutes, so what the person did next (their next message, an early PR event) is there for the judge to read
+/// ([`after`]). A session ended idle had its last step the idle time ago ([`idle`]): it is judged at once.
+pub fn judge_wait() -> Duration {
+    Duration::from_secs(
+        std::env::var("MEMSTORE_SESSION_JUDGE_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(600),
     )
 }
 
@@ -1190,6 +1209,7 @@ pub async fn advise(
     if s.ended_at.is_some() {
         return Err(refuse(format!("session {id} has ended")));
     }
+    let before = s.conversation.clone();
     // The advice routed for this step goes to the agent even when its conversation can't be kept now (a write main
     // refused): a later step or the session's end keeps it. A refusal of the person (their day's cap) still stops it.
     let kept = match keep_conversation(store, scope, who, signed, &id, s, conversation).await {
@@ -1202,11 +1222,8 @@ pub async fn advise(
         }
         Err(e) => return Err(e),
     };
-    let (served, mut changed) = serve(store, scope, s, found).await?;
-    if let Some(lookup) = looked_up(&served) {
-        crate::advice_lookups::keep(&mut s.lookups, lookup);
-        changed = true;
-    }
+    let (served, changed) = serve(store, scope, s, found).await?;
+    let lookup = looked_up(&served);
     if let Served::Procedures {
         situation, text, ..
     } = &served
@@ -1217,12 +1234,52 @@ pub async fn advise(
             }
         });
     }
-    if kept || changed {
-        crate::qa_log::daily_cap(store, scope, who)
-            .await
-            .map_err(relay)?;
-        put(store, scope, who.user(), l);
+    if !(kept || changed || lookup.is_some()) {
+        return Ok(served);
     }
+    crate::qa_log::daily_cap(store, scope, who)
+        .await
+        .map_err(relay)?;
+    // Written onto the row as it stands now, not the one this step read before routing (seconds): a harness's Stop
+    // keeps the conversation while its step routes (the hook sends both at once), and the row read before would
+    // undo that, leaving a session that then ends idle with no transcript to judge. This step's changes go on top.
+    let mut fresh = Box::pin(find(store, scope, who, &id)).await?;
+    if let Some(h) = BUFFER.lock().unwrap().get(&(scope.namespace(), id.clone())) {
+        fresh = h.l.clone();
+    }
+    let s = l.session.as_ref().expect("a session");
+    let fs = fresh.session.as_mut().expect("a session");
+    // Ended meanwhile: the advice still goes out, and the ended session stays as it ended.
+    if fs.ended_at.is_some() {
+        return Ok(served);
+    }
+    // A conversation kept since this step read the row is newer than the one it kept before routing.
+    if kept && fs.conversation == before {
+        fs.conversation = s.conversation.clone();
+        crate::session_prs::merge(&mut fs.prs, s.prs.clone());
+    }
+    for k in &s.served {
+        if !fs.served.contains(k) {
+            fs.served.push(k.clone());
+        }
+    }
+    for (k, v) in &s.served_versions {
+        fs.served_versions
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
+    for k in &s.withheld {
+        if !fs.withheld.contains(k) {
+            fs.withheld.push(k.clone());
+        }
+    }
+    if let Some(lookup) = lookup {
+        crate::advice_lookups::keep(&mut fs.lookups, lookup);
+    }
+    if !an_ask(&fresh.question) && an_ask(&l.question) {
+        fresh.question = l.question.clone();
+    }
+    put(store, scope, who.user(), fresh);
     Ok(served)
 }
 
@@ -1318,7 +1375,7 @@ async fn keep_conversation(
         body.as_bytes(),
         &acl,
     )
-    .version_of(&format!("sessions/{id}/conversation"));
+    .version_of(&conversation_key(id));
     store
         .commit(scope, who.user(), std::slice::from_ref(&ep), &[])
         .await?;
@@ -1326,6 +1383,37 @@ async fn keep_conversation(
     // The PRs it opened or pushed to so far, so what becomes of one finds the session while it is still open.
     crate::session_prs::merge(&mut s.prs, crate::session_prs::links_in(&body));
     Ok(true)
+}
+
+/// The document each keep of session `id`'s conversation so far is a version of ([`keep_conversation`]).
+fn conversation_key(id: &str) -> String {
+    format!("sessions/{id}/conversation")
+}
+
+/// Session `id`'s conversation so far as it was last kept, read as its `asker` with the session's `acl` (whom its
+/// conversation is kept to): the newest version of its document ([`conversation_key`]), which outlives the row's
+/// pointer to it. A row can lose that pointer (a step's write that raced a keep, before [`advise`] wrote onto the
+/// row as it stands; a reopen, which leaves it to the next keep) while the conversation itself was kept.
+async fn last_kept(
+    store: &Store,
+    scope: &Scope,
+    asker: &str,
+    acl: &[String],
+    id: &str,
+) -> Result<Option<String>> {
+    let groups = acl
+        .iter()
+        .filter_map(|a| {
+            a.strip_prefix("group:")
+                .map(str::to_string)
+                .or_else(|| a.strip_prefix("role:").map(|r| format!("role:{r}")))
+        })
+        .collect();
+    let who = Principal::from_parts(asker.to_string(), groups);
+    Ok(store
+        .document(scope, &who, &conversation_key(id), None)
+        .await?
+        .map(|(_, _, b)| String::from_utf8_lossy(&b).into_owned()))
 }
 
 /// Writes `kept` as session `id`'s conversation on its row as it stands now, as fire writes it: a step or an end
@@ -2126,6 +2214,11 @@ pub async fn end(
         }
         (None, _) => None,
     };
+    // A row that lost its pointer to the conversation still has the conversation as it was last kept.
+    let transcript = match transcript {
+        None if !discard => last_kept(store, scope, asker, &s.acl, &id).await?,
+        t => t,
+    };
     s.ended_at = Some(now_micros());
     // The PRs it opened or pushed to, which what becomes of them grades ([`pr_event`]).
     if let Some(t) = &transcript {
@@ -2163,13 +2256,7 @@ pub async fn end(
         .into(),
     );
     if let Some(t) = &transcript {
-        // As a run's trace is kept (`crate::runs::record`), so advice can learn from a rewarded session.
-        let mut body = format!("Session {id}\n\nTask: {}\n\nTrace:\n{t}\n", l.question);
-        if let Some(o) = outcome {
-            body.push_str(&format!("\nOutcome: {o}\n"));
-        }
-        let acl: Vec<&str> = s.acl.iter().map(String::as_str).collect();
-        let ep = Episode::sourced(&format!("{signed}session:{id}"), body.as_bytes(), &acl);
+        let ep = transcript_episode(signed, &id, &l.question, t, outcome, &s.acl);
         store
             .commit(scope, asker, std::slice::from_ref(&ep), &[])
             .await?;
@@ -2182,6 +2269,24 @@ pub async fn end(
     }
     put(store, scope, asker, l.clone());
     Ok(l)
+}
+
+/// Session `id`'s transcript `t` as the episode its end keeps (`<signed>session:<id>`, readable by `acl`), with its
+/// task and outcome: as a run's trace is kept (`crate::runs::record`), so advice can learn from a rewarded session.
+fn transcript_episode(
+    signed: &str,
+    id: &str,
+    task: &str,
+    t: &str,
+    outcome: Option<&str>,
+    acl: &[String],
+) -> Episode {
+    let mut body = format!("Session {id}\n\nTask: {task}\n\nTrace:\n{t}\n");
+    if let Some(o) = outcome {
+        body.push_str(&format!("\nOutcome: {o}\n"));
+    }
+    let acl: Vec<&str> = acl.iter().map(String::as_str).collect();
+    Episode::sourced(&format!("{signed}session:{id}"), body.as_bytes(), &acl)
 }
 
 /// What became of a PR, for `who`'s sessions that opened it or pushed to its branch (`POST /sessions/prs`,
@@ -2283,6 +2388,8 @@ or say it supplied nothing new.
 Then say how the session turned out for the user: succeeded, failed, or unclear. Read what the user asked from the \
 transcript's start.
 
+{rules}
+
 Answer with one JSON object, and nothing else:
 {\"outcome\": \"succeeded|failed|unclear\", \"reason\": \"one sentence: what the user wanted, and whether they \
 got it\", \"notes\": {\"<note key>\": {\"applied\": true, \"redundant\": false, \"helped\": true, \"why\": \"one \
@@ -2296,7 +2403,31 @@ Transcript:
 {transcript}
 {fence}";
 
-/// Judges ended session `l`, reading its notes as `who` and its transcript, and keeps the verdicts on it. A
+/// How the judge reads what [`judge`] adds to a session's transcript: what came after the session ([`after`]), a
+/// partial record ([`partial_record`]), and its requests listed one by one.
+const JUDGE_RULES: &str = "After the transcript, under \"After the session\", is what was seen once the session \
+ended, when there was anything: what became of the pull requests it opened or pushed to, the person's next message \
+(what they asked next, and how soon), and a rating or reward given to the session. Read it with the transcript:
+- A PR the session opened that was merged confirms its work landed; one reverted, or blamed for a regression, \
+shows it failed. One still open, or closed unmerged, shows nothing either way: judge from the transcript as you \
+would without it.
+- The next message shows how the session went only when it is plainly about this session's work: thanks or \
+approval, building on the result, saying it works, or saying it is wrong, still broken or to be redone. A next \
+message about anything else shows nothing either way (people run several sessions at once): judge from the \
+transcript as you would without it.
+- A rating, or a reward given to the session, is someone's account of how it went: weigh it with the rest.
+- A transcript marked \"Partial record\" holds only what the session was opened with and the advice it was given, \
+not what the agent did: say succeeded or failed from it only when what came after shows how it went, else unclear.
+- Judge the session by how its work went for the user. When the main work was done and only a last follow-up was \
+still under way when the session stopped, judge by the work done; when the main work itself was still under way, \
+or nothing shows how it went, it is unclear. Never guess.
+When the user's requests are listed under \"Requests\", also say how each went, in the same object: \
+\"requests\": [{\"n\": 1, \"outcome\": \"succeeded|failed|unclear\"}].";
+
+/// Judges ended session `l`, reading its notes as `who`, its transcript and what came after it among the scope's
+/// sessions `all` ([`after`]), and keeps the verdicts on it. A session that ended with no transcript is judged on
+/// the conversation it last kept, where its row lost the pointer to it (kept now as its transcript, signed
+/// `signed`), else on a partial record of what it left, and only when something after it shows how it went. A
 /// judge that fails leaves the session unscored, saying why.
 pub async fn judge(
     store: &Store,
@@ -2304,6 +2435,8 @@ pub async fn judge(
     who: &Principal,
     cx: &Extractor,
     l: Logged,
+    all: &[Logged],
+    signed: &str,
 ) -> Result<Logged> {
     let s = l.session.as_ref().expect("a session");
     let mut notes = vec![];
@@ -2346,47 +2479,135 @@ pub async fn judge(
         notes.push(format!("Note `{k}`:\n{note}"));
     }
     // Kept last, after the episodes its cited facts come from ([`end`]).
-    let transcript = match l.episodes.last() {
+    let kept = match l.episodes.last() {
         Some(e) => store
             .episode_bodies(scope, vec![e.clone()])
             .await?
             .remove(e)
-            .map(|b| both_ends(&String::from_utf8_lossy(&b)))
-            .unwrap_or_default(),
-        None => String::new(),
+            .map(|b| (e.clone(), String::from_utf8_lossy(&b).into_owned())),
+        None => None,
     };
-    let verdicts = if transcript.is_empty() {
-        json!({"unscored": "no transcript"})
-    } else {
-        let notes = if notes.is_empty() {
-            "(no notes)".to_string()
-        } else {
-            notes.join("\n\n")
-        };
-        let f = fence(&[&notes, &transcript]);
-        let prompt = JUDGE_PROMPT
-            .replace("{fence}", &f)
-            .replace("{notes}", &notes)
-            .replace("{transcript}", &transcript);
-        let log = crate::extract::train_log::Ctx::new(
-            "session_judge",
-            scope,
-            json!({"answer_id": l.answer_id}),
-        );
-        match log.run(cx.complete(&prompt)).await {
-            Ok(reply) => match json_object(&reply) {
-                Some(v) => verdicts(&v, &s.served, &shown),
-                None => json!({"unscored": "the judge's reply has no JSON"}),
-            },
-            Err(e) => json!({"unscored": head(&format!("{e:#}"), 300)}),
+    // Ended with none: the conversation it last kept, where its row lost the pointer to it (ended before `end` read
+    // it from its document), is its transcript, kept as its end would have kept it once judged.
+    let mut recovered = None;
+    let kept = match kept {
+        Some(k) => Some(k),
+        None => last_kept(store, scope, &l.asker, &s.acl, &l.answer_id)
+            .await?
+            .map(|c| {
+                let task = match first_said(&c) {
+                    Some(t) if l.question.trim().is_empty() => {
+                        crate::hook::redact(&head(t, MAX_CONTEXT))
+                    }
+                    _ => l.question.clone(),
+                };
+                let ep = transcript_episode(signed, &l.answer_id, &task, &c, None, &s.acl);
+                let k = (
+                    ep.episode_id.clone(),
+                    String::from_utf8_lossy(&ep.body).into_owned(),
+                );
+                recovered = Some((ep, task, c));
+                k
+            }),
+    };
+    let (after, shown_after) = after(&l, all);
+    // The requests the person made in it, each graded on its own where there are several, the latest kept.
+    let asked = kept.as_ref().map(|(_, b)| asks(b)).unwrap_or_default();
+    let listed = match asked.len() {
+        0 | 1 => &asked[..0],
+        n => &asked[n.saturating_sub(JUDGE_REQUESTS)..],
+    };
+    let mut verdicts = match &kept {
+        // What it left shows what was asked but not what the agent did: with nothing after it either, there is
+        // nothing to read for how it went, and no model is asked.
+        None if after.is_empty() => {
+            json!({"unscored": "no transcript, and nothing after the session shows how it went"})
+        }
+        _ => {
+            let notes = if notes.is_empty() {
+                "(no notes)".to_string()
+            } else {
+                notes.join("\n\n")
+            };
+            let mut transcript = match &kept {
+                Some((_, b)) => both_ends(b),
+                None => partial_record(&l),
+            };
+            if !listed.is_empty() {
+                let latest = match asked.len() - listed.len() {
+                    0 => String::new(),
+                    _ => format!("; the latest {} of {}", listed.len(), asked.len()),
+                };
+                transcript.push_str(&format!("\n\nRequests (the user's, in order{latest}):\n"));
+                for (i, a) in listed.iter().enumerate() {
+                    let cut = if a.interrupted { " (interrupted)" } else { "" };
+                    transcript.push_str(&format!(
+                        "{}. {}{cut}\n",
+                        i + 1,
+                        head(
+                            &a.said.split_whitespace().collect::<Vec<_>>().join(" "),
+                            JUDGE_REQUEST
+                        )
+                    ));
+                }
+            }
+            if !after.is_empty() {
+                transcript.push_str(&format!("\n\nAfter the session:\n{after}"));
+            }
+            let f = fence(&[&notes, &transcript]);
+            let prompt = JUDGE_PROMPT
+                .replace("{rules}", JUDGE_RULES)
+                .replace("{fence}", &f)
+                .replace("{notes}", &notes)
+                .replace("{transcript}", &transcript);
+            let log = crate::extract::train_log::Ctx::new(
+                "session_judge",
+                scope,
+                json!({"answer_id": l.answer_id}),
+            );
+            match log.run(cx.complete(&prompt)).await {
+                Ok(reply) => match json_object(&reply) {
+                    Some(v) => {
+                        let mut out = verdicts(&v, &s.served, &shown);
+                        if let Some((of, _)) = &kept
+                            && !listed.is_empty()
+                        {
+                            out["requests"] =
+                                json!({"of": of, "judged": judged_requests(&v, listed)});
+                        }
+                        out
+                    }
+                    None => json!({"unscored": "the judge's reply has no JSON"}),
+                },
+                Err(e) => json!({"unscored": head(&format!("{e:#}"), 300)}),
+            }
         }
     };
+    // What it was judged on, where that is more or less than its transcript.
+    if kept.is_none() {
+        verdicts["record"] = json!("partial");
+    } else if recovered.is_some() {
+        verdicts["record"] = json!("recovered");
+    }
+    if !shown_after.is_empty() {
+        verdicts["after"] = json!(shown_after);
+    }
     // On the row as it stands now, and only if it is still the session judged: its owner may have come back to it
     // during the model call (reopened, or ended it with a fuller transcript), which this copy would undo.
     let mut fresh = Box::pin(find(store, scope, who, &l.answer_id)).await?;
     let fs = fresh.session.as_mut().expect("a session");
-    if fs.ended_at.is_none() || fs.verdicts.is_some() || fresh.episodes != l.episodes {
+    if fs.ended_at.is_none() || fs.verdicts != s.verdicts || fresh.episodes != l.episodes {
         return Ok(fresh);
+    }
+    if let Some((ep, task, c)) = recovered {
+        store
+            .commit(scope, &fresh.asker, std::slice::from_ref(&ep), &[])
+            .await?;
+        fresh.episodes.push(ep.episode_id);
+        crate::session_prs::merge(&mut fs.prs, crate::session_prs::links_in(&c));
+        if fresh.question.trim().is_empty() {
+            fresh.question = task;
+        }
     }
     fs.verdicts = Some(verdicts.to_string());
     // A session nobody rewarded teaches advice by how the judge found it turned out (an agent's own reward, given
@@ -2402,8 +2623,12 @@ pub async fn judge(
             // may hold instructions, and the reason is read by the model that learns advice.
             fresh.reward = reward;
             fresh.reward_reason = Some(format!(
-                "{}the judge's reading of the session's transcript",
-                crate::qa_log::JUDGED
+                "{}the judge's reading of the session's {}",
+                crate::qa_log::JUDGED,
+                match kept {
+                    Some(_) => "transcript",
+                    None => "partial record and what came after it",
+                }
             ));
         }
     }
@@ -2480,6 +2705,193 @@ fn verdicts(
     }
     json!({"outcome": outcome, "reason": v["reason"].as_str().map(|r| head(r, 300)), "notes": notes,
            "counterfactual": true})
+}
+
+/// The judge's outcome of each request it was shown (`listed`, numbered from 1), as `{at, to, outcome}` in the
+/// transcript's episode ([`asks`]): each it named once, succeeded, failed or unclear.
+fn judged_requests(v: &Value, listed: &[Ask]) -> Vec<Value> {
+    let mut out: BTreeMap<usize, Value> = BTreeMap::new();
+    for r in v["requests"].as_array().into_iter().flatten() {
+        let Some(n) = r["n"].as_u64().and_then(|n| usize::try_from(n).ok()) else {
+            continue;
+        };
+        let (Some(a), Some(o)) = (
+            n.checked_sub(1).and_then(|i| listed.get(i)),
+            r["outcome"]
+                .as_str()
+                .filter(|o| matches!(*o, "succeeded" | "failed" | "unclear")),
+        ) else {
+            continue;
+        };
+        out.entry(n)
+            .or_insert_with(|| json!({"at": a.at, "to": a.to, "outcome": o}));
+    }
+    out.into_values().collect()
+}
+
+/// How soon after a session's last step its person's next session may begin to count as their next message
+/// ([`after`]): within the idle time ([`idle`]), as close as a step of the session itself could have come.
+fn next_within() -> i64 {
+    idle().as_micros() as i64
+}
+
+/// When session `l` last had a step, as near as its row tells: its end, or for one the server ended idle, the idle
+/// time before it ([`idle`]; the sweep ends it within a sweep of that).
+fn last_step(l: &Logged) -> i64 {
+    let s = l.session.as_ref().expect("a session");
+    let end = s.ended_at.unwrap_or(l.updated_at);
+    match s.ended_by.as_deref() {
+        Some("idle") => (end - idle().as_micros() as i64).max(l.asked_at),
+        _ => end,
+    }
+}
+
+/// The person's next message after session `l`: the opening ask of the first of their own sessions in `all` begun
+/// after its last step (a sweep's span before it, which the idle end's time is uncertain by) and within
+/// [`next_within`] of it, a person's, not opened with the same words (an agent's second session for the same
+/// turn); and how long after the last step it came.
+fn next_message<'a>(l: &Logged, all: &'a [Logged]) -> Option<(&'a Logged, i64)> {
+    const SLACK: i64 = 90_000_000;
+    let last = last_step(l);
+    all.iter()
+        .filter(|n| {
+            n.answer_id != l.answer_id
+                && n.asker == l.asker
+                && n.asked_at > l.asked_at
+                && n.asked_at >= last - SLACK
+                && n.asked_at <= last + next_within()
+                && n.kind.as_deref() == Some(KIND)
+                && !automated(n)
+                && !discarded(n)
+                && an_ask(&n.question)
+                && n.question.trim() != l.question.trim()
+        })
+        .min_by_key(|n| n.asked_at)
+        .map(|n| (n, (n.asked_at - last).max(0)))
+}
+
+/// `us` microseconds, in words.
+fn minutes(us: i64) -> String {
+    match us / 60_000_000 {
+        0 => "under a minute".into(),
+        1 => "1 minute".into(),
+        m => format!("{m} minutes"),
+    }
+}
+
+/// What was seen of session `l` after it ended, for the judge ([`JUDGE_RULES`]): what became of the PRs it opened
+/// or pushed to, the person's next message ([`next_message`]) and a rating or reward given to it (not the judge's
+/// own); with the kinds shown. Empty when there is none of these.
+fn after(l: &Logged, all: &[Logged]) -> (String, Vec<&'static str>) {
+    let s = l.session.as_ref().expect("a session");
+    let (mut out, mut kinds) = (vec![], vec![]);
+    for p in &s.prs {
+        let how = match p.how.as_str() {
+            "created" => "opened",
+            "pushed" => "pushed to",
+            _ => "said it opened",
+        };
+        let came = if p.events.is_empty() {
+            "not merged or closed yet".to_string()
+        } else {
+            p.events
+                .iter()
+                .map(|e| match e.by {
+                    Some(n) => format!("{} (by #{n})", e.kind),
+                    None => e.kind.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        out.push(format!("- It {how} PR {}: {came}.", p.named()));
+    }
+    if !s.prs.is_empty() {
+        kinds.push("pr");
+    }
+    if let Some((n, gap)) = next_message(l, all) {
+        out.push(format!(
+            "- The user's next message, {} after this session's last step, opening their next session:\n{}",
+            minutes(gap),
+            head(n.question.trim(), JUDGE_NEXT)
+        ));
+        kinds.push("next");
+    }
+    if let Some(r) = l.rating.as_deref() {
+        out.push(format!("- The user rated it {}.", r.replace('_', " ")));
+        kinds.push("rating");
+    }
+    let judged = l
+        .reward_reason
+        .as_deref()
+        .is_some_and(|w| w.starts_with(crate::qa_log::JUDGED));
+    if let Some(r) = l.reward.filter(|_| !judged) {
+        let why = l
+            .reward_reason
+            .as_deref()
+            .map(|w| format!(": {}", head(w, 300)))
+            .unwrap_or_default();
+        out.push(format!(
+            "- It was given the reward {r} (from -1 to 1){why}."
+        ));
+        kinds.push("reward");
+    }
+    (out.join("\n"), kinds)
+}
+
+/// What ended session `l` left when it kept no transcript, for the judge: what it was opened with, its advice
+/// steps, the notes it was served or withheld, the advice fired at its tool calls and how it ended. Marked partial:
+/// what the agent did isn't in it. A client without hooks that opens a session a turn and never ends it leaves
+/// only this.
+fn partial_record(l: &Logged) -> String {
+    let s = l.session.as_ref().expect("a session");
+    let mut out = format!(
+        "Partial record: this session kept no transcript (its agent never sent its conversation), so what the \
+         agent did is not known. What it left:\n\nOpened with (the user's message, or the agent's account of \
+         it):\n{}\n",
+        l.question.trim()
+    );
+    if !s.lookups.is_empty() {
+        out.push_str("\nIts asks for advice (minutes after it opened, where, what came of it):\n");
+        for k in &s.lookups {
+            let key = k
+                .key
+                .as_deref()
+                .map(|k| format!(", {k}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "- {}, {}: {}{key}\n",
+                (k.at - l.asked_at).max(0) / 60_000_000,
+                k.moment,
+                k.outcome
+            ));
+        }
+    }
+    for (what, keys) in [
+        ("Notes served", &s.served),
+        ("Notes withheld (the comparison arm)", &s.withheld),
+        ("Advice fired at its tool calls", &s.fires),
+    ] {
+        if !keys.is_empty() {
+            out.push_str(&format!("\n{what}: {}\n", keys.join("; ")));
+        }
+    }
+    if let Some(a) = l.answer.as_deref() {
+        out.push_str(&format!(
+            "\nIts agent ended it saying:\n{}\n",
+            head(a, JUDGE_NEXT)
+        ));
+    }
+    if let Some(e) = s.ended_at {
+        let how = match s.ended_by.as_deref() {
+            Some("idle") => "ended idle",
+            _ => "was ended by its agent",
+        };
+        out.push_str(&format!(
+            "\nIt {how}, its last step {} after it opened.\n",
+            minutes((last_step(l).min(e) - l.asked_at).max(0))
+        ));
+    }
+    out
 }
 
 const NEXT_MOVE: &str = "An AI coding agent was given request {n} below (in `requests`) and answered it. From the \
@@ -2635,10 +3047,19 @@ pub struct Swept {
 
 /// Sessions a sweep tries to grade at most ([`grade_tasks`]): a scope's backlog is worked through a sweep at a time.
 const MAX_GRADED: usize = 50;
+/// Sessions a sweep judges again at most of those an earlier judge left unscored for having no transcript
+/// ([`unjudged_before`]), so a scope's backlog of them is worked through a sweep at a time.
+const MAX_REJUDGED: usize = 50;
+
+/// Whether verdicts `v` are those a judge before partial records left on a session that ended with no transcript,
+/// asking no model: it is judged once more, on the conversation it last kept or what it left ([`judge`]).
+fn unjudged_before(v: &str) -> bool {
+    serde_json::from_str::<Value>(v).is_ok_and(|v| v == json!({"unscored": "no transcript"}))
+}
 
 /// Ends the scope's sessions idle for longer than `idle`, signing each transcript with `signed(asker)`, then
-/// judges the ended sessions that aren't judged yet (with `cx`, when there is one): all of them where the scope
-/// `learning` advice, else only those that were routed advice.
+/// judges the ended sessions that aren't judged yet (with `cx`, when there is one), once their last step is
+/// [`judge_wait`] old: all of them where the scope `learning` advice, else only those that were routed advice.
 pub async fn sweep(
     store: &Store,
     scope: &Scope,
@@ -2652,14 +3073,15 @@ pub async fn sweep(
         eprintln!("sessions {scope}: no decisions model to grade requests with: {e:#}");
         None
     });
-    let mut tried = 0;
+    let (mut tried, mut rejudged) = (0, 0);
     let before = now_micros() - idle.as_micros() as i64;
+    let settled = now_micros() - judge_wait().as_micros() as i64;
     let sessions: Vec<Logged> = list(store, scope)
         .await?
         .into_iter()
         .filter(|l| l.kind.as_deref() == Some(KIND))
         .collect();
-    for l in sessions {
+    for l in sessions.iter().cloned() {
         let s = l.session.as_ref().expect("a session");
         let l = if s.ended_at.is_none() {
             if l.updated_at > before {
@@ -2704,7 +3126,8 @@ pub async fn sweep(
             continue;
         }
         // A judged session of a person's, where advice learns, is graded request by request once.
-        if let Some(v) = &s.verdicts {
+        let again = s.verdicts.as_deref().is_some_and(unjudged_before);
+        if let Some(v) = s.verdicts.as_ref().filter(|_| !again) {
             let ungraded = || {
                 serde_json::from_str::<Value>(v)
                     .is_ok_and(|v| v.get("unscored").is_none() && v.get("tasks").is_none())
@@ -2724,11 +3147,16 @@ pub async fn sweep(
             }
             continue;
         }
+        // Judged once what the person did next could be seen ([`after`]).
+        if last_step(&l) > settled || (again && rejudged >= MAX_REJUDGED) {
+            continue;
+        }
         if let Some(cx) = cx {
+            rejudged += usize::from(again);
             // Its notes as the asker reads them (their own ACL entry; notes are written for the scope).
             let who = Principal::from_parts(l.asker.clone(), vec![]);
-            let id = l.answer_id.clone();
-            match judge(store, scope, &who, cx, l).await {
+            let (id, signed) = (l.answer_id.clone(), signed(&l.asker));
+            match judge(store, scope, &who, cx, l, &sessions, &signed).await {
                 Ok(_) => done.judged += 1,
                 Err(e) => eprintln!("sessions {scope}: judging {id}: {e:#}"),
             }

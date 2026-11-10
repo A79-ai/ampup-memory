@@ -57,7 +57,8 @@ pub struct Event {
 pub const KINDS: [&str; 4] = ["merged", "closed", "reverted", "regression"];
 
 impl Pr {
-    fn named(&self) -> String {
+    /// `owner/repo#number`, or its branch while its number isn't known.
+    pub(crate) fn named(&self) -> String {
         match self.number {
             Some(n) => format!("{}#{n}", self.repo),
             None => format!(

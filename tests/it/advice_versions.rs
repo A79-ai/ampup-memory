@@ -246,6 +246,8 @@ async fn a_notes_lessons_are_traced_item_by_item_across_its_versions() {
         std::env::set_var("MEMSTORE_ADVICE_ROUTE_URL", &url);
         std::env::set_var("MEMSTORE_ADVICE_ROUTE_KEY", "stand-in");
         std::env::set_var("MEMSTORE_ADVICE_EVIDENCE", "0");
+        // Judged as soon as it ends, not once what the person did next could be seen.
+        std::env::set_var("MEMSTORE_SESSION_JUDGE_WAIT_SECS", "0");
     }
     let issuer = start_idp().await;
     let dir = tempfile::tempdir().unwrap();
