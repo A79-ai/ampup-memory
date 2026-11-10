@@ -1,0 +1,175 @@
+[workspace]
+members = ["crates/memstore-core", "crates/memstore-client"]
+# `cargo test`, `cargo clippy` and `cargo build` cover every crate.
+default-members = [".", "crates/memstore-core", "crates/memstore-client"]
+
+# Shared by every crate (`license.workspace = true` and so on).
+[workspace.package]
+license = "Apache-2.0"
+repository = "https://github.com/A79-ai/ampup-memory"
+homepage = "https://github.com/A79-ai/ampup-memory"
+
+[workspace.dependencies]
+aes-gcm = "0.10"
+base64 = "0.22"
+anyhow = "1.0.104"
+arrow-arith = "58"
+arrow-array = "58"
+arrow-data = "58"
+arrow-schema = "58"
+arrow-select = "58"
+async-trait = "0.1.92"
+bytes = "1.12.1"
+chrono = "0.4.45"
+# Time zones an episode names (an email's `Timezone:` hint): already built for arrow.
+chrono-tz = "0.10"
+clap = { version = "4.5", features = ["derive", "env"] }
+csv = "1.3"
+futures = "0.3.34"
+iceberg = "0.10.1"
+iceberg-catalog-rest = "0.10.1"
+iceberg-storage-opendal = { version = "0.10.1", features = ["opendal-gcs", "opendal-azdls", "opendal-fs", "opendal-s3"] }
+# The embedding cache's object store (crates/memstore-core/src/search/embed_cache.rs) and the model-call cache's
+# (src/extract/cache.rs), and the writer lease's (src/server/writer.rs, which takes azdls for abfss:// catalogs):
+# the opendal iceberg-storage-opendal already builds.
+opendal = { version = "0.57", features = ["services-gcs", "services-s3", "services-fs", "services-azdls"] }
+# Only the object stores memstore keeps indexes in (a local path, gs://, s3://, abfss://). Lance's defaults add OSS,
+# COS, TOS, GooseFS, Hugging Face and geo: 113 build units, about an eighth of a cold build.
+lance = { version = "13", default-features = false, features = ["aws", "azure", "gcp"] }
+# Named metrics written as SQL, run over a reader's visible facts: the DataFusion Lance already builds, with its features.
+datafusion = { version = "54", default-features = false, features = ["crypto_expressions", "datetime_expressions", "encoding_expressions", "nested_expressions", "regex_expressions", "sql", "string_expressions", "unicode_expressions"] }
+lance-index = "13"
+lance-tokenizer = "13"
+toml_edit = "0.25"
+shlex = "2"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sentry = { version = "0.49.3", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+sentry-anyhow = "0.49.3"
+url = "2"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tokio = { version = "1.53.2", features = ["full"] }
+# Registers memstore's own Iceberg storage (src/platform.rs); the version iceberg already builds.
+typetag = "0.2.23"
+uuid = { version = "1.27.0", features = ["v4"] }
+fastembed = { version = "7.1.1", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
+lance-linalg = "13"
+lance-core = "13"
+roaring = "0.11.5"
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+rand = "0.8"
+parking_lot = "0.12"
+# The index cache every index dataset shares (crates/memstore-core/src/search/cache.rs): the version Lance already builds.
+quick_cache = "0.6"
+# statvfs, for the disk_usage alert (src/alerts.rs).
+libc = "0.2"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+tikv-jemallocator = "0.6"
+prometheus = { version = "0.14", default-features = false }
+schemars = { version = "1", features = ["chrono04"] }
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+# The deployment agent checks cosign image signatures (ECDSA P-256); the tests also use its JWKs.
+p256 = { version = "0.13", features = ["jwk", "pem"] }
+rsa = { version = "0.9", features = ["pem"] }
+tempfile = "3.27.0"
+
+[package]
+name = "memstore"
+version = "0.1.0"
+edition = "2024"
+description = "AmpUp Memory: a memory store and server for AI agents and the teams that run them"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Released as binaries (GitHub Releases), not to crates.io: the crates depend on each other by path alone.
+publish = false
+
+# No doctests (the doc code blocks are text and json), and the binary has no unit tests of its own: without
+# these `cargo test` would run rustdoc over the crate and link an empty test binary as big as the server.
+[lib]
+doctest = false
+
+[[bin]]
+name = "memstore"
+path = "src/main.rs"
+test = false
+
+[features]
+default = []
+# `memstore cloud` and `memstore init`, the CLI of the hosted control plane (src/cloud, src/onboard.rs). A build
+# without them is the self-hosted engine; a checkout without those files builds only without them.
+control-plane = []
+# Dev builds: link the dependencies from one dylib (crates/memstore-deps). Release builds stay static.
+dylib = ["dep:memstore-deps"]
+
+[dependencies]
+memstore-core = { path = "crates/memstore-core" }
+memstore-client = { path = "crates/memstore-client" }
+memstore-deps = { path = "crates/memstore-deps", optional = true }
+aes-gcm.workspace = true
+base64.workspace = true
+anyhow.workspace = true
+arrow-arith.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+clap.workspace = true
+csv.workspace = true
+futures.workspace = true
+iceberg.workspace = true
+iceberg-catalog-rest.workspace = true
+iceberg-storage-opendal.workspace = true
+opendal.workspace = true
+lance.workspace = true
+lance-index.workspace = true
+lance-tokenizer.workspace = true
+toml_edit.workspace = true
+shlex.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+reqwest.workspace = true
+sentry.workspace = true
+sentry-anyhow.workspace = true
+url.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+typetag.workspace = true
+uuid.workspace = true
+fastembed.workspace = true
+lance-linalg.workspace = true
+lance-core.workspace = true
+roaring.workspace = true
+jsonwebtoken.workspace = true
+rand.workspace = true
+parking_lot.workspace = true
+libc.workspace = true
+tikv-jemalloc-ctl.workspace = true
+tikv-jemallocator.workspace = true
+prometheus.workspace = true
+schemars.workspace = true
+ed25519-dalek.workspace = true
+p256.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+rsa.workspace = true
+tempfile.workspace = true
+
+[profile.dev]
+debug = false
+
+# Dependencies optimized a little in dev builds: an unoptimized binary with Lance, DataFusion and
+# ONNX outgrows arm64's 128 MB branch range at link time, and debug Lance is slow in tests.
+[profile.dev.package."*"]
+opt-level = 1

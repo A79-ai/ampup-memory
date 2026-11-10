@@ -1,0 +1,3 @@
+# Known throwaway test key: a 2048-bit RSA key generated for the integration tests only (tests/it signs test
+# JWTs with it and serves its modulus, tests/fixtures/idp_key.n, from a local fake JWKS). Nothing trusts it.
+tests/fixtures/idp_key.pem:private-key:1

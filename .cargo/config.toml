@@ -1,0 +1,11 @@
+[env]
+# Debug builds poll nested query futures (rel sub-queries over Lance scans) and the server's request
+# handler (`server::handle`: a poll frame near 4 MiB on arm64, more on x86_64) with large stack frames;
+# the default 2 MiB test-thread stack is too small for them, and 8 MiB sat a few bytes from the cliff
+# (`advice_never_blocks_agents` overflowed on CI). The binary gives its own debug workers 32 MiB too
+# (src/main.rs); reserved, not committed, so the size costs nothing idle.
+RUST_MIN_STACK = "33554432"
+# Tests and `cargo run` embed with the local model, whatever API keys the machine carries, so the
+# suite never calls an embeddings API (src/search/embed.rs: an OpenRouter or OpenAI key otherwise picks that API). Set
+# MEMSTORE_EMBED to choose otherwise; the built binary has no such pin.
+MEMSTORE_EMBED = "local"

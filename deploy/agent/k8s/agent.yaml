@@ -1,0 +1,280 @@
+# The deployment agent beside a memstore engine running as the Deployment `memstore` (container
+# `memstore`) in the namespace `memstore`. Change the names, the image repository and the agent's own
+# image to yours. The agent may read and patch that one Deployment and nothing else, and the
+# ValidatingAdmissionPolicy at the end limits what its patches may change.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: memstore-agent
+  namespace: memstore
+  annotations:
+    # Workload Identity: the Google service account the agent reads image signatures as (it needs
+    # roles/artifactregistry.reader on the signature repository). Not needed for a public registry.
+    iam.gke.io/gcp-service-account: memstore-agent@YOUR-PROJECT.iam.gserviceaccount.com
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: memstore-agent
+  namespace: memstore
+rules:
+  # Read the engine's Deployment (its image, flag variables and rollout status) and patch it (the
+  # engine container's image and MEMSTORE_FLAG_* variables, and the restartedAt annotation). The rollout
+  # is judged from the Deployment's own status, so no access to its ReplicaSets or pods is needed.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["memstore"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: memstore-agent
+  namespace: memstore
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: memstore-agent
+subjects:
+  - kind: ServiceAccount
+    name: memstore-agent
+    namespace: memstore
+---
+# The public key your images are signed with (cosign v2, --tlog-upload=false). From Cloud KMS:
+#   gcloud kms keys versions get-public-key 1 --key=KEY --keyring=RING --location=LOC --project=PROJECT \
+#     --output-file=cosign.pub
+#   kubectl -n memstore create configmap memstore-agent-cosign --from-file=cosign.pub
+# A public key, not a secret: a ConfigMap is enough.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: memstore-agent-cosign
+  namespace: memstore
+data:
+  cosign.pub: |
+    -----BEGIN PUBLIC KEY-----
+    YOUR-P256-PUBLIC-KEY
+    -----END PUBLIC KEY-----
+---
+# What the agent remembers: the generation it applied, the actions it ran, the control plane's key.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: memstore-agent-state
+  namespace: memstore
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memstore-agent
+  namespace: memstore
+spec:
+  # One agent, never two at once: Recreate, not a rolling update.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: memstore-agent}
+  template:
+    metadata:
+      labels: {app: memstore-agent}
+    spec:
+      serviceAccountName: memstore-agent
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: agent
+          # The same memstore binary, pinned by you: the agent never changes its own image.
+          image: us-docker.pkg.dev/YOUR-PROJECT/memstore/engine:1.0.0@sha256:YOUR-DIGEST
+          args: ["agent"]
+          env:
+            - {name: MEMSTORE_DEPLOYMENT_CREDENTIAL, value: /etc/memstore/deployment.json}
+            - {name: MEMSTORE_AGENT_STATE, value: /var/lib/memstore-agent/agent.state.json}
+            # The only repository the engine may run from; the control plane names a tag and digest.
+            - {name: MEMSTORE_AGENT_IMAGE_REPOSITORY, value: us-docker.pkg.dev/YOUR-PROJECT/memstore/engine}
+            - {name: MEMSTORE_AGENT_DEPLOYMENT, value: memstore}
+            - {name: MEMSTORE_AGENT_CONTAINER, value: memstore}
+            # report detects drift without changing workloads; repair restores the accepted spec in its windows.
+            - {name: MEMSTORE_AGENT_DRIFT_MODE, value: report}
+            # To allow embedding changes, set both this list and embedProviders in the admission policy below.
+            # - {name: MEMSTORE_AGENT_EMBED_PROVIDERS, value: "local,openai"}
+            - {name: MEMSTORE_AGENT_HEALTH_URL, value: "http://memstore.memstore.svc:8080/healthz"}
+            # An image runs only with a cosign signature by this key for its digest.
+            - {name: MEMSTORE_AGENT_COSIGN_KEY, value: /etc/memstore-cosign/cosign.pub}
+            # gcp-metadata is the default for *-docker.pkg.dev and gcr.io; anonymous for a public registry.
+            - {name: MEMSTORE_AGENT_REGISTRY_AUTH, value: gcp-metadata}
+            # Only when images are signed with COSIGN_REPOSITORY: where their signatures are.
+            # - {name: MEMSTORE_AGENT_SIGNATURE_REPOSITORY, value: us-docker.pkg.dev/YOUR-PROJECT/memstore-signatures/engine}
+          volumeMounts:
+            - {name: credential, mountPath: /etc/memstore, readOnly: true}
+            - {name: cosign-key, mountPath: /etc/memstore-cosign, readOnly: true}
+            - {name: state, mountPath: /var/lib/memstore-agent}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+      volumes:
+        # The deployment credential `memstore deployment enroll` wrote, as a Secret (the engine's own).
+        - name: credential
+          secret:
+            secretName: memstore-deployment
+            defaultMode: 0440
+        - name: cosign-key
+          configMap:
+            name: memstore-agent-cosign
+        - name: state
+          persistentVolumeClaim:
+            claimName: memstore-agent-state
+---
+# What the agent may change, enforced by the API server, not by trusting the agent: RBAC lets it
+# patch the engine's Deployment, and this policy refuses any request from its service account that
+# changes anything but the memstore container's image (from the approved repository, by digest),
+# its MEMSTORE_FLAG_* variables (literal 0 or 1), explicitly allowed embedding settings, and the
+# pod template's restartedAt annotation. A
+# compromised agent can't run another image, command, volume or service account in the pod.
+#
+# CEL can't iterate a typed object's fields (`all()` over one sees none, so it would pass anything),
+# so each field is named: every field of DeploymentSpec, ObjectMeta, PodSpec and Container in
+# Kubernetes 1.35's OpenAPI (api/openapi-spec/v3/apis__apps__v1_openapi.json), each required to be
+# as it was. When the cluster moves to a Kubernetes with new fields, add them here.
+#
+# The engine's own image must be pinned by digest too, or the agent's rollback to it is refused.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: memstore-agent-limits
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["deployments", "deployments/scale", "deployments/status"]
+  matchConditions:
+    - name: from-the-agent
+      expression: request.userInfo.username == "system:serviceaccount:memstore:memstore-agent"
+  variables:
+    # Keep empty to forbid embedding changes. To allow them, list the same providers as
+    # MEMSTORE_AGENT_EMBED_PROVIDERS, including the original provider needed for rollback.
+    # Example: '["local", "openai"]'. Changing this policy requires the customer's administrator.
+    - name: embedProviders
+      expression: '[]'
+    - name: embedVars
+      expression: '["MEMSTORE_EMBED", "MEMSTORE_EMBED_MODEL", "MEMSTORE_EMBED_DIMS"]'
+    - name: newPod
+      expression: object.spec.template.spec
+    - name: oldPod
+      expression: oldObject.spec.template.spec
+    - name: engine
+      expression: object.spec.template.spec.containers.filter(c, c.name == "memstore")
+    - name: was
+      expression: oldObject.spec.template.spec.containers.filter(c, c.name == "memstore")
+    - name: newEnv
+      expression: 'has(variables.engine[0].env) ? variables.engine[0].env : []'
+    - name: oldEnv
+      expression: 'has(variables.was[0].env) ? variables.was[0].env : []'
+    - name: newEmbed
+      expression: 'variables.newEnv.filter(v, v.name in variables.embedVars)'
+    - name: oldEmbed
+      expression: 'variables.oldEnv.filter(v, v.name in variables.embedVars)'
+    - name: newAnn
+      expression: 'has(object.spec.template.metadata.annotations) ? object.spec.template.metadata.annotations : {}'
+    - name: oldAnn
+      expression: 'has(oldObject.spec.template.metadata.annotations) ? oldObject.spec.template.metadata.annotations : {}'
+    - name: objectMetaFields
+      expression: >-
+        ["annotations", "creationTimestamp", "deletionGracePeriodSeconds", "deletionTimestamp", "finalizers",
+         "generateName", "labels", "name", "namespace", "ownerReferences", "selfLink", "uid"]
+  validations:
+    - expression: >-
+        request.operation == "UPDATE" && (!has(request.subResource) || request.subResource == "") &&
+        object.metadata.namespace == "memstore" && object.metadata.name == "memstore"
+      message: the agent may only update the memstore Deployment itself
+    # The Deployment's own metadata (all but what the server keeps), then its spec but the template.
+    - expression: >-
+        variables.objectMetaFields.all(f,
+          (f in object.metadata) == (f in oldObject.metadata) &&
+          (!(f in object.metadata) || object.metadata[f] == oldObject.metadata[f]))
+      message: the agent may not change the Deployment's metadata (labels, annotations, owners, finalizers)
+    - expression: >-
+        ["minReadySeconds", "paused", "progressDeadlineSeconds", "replicas", "revisionHistoryLimit", "selector",
+         "strategy"].all(f,
+          (f in object.spec) == (f in oldObject.spec) && (!(f in object.spec) || object.spec[f] == oldObject.spec[f]))
+      message: the agent may not change the Deployment's spec beyond its pod template
+    # The pod template's metadata: only restartedAt.
+    - expression: >-
+        variables.objectMetaFields.filter(f, f != "annotations").all(f,
+          (f in object.spec.template.metadata) == (f in oldObject.spec.template.metadata) &&
+          (!(f in object.spec.template.metadata) || object.spec.template.metadata[f] == oldObject.spec.template.metadata[f]))
+      message: the agent may not change the pod template's labels or other metadata
+    - expression: >-
+        variables.newAnn.all(k, k == "kubectl.kubernetes.io/restartedAt" || (k in variables.oldAnn && variables.oldAnn[k] == variables.newAnn[k])) &&
+        variables.oldAnn.all(k, k == "kubectl.kubernetes.io/restartedAt" || k in variables.newAnn)
+      message: of the pod template's annotations the agent may change only restartedAt
+    # The pod spec: every field but the containers, as it was.
+    - expression: >-
+        ["activeDeadlineSeconds", "affinity", "automountServiceAccountToken", "dnsConfig", "dnsPolicy",
+         "enableServiceLinks", "ephemeralContainers", "hostAliases", "hostIPC", "hostNetwork", "hostPID", "hostUsers",
+         "hostname", "hostnameOverride", "imagePullSecrets", "initContainers", "nodeName", "nodeSelector", "os",
+         "overhead", "preemptionPolicy", "priority", "priorityClassName", "readinessGates", "resourceClaims",
+         "resources", "restartPolicy", "runtimeClassName", "schedulerName", "schedulingGates", "securityContext",
+         "serviceAccount", "serviceAccountName", "setHostnameAsFQDN", "shareProcessNamespace", "subdomain",
+         "terminationGracePeriodSeconds", "tolerations", "topologySpreadConstraints", "volumes", "workloadRef"].all(f,
+          (f in variables.newPod) == (f in variables.oldPod) &&
+          (!(f in variables.newPod) || variables.newPod[f] == variables.oldPod[f]))
+      message: the agent may not change the pod's service account, volumes, init containers, security context or placement
+    - expression: >-
+        size(variables.newPod.containers) == size(variables.oldPod.containers) &&
+        variables.newPod.containers.all(c, c.name == "memstore" || c in variables.oldPod.containers) &&
+        size(variables.engine) == 1 && size(variables.was) == 1
+      message: the agent may change only the memstore container
+    # The memstore container: every field but image and env, as it was.
+    - expression: >-
+        ["args", "command", "envFrom", "imagePullPolicy", "lifecycle", "livenessProbe", "name", "ports",
+         "readinessProbe", "resizePolicy", "resources", "restartPolicy", "restartPolicyRules", "securityContext",
+         "startupProbe", "stdin", "stdinOnce", "terminationMessagePath", "terminationMessagePolicy", "tty",
+         "volumeDevices", "volumeMounts", "workingDir"].all(f,
+          (f in variables.engine[0]) == (f in variables.was[0]) &&
+          (!(f in variables.engine[0]) || variables.engine[0][f] == variables.was[0][f]))
+      message: of the memstore container the agent may change only its image and allowed environment settings
+    - expression: >-
+        variables.newEnv.filter(v, !v.name.startsWith("MEMSTORE_FLAG_") && !(v.name in variables.embedVars)) ==
+        variables.oldEnv.filter(v, !v.name.startsWith("MEMSTORE_FLAG_") && !(v.name in variables.embedVars))
+      message: the agent may change only feature flags and explicitly allowed embedding settings
+    - expression: >-
+        variables.newEmbed == variables.oldEmbed ||
+        (size(variables.embedProviders) > 0 &&
+         variables.newEmbed.all(v, has(v.value) && !has(v.valueFrom) &&
+           ((v.name == "MEMSTORE_EMBED" && v.value in variables.embedProviders && v.value in ["local", "openai", "openrouter"]) ||
+            (v.name == "MEMSTORE_EMBED_MODEL" && v.value.matches("^[A-Za-z0-9/._:-]{1,128}$")) ||
+            (v.name == "MEMSTORE_EMBED_DIMS" && v.value.matches("^[0-9]{1,4}$") && int(v.value) >= 1 && int(v.value) <= 8192))) &&
+         (size(variables.newEmbed) == 0 || variables.newEmbed.exists(v, v.name == "MEMSTORE_EMBED")))
+      message: embedding changes require an allowed literal provider, a bounded model and dimensions, with no secret references
+    - expression: >-
+        ("env" in variables.engine[0] ? variables.engine[0].env : []).all(v, !v.name.startsWith("MEMSTORE_FLAG_") ||
+          (v.name.matches("^MEMSTORE_FLAG_[A-Z][A-Z0-9_]{0,47}$") && "value" in v && v.value in ["0", "1"] && !("valueFrom" in v)))
+      message: a flag variable is MEMSTORE_FLAG_<NAME> with the literal value 0 or 1
+    - expression: >-
+        variables.engine[0].image == variables.was[0].image ||
+        variables.engine[0].image.matches("^us-docker\\.pkg\\.dev/YOUR-PROJECT/memstore/engine(:[0-9A-Za-z][0-9A-Za-z._-]{0,63})?@sha256:[0-9a-f]{64}$")
+      message: the engine image must come from YOUR-PROJECT/memstore/engine, pinned by digest
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: memstore-agent-limits
+spec:
+  policyName: memstore-agent-limits
+  validationActions: [Deny]

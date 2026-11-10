@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "memstore": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/memstore-client",
+      "args": ["mcp"]
+    }
+  }
+}

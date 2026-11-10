@@ -1,0 +1,288 @@
+{
+ "name": "sales_call",
+ "version": 1,
+ "description": "What a recorded sales call can state: one simple fact per thing said, about the deal, the people, the account, and the commitments and objections it opens. Status is never extracted; aggregation derives it. Tuned on a set of recorded discovery and demo calls.",
+ "mode": "strict",
+ "types": {
+  "deal": {
+   "description": "A sales opportunity, by its CRM id: deal:hs-<id>.",
+   "predicates": {
+    "pain": {
+     "type": "string",
+     "card": "many",
+     "description": "a problem the prospect has today"
+    },
+    "desired_outcome": {
+     "type": "string",
+     "card": "many",
+     "description": "something they want to achieve; keep the figures and examples the speaker names"
+    },
+    "close_rate": {
+     "type": "number",
+     "unit": "%",
+     "description": "their current close rate, with what it measures"
+    },
+    "avg_deal_size": {
+     "type": "money",
+     "unit": "USD",
+     "description": "their average deal size"
+    },
+    "price_quoted": {
+     "type": "money",
+     "unit": "USD per rep per month",
+     "card": "many",
+     "description": "a price we quoted (one fact per bound of a range)"
+    },
+    "decision_criterion": {
+     "type": "string",
+     "card": "many",
+     "description": "something they will judge vendors on"
+    },
+    "decision_maker": {
+     "type": "string",
+     "card": "many",
+     "description": "a person who takes part in the final decision (not someone only gathering information for the deciders); a name with role if not on the call; a person's id from the call, or their name and role"
+    },
+    "economic_buyer": {
+     "type": "string",
+     "description": "the person who controls budget or signs; a person's id from the call, or their name and role"
+    },
+    "advocate": {
+     "type": "ref",
+     "to": [
+      "contact"
+     ],
+     "card": "many",
+     "description": "a prospect who says they want this or will push for it"
+    },
+    "competitor": {
+     "type": "string",
+     "card": "many",
+     "description": "another vendor in play for this need"
+    },
+    "current_tool": {
+     "type": "string",
+     "card": "many",
+     "description": "a tool they use today relevant to the deal, including in-house tools and home-built attempts that failed; keep the key specifics"
+    },
+    "decision_date": {
+     "type": "date",
+     "description": "when they say they will decide"
+    },
+    "compelling_event": {
+     "type": "string",
+     "card": "many",
+     "description": "an event or deadline that creates urgency"
+    },
+    "requirement": {
+     "type": "string",
+     "card": "many",
+     "description": "a capability they need from us; one fact per item when they list several, with the reason when they give one"
+    },
+    "next_meeting": {
+     "type": "date",
+     "description": "the date of the next meeting they agreed"
+    },
+    "decision_process_step": {
+     "type": "string",
+     "card": "many",
+     "description": "how the group decides or who must see what, e.g. 'both co-founders sign off; finance reviews the contract first'"
+    },
+    "top_rep_sales": {
+     "type": "money",
+     "unit": "USD",
+     "description": "sales by their best rep in the stated period, e.g. top rep closed $400k last quarter"
+    },
+    "capability_claimed": {
+     "type": "string",
+     "card": "many",
+     "description": "something we said our product can do in answer to a prospect question, with how, e.g. 'CRM stage changes via API, human approves each write'"
+    },
+    "next_meeting_detail": {
+     "type": "string",
+     "card": "many",
+     "description": "time, timezone, purpose or invitees of the agreed next meeting, e.g. '11:00 AM Central', 'pricing walkthrough; Dana adds her ops lead'"
+    },
+    "scheduling_constraint": {
+     "type": "string",
+     "card": "many",
+     "description": "a stated reason a date does not work or someone is unavailable, e.g. 'Dana at a trade show until the 14th'"
+    },
+    "pricing_model": {
+     "type": "string",
+     "card": "many",
+     "description": "how we said pricing is structured or given, e.g. 'per user per month', 'verbal range, flexible'"
+    }
+   }
+  },
+  "account": {
+   "description": "The prospect's company, by its CRM id.",
+   "predicates": {
+    "team_size": {
+     "type": "number",
+     "unit": "reps",
+     "description": "number of field sales reps"
+    },
+    "industry": {
+     "type": "string"
+    },
+    "headquarters": {
+     "type": "string"
+    },
+    "product_line": {
+     "type": "string",
+     "card": "many",
+     "description": "a line of business, including the business mix ('mostly commercial accounts') and lines they no longer sell"
+    },
+    "team_count": {
+     "type": "number",
+     "unit": "teams",
+     "description": "number of sales teams the reps are split into"
+    },
+    "current_process": {
+     "type": "string",
+     "card": "many",
+     "description": "one step of how they onboard, train or coach reps today, e.g. 'two weeks shadowing a senior rep before taking calls'"
+    },
+    "sales_language": {
+     "type": "string",
+     "card": "many",
+     "description": "a language their reps sell in"
+    }
+   }
+  },
+  "contact": {
+   "description": "A person at the prospect, by CRM id or email.",
+   "predicates": {
+    "title": {
+     "type": "string",
+     "description": "job title; a stated future title gets valid_from on its start date"
+    },
+    "location": {
+     "type": "string",
+     "description": "where the person is, if stated"
+    },
+    "tenure": {
+     "type": "string",
+     "card": "many",
+     "description": "how long the person has been at the company or in the industry, one fact each"
+    },
+    "scope": {
+     "type": "string",
+     "description": "what the person leads or is responsible for, in their words, e.g. 'runs the regional managers'"
+    }
+   }
+  },
+  "commitment": {
+   "description": "Something someone promised on the call. An item: the engine names it commitment:<episode>#<n>.",
+   "predicates": {
+    "action": {
+     "type": "string",
+     "description": "something either side promised or offered to do (e.g. 'offered to send a sample rollout plan'), including what the prospect says they will do"
+    },
+    "owner": {
+     "type": "string",
+     "description": "a person's id from the call, or their name and role"
+    },
+    "due": {
+     "type": "date"
+    },
+    "for_deal": {
+     "type": "ref",
+     "to": [
+      "deal"
+     ]
+    }
+   }
+  },
+  "objection": {
+   "description": "A concern the prospect raised. An item: the engine names it objection:<episode>#<n>.",
+   "predicates": {
+    "concern": {
+     "type": "string",
+     "description": "a concern or doubt the prospect raises, including doubts phrased as questions (setup effort, seat flexibility) and stated risks"
+    },
+    "category": {
+     "type": "enum",
+     "values": [
+      "price",
+      "timing",
+      "fit",
+      "integration",
+      "security",
+      "competition",
+      "authority",
+      "other"
+     ]
+    },
+    "raised_by": {
+     "type": "string",
+     "description": "a person's id from the call, or their name and role"
+    },
+    "for_deal": {
+     "type": "ref",
+     "to": [
+      "deal"
+     ]
+    },
+    "response": {
+     "type": "string",
+     "card": "many",
+     "description": "the answer we gave to this concern, e.g. 'setup takes under a day'; not whether it resolved it"
+    }
+   }
+  },
+  "meeting": {
+   "description": "This call, by its meeting id.",
+   "predicates": {
+    "meeting_type": {
+     "type": "enum",
+     "values": [
+      "discovery",
+      "demo",
+      "follow_up",
+      "negotiation",
+      "onboarding",
+      "no_show"
+     ]
+    },
+    "shown": {
+     "type": "string",
+     "card": "many",
+     "description": "one thing we demonstrated, keeping specifics such as the scenario, figures, scores and named features"
+    },
+    "invited": {
+     "type": "ref",
+     "to": [
+      "contact",
+      "rep"
+     ],
+     "card": "many",
+     "description": "Written by the engine, not the model: calendar metadata, not extraction."
+    },
+    "attended_by": {
+     "type": "ref",
+     "to": [
+      "contact",
+      "rep"
+     ],
+     "card": "many",
+     "description": "Written by the engine, not the model: who spoke in the recording, not extraction."
+    },
+    "scheduled_at": {
+     "type": "timestamp",
+     "description": "Written by the engine, not the model: when the call took place. Its title is its name."
+    }
+   }
+  },
+  "rep": {
+   "description": "One of our sales people, by email.",
+   "predicates": {
+    "title": {
+     "type": "string",
+     "description": "one of our reps' role or title as stated on the call"
+    }
+   }
+  }
+ }
+}

@@ -1,0 +1,43 @@
+spec:
+  containers:
+  - name: main
+    image: /memstore_pkg_src/public/images/memstore:v0_1
+    command: [memstore, serve, org, "8080", {{ groups }}]
+    secrets:
+    - snowflakeSecret:
+        objectReference: engine_credential
+      directoryPath: /secrets/engine
+    env:
+      MEMSTORE_PLATFORM: snowflake
+      SNOWFLAKE_DATABASE: {{ db }}
+      SNOWFLAKE_ROLE: {{ role }}
+      SNOWFLAKE_ACCOUNT: {{ account }}
+      SNOWFLAKE_PAT_FILE: /secrets/engine/secret_string
+      MEMSTORE_SERVE_BIND: 0.0.0.0
+      MEMSTORE_INDEX_URI: /tmp/index
+      # Each request runs as the Snowflake user who made it: on `api`, the user Snowflake's caller token proves;
+      # on `fn` (the app's own service functions), the user the app's wrappers pass with the secret.
+      MEMSTORE_CALLER_IDENTITY: snowflake
+      MEMSTORE_FN_PORT: "8081"
+      MEMSTORE_FN_SECRET: {{ fn_secret }}
+    readinessProbe:
+      port: 8080
+      path: /healthz
+  endpoints:
+  - name: api
+    port: 8080
+    # Public = reachable by MCP clients (CoCo, Claude, Cursor) through Snowflake's ingress, which
+    # authenticates every request with Snowflake login first; only the MEMORY service role may enter.
+    public: true
+  # The app's service functions only: in no service role, so no consumer service can reach it.
+  - name: fn
+    port: 8081
+serviceRoles:
+- name: memory
+  endpoints:
+  - api
+# Snowflake adds Sf-Context-Current-User-Token to every request through ingress, so the engine can learn the
+# caller's identity from Snowflake (connect with <service token>.<user token>) instead of trusting a header.
+capabilities:
+  securityContext:
+    executeAsCaller: true

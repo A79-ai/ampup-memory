@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A PR's new push supersedes its last run. Each commit on main gets its own group, so a merge never
+  # cancels (or queues behind) the previous merge's run and every merge gets its own verdict.
+  group: ci-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+# GitHub-hosted runners, no secrets and no cloud access: everything here runs the same on a fork. target/ doesn't
+# persist between runs (only its dependencies are cached, .github/actions/rust), so incremental compilation would
+# only cost disk.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+# Hosted runners are free on a public repository but billed on a private one: while this repository is private (before
+# its launch) the jobs run only when started by hand (workflow_dispatch), not on every push and pull request.
+jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/rust
+        with:
+          target: clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # One test binary (tests/it): a file directly in tests/ would build and link a binary of its own, and a
+      # file in tests/it/ without its `mod` line in tests/it/main.rs would never run.
+      - name: Test files are modules of tests/it
+        run: |
+          ok=true
+          for f in tests/*.rs; do
+            [ -e "$f" ] || continue
+            echo "::error file=$f::move it to tests/it/ and add its mod line to tests/it/main.rs"; ok=false
+          done
+          for f in tests/it/*.rs; do
+            m=$(basename "$f" .rs)
+            [ "$m" = main ] || grep -qx "mod $m;" tests/it/main.rs && continue
+            echo "::error file=$f::add 'mod $m;' to tests/it/main.rs"; ok=false
+          done
+          $ok
+      # The `dylib` feature links crates/memstore-deps instead of each dependency: its [dependencies] must be the
+      # workspace's runtime dependencies, or a dev build compiles two versions of a crate.
+      - name: crates/memstore-deps lists the workspace's dependencies
+        run: |
+          deps() {
+            cargo metadata --format-version 1 --locked --all-features | jq -c --argjson p "$1" \
+              '[.packages[] | select(.name as $n | $p | index($n)) | .dependencies[]
+                | select(.kind == null and (.name | startswith("memstore-") | not))
+                | {name, req, features, uses_default_features}] | unique | sort_by(.name)'
+          }
+          diff <(deps '["memstore", "memstore-core", "memstore-client"]' | jq '.[]') <(deps '["memstore-deps"]' | jq '.[]') \
+            || { echo "::error file=crates/memstore-deps/Cargo.toml::list every dependency of memstore, memstore-core and memstore-client here (name.workspace = true)"; exit 1; }
+
+  test:
+    name: Test
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Pure local fixtures and fake servers: the search benchmark's failure gates, without latency measurements or
+      # a live organization. Skipped where the benchmark isn't in the tree.
+      - name: Search benchmark regression tests
+        if: hashFiles('harness/test_search_cpu_bench.py') != ''
+        run: python3 -m unittest discover -s harness -p test_search_cpu_bench.py
+      - uses: ./.github/actions/rust
+        with:
+          target: test
+      # The default local embedding model (fastembed, from Hugging Face) is downloaded on first use.
+      - name: Cache the embedding model
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/memstore/models
+          key: embed-models-v1
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: nextest
+      - name: Build
+        run: cargo nextest run --locked --no-run
+      # Every test, run at once, one process per test (.config/nextest.toml). The crate has no doctests (its doc
+      # code blocks are text and json; Cargo.toml turns them off for cargo test too). The REST catalog flows skip
+      # here: catalog-nightly.yml runs them against a local Iceberg REST catalog.
+      # MEMSTORE_CHECK_PLAN: every table refresh that reads only the manifests appended since the last one is
+      # checked against a full plan of the table, so a divergence fails the test that hit it.
+      - name: Test
+        run: cargo nextest run --locked --profile ci
+        env:
+          MEMSTORE_CHECK_PLAN: "1"
+
+  # The BYOC / BYOVPC IAM templates (deploy/iam) and the GCP module (deploy/gcp/terraform): format, validate, the
+  # offline plan tests that check what the vendor's role may and may not do, and every AWS action against AWS's
+  # published service reference. No cloud credentials: nothing is planned against a real account. Whichever of those
+  # modules isn't in the tree is left out, and with none of them the job passes with nothing to check.
+  iam-templates:
+    name: IAM templates (terraform)
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Modules to check
+        id: modules
+        run: |
+          found=()
+          for m in deploy/iam/*/modules/*/ deploy/iam/*/byoc deploy/iam/*/byovpc deploy/gcp/terraform; do
+            [ -d "$m" ] && found+=("${m%/}")
+          done
+          echo "list=${found[*]}" >> "$GITHUB_OUTPUT"
+          [ ${#found[@]} -gt 0 ] && printf '%s\n' "${found[@]}" || echo "no terraform modules in the tree"
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: steps.modules.outputs.list != ''
+        with:
+          terraform_version: 1.11.4 # terraform test's override_during needs 1.11
+          terraform_wrapper: false
+      # Every module at once, each into its own log, printed in order afterwards: one after another they took ~80 s.
+      - name: Format, validate and test every module
+        if: steps.modules.outputs.list != ''
+        env:
+          TF_MODULES: ${{ steps.modules.outputs.list }}
+        run: |
+          read -ra modules <<< "$TF_MODULES"
+          for d in deploy/iam deploy/gcp/terraform; do [ ! -d "$d" ] || terraform fmt -check -recursive "$d"; done
+          check() {
+            terraform -chdir="$1" init -backend=false -input=false && terraform -chdir="$1" validate \
+              && { [ ! -d "$1/tests" ] || terraform -chdir="$1" test; }
+          }
+          logs=$(mktemp -d); pids=()
+          for i in "${!modules[@]}"; do check "${modules[$i]}" > "$logs/$i" 2>&1 & pids+=($!); done
+          ok=true
+          for i in "${!modules[@]}"; do
+            m=${modules[$i]}
+            if wait "${pids[$i]}"; then
+              echo "::group::$m"; cat "$logs/$i"; echo "::endgroup::"
+            else
+              echo "::group::$m (failed)"; cat "$logs/$i"; echo "::endgroup::"
+              echo "::error::$m failed: see its group above"; ok=false
+            fi
+          done
+          $ok
+      - name: AWS actions exist in AWS's service reference
+        if: hashFiles('deploy/iam/check_permissions.py') != ''
+        run: python3 deploy/iam/check_permissions.py

@@ -1,0 +1,169 @@
+name: Release
+
+# Two kinds of release, each from its own tags, so a change to one never re-releases the other:
+#
+# - `v*` (the server): the memstore CLI as a GitHub release of this repository, per platform a tarball of memstore
+#   and memstore-client with its checksum, and install.sh, which anyone can run with no sign-in:
+#     curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/install.sh | sh
+# - `client-v*` (the client): memstore-client alone (what the Claude Code, Cursor and Codex plugins run, a few MB),
+#   per platform, installed with MEMSTORE_INSTALL=client.
+#
+# Push a tag to release it (git tag v0.1.0 && git push origin v0.1.0); a tag with a `-` in it (v0.2.0-rc.1) is a
+# pre-release. Run it by hand (workflow_dispatch) on a tag to build and publish that tag again: files already on its
+# release are replaced. Only the workflow's own GITHUB_TOKEN is used, and only the publish job may write.
+#
+# Each build is checked as it comes off the runner (.github/scripts/release-check.sh: memstore serves a local store,
+# and memstore-client is its client), and once published, installed with install.sh and checked again.
+#
+# Every archive carries LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt: the licenses of every crate linked into the
+# binaries (and ONNX Runtime's), written for the release by .github/scripts/third-party-notices.sh (cargo-about).
+#
+# Platforms: Linux x86_64 and arm64 (glibc 2.39 or newer: built on Ubuntu 24.04) and Apple Silicon macOS. No Intel
+# macOS: onnxruntime (ort) ships no prebuilt library for it. macOS builds aren't signed or notarized yet:
+# install.sh clears the quarantine flag.
+on:
+  push:
+    tags: ["v*", "client-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # A client this run built and checks never replaces itself with the latest public release midway (its
+  # session-start hook would): the release would package the previous one.
+  MEMSTORE_CLIENT_UPDATE: "off"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    # Dispatched on anything but a release tag, it builds nothing.
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/client-v')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, runner: macos-15 }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: What this release is
+        id: kind
+        run: |
+          case "$GITHUB_REF_NAME" in
+            client-v*) echo "kind=client" >> "$GITHUB_OUTPUT"; echo "version=${GITHUB_REF_NAME#client-}" >> "$GITHUB_OUTPUT" ;;
+            *) echo "kind=server" >> "$GITHUB_OUTPUT"; echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - uses: ./.github/actions/rust
+        with:
+          target: release
+      # Both, for either kind: the check runs memstore-client against memstore. Only this release's kind is packaged.
+      - name: Build
+        # --version names the release, which the plugin compares with the latest to keep the client current.
+        env:
+          MEMSTORE_RELEASE: ${{ steps.kind.outputs.version }}
+        run: cargo build --release --locked --bin memstore --bin memstore-client
+      - name: Check the build
+        run: .github/scripts/release-check.sh target/release/memstore target/release/memstore-client
+      - name: Install cargo-about
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: cargo-about
+      # A crate under a license about.toml doesn't accept fails this, and with it the release.
+      - name: Third-party notices
+        run: .github/scripts/third-party-notices.sh THIRD-PARTY-NOTICES.txt
+      - name: Package
+        env:
+          KIND: ${{ steps.kind.outputs.kind }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          strip target/release/memstore target/release/memstore-client
+          # The binaries beside the license, the notice and the third-party notices, all at the archive's top.
+          docs=(LICENSE NOTICE THIRD-PARTY-NOTICES.txt)
+          for f in "${docs[@]}"; do test -s "$f" || { echo "::error::$f is missing"; exit 1; }; done
+          if [ "$KIND" = client ]; then
+            asset=memstore-client-$TARGET.tar.gz
+            tar -czf "$asset" -C target/release memstore-client -C "$GITHUB_WORKSPACE" "${docs[@]}"
+          else
+            asset=memstore-$TARGET.tar.gz
+            tar -czf "$asset" -C target/release memstore memstore-client -C "$GITHUB_WORKSPACE" "${docs[@]}"
+          fi
+          tar -tzf "$asset"
+          if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256"; else shasum -a 256 "$asset" > "$asset.sha256"; fi
+          cat "$asset.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: memstore-${{ matrix.target }}
+          path: memstore-*${{ matrix.target }}.tar.gz*
+          retention-days: 1 # only carries the build to this run's publish job; the release keeps the files
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: memstore-*
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-v*-*|v*-*) prerelease="--prerelease" ;; esac
+          case "$GITHUB_REF_NAME" in
+            client-v*) title="memstore-client ${GITHUB_REF_NAME#client-}" ;;
+            *) title="memstore $GITHUB_REF_NAME" ;;
+          esac
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* install.sh --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* install.sh $prerelease --generate-notes --title "$title"
+          fi
+
+  verify:
+    name: Install on ${{ matrix.runner }}
+    needs: publish
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    # As a stranger installs it: install.sh from this tag, downloading from this repository's public releases with
+    # no token.
+    env:
+      MEMSTORE_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # A client release is checked against the newest server release, as a user would run them together: no
+      # version named, so install.sh picks it.
+      - name: Install the server
+        env:
+          MEMSTORE_INSTALL_DIR: ${{ runner.temp }}/bin
+        run: |
+          case "$GITHUB_REF_NAME" in client-v*) ;; *) export MEMSTORE_VERSION="$GITHUB_REF_NAME" ;; esac
+          sh install.sh
+      - name: Install the client alone, as the plugins need
+        if: startsWith(github.ref_name, 'client-v')
+        env:
+          MEMSTORE_VERSION: ${{ github.ref_name }}
+          MEMSTORE_INSTALL_DIR: ${{ runner.temp }}/client
+          MEMSTORE_INSTALL: client
+        run: sh install.sh
+      - name: Check what it installed
+        run: |
+          if [ -x "$RUNNER_TEMP/client/memstore-client" ]; then
+            .github/scripts/release-check.sh "$RUNNER_TEMP/bin/memstore" "$RUNNER_TEMP/client/memstore-client"
+          else
+            .github/scripts/release-check.sh "$RUNNER_TEMP/bin/memstore" "$RUNNER_TEMP/bin/memstore-client"
+          fi

@@ -1,0 +1,37 @@
+{
+  "name": "engineering",
+  "version": 1,
+  "description": "What the warehouse extraction writes today: facts about product features, one entity per feature name, in nine kinds. Plus findings: compiled, tagged statements a compile step writes from many episodes.",
+  "mode": "open",
+  "default_type": "feature",
+  "types": {
+    "feature": {
+      "description": "A product feature or component, named in lower case (csv export, notetaker).",
+      "predicates": {
+        "decision": {"type": "text", "card": "many"},
+        "issue": {"type": "text", "card": "many", "freshness_days": 90},
+        "owner": {"type": "text", "card": "many", "freshness_days": 180},
+        "how_it_works": {"type": "text", "card": "many"},
+        "how_to_enable": {"type": "text", "card": "many"},
+        "supports": {"type": "text", "card": "many", "list": true},
+        "shipped_in": {"type": "text", "card": "many", "list": true},
+        "changed_in": {"type": "text", "card": "many"},
+        "requested_by": {"type": "text", "card": "many"}
+      }
+    },
+    "finding": {
+      "description": "One self-contained statement about the system that a compile step wrote from many episodes for a job (reviewing a change, fixing an error), tagged so it can be filtered. Each compile is a set, valid until the next compile's set replaces it.",
+      "predicates": {
+        "text": {"type": "text", "description": "The statement, naming its module or file and quoting identifiers and error text verbatim."},
+        "kind": {"type": "enum", "values": ["structure", "dependency", "contract", "config", "failure-mode", "signature", "regression", "fix-pattern", "convention", "decision", "gotcha"],
+                 "description": "failure-mode: a way it breaks, and the mechanism; signature: what a failure looks like (exception and error text); regression: a past change that broke something, and why; fix-pattern: how such a bug was fixed."},
+        "area": {"type": "enum", "description": "The part of the system it belongs to, as the compile named it."},
+        "path": {"type": "text", "description": "The file or directory it is about, if any."},
+        "topic": {"type": "text", "description": "The feature, flag, table or endpoint it is about, if any."}
+      }
+    }
+  },
+  "guidance": [
+    "Findings say what to check before changing something and what an error means: filter type finding by kind, area or path (contains), and rank by text."
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "memstore",
+  "owner": { "name": "AmpUp" },
+  "plugins": [
+    {
+      "name": "memstore",
+      "source": "plugins/memstore",
+      "description": "Team memory for Cursor: recall at a session's start, sessions recorded as runs to learn from, and skills to search, follow advice, see where things stand and remember"
+    }
+  ]
+}

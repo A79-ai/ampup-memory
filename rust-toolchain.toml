@@ -1,0 +1,5 @@
+# Pinned so a new Rust release doesn't throw away every compiled dependency in CI. Bump it on purpose.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

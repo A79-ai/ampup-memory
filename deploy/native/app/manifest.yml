@@ -1,0 +1,32 @@
+manifest_version: 2
+version:
+  name: V0_5
+  label: "Memory 0.5"
+artifacts:
+  setup_script: setup.sql
+  readme: README.md
+  container_services:
+    images:
+      - /memstore_pkg_src/public/images/memstore:v0_1
+privileges:
+  - CREATE DATABASE:
+      description: "Creates the database that holds the memory's Iceberg tables (owned by the app; APP_USER can read them)."
+  - CREATE COMPUTE POOL:
+      description: "Runs the memory engine and its load jobs."
+  - CREATE EXTERNAL ACCESS INTEGRATION:
+      description: "Lets the engine read and write the memory's Iceberg files in this account's Snowflake-managed storage."
+  - BIND SERVICE ENDPOINT:
+      description: "Exposes the engine's MCP endpoint (for CoCo, Claude, Cursor) behind Snowflake login; only APP_USER can reach it."
+  - EXECUTE TASK:
+      description: "Runs scheduled ingestion (core.schedule_ingest)."
+  - EXECUTE MANAGED TASK:
+      description: "Runs scheduled ingestion as a serverless task (core.schedule_ingest)."
+references:
+  - engine_credential:
+      label: "Engine credential"
+      description: "PAT (generic string secret) of the service user whose role owns the memory database."
+      privileges:
+        - READ
+      object_type: SECRET
+      register_callback: core.register_reference
+      configuration_callback: core.reference_config

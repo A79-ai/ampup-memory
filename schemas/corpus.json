@@ -1,0 +1,42 @@
+{
+  "name": "corpus",
+  "version": 1,
+  "description": "The synthetic verification corpus (memstore gen): people, teams, projects, accounts and tickets, with ids like p000123.",
+  "types": {
+    "person": {
+      "id_prefix": "p",
+      "predicates": {
+        "role": {"type": "enum", "values": ["Engineer", "Senior Engineer", "Staff Engineer", "Engineering Manager", "Account Executive", "Sales Engineer", "Product Manager", "Designer"]},
+        "team": {"type": "ref", "to": ["team"]},
+        "private_note": {"type": "text", "description": "Visible only to the person (user scope)."},
+        "mentioned_with": {"type": "ref", "to": ["person", "account"], "card": "many"}
+      }
+    },
+    "team": {
+      "id_prefix": "t",
+      "predicates": {
+        "manager": {"type": "ref", "to": ["person"]}
+      }
+    },
+    "project": {
+      "id_prefix": "proj",
+      "predicates": {
+        "owner": {"type": "ref", "to": ["person"]}
+      }
+    },
+    "account": {
+      "id_prefix": "acct",
+      "predicates": {
+        "stage": {"type": "enum", "values": ["prospect", "discovery", "evaluation", "negotiation", "closed_won", "renewal"]},
+        "account_owner": {"type": "ref", "to": ["person"]},
+        "last_contact": {"type": "ref", "to": ["person"]}
+      }
+    },
+    "ticket": {
+      "id_prefix": "ticket",
+      "predicates": {
+        "opened_for": {"type": "ref", "to": ["account"], "card": "many"}
+      }
+    }
+  }
+}

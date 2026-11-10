@@ -1,0 +1,68 @@
+name: Catalog nightly
+
+# The replica, offboarding and isolation flows on a real Iceberg REST catalog over object storage, with two
+# `memstore serve` processes (tests/it/rest_catalog.rs). The fixture is tests/fixtures/rest-catalog (Apache
+# Iceberg's REST fixture and MinIO, public images run with docker compose on the runner): no cloud account and no
+# secrets. ci.yml runs the rest of the suite, where these tests skip.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalog-nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Hosted runners are free on a public repository but billed on a private one: while this repository is private
+  # (before its launch) the nightly run stops here, and only a run started by hand goes on.
+  public:
+    name: Public repository
+    runs-on: ubuntu-24.04
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          private=$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)
+          echo "private: $private"
+          if [ "$private" = false ] || [ "$EVENT" = workflow_dispatch ]; then echo "run=true" >> "$GITHUB_OUTPUT"; fi
+
+  rest-catalog:
+    name: REST catalog flows
+    needs: public
+    if: needs.public.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The same cache as CI's Test job: it builds the same test binaries.
+      - uses: ./.github/actions/rust
+        with:
+          target: test
+      - name: Cache the embedding model
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/memstore/models
+          key: embed-models-v1
+      - name: Start the REST catalog and MinIO
+        run: docker compose -f tests/fixtures/rest-catalog/docker-compose.yml up -d --wait
+      - name: Build
+        run: cargo test --locked --no-run
+      - name: REST catalog flows
+        run: |
+          source tests/fixtures/rest-catalog/env.sh
+          cargo test --locked --test it rest_catalog:: -- --nocapture
+      - name: Catalog logs
+        if: failure()
+        run: docker compose -f tests/fixtures/rest-catalog/docker-compose.yml logs --tail 300

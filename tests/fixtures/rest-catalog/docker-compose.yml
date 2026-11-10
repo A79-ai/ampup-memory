@@ -1,0 +1,36 @@
+# A REST catalog over object storage for the catalog tests (tests/it/rest_catalog.rs): Apache Iceberg's REST
+# fixture (the reference REST server: Iceberg's JDBC catalog behind the REST protocol, S3FileIO for purges)
+# and MinIO.
+#
+#   docker compose -f tests/fixtures/rest-catalog/docker-compose.yml up -d --wait
+#   source tests/fixtures/rest-catalog/env.sh
+#   cargo test --test it rest_catalog::
+#
+# MinIO no longer publishes its own images; bitnamilegacy/minio is the MinIO server, frozen at a release.
+# The catalog keeps no volume: `down` and `up` again start from nothing.
+services:
+  minio:
+    image: bitnamilegacy/minio:2025.7.23
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_DEFAULT_BUCKETS: memstore
+    ports: ["19000:9000"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/ready"]
+      interval: 2s
+      retries: 60
+
+  rest:
+    image: apache/iceberg-rest-fixture:1.10.0
+    depends_on:
+      minio: { condition: service_healthy }
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://memstore/warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports: ["18181:8181"]

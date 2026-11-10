@@ -1,0 +1,49 @@
+{
+ "name": "crm_update",
+ "version": 1,
+ "description": "A change to a CRM record. Written field by field by the engine; no model reads it.",
+ "mode": "open",
+ "types": {
+  "deal": {
+   "description": "A sales opportunity, by its CRM id.",
+   "predicates": {
+    "stage": {
+     "type": "enum",
+     "description": "the pipeline stage (open enum)"
+    },
+    "amount": {
+     "type": "money",
+     "unit": "USD"
+    },
+    "close_date": {
+     "type": "date"
+    },
+    "owner": {
+     "type": "string"
+    }
+   }
+  },
+  "contact": {
+   "description": "A person at the prospect.",
+   "predicates": {
+    "title": {
+     "type": "string"
+    },
+    "email": {
+     "type": "string"
+    }
+   }
+  },
+  "account": {
+   "description": "The prospect's company.",
+   "predicates": {
+    "industry": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "string"
+    }
+   }
+  }
+ }
+}

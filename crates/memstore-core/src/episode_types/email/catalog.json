@@ -1,0 +1,88 @@
+{
+ "name": "email",
+ "version": 2,
+ "description": "What an email can state: what was sent or proposed, prices, the meetings it plans and promises. Status is never extracted. Version 2 replaced deal.meeting_proposed (a date per proposal) with meeting_plan items; facts version 1 wrote still read.",
+ "mode": "strict",
+ "types": {
+  "deal": {
+   "description": "A sales opportunity, by its CRM id.",
+   "predicates": {
+    "action_taken": {
+     "type": "string",
+     "card": "many",
+     "description": "something the sender says they did"
+    },
+    "attachment_sent": {
+     "type": "string",
+     "card": "many",
+     "description": "the name of a file attached"
+    },
+    "price_quoted": {
+     "type": "money",
+     "unit": "USD per rep per month",
+     "card": "many",
+     "description": "a price stated in the email"
+    },
+    "requirement": {
+     "type": "string",
+     "card": "many",
+     "description": "a capability the prospect asks for"
+    }
+   }
+  },
+  "contact": {
+   "description": "A person at the prospect.",
+   "predicates": {
+    "title": {
+     "type": "string",
+     "description": "job title, e.g. from a signature"
+    }
+   }
+  },
+  "rep": {
+   "description": "One of our people, by email.",
+   "predicates": {}
+  },
+  "commitment": {
+   "description": "Something promised in the email. An item: commitment:<episode>#<n>.",
+   "predicates": {
+    "action": {
+     "type": "string"
+    },
+    "owner": {
+     "type": "string",
+     "description": "who promised it, by id: rep:<email> for one of ours, contact:<email> for someone at the prospect"
+    },
+    "due": {
+     "type": "date"
+    },
+    "for_deal": {
+     "type": "ref",
+     "to": [
+      "deal"
+     ]
+    }
+   }
+  },
+  "meeting_plan": {
+   "description": "A meeting this email itself proposes, accepts, moves or cancels; never one only in quoted or forwarded history. An item: meeting_plan:<episode>#<n>, one per meeting. Whether it is agreed is not extracted: aggregation works it out across the thread, so a later acceptance settles earlier proposals.",
+   "predicates": {
+    "step": {
+     "type": "string",
+     "description": "what this email does about the meeting and when, e.g. 'proposes Tue or Wed afternoon', 'accepts Thu 3pm CT', 'cancels Friday's demo'"
+    },
+    "starts_at": {
+     "type": "timestamp",
+     "card": "many",
+     "description": "when the meeting would start, one fact per time this email names for it"
+    },
+    "for_deal": {
+     "type": "ref",
+     "to": [
+      "deal"
+     ]
+    }
+   }
+  }
+ }
+}

@@ -1,0 +1,30 @@
+[package]
+name = "memstore-client"
+version = "0.1.0"
+edition = "2024"
+description = "AmpUp Memory's client: sign-in, contexts, and the coding agents' hooks and MCP bridge"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+# What runs on a person's machine to reach a team's memory: the sign-in and contexts (`client`), and the coding
+# agents' hooks and MCP bridge (`hook`). Its binary, `memstore-client`, is all the Claude Code plugin needs, a few
+# MB where memstore (the store and server too) is hundreds. memstore-core and memstore re-export both modules.
+[lib]
+doctest = false
+
+[[bin]]
+name = "memstore-client"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+uuid.workspace = true

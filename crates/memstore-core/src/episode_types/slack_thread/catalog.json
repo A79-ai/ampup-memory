@@ -1,0 +1,74 @@
+{
+ "name": "slack_thread",
+ "version": 1,
+ "description": "What a Slack thread can state: actions taken, promises, decisions, blockers and questions, about the deals and people it concerns. Status is never extracted.",
+ "mode": "strict",
+ "types": {
+  "deal": {
+   "description": "A sales opportunity, by its CRM id.",
+   "predicates": {
+    "action_taken": {
+     "type": "string",
+     "card": "many",
+     "description": "something someone says they did (sent the deck, booked the demo), with whom"
+    },
+    "decision": {
+     "type": "string",
+     "card": "many",
+     "description": "something decided in the thread"
+    },
+    "blocker": {
+     "type": "string",
+     "card": "many",
+     "description": "something stopping progress"
+    },
+    "question_asked": {
+     "type": "string",
+     "card": "many",
+     "description": "an open question someone asks about the deal"
+    },
+    "price_quoted": {
+     "type": "money",
+     "unit": "USD per rep per month",
+     "card": "many",
+     "description": "a price stated in the thread"
+    }
+   }
+  },
+  "contact": {
+   "description": "A person at the prospect.",
+   "predicates": {
+    "title": {
+     "type": "string",
+     "description": "job title as stated"
+    }
+   }
+  },
+  "rep": {
+   "description": "One of our people, by email.",
+   "predicates": {}
+  },
+  "commitment": {
+   "description": "Something someone promised in the thread. An item: commitment:<episode>#<n>.",
+   "predicates": {
+    "action": {
+     "type": "string",
+     "description": "what was promised"
+    },
+    "owner": {
+     "type": "string",
+     "description": "who promised it, by id: rep:<email> for one of ours (the thread's people are listed by id), contact:<email> for someone at the customer; a name only for someone with no id here"
+    },
+    "due": {
+     "type": "date"
+    },
+    "for_deal": {
+     "type": "ref",
+     "to": [
+      "deal"
+     ]
+    }
+   }
+  }
+ }
+}

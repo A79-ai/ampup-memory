@@ -1,0 +1,172 @@
+{
+  "name": "sales",
+  "version": 1,
+  "description": "B2B sales memory: deals, accounts, contacts and reps from the CRM, plus what calls, emails and notes say about them (stakeholders, commitments, objections, competitors, qualification).",
+  "types": {
+    "deal": {
+      "description": "An opportunity. Ids are deal:<crm id>.",
+      "predicates": {
+        "stage": {"type": "enum", "description": "The org's own pipeline stages (open enum).", "freshness_days": 45},
+        "status": {"type": "enum", "values": ["open", "won", "lost"], "pending": ["open"]},
+        "amount": {"type": "money", "unit": "USD", "freshness_days": 90},
+        "close_date": {"type": "date", "plan": true},
+        "owner": {"type": "ref", "to": ["rep"]},
+        "account": {"type": "ref", "to": ["account"], "part_of": true},
+        "champion": {"type": "ref", "to": ["contact"], "card": "many"},
+        "economic_buyer": {"type": "ref", "to": ["contact"], "card": "many"},
+        "competitor": {"type": "ref", "to": ["competitor"], "card": "many"},
+        "current_tool": {"type": "string", "card": "many", "list": true, "description": "a tool they use today relevant to the deal, including in-house tools and home-built attempts that failed; keep the key specifics"},
+        "next_step": {"type": "text", "freshness_days": 21},
+        "budget_status": {"type": "enum", "values": ["unknown", "identified", "approved", "rejected"], "freshness_days": 90},
+        "meddpicc_metrics": {"type": "enum", "values": ["confirmed", "partial", "unknown", "none"]},
+        "meddpicc_economic_buyer": {"type": "enum", "values": ["confirmed", "partial", "unknown", "none"]},
+        "meddpicc_decision_criteria": {"type": "enum", "values": ["confirmed", "partial", "unknown", "none"]},
+        "meddpicc_decision_process": {"type": "enum", "values": ["confirmed", "partial", "unknown", "none"]},
+        "meddpicc_paper_process": {"type": "enum", "values": ["confirmed", "partial", "unknown", "none"]},
+        "meddpicc_identify_pain": {"type": "enum", "values": ["confirmed", "partial", "unknown", "none"]},
+        "meddpicc_champion": {"type": "enum", "values": ["confirmed", "partial", "unknown", "none"]},
+        "meddpicc_competition": {"type": "enum", "values": ["confirmed", "partial", "unknown", "none"]}
+      }
+    },
+    "account": {
+      "description": "A company, or a household in wealth management. Ids are account:<id>.",
+      "predicates": {
+        "domain": {"type": "string"},
+        "industry": {"type": "string"},
+        "tier": {"type": "enum"},
+        "status": {"type": "enum"},
+        "owner": {"type": "ref", "to": ["rep"]},
+        "current_process": {"type": "string", "card": "many", "list": true, "description": "one step of how they onboard, train or coach reps today, e.g. 'two weeks shadowing a senior rep before taking calls'"},
+        "product_line": {"type": "string", "card": "many", "list": true, "description": "a line of business, including the business mix ('mostly commercial accounts') and lines they no longer sell"},
+        "sales_language": {"type": "string", "card": "many", "list": true, "description": "a language their reps sell in"}
+      }
+    },
+    "contact": {
+      "description": "A person at an account. Ids are contact:<id>.",
+      "predicates": {
+        "email": {"type": "string"},
+        "title": {"type": "string", "freshness_days": 365},
+        "account": {"type": "ref", "to": ["account"], "part_of": true},
+        "company": {"type": "string", "description": "The company name on the CRM record, which may name a company that has no account."},
+        "last_contacted_at": {"type": "timestamp"}
+      }
+    },
+    "stakeholder": {
+      "description": "A contact's part in one deal: an edge with properties. Ids are stakeholder:<deal id>:<contact id>.",
+      "predicates": {
+        "deal": {"type": "ref", "to": ["deal"], "part_of": true},
+        "contact": {"type": "ref", "to": ["contact"]},
+        "role": {"type": "enum", "values": ["champion", "economic_buyer", "technical_evaluator", "decision_maker", "influencer", "blocker", "other"]},
+        "stance": {"type": "enum", "values": ["supportive", "neutral", "skeptical", "opposed"], "freshness_days": 90},
+        "engagement": {"type": "enum", "values": ["high", "medium", "low", "none"], "freshness_days": 60},
+        "last_engaged_at": {"type": "timestamp"}
+      }
+    },
+    "rep": {
+      "description": "A seller on our side. Ids are rep:<user id>.",
+      "predicates": {
+        "email": {"type": "string"},
+        "role": {"type": "string"},
+        "region": {"type": "string"},
+        "manager": {"type": "ref", "to": ["rep"]}
+      }
+    },
+    "meeting": {
+      "description": "A call or meeting. Ids are meeting:<id>.",
+      "predicates": {
+        "scheduled_at": {"type": "timestamp"},
+        "status": {"type": "enum", "values": ["scheduled", "completed", "cancelled", "no_show"]},
+        "deal": {"type": "ref", "to": ["deal"], "part_of": true},
+        "account": {"type": "ref", "to": ["account"], "part_of": true},
+        "participant": {"type": "ref", "to": ["contact", "rep"], "card": "many"},
+        "series": {"type": "string"}
+      }
+    },
+    "commitment": {
+      "description": "Something someone said they would do. Ids are commitment:<id>.",
+      "predicates": {
+        "owner": {"type": "ref", "to": ["rep", "contact"]},
+        "action": {"type": "text"},
+        "due": {"type": "date", "plan": true},
+        "status": {"type": "enum", "values": ["open", "done", "stale", "dropped"], "pending": ["open", "stale"], "freshness_days": 30},
+        "about": {"type": "ref", "to": ["deal", "account"], "part_of": true},
+        "stated_in": {"type": "ref", "to": ["meeting"]}
+      }
+    },
+    "task": {
+      "description": "A to-do in AmpUp or the CRM; its name is the subject. Ids are task:<id>.",
+      "predicates": {
+        "status": {"type": "enum", "description": "open, completed, dismissed, expired and the like (open enum).", "pending": ["open", "not_started", "in_progress", "waiting"]},
+        "priority": {"type": "enum"},
+        "due": {"type": "timestamp", "plan": true},
+        "owner": {"type": "ref", "to": ["rep"]},
+        "source": {"type": "string", "description": "Where the task came from, such as AmpUp or hubspot."},
+        "resolved_at": {"type": "timestamp"},
+        "deal": {"type": "ref", "to": ["deal"], "card": "many", "part_of": true},
+        "account": {"type": "ref", "to": ["account"], "card": "many", "part_of": true},
+        "meeting": {"type": "ref", "to": ["meeting"], "card": "many", "part_of": true},
+        "contact": {"type": "ref", "to": ["contact"], "card": "many"}
+      }
+    },
+    "objection": {
+      "description": "A concern a buyer raised. Ids are objection:<id>.",
+      "predicates": {
+        "category": {"type": "enum", "description": "The org's own objection categories (open enum)."},
+        "text": {"type": "text"},
+        "about": {"type": "ref", "to": ["deal", "account"], "part_of": true},
+        "raised_by": {"type": "ref", "to": ["contact"]},
+        "raised_in": {"type": "ref", "to": ["meeting"], "card": "many", "description": "The meetings it came up in, so counts per meeting work."},
+        "status": {"type": "enum", "values": ["open", "addressed", "resolved"], "pending": ["open"], "freshness_days": 60}
+      }
+    },
+    "competitor": {
+      "description": "Another vendor in the deal. Ids are competitor:<slug>.",
+      "predicates": {
+        "website": {"type": "string"}
+      }
+    },
+    "coaching_signal": {
+      "description": "An observation about a rep's selling. Ids are coaching_signal:<id>.",
+      "predicates": {
+        "rep": {"type": "ref", "to": ["rep"]},
+        "skill": {"type": "enum"},
+        "observation": {"type": "text"},
+        "period_start": {"type": "date"},
+        "period_end": {"type": "date"}
+      }
+    }
+  },
+  "metrics": {
+    "pipeline_by_stage": {
+      "title": "Open pipeline by stage",
+      "tags": ["pipeline"],
+      "description": "Open deals per stage, with their total amount.",
+      "query": {"find": "count", "type": "deal", "where": [{"attr": "status", "eq": "open"}],
+                "group_by": "stage", "metrics": ["count", {"sum": "amount"}]}
+    },
+    "objections_by_category": {
+      "title": "Objections by category",
+      "tags": ["objections"],
+      "description": "Objections per category.",
+      "query": {"find": "count", "type": "objection", "group_by": "category"}
+    },
+    "objections_by_deal_stage": {
+      "title": "Objections by deal stage",
+      "tags": ["objections", "pipeline"],
+      "description": "Objections per stage of the deal they are about.",
+      "query": {"find": "count", "type": "objection", "group_by": "about.stage"}
+    },
+    "open_commitments_by_owner": {
+      "title": "Open commitments by owner",
+      "tags": ["follow_through"],
+      "description": "Open or stale commitments per owner.",
+      "query": {"find": "count", "type": "commitment",
+                "where": [{"attr": "status", "in": ["open", "stale"]}], "group_by": "owner.name"}
+    }
+  },
+  "guidance": [
+    "Deals won in a period: count by close_date, which the CRM sets when a deal is won. Deals lost in a period: a lost deal's close_date often keeps its old expected date, so count by when its status changed to lost (find changes with type deal, select [\"status\"] and that window). When close_date and the status change disagree, say which you counted.",
+    "A stakeholder's CRM role is often missing or stale. For who decides, the champion or a blocker, also read passages about the deal (deal context, qualification reviews, calls) and say where they disagree with the CRM.",
+    "Tasks are records, not passages: find them with type task, for example where {\"rel\": \"deal\", \"to\": {\"id\": \"deal:<id>\"}} and status eq open."
+  ]
+}

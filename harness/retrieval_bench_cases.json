@@ -1,0 +1,14 @@
+[
+  {"id":"company", "session":"000001", "query":"What does Scaffold let customers do with connected data sources?"},
+  {"id":"onboarding", "session":"000010", "query":"Who should review the onboarding flow mockups with Morgan?"},
+  {"id":"pitch", "session":"000013", "query":"How should Morgan order the Series B pitch deck around retention and growth?"},
+  {"id":"anniversary", "session":"000050", "query":"What celebration did Morgan want for Scaffold's second anniversary?"},
+  {"id":"zulu", "session":"000150", "query":"How much notice was Zulu Logistics given when service ended?"},
+  {"id":"payments", "session":"000300", "query":"Which payments need manual review before they are paid?"},
+  {"id":"hiring", "session":"000400", "query":"What kind of engineers was Tessl recruiting when Morgan met Anna Rao?"},
+  {"id":"offsite", "session":"000500", "query":"What should people bring to the Mercury offsite?"},
+  {"id":"pinecone", "session":"000600", "query":"Why did the Pinecone connector sandbox request fail signature validation?"},
+  {"id":"aws", "session":"000700", "query":"What caused the non-production AWS NAT egress cost spike?"},
+  {"id":"invoice", "session":"000900", "query":"Under what conditions can Jamie pay the corrected Blueline repair invoice?"},
+  {"id":"room", "session":"001100", "query":"How did Priya's design review proceed after Redwood was double-booked?"}
+]

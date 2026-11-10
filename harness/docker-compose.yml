@@ -1,0 +1,45 @@
+# Standalone stack for the verification harness: Apache Polaris as the Iceberg REST
+# catalog over an S3-compatible store. Only the seams the engine uses today are here; Keycloak (OIDC/SCIM),
+# Redpanda (events), and OpenTelemetry/Prometheus join when those seams are built.
+services:
+  s3:
+    # SeaweedFS's S3 gateway. RustFS (the first choice, since MinIO no longer publishes public
+    # images) returned persistent 500s under 50 concurrent writers in the concurrent-commit checks.
+    image: chrislusf/seaweedfs:latest
+    command: server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json -volume.max=0
+    volumes: ["./s3.json:/etc/seaweedfs/s3.json:ro"]
+    ports: ["9000:9000"]
+
+  s3-init:
+    image: amazon/aws-cli:latest
+    depends_on: [s3]
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+    entrypoint: >
+      sh -c "for i in $$(seq 60); do aws --endpoint-url http://s3:9000 s3 mb s3://warehouse 2>&1 | grep -qE 'make_bucket|BucketAlready' && exit 0; sleep 1; done; exit 1"
+
+  polaris:
+    image: apache/polaris:1.8.0
+    depends_on:
+      s3-init: { condition: service_completed_successfully }
+    ports: ["8181:8181", "8182:8182"]
+    environment:
+      POLARIS_BOOTSTRAP_CREDENTIALS: POLARIS,root,s3cr3t
+      polaris.realm-context.realms: POLARIS
+      quarkus.otel.sdk.disabled: "true"
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8182/q/health"]
+      interval: 2s
+      retries: 60
+
+  polaris-init:
+    image: curlimages/curl:latest
+    depends_on:
+      polaris: { condition: service_healthy }
+    entrypoint: ["sh", "/init.sh"]
+    volumes: ["./polaris-init.sh:/init.sh:ro"]

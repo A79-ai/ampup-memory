@@ -1,0 +1,9 @@
+AmpUp Memory
+Copyright 2026 The AmpUp Memory Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It is built on third-party open source software, including Apache Arrow, Apache DataFusion and Apache Iceberg
+(Apache License 2.0, The Apache Software Foundation), Lance (Apache License 2.0), and ONNX Runtime (MIT License,
+Microsoft Corporation), which the release binaries link statically through the `ort` crate. Each dependency's
+license is in its own source distribution; Cargo.lock lists every crate the binaries are built from.

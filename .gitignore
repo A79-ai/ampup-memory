@@ -1,0 +1,7 @@
+/target
+/corpora
+/reports
+corpora_*/
+reports/evals/*.jsonl
+.DS_Store
+__pycache__/

@@ -1,0 +1,111 @@
+#!/bin/sh
+# What the plugin runs for every hook, its MCP server and its commands: memstore-client where it is installed, and
+# where it isn't, it installs it from the public releases (bin/install.sh) and runs that. Never a full `memstore` on
+# the PATH instead: that one is whatever its owner last built or installed, often older than the plugin.
+#
+# Never in the person's way: a hook with nothing installed doesn't wait for a download. A session's start installs
+# in the background and says once that the memory is on from the next session; the other hooks do nothing. The MCP
+# server and the commands, which can't run without it, install first (a few MB) and then run.
+#
+#   memstore-client <args>   as memstore-client would run them
+#   memstore-client login [<server>] [--org <org>]
+#                            signs in as you (Google, a password): the server defaults to MEMSTORE_URL; with
+#                            neither, the plugin uses a local server (memstore serve --local, http://127.0.0.1:8080),
+#                            which needs no sign-in. The org defaults to MEMSTORE_ORG, else the one org holding you
+#                            (several: name one; none: name the one to ask to join). Not a member of the org yet: asks
+#                            to join it, and its admins are emailed to approve
+here=$(cd "$(dirname "$0")" && pwd)
+dir=${MEMSTORE_INSTALL_DIR:-$HOME/.local/bin}
+# The installer's lock and log, in the user's own directory: never a fixed name in a shared /tmp.
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/memstore
+
+find_bin() {
+  for b in "$dir/memstore-client" "$(command -v memstore-client 2>/dev/null)"; do
+    # Not this script, which is on PATH as memstore-client where the host adds the plugin's bin/.
+    [ -n "$b" ] && [ -x "$b" ] && [ "$(cd "$(dirname "$b")" && pwd)" != "$here" ] && { echo "$b"; return; }
+  done
+}
+
+install() {
+  # One install at a time: every hook of every open session may find it missing at once.
+  mkdir -p "$cache" && chmod 700 "$cache" || return 1
+  lock=$cache/install.lock
+  # A lock an install killed midway left behind doesn't block the next for good.
+  find "$lock" -maxdepth 0 -mmin +10 -exec rmdir {} \; 2>/dev/null
+  mkdir "$lock" 2>/dev/null || return 1
+  trap 'rmdir "$lock" 2>/dev/null' EXIT
+  sh "$here/install.sh" >"$cache/install.log" 2>&1
+  status=$?
+  rmdir "$lock" 2>/dev/null
+  trap - EXIT
+  return $status
+}
+
+# A client from v0.1.7 on keeps itself current (hourly at a session's start, and before every sign-in), so this
+# launcher checks only for one older than that, which can't: its first update brings one that can.
+selfupdates() {
+  "$1" update --help >/dev/null 2>&1
+}
+
+# Keeps an older client current: where the newest client release (a client-v* tag, which install.sh --latest
+# names) isn't the one installed (`memstore-client --version` names it without the client- prefix), installs it. With a number, at most once in that many minutes (a session's start, in the background,
+# hourly); without, every time (a sign-in, which waits for it). A pinned MEMSTORE_VERSION, or
+# MEMSTORE_CLIENT_UPDATE=off, leaves it as it is.
+update() {
+  [ -z "${MEMSTORE_VERSION:-}" ] && [ "${MEMSTORE_CLIENT_UPDATE:-on}" != off ] || return 0
+  mkdir -p "$cache" && chmod 700 "$cache" || return 0
+  stamp=$cache/update-checked
+  [ -z "$2" ] || [ -z "$(find "$stamp" -mmin -"$2" 2>/dev/null)" ] || return 0
+  : >"$stamp"
+  latest=$(sh "$here/install.sh" --latest 2>/dev/null)
+  [ -n "$latest" ] || return 0
+  [ "$("$1" --version 2>/dev/null | cut -d' ' -f2)" = "${latest#client-}" ] && return 0
+  MEMSTORE_VERSION=$latest install
+}
+
+bin=$(find_bin)
+if [ -n "$bin" ] && [ "$1 $2" = "hook session-start" ] && ! selfupdates "$bin"; then
+  (update "$bin" 60 </dev/null >/dev/null 2>&1 &)
+fi
+if [ -z "$bin" ]; then
+  case "$1 $2" in
+    "hook session-start")
+      # The installer outlives this hook: the person's session starts at once.
+      (install </dev/null >/dev/null 2>&1 &)
+      printf '%s\n' "memstore (the team memory) is being installed in the background (memstore-client, to $dir). Tell the user once, briefly: it is on from their next session, and if they haven't signed in to the team's memory on this machine, /memstore:login does it. Then carry on with their request."
+      exit 0
+      ;;
+    hook\ *) exit 0 ;;
+  esac
+  install || {
+    echo "memstore-client isn't installed and installing it failed: see $cache/install.log, or install it with: curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/install.sh | MEMSTORE_INSTALL=client sh" >&2
+    exit 1
+  }
+  bin=$(find_bin)
+fi
+
+if [ "$1" = login ]; then
+  shift
+  selfupdates "$bin" || {
+    update "$bin" </dev/null >/dev/null 2>&1
+    bin=$(find_bin)
+  }
+  # The server is the one named, else MEMSTORE_URL (an admin can set it and MEMSTORE_ORG for everyone in managed
+  # settings). You sign in as yourself: the org is the one holding you, or the one you name (--org) to ask to join.
+  server=${MEMSTORE_URL:-}
+  case "$1" in http*) server=$1; shift ;; esac
+  if [ -z "$server" ]; then
+    # No team server: the hooks and the MCP server use a local one (memstore serve --local), which serves only
+    # this machine and needs no sign-in.
+    echo "No server named and MEMSTORE_URL isn't set, so the memory is a local server on this machine (http://127.0.0.1:8080, started with: memstore serve --local), which needs no sign-in. To use your team's server: /memstore:login <server> --org <org>, or set MEMSTORE_URL and MEMSTORE_ORG."
+    exit 0
+  fi
+  case " $* " in
+    *" --org "*) exec "$bin" join "$server" "$@" ;;
+  esac
+  if [ -n "${MEMSTORE_ORG:-}" ]; then
+    exec "$bin" join "$server" --org "$MEMSTORE_ORG" "$@"
+  fi
+  exec "$bin" join "$server" "$@"
+fi
+exec "$bin" "$@"

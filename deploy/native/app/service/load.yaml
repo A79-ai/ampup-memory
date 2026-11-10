@@ -1,0 +1,23 @@
+spec:
+  containers:
+  - name: main
+    image: /memstore_pkg_src/public/images/memstore:v0_1
+    command: [memstore, load, {{ path }}, "1000"]
+    secrets:
+    - snowflakeSecret:
+        objectReference: engine_credential
+      directoryPath: /secrets/engine
+    env:
+      MEMSTORE_PLATFORM: snowflake
+      SNOWFLAKE_DATABASE: {{ db }}
+      SNOWFLAKE_ROLE: {{ role }}
+      SNOWFLAKE_ACCOUNT: {{ account }}
+      SNOWFLAKE_PAT_FILE: /secrets/engine/secret_string
+    volumeMounts:
+    - name: batches
+      mountPath: /batches
+  volumes:
+  - name: batches
+    source: "@state.batches"
+    uid: 65532
+    gid: 65532

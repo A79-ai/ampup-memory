@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in AmpUp Memory doesn't work as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting it. A security issue (memory reaching someone who must not read it, deleted memory
+        surviving, an auth bypass) doesn't belong here: report it privately, as SECURITY.md describes.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands, requests or agent session that show it, smallest first.
+      placeholder: |
+        1. memstore serve --local /tmp/store
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `memstore --version` (and `memstore-client --version` for a client issue), or the commit you built.
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple Silicon)
+        - Linux x86_64
+        - Linux arm64
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: store
+    attributes:
+      label: Store
+      description: Where the memory is kept.
+      options:
+        - Local (serve --local)
+        - Iceberg REST catalog
+        - Other or not sure
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output from memstore or memstore-client. Remove tokens and anything private first.
+      render: text
