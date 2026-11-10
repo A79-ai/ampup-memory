@@ -330,6 +330,10 @@ pub enum OrgCmd {
         /// their newest few notes, instead of their newest 20 alone (default: the server's MEMSTORE_PROFILE, off)
         #[arg(long)]
         profile: Option<bool>,
+        /// Have the plugin's hooks keep each session's whole transcript, tool calls and results included, as its
+        /// author's own episode, readable by them alone (default: the server's MEMSTORE_TRANSCRIPTS, off)
+        #[arg(long)]
+        transcripts: Option<bool>,
         /// Other scopes of the org its readers also search, comma-separated (team:<org>/<team>; "" unsets them;
         /// the operator only)
         #[arg(long)]
@@ -1140,6 +1144,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             advice_curation,
             advice_automated,
             profile,
+            transcripts,
             reads,
             purge,
             activity,
@@ -1179,6 +1184,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 advice_curation: *advice_curation,
                 advice_automated: *advice_automated,
                 profile: *profile,
+                transcripts: *transcripts,
                 reads: reads.as_deref().map(|r| {
                     r.split(',')
                         .map(str::trim)

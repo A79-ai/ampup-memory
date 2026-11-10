@@ -23,6 +23,10 @@
 //!   (short) and each tool call with the start of its result, secrets redacted, and its last answer as the
 //!   outcome, so the advice served in it can be judged and learned from. Claude Code gives SessionEnd hooks
 //!   1.5 s together, so `end` hands its work to a copy of itself that runs on.
+//! - `session-end`, `stop` (at most every [`KEEP_EVERY`]) and `end`, where the scope keeps them: what the session's
+//!   transcript gained since the last part the memory took, whole (each tool call with its input and its result;
+//!   never thinking), secrets redacted, is kept as the caller's own episode for later passes to check notes against
+//!   (`transcripts`, `POST /transcripts`). The note and the trace above stay as they were.
 //! - `outcome` (`/memstore:outcome good|bad [why]`, no stdin): rewards this session, which advice learns from.
 //! - `status`: where the memory is and whether it answers.
 //!
@@ -71,6 +75,8 @@ const DETACHED: &str = "MEMSTORE_HOOK_DETACHED";
 
 #[path = "advice_traces.rs"]
 mod advice_traces;
+#[path = "transcripts.rs"]
+mod transcripts;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -934,12 +940,16 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
     match event {
         // Both at once: the harness gives the end of a session little time.
         "end" => {
-            let (remembered, ended) = tokio::join!(
+            let (remembered, ended, kept) = tokio::join!(
                 remember_session(&client, &input, 0, harness),
-                end_session(&client, &input, harness)
+                end_session(&client, &input, harness),
+                transcripts::send(&client, &input, harness, transcripts::Due::Ending)
             );
             if let Err(e) = ended {
                 warn(format!("the session wasn't ended: {e:#}"));
+            }
+            if let Err(e) = kept {
+                warn(format!("the session's transcript wasn't kept: {e:#}"));
             }
             // The rest of its markers: they outlive a compaction, not the harness session.
             for kind in ["recalled", "remembered"] {
@@ -949,10 +959,19 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             }
             remembered
         }
-        "session-end" => remember_session(&client, &input, 0, harness).await,
+        "session-end" => {
+            let (remembered, kept) = tokio::join!(
+                remember_session(&client, &input, 0, harness),
+                transcripts::send(&client, &input, harness, transcripts::Due::Now)
+            );
+            if let Err(e) = kept {
+                warn(format!("the session's transcript wasn't kept: {e:#}"));
+            }
+            remembered
+        }
         "stop" if detached => {
             let keep = keep_due(&input);
-            let (remembered, kept, advised, traced) = tokio::join!(
+            let (remembered, kept, advised, traced, transcribed) = tokio::join!(
                 remember_session(&client, &input, EVERY, harness),
                 async {
                     match keep {
@@ -967,10 +986,14 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
                         false => Ok(None),
                     }
                 },
-                advice_traces::send(&client, &input, harness)
+                advice_traces::send(&client, &input, harness),
+                transcripts::send(&client, &input, harness, transcripts::Due::Every)
             );
             if let Err(e) = traced {
                 warn(format!("the session's advice traces weren't sent: {e:#}"));
+            }
+            if let Err(e) = transcribed {
+                warn(format!("the session's transcript wasn't kept: {e:#}"));
             }
             if let Err(e) = kept {
                 warn(format!("the session's conversation wasn't kept: {e:#}"));
@@ -1643,7 +1666,7 @@ fn marker(kind: &str, session: &str) -> Option<std::path::PathBuf> {
 /// Removes per-session markers a week old: those of harness sessions that never reached their end (killed, or a
 /// harness with no end hook), which would otherwise pile up.
 fn prune_markers() {
-    const KINDS: [&str; 15] = [
+    const KINDS: [&str; 18] = [
         "session",
         "advised",
         "asked",
@@ -1659,6 +1682,9 @@ fn prune_markers() {
         "lined",
         "recall",
         "decided",
+        "transcript",
+        "transcriptlock",
+        "transcriptoff",
     ];
     let Some(dir) = marker("prune", "x").and_then(|m| m.parent().map(Path::to_path_buf)) else {
         return;

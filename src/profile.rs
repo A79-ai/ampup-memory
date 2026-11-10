@@ -199,10 +199,11 @@ fn author_of(source: &str) -> Option<(&str, &str)> {
 
 /// Whether what follows a note's author in its source is a note to hand at a session's start: not a run's trace, a
 /// session's (`session:<id>`) or the conversation a Stop kept of one, a hook's session note (what was said, not
-/// what to honour), or a profile.
+/// what to honour) or its transcript, or a profile.
 pub(crate) fn is_note(rest: &str) -> bool {
     !rest.starts_with("run:")
         && !rest.starts_with("session:")
+        && !rest.starts_with(crate::transcripts::SOURCE)
         && !crate::keep::session_note(rest)
         && rest != SOURCE_TAIL
 }

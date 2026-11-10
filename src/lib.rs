@@ -83,3 +83,4 @@ pub mod sessions;
 pub mod support_bundle;
 pub mod telemetry;
 pub mod train_data;
+pub mod transcripts;

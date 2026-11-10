@@ -1844,6 +1844,10 @@ pub(crate) fn typed(scope: &Scope, ep: &Episode) -> bool {
     if crate::advice_traces::is_trace(&ep.source) {
         return false;
     }
+    // A session's whole transcript, kept for its author to check notes against: never read for facts.
+    if crate::transcripts::is_transcript(&ep.source) {
+        return false;
+    }
     if crate::sessions::conversation_so_far(&ep.source) && !extract_conversations() {
         static SAID: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
         if SAID.lock().unwrap().insert(scope.namespace()) {

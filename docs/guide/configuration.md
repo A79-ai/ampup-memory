@@ -117,6 +117,7 @@ Requests carry `X-Title: memstore`, so their spend shows apart on a shared key.
 |---|---|
 | `MEMSTORE_KEEP=off` | Don't keep preferences and decisions from session text, and don't share them. |
 | `MEMSTORE_PROFILE=1` | Fold each person's notes into a profile. |
+| `MEMSTORE_TRANSCRIPTS=1` | Keep each coding-agent session's whole transcript, for its person alone. |
 | `MEMSTORE_AGGREGATE_SECS` (3600) | The hourly pass for summaries and team sharing. |
 | `MEMSTORE_MCP_TOOLS` | `all`, or a comma-separated list of tools to list over MCP. |
 

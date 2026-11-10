@@ -949,6 +949,14 @@ pub struct Settings {
     /// only their newest 20 (`memstore::profile`). Unset, the server's `MEMSTORE_PROFILE` decides (off by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<bool>,
+    /// Whether the plugin's hooks keep each coding agent session's whole transcript (prompts, answers, every tool
+    /// call with its input and result; never thinking) as its author's own episode, readable by them alone, so a
+    /// later pass can check what was noted against what actually ran (`memstore::transcripts`). Never extracted,
+    /// searched or read for the team; forgetting, retention and offboarding remove it as any of their episodes.
+    /// Tool output can hold anything the session read, customers' data too, so off unless set true. Unset, the
+    /// server's `MEMSTORE_TRANSCRIPTS` decides (off by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcripts: Option<bool>,
     /// Other scopes of the same org whose memory this scope's readers also search (`team:<org>/<team>`, or
     /// `org:<org>` for a team): the read routes they search through (`/search`, `/episode`, `search_memory`,
     /// `get_episode`) read this scope and these, each hit naming its scope. Writes, extraction, the schema and
@@ -1013,6 +1021,7 @@ impl Settings {
             && self.advice_curation.is_none()
             && self.advice_automated.is_none()
             && self.profile.is_none()
+            && self.transcripts.is_none()
             && self.reads.is_none()
             && self.purge.is_none()
             && self.activity.is_none()
@@ -1098,6 +1107,9 @@ impl Settings {
         }
         if other.profile.is_some() {
             self.profile = other.profile;
+        }
+        if other.transcripts.is_some() {
+            self.transcripts = other.transcripts;
         }
         if other.reads.is_some() {
             self.reads = other.reads;
@@ -2256,6 +2268,19 @@ impl Directory {
         self.setting(scope, |s| s.profile, profiles_from_env())
     }
 
+    /// Whether the hooks keep `scope`'s sessions' whole transcripts (`Settings::transcripts`): its team's setting,
+    /// else its org's, else the server's `MEMSTORE_TRANSCRIPTS` (off unless set), which a scope the directory
+    /// doesn't hold also gets.
+    pub fn keeps_transcripts(&self, scope: &crate::Scope) -> bool {
+        let env = std::env::var("MEMSTORE_TRANSCRIPTS").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        });
+        self.setting(scope, |s| s.transcripts, env)
+    }
+
     /// The other scopes `scope`'s readers also search (`Settings::reads`), in the order the setting names them:
     /// only the scope's own setting (a team's never comes from its org), only scopes of its own org, never itself,
     /// and only teams the org still has. None in a scope the directory doesn't hold.
@@ -2721,6 +2746,7 @@ impl Change {
                     && settings.advice_automated.is_none()
                     && settings.purge.is_none()
                     && settings.profile.is_none()
+                    && settings.transcripts.is_none()
                     && settings.activity.is_none()
                     && settings.session_branches.is_none()
                     && settings.auto_review.is_none()
@@ -3294,7 +3320,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             if settings.is_empty() {
                 refuse!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"transcripts\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             if let Some(sources) = &settings.compile_sources {

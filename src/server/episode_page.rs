@@ -156,7 +156,7 @@ pub(super) async fn of_facts(
 }
 
 /// Episode `eid`'s `body` as `get_episode` returns it: whole when short and no part is asked for, else the part.
-async fn page(
+pub(super) async fn page(
     session: &Session,
     store: &Store,
     args: &Value,

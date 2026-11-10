@@ -1251,6 +1251,139 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         assert_eq!(status, 403, "{what} reads acme's advice traces: {body}");
         assert!(!body.contains("xqcarolprefix"), "{body}");
     }
+    // Session transcripts ahead of the forget. Off until acme's admins turn them on: Carol's hook is told so and
+    // nothing is kept. On, each part of her session's transcript is her own episode: she reads it, by its id or its
+    // document, and neither Bob nor acme's admin does; a part sent again is no new version. The forget below takes
+    // every part out of every file.
+    let part = |from: u64, said: &str| {
+        json!({"harness": "claude-code", "repo": "launch", "session_id": "s-xqscript", "from": from,
+               "text": format!("Claude Code session s-xqscript in launch: its transcript from entry {from}.\n\n\
+                                Claude called Bash (call 1):\n  {{\"command\":\"cat plan\"}}\n\n\
+                                Result of Bash (call 1):\n  {said} launch plan\n  \n  second line")})
+    };
+    let (status, body) = post(
+        &format!("{s}/transcripts?org=acme"),
+        &carol,
+        &part(0, "xqcarolran"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""off":true"#), "{body}");
+    assert!(in_files("xqcarolran").is_empty());
+    let (status, body) = admin_as(
+        s,
+        &alice,
+        json!({"op": "set_settings", "org": "acme", "settings": {"transcripts": true}}),
+    )
+    .await;
+    assert_eq!(status, 200, "an org admin turns transcripts on: {body}");
+    let mut parts = vec![];
+    for (from, said) in [(0, "xqcarolran"), (0, "xqcarolran"), (3, "xqcarolsaw")] {
+        let (status, body) = post(
+            &format!("{s}/transcripts?org=acme"),
+            &carol,
+            &part(from, said),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["kept"], true, "{body}");
+        parts.push(v["episode_id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(parts[0], parts[1], "a part sent again was kept twice");
+    assert!(!in_files("xqcarolran").is_empty() && !in_files("xqcarolsaw").is_empty());
+    let episode = |who: &str, args: Value| {
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "get_episode", "arguments": args}});
+        let who = who.to_string();
+        async move { post(&format!("{s}/mcp?org=acme"), &who, &call).await.1 }
+    };
+    let listing = json!({"document": "transcripts/claude-code/s-xqscript/"});
+    let body = episode(&carol, listing.clone()).await;
+    assert!(
+        body.contains("s-xqscript/00000000") && body.contains("s-xqscript/00000003"),
+        "{body}"
+    );
+    let body = episode(&carol, json!({"episode_id": parts[2]})).await;
+    assert!(body.contains("xqcarolsaw"), "{body}");
+    for (who, what) in [(&bob, "a plain member"), (&alice, "acme's admin")] {
+        let body = episode(who, json!({"episode_id": parts[0]})).await;
+        assert!(
+            !body.contains("xqcarolran"),
+            "{what} read her transcript: {body}"
+        );
+        let body = episode(who, listing.clone()).await;
+        assert!(
+            !body.contains("s-xqscript/0"),
+            "{what} listed her transcript: {body}"
+        );
+        let body = episode(
+            who,
+            json!({"document": "transcripts/claude-code/s-xqscript/00000000"}),
+        )
+        .await;
+        assert!(
+            !body.contains("xqcarolran"),
+            "{what} read her transcript: {body}"
+        );
+    }
+    // Sent again with more, a part is a new version of it. Carol forgets the newest, and every version goes: neither
+    // is read by its id or its document, listed or matched, and sending it again keeps nothing, from the same entry
+    // or from a hook that lost its marker.
+    let more = part(3, "xqcarolsaw xqcarolmore");
+    let (status, body) = post(&format!("{s}/transcripts?org=acme"), &carol, &more).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let newest = v["episode_id"].as_str().unwrap().to_string();
+    assert_ne!(
+        newest, parts[2],
+        "sent with more, the part is a new version: {body}"
+    );
+    let part3 = json!({"document": "transcripts/claude-code/s-xqscript/00000003"});
+    assert!(episode(&carol, part3.clone()).await.contains("xqcarolmore"));
+    let tool = |name: &str, args: Value| {
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": name, "arguments": args}});
+        let who = carol.clone();
+        async move { post(&format!("{s}/mcp?org=acme"), &who, &call).await.1 }
+    };
+    let body = tool("forget_memory", json!({"episode_id": newest})).await;
+    assert!(body.contains("and 1 other version"), "{body}");
+    for args in [
+        json!({"episode_id": parts[2]}),
+        json!({"episode_id": newest}),
+        part3.clone(),
+    ] {
+        let body = episode(&carol, args).await;
+        assert!(
+            !body.contains("xqcarolsaw") && !body.contains("xqcarolmore"),
+            "a version of the part she forgot is read: {body}"
+        );
+    }
+    let body = episode(&carol, listing.clone()).await;
+    assert!(
+        body.contains("s-xqscript/00000000") && !body.contains("s-xqscript/00000003"),
+        "{body}"
+    );
+    let body = tool("forget_memory", json!({"matching": "xqcarolsaw"})).await;
+    assert!(
+        !body.contains(&parts[2]) && !body.contains(&newest),
+        "{body}"
+    );
+    let (status, body) = post(&format!("{s}/transcripts?org=acme"), &carol, &more).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains(r#""forgotten":true"#) && !body.contains(r#""kept":true"#),
+        "a part she forgot is kept again: {body}"
+    );
+    let resume = json!({"check": true, "harness": "claude-code", "session_id": "s-xqscript"});
+    let (status, body) = post(&format!("{s}/transcripts?org=acme"), &carol, &resume).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains(r#""forgotten":true"#) && !body.contains(r#""from""#),
+        "a hook that lost its marker would send the part she forgot again: {body}"
+    );
+    assert!(!episode(&carol, part3).await.contains("xqcarolsaw"));
     // Acme's admin is demoted as she forgets Carol: right after the directory takes Carol out of acme, before
     // anything of hers is deleted. The forget stops there, refused, and says how to finish it: Carol is out of
     // acme, nothing of hers is deleted, and no tombstone is left. Made an admin again, Alice runs it again below,
@@ -1299,8 +1432,9 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     .await;
     assert_eq!(status, 200, "{body}");
     let done: Value = serde_json::from_str(&body).unwrap();
-    // Her four notes and both parts of her advice trace.
-    assert_eq!(done["forgotten"]["acme"]["episodes"], 6, "{body}");
+    // Her four notes, both parts of her advice trace and her session transcript's three versions of two parts (the
+    // two she forgot too).
+    assert_eq!(done["forgotten"]["acme"]["episodes"], 9, "{body}");
     assert_eq!(done["forgotten"]["acme"]["facts"], 3, "{body}");
     // Her ownership, her decision and the proposal built on her note are in no file; the entity is unowned, the
     // inbox doesn't list the proposal, and a change to the entity publishes without review.
@@ -1310,6 +1444,9 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         "xqgovnote",
         "xqcarolprefix",
         "xqcarolnextturn",
+        "xqcarolran",
+        "xqcarolsaw",
+        "xqcarolmore",
     ] {
         assert_eq!(in_files(t), Vec::<PathBuf>::new(), "{t} still stored");
     }

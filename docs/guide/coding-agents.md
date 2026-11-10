@@ -56,6 +56,13 @@ none is installed, and checks once a day for a newer one. With a client built fr
   last answer as the outcome. Only its person can read the trace.
 - **Notes.** The session is also remembered as a condensed note every five prompts, before compaction and at the
   end.
+- **Transcripts (opt-in).** Where the org's or team's admins turn `transcripts` on (else the server's
+  `MEMSTORE_TRANSCRIPTS=1`), the hooks also keep each Claude Code, Codex and Gemini CLI session's whole transcript,
+  for its person alone: each prompt, each answer and each tool call with its input and result (whole up to 64 KB,
+  else its first and last 32 KB), never thinking. It goes in parts as the session grows, at most 32 MB a session,
+  and is never searched, extracted or read for the team. Forgetting a part forgets every version of it, and a part
+  you forgot is never sent again. `get_episode {"document": "transcripts/claude-code/<session>/"}` lists a session's
+  parts.
 - **Starter memory.** At session start the repo's `CLAUDE.md`, `.claude/CLAUDE.md`, `AGENTS.md`, `GEMINI.md`,
   `.claude/rules` and `.cursor/rules`, and your Claude Code memory files for the repo, are imported into your own
   memory (`?scope=mine`), which no teammate reads. At most 40 files of up to 64 KB; a file is sent again only when
@@ -87,7 +94,7 @@ In a terminal, `memstore-client hook outcome good|bad [why]` rates the last sess
 | `MEMSTORE_ORG` | the CLI context's org | The org, with `MEMSTORE_URL`. |
 | `MEMSTORE_TOKEN` | the CLI's sign-in | A bearer to send instead (an API key, for CI). |
 | `MEMSTORE_SCOPE` | the team's | `mine` keeps sessions, notes and recall in your own memory. |
-| `MEMSTORE_CAPTURE` | on | `off`: no notes, no session trace. Advice and recall still work. |
+| `MEMSTORE_CAPTURE` | on | `off`: no notes, no session trace, no transcript. Advice and recall still work. |
 | `MEMSTORE_RECALL` | first prompt | `every` recalls facts on every prompt. |
 | `MEMSTORE_INSTALL_DIR` | `~/.local/bin` | Where the plugin looks for `memstore-client`. |
 | `MEMSTORE_CLIENT_UPDATE` | on | `off` keeps the installed client. |

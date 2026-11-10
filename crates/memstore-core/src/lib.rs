@@ -967,6 +967,25 @@ impl Vis {
             .map(|(t, id)| (*t, id.as_str()))
     }
 
+    /// Every committed version of each document under `prefix`, whoever may read it, newest first, by document
+    /// (sorted): what forgetting one version of a document must take with it, and what a reader no longer reads.
+    pub fn document_versions(&self, prefix: &str) -> Vec<(&str, Vec<&str>)> {
+        let mut out: Vec<(&str, Vec<&str>)> = self
+            .documents
+            .versions
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.as_str(), v.iter().map(|(_, id)| id.as_str()).collect()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The document episode `id` is a version of, if any.
+    pub fn document_of(&self, id: &str) -> Option<&str> {
+        self.documents.of.get(id).map(String::as_str)
+    }
+
     /// Whether search shows this episode at `at`: always, unless it is a version of a document and
     /// another version is the one [`Vis::version_at`] gives then.
     pub fn is_current(&self, episode_id: &str, who: &Principal, at: Option<i64>) -> bool {

@@ -3664,14 +3664,16 @@ const RESERVED_SOURCES: [&str; 4] = ["mcp:", "goal:", "compile:", "advice:"];
 
 /// Document keys the server writes itself: goals (`goals/`, from before they were retired), compiled skills and their AIP graphs
 /// ([`crate::compile::SKILLS`], [`crate::compile::AIP`]), learned advice ([`crate::advice::PREFIX`]), which
-/// `get_advice` serves as the scope's own, and people's profiles ([`crate::profile::PREFIX`]).
-const RESERVED_DOCUMENTS: [&str; 6] = [
+/// `get_advice` serves as the scope's own, people's profiles ([`crate::profile::PREFIX`]), and sessions'
+/// transcripts ([`crate::transcripts::PREFIX`]).
+const RESERVED_DOCUMENTS: [&str; 7] = [
     "goals/",
     crate::compile::SKILLS,
     crate::compile::AIP,
     crate::advice::PREFIX,
     crate::advice::MINE,
     crate::profile::PREFIX,
+    crate::transcripts::PREFIX,
 ];
 
 /// The largest version of a starter document a note may write (the hooks send files of up to this).
@@ -4830,6 +4832,13 @@ async fn handle(
             json!({"error": "POST {session_id, file, lines, calls} (or {check: true}) to /advice-traces"}),
         ));
     }
+    let transcripts_route = !internal && path == "/transcripts";
+    if transcripts_route && req.method() != hyper::Method::POST {
+        return Ok(reply(
+            StatusCode::METHOD_NOT_ALLOWED,
+            json!({"error": "POST {harness, repo, session_id, from, text} (or {check: true}) to /transcripts"}),
+        ));
+    }
     let sessions_route =
         !internal && (path == "/sessions" || path == "/sessions/end" || path == "/sessions/prs");
     if sessions_route && req.method() != hyper::Method::POST {
@@ -4907,6 +4916,7 @@ async fn handle(
         && !feedback_route
         && !runs_route
         && !traces_route
+        && !transcripts_route
         && !sessions_route
     {
         return Ok(reply(StatusCode::OK, json!({"ok": true})));
@@ -4921,8 +4931,8 @@ async fn handle(
     let (source, caller_token, via_iap) = state.pick(req.headers());
     // The app the call came from, for the advice log (`advice_calls`).
     let app = advice_calls::app_of(req.headers());
-    // `/remember` carries a hook's whole session.
-    let max_body = if ingest || remember_route {
+    // `/remember` carries a hook's whole session, `/transcripts` a part of one's transcript.
+    let max_body = if ingest || remember_route || transcripts_route {
         MAX_INGEST_BODY
     } else if runs_route || traces_route {
         MAX_RUNS_BODY
@@ -6178,6 +6188,49 @@ async fn handle(
                     reply(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         json!({"error": "advice traces failed"}),
+                    )
+                }
+            },
+        });
+    }
+    if transcripts_route {
+        let who = who.expect("public port");
+        let writes = writes_for(
+            &state,
+            &via,
+            &scope,
+            sel_org.as_deref(),
+            sel_team.as_deref(),
+        );
+        if !via.may_write() || writes != Writes::Scope || !view.is_main() {
+            return Ok(reply(
+                StatusCode::FORBIDDEN,
+                json!({"error": format!("transcripts on {scope} aren't kept here: keep them where its memory is written, on main")}),
+            ));
+        }
+        let store = state.store.read().unwrap().clone();
+        let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let done = match own_acl(&state, &who, &via, "transcript") {
+            Ok(acl) => {
+                crate::transcripts::keep(&store, &scope, &who, &acl, &provenance(&who, ""), &args)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        return Ok(match done {
+            Ok(v) => reply(StatusCode::OK, v),
+            Err(e) => match (
+                e.downcast_ref::<crate::transcripts::Refused>(),
+                e.downcast_ref::<crate::runs::Refused>(),
+            ) {
+                (Some(r), _) => reply(StatusCode::BAD_REQUEST, json!({"error": r.to_string()})),
+                (_, Some(r)) => reply(StatusCode::FORBIDDEN, json!({"error": r.to_string()})),
+                _ => {
+                    eprintln!("transcripts failed: {e:#}");
+                    crate::report::failure("transcripts", &e);
+                    reply(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": "transcripts failed"}),
                     )
                 }
             },
@@ -12908,10 +12961,15 @@ async fn document_text(
             keys.join("\n")
         });
     }
-    if let Some((_, t, body)) = session.document(store, who, key, at).await? {
+    if let Some((id, t, body)) = session.document(store, who, key, at).await? {
         let day = chrono::DateTime::from_timestamp_micros(t)
             .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_default();
+        // A part of a session's transcript (up to megabytes) is read as its episode is: a page of turns at a time.
+        if key.starts_with(crate::transcripts::PREFIX) {
+            let part = episode_page::page(session, store, args, &id, &body).await?;
+            return Ok(format!("{key} (version of {day}, episode {id})\n\n{part}"));
+        }
         return Ok(format!(
             "{key} (version of {day})\n\n{}",
             String::from_utf8_lossy(&body)
@@ -13242,6 +13300,14 @@ async fn forget(
         }
         // And what it gave their profile: no version of it keeps what the note said.
         crate::profile::forgotten(store, scope, me, state.fixed(), episode_id).await?;
+        // A part of a session's transcript goes in every version, so no earlier send of it is read again.
+        let more = crate::transcripts::forgotten(store, scope, me, episode_id).await?;
+        if more > 0 {
+            return Ok(format!(
+                "forgot episode {episode_id}, and {more} other version{} of the same transcript part",
+                if more == 1 { "" } else { "s" }
+            ));
+        }
         Ok(format!("forgot episode {episode_id}"))
     } else {
         Err(ToolError(format!(
