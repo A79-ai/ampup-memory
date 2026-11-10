@@ -633,9 +633,38 @@ enum Issuer {
 /// server fetch on every request.
 const ISSUER_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How often a keys file is looked at for changes, unless [`TokenAuth::reload_every`] says otherwise.
+pub const KEYS_FILE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A keys file the server reads again when it changes.
+struct KeysFile {
+    path: std::path::PathBuf,
+    every: std::time::Duration,
+    /// sha256 of its contents as last read, and the error they gave (none: they took effect).
+    seen: std::sync::Mutex<([u8; 32], Option<String>)>,
+}
+
+/// A keys file's rows, checked: every sha256 64 hex characters, no id twice.
+fn parse_keys(json: &str) -> Result<Vec<ApiKeyRow>> {
+    let keys: Vec<ApiKeyRow> = serde_json::from_str(json).context("MEMSTORE_API_KEYS")?;
+    let mut seen = HashSet::new();
+    for k in &keys {
+        anyhow::ensure!(
+            k.sha256.len() == 64 && k.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+            "api key {}: sha256 must be 64 hex chars",
+            k.id
+        );
+        anyhow::ensure!(seen.insert(&k.id), "duplicate api key id {}", k.id);
+    }
+    Ok(keys)
+}
+
 /// API keys and signed tokens: how a caller proves who they are.
 pub struct TokenAuth {
-    keys: Vec<ApiKeyRow>,
+    /// The keys file's rows as last read: swapped whole when the file changes ([`Self::reload_keys_file`]).
+    keys: std::sync::RwLock<Arc<Vec<ApiKeyRow>>>,
+    /// Where they were read from, if a file: read again when it changes.
+    keys_file: Option<KeysFile>,
     jwt: Option<JwtConfig>,
     oidc: Option<OidcConfig>,
     auth0: Option<Auth0>,
@@ -650,27 +679,114 @@ pub use memstore_client::KEY_PREFIX;
 
 impl TokenAuth {
     pub fn new(keys_json: Option<&str>, jwt: Option<JwtConfig>) -> Result<Self> {
-        let keys: Vec<ApiKeyRow> = match keys_json {
-            Some(j) => serde_json::from_str(j).context("MEMSTORE_API_KEYS")?,
+        let keys = match keys_json {
+            Some(j) => parse_keys(j)?,
             None => vec![],
         };
-        let mut seen = HashSet::new();
-        for k in &keys {
-            anyhow::ensure!(
-                k.sha256.len() == 64 && k.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
-                "api key {}: sha256 must be 64 hex chars",
-                k.id
-            );
-            anyhow::ensure!(seen.insert(&k.id), "duplicate api key id {}", k.id);
-        }
         Ok(TokenAuth {
-            keys,
+            keys: std::sync::RwLock::new(Arc::new(keys)),
+            keys_file: None,
             jwt,
             oidc: None,
             auth0: None,
             org_issuers: Default::default(),
             local_issuers: false,
         })
+    }
+
+    /// [`Self::new`] with the keys read from the keys file at `path` (`MEMSTORE_API_KEYS`), which the server
+    /// reads again whenever it changes ([`Self::reload_keys_file`]): a key taken out of the file stops working
+    /// within the poll interval ([`KEYS_FILE_POLL`], [`Self::reload_every`]), on every server reading it, with no restart.
+    pub fn from_keys_file(path: &std::path::Path, jwt: Option<JwtConfig>) -> Result<Self> {
+        let text =
+            std::fs::read(path).with_context(|| format!("MEMSTORE_API_KEYS {}", path.display()))?;
+        let keys = parse_keys(std::str::from_utf8(&text).context("MEMSTORE_API_KEYS")?)?;
+        let mut auth = Self::new(None, jwt)?;
+        *auth.keys.write().unwrap() = Arc::new(keys);
+        auth.keys_file = Some(KeysFile {
+            path: path.to_path_buf(),
+            every: KEYS_FILE_POLL,
+            seen: std::sync::Mutex::new((sha2::Sha256::digest(&text).into(), None)),
+        });
+        Ok(auth)
+    }
+
+    /// How often the keys file is looked at for changes ([`KEYS_FILE_POLL`] unless set).
+    pub fn reload_every(mut self, every: std::time::Duration) -> Self {
+        if let Some(f) = &mut self.keys_file {
+            f.every = every;
+        }
+        self
+    }
+
+    /// The keys file and how often it is looked at, if the keys came from one.
+    pub fn keys_file(&self) -> Option<(&std::path::Path, std::time::Duration)> {
+        self.keys_file.as_ref().map(|f| (f.path.as_path(), f.every))
+    }
+
+    /// Read the keys file again: if it changed and parses, its keys replace the ones held, all at once (a
+    /// request sees the old set or the new one, never a mix), so a key taken out of it stops working. If
+    /// it can't be read or doesn't parse, the keys held stay (a half-written file never locks everyone
+    /// out), `memstore_keys_file_failing` is 1 until it reads again, and the error is returned (the same
+    /// error once: `Ok(None)` after that). `Ok(Some((keys, admin keys)))`: the new set took effect;
+    /// `Ok(None)`: nothing changed.
+    pub fn reload_keys_file(&self) -> Result<Option<(usize, usize)>> {
+        let Some(f) = &self.keys_file else {
+            return Ok(None);
+        };
+        let read = std::fs::read(&f.path)
+            .with_context(|| format!("MEMSTORE_API_KEYS {}", f.path.display()))
+            .map(|text| {
+                let digest: [u8; 32] = sha2::Sha256::digest(&text).into();
+                (digest, text)
+            });
+        let mut seen = f.seen.lock().unwrap();
+        let failed = |seen: &mut ([u8; 32], Option<String>), e: anyhow::Error| {
+            crate::metrics::KEYS_FILE_FAILING.set(1);
+            let said = format!("{e:#}");
+            let again = seen.1.as_deref() == Some(said.as_str());
+            seen.1 = Some(said);
+            match again {
+                true => Ok(None),
+                false => Err(e.context("the keys file (the keys last read are kept)")),
+            }
+        };
+        let (digest, text) = match read {
+            Ok(r) => r,
+            Err(e) => return failed(&mut seen, e),
+        };
+        if digest == seen.0 && seen.1.is_none() {
+            return Ok(None);
+        }
+        let keys = match std::str::from_utf8(&text)
+            .context("MEMSTORE_API_KEYS is not UTF-8")
+            .and_then(parse_keys)
+        {
+            Ok(k) => k,
+            Err(e) => {
+                seen.0 = digest;
+                return failed(&mut seen, e);
+            }
+        };
+        let counts = (keys.len(), keys.iter().filter(|k| k.admin).count());
+        *self.keys.write().unwrap() = Arc::new(keys);
+        *seen = (digest, None);
+        crate::metrics::KEYS_FILE_FAILING.set(0);
+        crate::metrics::KEYS_FILE_RELOADS.inc();
+        Ok(Some(counts))
+    }
+
+    /// The keys file's rows as held now.
+    fn file_keys(&self) -> Arc<Vec<ApiKeyRow>> {
+        self.keys.read().unwrap().clone()
+    }
+
+    /// sha256 (hex, lower-case) of every key the keys file holds now.
+    pub fn file_key_hashes(&self) -> std::collections::BTreeSet<String> {
+        self.file_keys()
+            .iter()
+            .map(|k| k.sha256.to_ascii_lowercase())
+            .collect()
     }
 
     /// Also accept people's ID tokens from an identity provider.
@@ -745,7 +861,10 @@ impl TokenAuth {
 
     /// Whether any caller could authenticate.
     pub fn has_credentials(&self) -> bool {
-        !self.keys.is_empty() || self.jwt.is_some() || self.oidc.is_some() || self.auth0.is_some()
+        !self.file_keys().is_empty()
+            || self.jwt.is_some()
+            || self.oidc.is_some()
+            || self.auth0.is_some()
     }
 
     /// The identity provider people sign in with, if any.
@@ -755,10 +874,8 @@ impl TokenAuth {
 
     /// How many API keys there are, and how many of them are admin keys.
     pub fn key_counts(&self) -> (usize, usize) {
-        (
-            self.keys.len(),
-            self.keys.iter().filter(|k| k.admin).count(),
-        )
+        let keys = self.file_keys();
+        (keys.len(), keys.iter().filter(|k| k.admin).count())
     }
 
     /// Whether a bearer is one this source takes: an API key, or a JWT from its JWT or OIDC issuer. Used to
@@ -793,7 +910,7 @@ impl TokenAuth {
         let digest = digest.to_ascii_lowercase();
         // Every key is compared, in constant time, so timing doesn't say how close a guess was.
         let mut found = None;
-        for k in &self.keys {
+        for k in self.file_keys().iter() {
             if constant_eq(k.sha256.to_ascii_lowercase().as_bytes(), digest.as_bytes()) {
                 found = Some(KeyCaller {
                     id: k.id.clone(),

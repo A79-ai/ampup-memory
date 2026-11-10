@@ -31,6 +31,8 @@ RUN MEMSTORE_MODEL_DIR=/fetch target/release/memstore embed warmup >/dev/null \
 FROM cgr.dev/chainguard/glibc-dynamic:latest-dev
 COPY --from=build /src/target/release/memstore /usr/local/bin/memstore
 COPY --from=build /models /models
+# The licenses of what the image holds: memstore's, the crates and ONNX Runtime it links, and the model.
+COPY --from=build /src/LICENSE /src/NOTICE /src/THIRD-PARTY-NOTICES.txt /usr/share/doc/memstore/
 ENV MEMSTORE_MODEL_DIR=/models
 USER nonroot
 ENTRYPOINT ["/usr/local/bin/memstore"]

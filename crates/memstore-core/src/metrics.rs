@@ -266,6 +266,25 @@ pub static EXPIRED_KEY_REFUSALS: std::sync::LazyLock<IntCounter> = std::sync::La
     .unwrap()
 });
 
+/// 1 while the keys file (`MEMSTORE_API_KEYS`) as it is now can't be read or doesn't parse: the server keeps
+/// the keys it last read, so a key removed from the file since still works here. 0 once the file reads again.
+pub static KEYS_FILE_FAILING: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+    IntGauge::new(
+        "memstore_keys_file_failing",
+        "1 while the keys file can't be read or parsed (the keys last read are kept)",
+    )
+    .unwrap()
+});
+
+/// Times the keys file was read again because it changed, and its new keys took effect.
+pub static KEYS_FILE_RELOADS: std::sync::LazyLock<IntCounter> = std::sync::LazyLock::new(|| {
+    IntCounter::new(
+        "memstore_keys_file_reloads_total",
+        "Times a changed keys file was read and its keys took effect",
+    )
+    .unwrap()
+});
+
 /// 1 while this server holds the writer lease (does the background writing: extraction, summarising, index
 /// updates), else 0; 1 too with `MEMSTORE_WRITER_LEASE=off`. Summed over a catalog's servers it is 1: 0 for
 /// longer than a minute means nothing is extracted or indexed anywhere.

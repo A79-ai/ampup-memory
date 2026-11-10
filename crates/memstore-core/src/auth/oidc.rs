@@ -215,7 +215,9 @@ pub fn email_of(c: &serde_json::Value) -> Result<String> {
         c["email_verified"] != false && c["email_verified"] != "false",
         "the token's email is not verified"
     );
-    Ok(email.to_lowercase())
+    // ASCII letters only, as user ids are compared (`directory::user_id`): never a lookalike folded into
+    // someone's address.
+    Ok(email.to_ascii_lowercase())
 }
 
 impl OidcConfig {}

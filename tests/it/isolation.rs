@@ -2096,6 +2096,9 @@ async fn agent_model() -> String {
 /// team, another org's member, acme's reader key and the operator, by `start_session`, its episode id and its
 /// document key (`get_episode`, `/episode`, `/browse`, `/document`, including the list of documents), passage and
 /// fact search; nor an agent run (`/agent/run`) for someone else that asks for it by id and by key. Carol reads hers.
+/// The server has a BigQuery inbox (`MEMSTORE_INBOX_TABLE`, as a GCP deployment does): the deployment's one inbox,
+/// drained into the default org's memory, takes the served scope's writes only. What acme's members remember goes
+/// into acme's memory, never the inbox; acme's reader key is refused a write still.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_persons_profile_reaches_no_one_else() {
     if !crate::own_process("isolation::a_persons_profile_reaches_no_one_else") {
@@ -2110,6 +2113,9 @@ async fn a_persons_profile_reaches_no_one_else() {
         std::env::set_var("MEMSTORE_EXTRACT_URL", &url);
         std::env::set_var("MEMSTORE_MODEL_CACHE", "off");
         std::env::set_var("MEMSTORE_KEEP", "off");
+        // An inbox with no project to reach: a write sent to it fails.
+        std::env::set_var("MEMSTORE_INBOX_TABLE", "project.memstore_api.inbox");
+        std::env::remove_var("GCP_PROJECT");
     }
     let issuer = start_idp().await;
     let dir = tempfile::tempdir().unwrap();
@@ -2177,9 +2183,25 @@ async fn a_persons_profile_reaches_no_one_else() {
             let note = json!({"source": "notes", "body": format!("{tag} preference {i}: indent with {i} spaces")});
             let (_, raw) = mcp_call(s, "?org=acme", bearer, "remember_memory", note).await;
             let (text, failed) = tool_text(&raw);
-            assert!(!failed && text.contains("visible to user:"), "{raw}");
+            assert!(
+                !failed
+                    && text.contains("remembered in org:acme")
+                    && text.contains("visible to user:"),
+                "an acme member's note not in acme's memory: {raw}"
+            );
         }
     }
+    // The served scope's writes go to the inbox, which this server can't reach: the call fails inside (with no
+    // inbox, the default org's memory takes no writes, and the tool isn't offered). Acme's reader key writes nowhere.
+    let note = json!({"source": "notes", "body": "xprofserved for the inbox"});
+    let (_, raw) = mcp_call(s, "", ADMIN_KEY, "remember_memory", note.clone()).await;
+    assert_eq!(tool_text(&raw), ("tool failed".to_string(), true), "{raw}");
+    let (_, raw) = mcp_call(s, "", &reader, "remember_memory", note).await;
+    let (text, failed) = tool_text(&raw);
+    assert!(
+        (failed || raw.contains("\"error\"")) && !text.contains("remembered in"),
+        "acme's reader key wrote: {raw}"
+    );
     let acme = Scope::org("acme").unwrap();
     let doc = |user: &str| memstore::profile::document(user);
     let t = Instant::now();

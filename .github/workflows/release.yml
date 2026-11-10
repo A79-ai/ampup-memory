@@ -16,7 +16,7 @@ name: Release
 # and memstore-client is its client), and once published, installed with install.sh and checked again.
 #
 # Every archive carries LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt: the licenses of every crate linked into the
-# binaries (and ONNX Runtime's), written for the release by .github/scripts/third-party-notices.sh (cargo-about).
+# binaries, ONNX Runtime's and the embedding model's, kept current by .github/scripts/third-party-notices.sh.
 #
 # Platforms: Linux x86_64 and arm64 (glibc 2.39 or newer: built on Ubuntu 24.04) and Apple Silicon macOS. No Intel
 # macOS: onnxruntime (ort) ships no prebuilt library for it. macOS builds aren't signed or notarized yet:
@@ -70,13 +70,18 @@ jobs:
         run: cargo build --release --locked --bin memstore --bin memstore-client
       - name: Check the build
         run: .github/scripts/release-check.sh target/release/memstore target/release/memstore-client
-      - name: Install cargo-about
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
-        with:
-          tool: cargo-about
-      # A crate under a license about.toml doesn't accept fails this, and with it the release.
-      - name: Third-party notices
-        run: .github/scripts/third-party-notices.sh THIRD-PARTY-NOTICES.txt
+      # The committed THIRD-PARTY-NOTICES.txt must be what the script makes of this Cargo.lock (a crate under a
+      # license about.toml doesn't accept fails it too), checked on the Linux builds; the release publishes nothing
+      # unless every build passed.
+      - name: Third-party notices are current
+        if: runner.os == 'Linux'
+        run: |
+          .github/scripts/third-party-notices.sh "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt"
+          cmp -s THIRD-PARTY-NOTICES.txt "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt" || {
+            diff -u THIRD-PARTY-NOTICES.txt "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt" | head -40
+            echo "::error file=THIRD-PARTY-NOTICES.txt::stale: run .github/scripts/third-party-notices.sh THIRD-PARTY-NOTICES.txt"
+            exit 1
+          }
       - name: Package
         env:
           KIND: ${{ steps.kind.outputs.kind }}

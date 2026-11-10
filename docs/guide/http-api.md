@@ -119,8 +119,10 @@ The CLI's people commands (`memstore org`, `team`, `member`, `apikey`, `audit`) 
 ## Errors
 
 - 400 for a malformed body, with a reason.
-- 401 without a credential the server accepts; 403 when the caller may not do this here, with a reason code
+- 401 without a credential the server accepts, answered before the body is read; 403 when the caller may not do this here, with a reason code
   (`not_member`, `as_denied`, …).
 - 404 for anything the caller may not see.
-- 429 with `Retry-After` past the caller's rate limit.
-- 503 for advice with no routing model, and from `/ready` during warm-up.
+- 429 with `Retry-After` past the caller's rate limit (a batch costs a token per item) or past its requests in
+  flight at once (`MEMSTORE_MAX_IN_FLIGHT_PER_CALLER`).
+- 503 for advice with no routing model, from `/ready` during warm-up, and with `Retry-After: 1` when the server is
+  at its connection or in-flight cap.

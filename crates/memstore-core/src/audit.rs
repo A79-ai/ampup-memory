@@ -41,16 +41,19 @@
 //! past [`MAX_PENDING`] buffered rows new events are dropped (and counted in the log) rather than held.
 //! Refusals, which anyone can cause, get half of that and sign-ins and key use the other half.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use arrow_array::{Array, ArrayRef, Int64Array, StringArray, cast::AsArray, types::Int64Type};
+use arrow_array::{
+    Array, ArrayRef, Int64Array, RecordBatch, StringArray, cast::AsArray, types::Int64Type,
+};
 use iceberg::spec::{PrimitiveType, Schema};
 use serde_json::{Value, json};
 
+use crate::people::directory::Directory;
 use crate::{OnConflict, SYSTEM_NS, Store, append, optional_strings, schema, timestamps, ts};
 
 /// The high-volume events' table (`memory_system.audit`).
@@ -61,6 +64,10 @@ pub const MAX_PENDING: usize = 10_000;
 /// Buffered `read` rows a server holds at most, apart from [`MAX_PENDING`] so a burst of reads can't push
 /// out sign-ins and refusals.
 pub const MAX_READS: usize = 10_000;
+/// Distinct callers one org's identity provider has refusals of in the buffer, each a row of their own; past
+/// them, its callers' refusals are counted together in one row under the provider ([`Recorder::refusal_via`]).
+/// The provider can mint any name, so its names alone can't take the refusals' half from everyone else's.
+pub const MAX_REFUSED_PER_PROVIDER: usize = 100;
 /// Episode ids one `read` row names at most; its item count says how many there were.
 pub const MAX_READ_IDS: usize = 100;
 /// How often a server writes its buffered events, unless `MEMSTORE_AUDIT_FLUSH_SECS` says otherwise.
@@ -571,6 +578,8 @@ type KeyUseKey = (
 #[derive(Default)]
 struct Pending {
     refusals: HashMap<RefusalKey, (i64, i64)>,
+    /// Refusal rows of their own each provider's callers hold ([`MAX_REFUSED_PER_PROVIDER`]).
+    vouched: HashMap<String, usize>,
     signins: Vec<Entry>,
     /// (user, org) first seen in `seen_hour`.
     seen: std::collections::HashSet<(String, Option<(String, i64)>)>,
@@ -662,13 +671,45 @@ impl Recorder {
     /// A 401 or 403. `org`: the org the caller is authenticated as belonging to, if the refusal is about
     /// it (none otherwise). `actor` is `-` when no credential proved who the caller is.
     pub fn refusal(&self, org: OrgOf, actor: &str, route: &'static str, status: u16, why: Reason) {
+        self.refusal_via(org, actor, None, route, status, why)
+    }
+
+    /// [`Recorder::refusal`] of a caller `provider` vouched for (an org's own identity provider, as
+    /// `idp:<org>`): once that provider's callers hold [`MAX_REFUSED_PER_PROVIDER`] rows, the refusals of
+    /// any other caller of it are counted in one row whose caller is `provider`.
+    pub fn refusal_via(
+        &self,
+        org: OrgOf,
+        actor: &str,
+        provider: Option<&str>,
+        route: &'static str,
+        status: u16,
+        why: Reason,
+    ) {
         let org = if actor == "-" { None } else { org_name(org) };
         let key = (org, clean(actor), route, status as i64, why);
         let mut p = self.pending.lock().unwrap();
         if let Some((_, n)) = p.refusals.get_mut(&key) {
             *n += 1;
+            return;
+        }
+        let provider = provider.filter(|_| actor != "-").map(clean);
+        let full = provider.as_ref().is_some_and(|v| {
+            p.vouched
+                .get(v)
+                .is_some_and(|n| *n >= MAX_REFUSED_PER_PROVIDER)
+        });
+        let (key, own) = match provider {
+            Some(v) if full => ((key.0, v, route, status as i64, why), None),
+            v => (key, v),
+        };
+        if let Some((_, n)) = p.refusals.get_mut(&key) {
+            *n += 1;
         } else if p.room(true) {
             p.refusals.insert(key, (now_us(), 1));
+            if let Some(v) = own {
+                *p.vouched.entry(v).or_default() += 1;
+            }
         }
     }
 
@@ -823,6 +864,7 @@ impl Recorder {
         p.support.clear();
         p.reads.clear();
         p.refusals.clear();
+        p.vouched.clear();
         p.keys.clear();
         (rows, retried, std::mem::take(&mut p.dropped))
     }
@@ -942,9 +984,68 @@ fn longs(b: &arrow_array::RecordBatch, col: &str) -> Vec<Option<i64>> {
     }
 }
 
+/// Whether an audit row of `org`, recorded under the incarnation `incarnation` (the `at` of the org's
+/// `org.create` then), is of an org `dir` has now, as that incarnation. An org deleted since, or deleted and
+/// created again, is gone: its delete removed its rows, so no server writes it more of them, however long its
+/// buffer held them. A row of no org, and an org's row from before rows carried the incarnation, need the org only.
+pub fn row_stays(dir: &Directory, org: Option<&str>, incarnation: Option<i64>) -> bool {
+    org.is_none_or(|o| {
+        dir.orgs
+            .get(o)
+            .is_some_and(|live| incarnation.is_none_or(|i| i == live.created_at))
+    })
+}
+
+/// Whether a key usage row of `org`'s key `sha256` is of a key `dir` has now in that org. A deleted org's keys
+/// go with it, and an org created again under its name holds none of them.
+pub fn key_use_stays(dir: &Directory, org: &str, sha256: &str) -> bool {
+    dir.orgs
+        .get(org)
+        .is_some_and(|o| o.keys.values().any(|k| k.sha256 == sha256))
+}
+
+/// What, beside its org, tells which org a system table's row is of ([`Store::unwrite_gone`]): the audit's
+/// incarnation, a key usage row's key.
+pub(crate) trait KeyOf: Sized {
+    fn stays(&self, dir: &Directory, org: &str) -> bool;
+    fn column(b: &RecordBatch) -> Vec<Self>;
+}
+
+impl KeyOf for Option<i64> {
+    fn stays(&self, dir: &Directory, org: &str) -> bool {
+        row_stays(dir, Some(org), *self)
+    }
+    fn column(b: &RecordBatch) -> Vec<Self> {
+        longs(b, "org_created_at")
+    }
+}
+
+impl KeyOf for String {
+    fn stays(&self, dir: &Directory, org: &str) -> bool {
+        key_use_stays(dir, org, self)
+    }
+    fn column(b: &RecordBatch) -> Vec<Self> {
+        crate::strings(b, "sha256")
+    }
+}
+
 impl Store {
-    /// Append audit rows (`memory_system.audit`), all in one write.
+    /// Append audit rows (`memory_system.audit`), all in one write. Rows of an org the directory, read now, no
+    /// longer has as they were recorded ([`row_stays`]) are left out; any the org's delete committed while they
+    /// were written are taken out again ([`Store::unwrite_gone`]).
     pub async fn append_audit(&self, rows: &[Entry]) -> Result<()> {
+        let of_orgs = rows.iter().any(|e| e.org.is_some());
+        let kept: Vec<Entry> = match of_orgs {
+            true => {
+                let dir = Directory::fresh(self).await?;
+                rows.iter()
+                    .filter(|e| row_stays(&dir, e.org.as_deref(), e.incarnation))
+                    .cloned()
+                    .collect()
+            }
+            false => rows.to_vec(),
+        };
+        let rows = &kept[..];
         if rows.is_empty() {
             return Ok(());
         }
@@ -981,7 +1082,60 @@ impl Store {
         )
         .await?;
         self.invalidate(SYSTEM_NS, AUDIT);
+        if of_orgs {
+            let written: BTreeSet<(String, Option<i64>)> = rows
+                .iter()
+                .filter_map(|e| Some((e.org.clone()?, e.incarnation)))
+                .collect();
+            self.unwrite_gone(AUDIT, written).await;
+        }
         Ok(())
+    }
+
+    /// After rows of the orgs in `written` (org, incarnation, as [`row_stays`] takes them) were appended to
+    /// `memory_system.<table>` (the audit or key usage table): the directory is read again, and the rows of any
+    /// of them that is gone now are removed again. An org's delete commits to the directory before it rewrites
+    /// these tables, so either it is in this read, or its rewrite comes after these rows landed and removes
+    /// them itself. A key usage row's "incarnation" is its key's sha256, which only the org that holds the key
+    /// keeps ([`key_use_stays`]). A failure is logged: the rows were written, and are not written again.
+    pub(crate) async fn unwrite_gone<T>(&self, table: &str, written: BTreeSet<(String, T)>)
+    where
+        T: Ord + Clone + Send + Sync + KeyOf,
+    {
+        let gone: BTreeSet<(String, T)> = match Directory::fresh(self).await {
+            Ok(dir) => written
+                .into_iter()
+                .filter(|(org, k)| !k.stays(&dir, org))
+                .collect(),
+            Err(e) => {
+                eprintln!(
+                    "{table}: not checked against org deletes after the write (directory unreadable): {e:#}"
+                );
+                return;
+            }
+        };
+        if gone.is_empty() {
+            return;
+        }
+        let removed = self
+            .rewrite_table(SYSTEM_NS, table, &mut |b| {
+                let orgs = optional_strings(b, "org");
+                let keys = T::column(b);
+                Ok(orgs
+                    .into_iter()
+                    .zip(keys)
+                    .map(|(org, k)| Some(!org.is_some_and(|o| gone.contains(&(o, k)))))
+                    .collect())
+            })
+            .await;
+        match removed {
+            Ok(n) => {
+                eprintln!("{table}: {n} rows of orgs deleted while they were written removed again")
+            }
+            Err(e) => eprintln!(
+                "{table}: rows of orgs deleted while they were written not removed: {e:#}"
+            ),
+        }
     }
 
     /// Every row of `memory_system.audit` (none before the first write).

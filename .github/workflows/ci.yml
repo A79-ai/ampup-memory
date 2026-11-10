@@ -64,6 +64,26 @@ jobs:
           diff <(deps '["memstore", "memstore-core", "memstore-client"]' | jq '.[]') <(deps '["memstore-deps"]' | jq '.[]') \
             || { echo "::error file=crates/memstore-deps/Cargo.toml::list every dependency of memstore, memstore-core and memstore-client here (name.workspace = true)"; exit 1; }
 
+  # THIRD-PARTY-NOTICES.txt (in every release archive) must be what .github/scripts/third-party-notices.sh makes of
+  # this Cargo.lock: a dependency added, removed or bumped without regenerating it fails here, as does a dependency
+  # under a license about.toml doesn't accept. No build: only cargo metadata and the crate sources.
+  notices:
+    name: Third-party notices
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install the pinned toolchain
+        run: rustup toolchain install && rustc -V
+      - name: THIRD-PARTY-NOTICES.txt is current
+        run: |
+          .github/scripts/third-party-notices.sh "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt"
+          cmp -s THIRD-PARTY-NOTICES.txt "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt" || {
+            diff -u THIRD-PARTY-NOTICES.txt "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt" | head -60
+            echo "::error file=THIRD-PARTY-NOTICES.txt::stale: run .github/scripts/third-party-notices.sh THIRD-PARTY-NOTICES.txt and commit it"
+            exit 1
+          }
+
   test:
     name: Test
     if: github.event_name == 'workflow_dispatch' || !github.event.repository.private

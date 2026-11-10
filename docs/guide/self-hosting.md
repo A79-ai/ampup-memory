@@ -103,6 +103,10 @@ Any number of servers may share a catalog.
 - **Stopping.** On SIGTERM a server answers `/ready` with 503 but keeps answering for
   `MEMSTORE_SHUTDOWN_DRAIN_SECS` (5), then finishes in-flight requests for up to `MEMSTORE_SHUTDOWN_WAIT_SECS` (60).
   A Kubernetes `terminationGracePeriodSeconds` must cover both plus about 30 seconds.
+- **Behind a load balancer.** With sign-in (`MEMSTORE_CALLER_IDENTITY=token`), set `MEMSTORE_PUBLIC_URL` to the
+  URL people reach; a server listening beyond loopback won't start without it. Keep `MEMSTORE_API_KEYS` the same
+  file on every server (each reads it again within 2 seconds of a change), and `MEMSTORE_HEADER_TIMEOUT_SECS`
+  (660) above the balancer's idle timeout. The connection and in-flight caps are per server.
 - **Throughput.** Every commit is one compare-and-set on the ledger table: about 1 to 2.5 commits a second under
   contention. Batch writes (`/ingest` takes 500 episodes a commit; `/runs` takes 1,000 runs) where throughput
   matters.

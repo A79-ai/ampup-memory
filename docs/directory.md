@@ -12,8 +12,8 @@ Code is cited as `file:function`, because line numbers go stale.
 |---|---|---|---|
 | `directory` | The log: one row per change (`at, actor, op, org, team, user, role, detail, version`). Rows are only ever appended. | `Store::append_directory_with` (a CAS commit) | `Store::directory` (the fold), `Store::directory_events` (the whole log: audit, checks) |
 | `directory_snapshot` | The log folded: `at, events, digest, format, state, taken_at, actor` | `Store::directory_written` (every 500 changes, `MEMSTORE_DIRECTORY_SNAPSHOT_EVERY`), `/admin {"op":"snapshot"}` | `Store::fold_directory_from`, on a server's first load only |
-| `key_usage` | When each key was last used: `sha256, org, name, at`. Kept apart from the log so the log stays small. | `server::flush_key_uses`, at most once per key per hour | `Directory::with_usage` (`show`, `apikey list`) |
-| `audit` | Sign-ins, refusals, key use, each stamped with `org` and `org_created_at` (the incarnation) | `audit::Audit::flush` (every 60 s, `MEMSTORE_AUDIT_FLUSH_SECS`) | `audit::collect`, `audit::collect_operator` |
+| `key_usage` | When each key was last used: `sha256, org, name, at`. Kept apart from the log so the log stays small. | `server::flush_key_uses`, at most once per key per hour, through `Store::append_key_usage`, which writes no use of a key the directory (read then) no longer has in its org | `Directory::with_usage` (`show`, `apikey list`) |
+| `audit` | Sign-ins, refusals, key use, each stamped with `org` and `org_created_at` (the incarnation) | `audit::Audit::flush` (every 60 s, `MEMSTORE_AUDIT_FLUSH_SECS`), through `Store::append_audit`, which writes no row of an org the directory (read then) no longer has as that incarnation (`audit::row_stays`) | `audit::collect`, `audit::collect_operator` |
 
 ## 1. The model
 
@@ -32,25 +32,25 @@ only `detail` for keys.
 | `team.create` | org, team | Adds an empty team. | `CreateTeam`, `Sync` (for teams it names) |
 | `team.delete` | org, team | Removes the team and its keys. Verified imports among them are retired. | `DeleteTeam` |
 | `member.add` | org, user, role | Sets the role (`admin` or `member`; anything else counts as `member`). Clears `removed`. | `CreateOrg` (first admin), `AddMember`, `AddToTeam`, `Invite`, `Sync` |
-| `member.remove` | org, user | Removes the membership and every team membership. Adds the user to `removed`, so a domain or a group won't bring them back. | `RemoveMember`, `Sync`, `offboard::forget_user` |
+| `member.remove` | org, user | Removes the membership and every team membership. Adds the user to `removed`, so a domain or a group won't bring them back. The planner writes a `key.revoke` with it for every key imported in the user's name there (`directory::import_revokes`). | `RemoveMember`, `Sync`, `offboard::forget_user` |
 | `member.forget` | org, user, detail = `Forgotten` counts | None. It is a tombstone, used by `describe` and the audit. | `offboard::forget_user` |
 | `member.request` | org, user | Adds the user to `pending` (with `at`), unless they are a member. Grants nothing: `access` never reads `pending`. `member.add` and `member.remove` clear it. | `RequestJoin` (the person themselves, through `/admin` op `request_join`: `memstore join`) |
 | `member.decline` | org, user | Removes the user from `pending`. | `Decline` |
 | `team.add` | org, team, user | Adds the user to the team, but only if they are a member and the team exists. | `AddToTeam`, `Invite`, `Sync` |
-| `team.remove` | org, team, user | Removes the user from the team. | `RemoveFromTeam`, `Sync` |
+| `team.remove` | org, team, user | Removes the user from the team. The planner writes a `key.revoke` with it for every key of that team imported in the user's name. | `RemoveFromTeam`, `Sync` |
 | `org.profile` | org, detail = `Profile` JSON | Sets the profile. JSON that doesn't parse clears it. | `SetProfile` |
 | `auth.provider` | org, detail = `Provider` JSON or none | Sets the org's IdP. With no detail, it removes it. | `SetProvider`, `RemoveProvider` |
 | `org.auth0` | org, detail = Auth0 Organization id (`org_…`) or none | Sets the org's `auth0_org`. With no detail, it unbinds it. | `CreateOrg` (with `auth0_org`), `SetAuth0Org` |
 | `domain.add` / `domain.remove` | org, detail = domain, team | Adds the domain (with its join team) or removes it. | `AddDomain` / `RemoveDomain` |
 | `group.map` / `group.unmap` | org, team, detail = group | Adds or removes the group's link to the team. | `MapGroup` / `UnmapGroup` |
-| `key.create` | org, detail = `KeyDetail {name, sha256, team, role, expires_at, sources?, created_by, imported_from?, verified?}` (version 2 when it has `sources`) | Inserts the key by name, replacing any key with that name. A verified import (`imported_from` and `verified`) removes its sha256 from `retired_keys`. A detail that doesn't parse (an unknown role, say) is skipped. | `CreateKey`, `ImportKeys` |
+| `key.create` | org, detail = `KeyDetail {name, sha256, team, role, expires_at, sources?, created_by, imported_from?, verified?, imported_user?}` (version 2 when it has `sources`) | Inserts the key by name, replacing any key with that name. A verified import (`imported_from` and `verified`) removes its sha256 from `retired_keys`. An import keeps the user it acted as (`imported_user`, or on older rows the user `imported_from` names). A detail that doesn't parse (an unknown role, say) is skipped. | `CreateKey`, `ImportKeys` |
 | `key.revoke` | org, detail = key name | Removes the key. A verified import goes into `retired_keys`. | `RevokeKey` |
 | `key.sources` (version 2) | org, detail = `KeySources {name, sources}` | Sets the key's source prefixes (empty: any source). A key not there is skipped. | `SetKeySources` |
 | anything else | | Ignored | |
 
 The fold also keeps state that belongs to no single org: `retired_keys`, `purging`, `purged`, and each
 org's `removed` and `created_at`. Snapshots keep all of it (`SnapOrg`, `SnapKey`,
-`Directory::snapshot_json`). `SNAPSHOT_FORMAT` is 6.
+`Directory::snapshot_json`). `SNAPSHOT_FORMAT` is 9 (an imported key's user is kept since 9).
 
 ### Invariants and where each is enforced
 
@@ -64,17 +64,20 @@ directory as it is when the change commits. The fold does not re-check them.
 | Team names are unique within an org. Key names are unique within an org. | `plan` (`CreateTeam`, `CreateKey`, `ImportKeys`) |
 | **One identity per key.** A sha256 names at most one directory key across all orgs. | `plan` (`CreateKey`: "already in use"; `ImportKeys`: "under another name") |
 | At authentication, a hash that matches two keys names neither. Keys are compared in constant time. | `tokens.rs:org_key_caller` |
-| A new key is not one of this server's file keys | `server/mod.rs:directory_change` (`auth.file_key(key.sha256())`). |
+| A new key is none of the file keys known where it is made: the server's keys file, or with `--direct` the catalog owner's `MEMSTORE_API_KEYS` (unreadable: the change is refused). A bearer that is a non-admin file key on a server and also a directory key other than its verified import (made where the keys file didn't hold it) names two callers, so that server refuses it: one bearer is never one caller here and another elsewhere. | `plan` (`CreateKey`, `Actor::file_keys`); `cli.rs:direct_file_keys`; `server/mod.rs:request_principal` |
 | The server hashes a new key. A client never names a hash. | `Change::CreateKey { key: NewKey }`; `directory_change` refuses a `sha256` field |
 | A retired hash can't be created again. Only a verified re-import brings it back. | `plan` (`CreateKey`); `apply_events` (`key.create`) |
 | An admin file key is always the file's. A non-admin file key is replaced by its verified import, and by no other directory key. A retired one is refused, never served as its file twin. | `server/mod.rs:request_principal` (the `Identity::Token` arm) |
 | Imports are verified: the server holds the key, or the catalog owner runs the import. The row must match the key held under that sha256 (id, user, groups, admin). | `plan` (`ImportKeys`: `actor.owner \|\| actor.vouched_keys`); `directory_change` (the row match) |
 | Only the operator or the key's holder may import. Imports skip the org-admin gate. | `plan` (the import gate at the top) |
-| An import gets no more than it had: no admin rows, no groups, and the user must be able to reach the scope | `plan` (`ImportKeys`). This is checked at import time only. |
+| An import gets no more than it had: no admin rows, no groups, and the user must be able to reach the scope (never an org that requires its own provider, which file keys don't reach). It keeps no more than its user has: removing the user from the org, or from the key's team, or forgetting them, revokes the key in the same commit (which retires its hash, so the file twin is refused too), and a key whose user is no longer a member there reads nothing, whichever planner removed them. | `plan` (`ImportKeys`, `import_revokes`); `offboard::forget_user`; `Directory::access` |
 | A key reads its own scope only. A team key never gets its org's scope. A key is served only while the fold still has it under that hash. | `Directory::access`, `Directory::resolve` |
 | `reader` never writes, and `ingest` never reads | `SignIn::may_write`, `SignIn::may_read`; the route gates in `server/mod.rs:handle` |
 | A `directory` key is org-wide, never imported, reads and writes no memory, and changes only its own org's non-admin members and its teams. It deletes no team holding admin-made config (team keys, team settings, group mappings, domains joining people to it) | `plan` (`CreateKey`, `ImportKeys`, `directory_key_may`); `directory_change` (`DIRECTORY_KEY_OPS`); `server/mod.rs:handle` (every other route); `Directory::resolve` |
-| An org's own IdP vouches for that org only. An org with a `required` provider takes no other sign-in from a person. | `Directory::vouched`; `tokens.rs:authenticate_any` (`orgs`). |
+| An org's own IdP vouches for that org only. An org with a `required` provider takes no other sign-in, a person's or a service's: not the server's IdP, Auth0, a gateway (IAP, a Google ID token, Snowflake), an app JWT or a file key. Only its own provider's sign-ins and its own directory keys (which its admins make) get in. | `Directory::vouched`, `Directory::access` (keys first); `tokens.rs:authenticate_any` (`orgs`) |
+| Closure groups (`/closure`, the team csv) are pushed for a bare email, so they apply only to a sign-in whose email the deployment vouches for: the server's IdP, the Auth0 tenant's own connections, an app JWT, a gateway, a key. A sign-in through an org's own IdP (or an Auth0 Organization's enterprise connection), which says what the email is, gets none. The disabled list applies to every sign-in. | `server/mod.rs:request_principal` |
+| User ids and IdP emails fold ASCII letters only, as `acl.rs` does: an address that only Unicode case rules fold into a member's (a Kelvin sign for `k`) is someone else. An id stored with other letters matches only that spelling. Forgetting a person also takes what was written under the Unicode-folded spelling of their id. | `directory.rs:user_id`, `forgets`; `oidc.rs:email_of`; `lib.rs:remembered_by` |
+| An org's whole view (`show`: members, teams, keys, provider, domains, requests) is its admins' (signed in as a person, not a file key in an admin's name), its directory key's and the operator's. Any other member sees themselves: their role, their teams and the org's profile. | `server/mod.rs:directory_change` (`show`); `Org::member_view` |
 | An IdP client (issuer and client id) belongs to one org. It is never the server's own client. | `plan` (`SetProvider`); `directory_change` |
 | An Auth0 Organization belongs to one org. At authentication, one held by two orgs binds neither. The operators' Organization binds no org. Only the operator (an admin key, the catalog owner, or an Auth0 operator) binds or unbinds an org; never its admins. | `plan` (`owner_only`, `auth0_free`); `Directory::auth0_bound`; `directory_change` (the operators' Organization) |
 | An Auth0 token counts only in the org bound to its `org_id`, as both the 5 s view (`DirectoryAuth::auth0_orgs`, `via.orgs`) and the 1 s fold say, never in an org that requires its own provider, and only for a member (by the token's verified email; an org's domains admit no one through Auth0). No `org_id`, through one of the platform's own connections (Google, the tenant's database, passwordless): the directory's member wherever it lists them, like an MCP client's access token (`memstore join` signs in as the person, then asks which orgs are theirs). No `org_id` through an enterprise connection, or an `org_id` no org is bound to: signed in, bound to no org. The operators' Organization's tokens are bound to no org. | `tokens.rs:Auth0::caller`; `Directory::vouched` |
@@ -110,7 +113,8 @@ Callers are the ones in the review's threat model. In the table, ✓ means allow
 "own" means within the caller's own org. A member column with ✗ also covers an outsider.
 
 - **Admin** is an org admin who is a person: they signed in through the server's IdP, an app JWT, or a
-  gateway such as IAP, Snowflake or a Google ID token.
+  gateway such as IAP, Snowflake or a Google ID token. In an org that requires its own provider, only
+  through that provider (the **Org IdP** column).
 - **Org IdP** is what an org's own IdP can do. It controls the email claim, so it can sign in as any
   member or admin *of that org*.
 - **Keys** are directory keys (`reader`, `writer`, `ingest`). They are all refused the same way, at the
@@ -142,9 +146,9 @@ Callers are the ones in the review's threat model. In the table, ✓ means allow
 | `CreateKey`, `RevokeKey` (`key.create`, `key.revoke`) | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✓ | `ingest` keys only (any org) | ✓ (any hash) | `plan`; `directory_change` |
 | `SetKeySources` (`key.sources`): an ingest key's source prefixes | ✗ | ✗ | own | own | ✗ (not even on itself) | ✗ | ✗ | ✓ | `ingest` keys (any org) | ✓ | `plan` (`key_sources`); `directory_change` (refuses keys) |
 | `ImportKeys` (`key.create` with `imported_from`) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | itself only (`--self`), into scopes its user reaches | ✓ (verified: the server holds the key, or `--direct`) | ✗ | ✓ | `plan` (the import gate, `vouched_keys`); `directory_change` (`--self`, the row match) |
-| `forget_user` (`member.remove`, `member.forget`) | ✗ | ✗ | own, as a person, not themselves | own | ✗ | ✗ | ✗ | ✓ (every org) | ✗ | ✓ | `offboard.rs:may_manage`, `forget_user` |
+| `forget_user` (`member.remove`, `member.forget`) | ✗ | ✗ | own, as a person, not themselves | own | ✗ | ✗ | ✗ | ✓ (every org) | ✗ | ✓ | `offboard.rs:may_manage`, `forget_user`: checked again inside the `member.remove` CAS, against the directory read fresh before each scope's memory is deleted, and inside the `member.forget` CAS. A caller who loses the right partway is refused there: the person is out of the org, no scope is half-forgotten, and someone who may can run it again to finish. |
 | `set_schema` (a ledger commit, not a directory event) | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ | `directory_change` |
-| Read `show` | ✗ | own | own | own | ✗ | own | its user's orgs | all | all | — | `directory_change` |
+| Read `show` | ✗ | own: themselves only | own | own (as whoever it signs in) | ✗ | own | its user's orgs: themselves only | all | all | — | `directory_change` |
 | Read the org's audit; `export_org` | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✓ | ✗ | — | `directory_change`; `offboard.rs:may_manage` |
 | Read the operator's audit; `snapshot`; `check_directory` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | admin file key only for the operator's audit | ✗ | — | `directory_change` |
 | `/ingest`, `/acl`, `/closure`, `/team`, `/metrics` (public port) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | admin file key | ✗ | — | `server/mod.rs:require_admin` |
@@ -192,21 +196,21 @@ There is no key rotation: to rotate, change the key everywhere, then run `auth s
 | Callers through a gateway (Google, Snowflake, IAP groups) | 110 s (`CALLER_TTL`). Not cached for bearer tokens. A closure push invalidates it. | `request_principal` | — |
 | Memory tables | 1 s, served stale in the background up to 60 s (`HARD_STALENESS`) | `Store::rows` | — |
 | Org IdP JWKS | 1 h TTL, refetched at most once every 30 s on an unknown `kid`. A failed issuer is retried after 60 s. | `tokens.rs` (`JWKS_TTL`, `JWKS_MIN_REFETCH`, `ISSUER_RETRY`) | — |
-| The keys file (`MEMSTORE_API_KEYS`) | Read at startup only. Revoking a key means restarting. | `token_auth_from_env` | — |
-| Audit buffer | 60 s | `audit::flush_interval` | Retried. An org delete flushes only the deleting server's buffer. |
-| Key usage | 1 h | `KEY_USE_FLUSH` | Retried every minute |
+| The keys file (`MEMSTORE_API_KEYS`) | Looked at every 2 s (`KEYS_FILE_POLL`) and read again when it changes. The new keys take effect whole, so a key taken out is refused within about 2 s, with no restart. | `TokenAuth::reload_keys_file`, `server::keys_file_watch` | A file that can't be read or doesn't parse keeps the keys last read; `memstore_keys_file_failing` is 1 and the log says `ALERT` until it reads again |
+| Audit buffer | 60 s. Refusals hold half of it; the people one org's IdP signed in hold at most 100 rows of their own, the rest counted in one row under the IdP (`idp:<org>`), so its minted names can't push out anyone else's. | `audit::flush_interval`, `Recorder::refusal_via` | Retried. An org delete flushes the deleting server's buffer before its purge. Another server's buffer may still hold the deleted org's rows: its flush drops them (`audit::row_stays`, against the directory read at the flush), and after writing it reads the directory again and removes any rows of an org deleted meanwhile (`Store::unwrite_gone`), so a delete that raced the write leaves none of them stored. |
+| Key usage | 1 h | `KEY_USE_FLUSH` | Retried every minute. A deleted org's key uses are dropped and removed again as the audit's are (`audit::key_use_stays`). |
 | A blocked fold (a newer version) | Until the server is upgraded | `Folded::apply` | Serves the directory as of the change before. Refuses writes. |
 
 ### Read paths and what they trust
 
 | Path | Reads | Trusts |
 |---|---|---|
-| Bearer to caller (`request_principal`) | The keys file, `directory_auth` (5 s), and OIDC or JWT signatures | The catalog for keys and providers; the IdPs for identity, bound to their org; the app JWT issuer and gateways completely |
+| Bearer to caller (`request_principal`) | The keys file, `directory_auth` (5 s), and OIDC or JWT signatures, from the headers alone: `handle` runs it before reading the body, and refuses a caller it doesn't know with the body unread (BigQuery's service agent, which names its caller in the body, has its body read once its token is shown to be the agent's) | The catalog for keys and providers; the IdPs for identity, bound to their org; the app JWT issuer and gateways completely |
 | Scope selection (`select_scope` → `Directory::resolve`) | The 1 s fold | The catalog. A caller with no selection and no directory route gets the served scope. |
 | Memory reads (`/search`, `/query`, `/episode`, MCP) | The scope, then episode ACLs (`acl.rs`), then `may_read` | The catalog grants on namespaces. Facts are visible only if every cited episode is. |
 | `/me`, `show` | The fold, plus `key_usage` for `show` | The catalog. `/me` is reduced for ingest keys, and refused to directory keys. |
 | Audit (`audit::collect`) | The audit table, the **raw log** (to find the incarnation), and this server's buffer | The catalog, and the incarnation stamps |
-| `protected_resource` (anonymous) | The fold; it resolves the secret of a client that isn't confidential | Nothing about the caller |
+| `protected_resource` (anonymous) | The fold; it resolves the secret of a client that isn't confidential. The `resource` it names, and every 401's `WWW-Authenticate`, come from `MEMSTORE_PUBLIC_URL` (`public_url`, at start) | Nothing about the caller, its `Host` header included |
 | A server's first load | The newest snapshot plus the log after it | The snapshot, if its count matches |
 | `check_directory`, `identity check` | A replay of the whole log, compared with the snapshot | The log |
 
@@ -223,7 +227,8 @@ There is no key rotation: to rotate, change the key everywhere, then run `auth s
 | Wire and fold: the `directory` role. As with `ingest`, an older server can't parse a `KeyDetail` with `role: directory`, skips the `key.create`, and so refuses the key (fails closed). **Upgrade servers before creating directory keys.** A snapshot an older server takes leaves the key out; a newer server that loads it doesn't know the key until it is made again. | — | `apply_events` (`.ok()` on the detail) |
 | Fold: an ingest key's source prefixes (`key.create` with `sources`, `key.sources`) are written at version 2, every other change at 1. A server before them stops folding at the first such change (fails closed) instead of reading the key as free to write any source. **Upgrade servers before setting a key's sources.** | An old fold would drop the prefixes | `SOURCES_VERSION`, `Folded::apply` |
 | `MEMSTORE_SECRET_KEY` is the same on every replica and on every `--direct` machine | See §3 | `identity check` (per replica) |
-| `MEMSTORE_API_KEYS` is the same on every replica | File-key behaviour, the anti-takeover row match and the "already in use" check are per replica | Nothing |
+| `MEMSTORE_PUBLIC_URL` is set on every server with token auth that listens beyond loopback | Sign-in discovery names it; without it the only other source would be the request's `Host`, which the caller sets | `public_url` (`serve` refuses to start) |
+| `MEMSTORE_API_KEYS` is the same on every replica | Each server serves its own file's keys, and the import row match is made against it. A file that differs fails closed (a bearer that is a directory key too is refused), but a key one file lacks works only where a file has it | Nothing; each server reads its file again when it changes |
 | Never roll back past the release that added the event version gate | Binaries before the version gate fold any row. Binaries before `retired_keys` and `purging` don't know them. | — |
 | New columns are added in place, and old rows read them as null (`org_created_at`, `version`) | Mixed fleets keep writing | `audit::collect` falls back to time for rows with no incarnation |
 
@@ -261,7 +266,7 @@ There is no key rotation: to rotate, change the key everywhere, then run `auth s
 
 | Candidate | Removes | Cost | Benefit |
 |---|---|---|---|
-| Retire non-admin file keys once operator keys live in the directory: import every one, then stop reading them | `SignIn::file_key`, `replaces_file_key`, `verified_import`, `retired_keys`, `KeyDetail.verified` and `imported_from` on new rows, `--self`, `vouched_keys`, the row match, the file-key op allow-list, `key_caller`'s `file:` branch | Medium. Operator keys in the directory first, then a migration (`apikey import` per deployment), then one release that still reads legacy rows | Removes a class of key-handling bugs and the per-replica divergence of file keys. One key system in fact. |
+| Retire non-admin file keys once operator keys live in the directory: import every one, then stop reading them | `SignIn::file_key`, `replaces_file_key`, `verified_import`, `retired_keys`, `KeyDetail.verified` and `imported_from` on new rows, `--self`, `vouched_keys`, the row match, the file-key op allow-list, `key_caller`'s `file:` branch | Medium. A migration (`apikey import` per deployment), then one release that still reads legacy rows | Removes a class of key-handling bugs, and the file keys that differ per replica. One key system in fact. |
 | Model the caller as one enum (`Operator`, `Person{via}`, `OrgKey`, `FileKey`) instead of `superuser`, `owner`, `via.key`, `via.file_key` and `via.person`, and make `plan` the only gate | Gates split across `directory_change`, `offboard::may_manage` and `plan` | Medium refactor; the tests stay as they are | §2 becomes one `match`. A new op can't forget a caller kind. |
 | Treat an unknown op at a known version as blocking, like a newer version | The silent `_ => {}` in `apply_events` | Small, but it needs a version bump itself | Fails closed when someone forgets the bump |
 | Take the audit incarnation from the fold (`Org::created_at`), not from the raw log | `audit::collect`'s full log scan | Small | One source of truth, and the audit stops reading the whole log on every call |

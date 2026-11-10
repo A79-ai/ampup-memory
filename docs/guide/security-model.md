@@ -32,6 +32,10 @@ configurable (`MEMSTORE_JWT_ISSUER`, `_AUDIENCE`, `_ORG_CLAIM`, `_GROUPS_CLAIM`,
 
 Emails compare case-insensitively everywhere; other ids are exact.
 
+With `token` identity, set `MEMSTORE_PUBLIC_URL` to the server's public URL: sign-in discovery and every 401's
+`WWW-Authenticate` name it, never a request's `Host` header (which the caller sets). A server that listens beyond
+loopback refuses to start without it.
+
 `memstore identity check` reports what `serve` makes of the environment and exits non-zero when a part fails. Run
 it in a deploy's smoke step.
 
@@ -63,7 +67,8 @@ memstore invite --email bob@acme.com --team sales     # or --file people.csv
 - `invite` sends no email: it prints the `memstore join` and `claude mcp add` lines to share.
 - `org sync people.csv [--dry-run] [--keep-absent]` makes the org match an IdP export.
 - An org can connect its own identity provider (`memstore auth setup --provider google|okta|entra|oidc …`,
-  `--require` to make it mandatory), map provider groups to teams (`auth map-group`) and admit verified email
+  `--require` to make it the only sign-in that counts there: not the server's provider, a gateway, an app's JWT or a
+  keys-file key; services use the org's own keys), map provider groups to teams (`auth map-group`) and admit verified email
   domains (`auth domain add`). A sign-in through an org's own provider counts in that org only.
 - Every URL the server fetches for an org's provider must be https and resolve to public addresses only; loopback,
   private, link-local (including the cloud metadata service) and CGNAT ranges are refused, and the connection is
@@ -172,7 +177,14 @@ against someone hiding one on purpose.
 `MEMSTORE_RATE_LIMIT=60/min:120` (rate and burst) and `MEMSTORE_INGEST_RATE_LIMIT` give each caller a token bucket,
 keyed by what authenticated them. Over the limit: 429 with `Retry-After`. Buckets live in each server's memory, so
 with N replicas a caller gets up to N times the limit. The operator's admin key and unauthenticated callers (who get
-no further than 401) aren't limited; put a per-address limit at the load balancer.
+no further than 401) aren't limited; put a per-address limit at the load balancer. A batch costs its items: a
+`/search` or `/query` with 100 rows costs what 100 requests would.
+
+A request's body is read only once its headers prove who sent it: without a credential, or with one the server
+refuses, it is answered 401 unread. Past `MEMSTORE_MAX_CONNECTIONS` or `MEMSTORE_MAX_IN_FLIGHT` a request is
+answered 503, and past `MEMSTORE_MAX_IN_FLIGHT_PER_CALLER` 429, both unread and with `Retry-After: 1`; `/ready` and
+the health probes are always answered. `MEMSTORE_HEADER_TIMEOUT_SECS` closes connections slow to send their
+headers ([configuration.md](configuration.md)).
 
 ## Operating rules
 

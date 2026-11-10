@@ -1,0 +1,197 @@
+# cargo-about: the licenses of every crate linked into the release binaries (memstore and memstore-client), which
+# .github/scripts/third-party-notices.sh writes, with the Apache NOTICE files those crates ship and the texts in
+# licenses/ (ONNX Runtime, the default embedding model), to THIRD-PARTY-NOTICES.txt.
+#
+# A crate under a license not accepted here fails the generation, and with it CI and the release: a new dependency
+# with an unusual license is a decision, not something that ships unnoticed. Accept a permissive license here; a
+# copyleft one (MPL-2.0 and the like) only for the crate that needs it, below.
+
+# In priority order: a crate offered under a choice of licenses is listed under the first of these it offers.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+# The platforms release.yml builds: a crate only another platform links (windows-sys, wasm-bindgen) isn't shipped.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
+
+# Build scripts' own dependencies and test-only crates aren't linked into the binaries.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# cargo-about's built-in fixes for crates whose license texts are hard to attribute. Only those that still match the
+# versions in Cargo.lock: the others (clap, ring, sentry, unicode-ident, rustix, bitvec) check a checksum of an older
+# release and are skipped, so listing them would only look like coverage.
+workarounds = ["chrono", "prost", "rustls"]
+
+# The workspace's own crates (publish = false) are this project, under its LICENSE, not third-party software.
+[private]
+ignore = true
+
+# option-ext (through dirs-sys, which hf-hub and lance-index use) is MPL-2.0, weak copyleft at the file level:
+# unmodified, it needs its license text and a pointer to its source, which the template prints for every MPL-2.0
+# crate.
+[option-ext]
+accepted = ["MPL-2.0"]
+
+# Clarifications: the license texts of crates whose package lacks them, holds them where cargo-about doesn't find
+# them, or bundles C or C++ code under its own license. Each file is pinned by its checksum, so a new version of the
+# crate fails the generation until its texts are looked at again (third-party-notices.sh fails on a clarification
+# that no longer matches, which cargo-about itself only warns about).
+
+# No license file in the package: the repository's, at the commit the package was built from.
+[alloc-stdlib.clarify]
+license = "BSD-3-Clause"
+[[alloc-stdlib.clarify.git]]
+path = "LICENSE"
+checksum = "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+
+[base64-simd.clarify]
+license = "MIT"
+[[base64-simd.clarify.git]]
+path = "LICENSE"
+checksum = "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+
+[vsimd.clarify]
+license = "MIT"
+[[vsimd.clarify.git]]
+path = "LICENSE"
+checksum = "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+
+# License files cargo-about doesn't recognise (extra text around the license), so it would print the bare license
+# without the copyright holders.
+[curve25519-dalek.clarify]
+license = "BSD-3-Clause"
+[[curve25519-dalek.clarify.files]]
+path = "LICENSE"
+checksum = "cca0bd3c4fcdba74145ef9d49c62337e2c9fbf9368288f11d0547f1b0273219f"
+
+# MIT, with the notices of the musl and CORE-MATH code it is derived from.
+[libm.clarify]
+license = "MIT"
+[[libm.clarify.files]]
+path = "LICENSE.txt"
+checksum = "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+
+# "BSD-3-Clause/MIT", and the package holds the BSD text only: used under BSD-3-Clause.
+[brotli-decompressor.clarify]
+license = "BSD-3-Clause"
+[[brotli-decompressor.clarify.files]]
+path = "LICENSE"
+checksum = "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+
+# AWS-LC (a BoringSSL and OpenSSL fork) and the libraries compiled into it: the LICENSE names each part's copyright
+# holders and license, and holds the license texts.
+[aws-lc-rs.clarify]
+license = "ISC AND (Apache-2.0 OR ISC)"
+[[aws-lc-rs.clarify.files]]
+path = "LICENSE"
+license = "ISC"
+checksum = "b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7"
+
+[aws-lc-sys.clarify]
+license = "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)"
+[[aws-lc-sys.clarify.files]]
+path = "LICENSE"
+license = "ISC"
+checksum = "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e"
+[[aws-lc-sys.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+start = "MIT License\n-----------\n"
+end = "SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n"
+checksum = "8674c76edd429899af9fdac766062acfac16d7e90620363a22ed0af8c470883b"
+[[aws-lc-sys.clarify.files]]
+path = "LICENSE"
+license = "BSD-3-Clause"
+start = "BSD 3-Clause License\n--------------------\n"
+end = "OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.\n"
+checksum = "2bd7ec4b3390a49a3b2b2d5638c17a92bc30da86410bcbc93d5c1a49daaea1b0"
+[[aws-lc-sys.clarify.files]]
+path = "aws-lc/third_party/fiat/LICENSE"
+license = "MIT"
+checksum = "43e358d7b6eb109d0f51f7b3a090fd82607965767c25fadee39e922475de2061"
+
+# Bundled C libraries, compiled in by the crate's build script, under licenses its own expression doesn't name.
+[lz4-sys.clarify]
+license = "MIT AND BSD-2-Clause"
+[[lz4-sys.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "77633124ac69bf094e06cf9f3157c54d6e51d6b58a38d4f28141947815ecadfa"
+[[lz4-sys.clarify.files]]
+path = "liblz4/lib/LICENSE"
+license = "BSD-2-Clause"
+checksum = "8b58c446121a109ccf32edc094bba3010a3d85e4ee3702950db55e4d3e87736c"
+
+[onig_sys.clarify]
+license = "MIT AND BSD-2-Clause"
+[[onig_sys.clarify.files]]
+path = "LICENSE.md"
+license = "MIT"
+checksum = "71f321038b088358004bee991635ac09e4c703bec467d3c30c06992c0595f189"
+[[onig_sys.clarify.files]]
+path = "oniguruma/COPYING"
+license = "BSD-2-Clause"
+checksum = "70ba5469ea0bab6e18a32d7009068f996503168d27be57747e08da34337ff26f"
+
+[tikv-jemalloc-sys.clarify]
+license = "(MIT OR Apache-2.0) AND BSD-2-Clause"
+[[tikv-jemalloc-sys.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+[[tikv-jemalloc-sys.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397"
+[[tikv-jemalloc-sys.clarify.files]]
+path = "jemalloc/COPYING"
+license = "BSD-2-Clause"
+checksum = "94aa2caa98c25d942f58b956c71dba6a99ff98fc3a31cbc669fe2a4cd0268b53"
+
+# esaxx's suffix-array C++ headers (MIT) inside the Apache-2.0 crate.
+[esaxx-rs.clarify]
+license = "Apache-2.0 AND MIT"
+[[esaxx-rs.clarify.files]]
+path = "LICENSE"
+license = "Apache-2.0"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+[[esaxx-rs.clarify.files]]
+path = "src/esa.hxx"
+license = "MIT"
+start = " * Copyright (c) 2010 Daisuke Okanohara"
+end = " * OTHER DEALINGS IN THE SOFTWARE.\n"
+checksum = "f5f8d8182fbf1b8f542dc376153d48b58781b5589bb33e54b77b816212e38e54"
+[[esaxx-rs.clarify.files]]
+path = "src/sais.hxx"
+license = "MIT"
+start = " * Copyright (c) 2008-2009 Yuta Mori"
+end = " * OTHER DEALINGS IN THE SOFTWARE.\n"
+checksum = "f24919ec63042fe915bbc807fc37261d7b8da05c6ee59be607f3d1fbd3aaf3d6"
+
+# The Unicode tables generated from Unicode's data files, under Unicode's license.
+[regex-syntax]
+accepted = ["Unicode-DFS-2016"]
+[regex-syntax.clarify]
+license = "(MIT OR Apache-2.0) AND Unicode-DFS-2016"
+[[regex-syntax.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+[[regex-syntax.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+[[regex-syntax.clarify.files]]
+path = "src/unicode_tables/LICENSE-UNICODE"
+license = "Unicode-DFS-2016"
+checksum = "74db5baf44a41b1000312c673544b3374e4198af5605c7f9080a402cec42cfa3"

@@ -35,6 +35,16 @@ pub mod workspace;
 
 /// The tool every `remember_memory` episode's source starts with.
 pub const REMEMBER_SOURCE: &str = "mcp:remember_memory";
+/// Whether `source` is a `remember_memory` note by `user` (`mcp:remember_memory:<user>:…`), their id compared
+/// as user ids are ([`people::directory::user_id`]: ASCII letters folded). A note written before ids were
+/// compared that way names its author as Unicode case rules lower-cased them, and is theirs too (what
+/// forgetting them erased then, it still erases).
+pub fn remembered_by(source: &str, user: &str) -> bool {
+    let ascii = format!("{REMEMBER_SOURCE}:{}:", people::directory::user_id(user));
+    let legacy = format!("{REMEMBER_SOURCE}:{}:", user.trim().to_lowercase());
+    source.to_ascii_lowercase().starts_with(&ascii) || source.to_lowercase().starts_with(&legacy)
+}
+
 /// The source family of one person's own learned advice, `advice:mine:<user id>`: forgetting the person deletes
 /// it, as it does what they wrote ([`REMEMBER_SOURCE`]).
 pub const PERSONAL_ADVICE_SOURCE: &str = "advice:mine:";
@@ -4577,7 +4587,9 @@ impl Store {
             .as_ref()
             .and_then(|t| t.metadata().current_snapshot())
             .map(|s| s.snapshot_id());
-        *held = Some((Instant::now(), sid, f.clone()));
+        // Dated by when the read began, not when it ended: a caller asking for a load after some instant
+        // never gets a fold that read the catalog before it, though it finished after.
+        *held = Some((t0, sid, f.clone()));
         Ok(f)
     }
 
@@ -4699,18 +4711,19 @@ impl Store {
         // they landed (a commit whose answer was lost may have).
         let mut tried: Option<(i64, Vec<directory::Event>)> = None;
         for attempt in 0..DIRECTORY_ATTEMPTS {
+            let read_at = Instant::now();
             let (table, base) = {
                 let mut held = self.dir.folded.lock().await;
                 let (table, f) = self.fold_directory(held.as_ref()).await?;
                 let table = table.context("memory_system.directory is gone")?;
                 let sid = table.metadata().current_snapshot().map(|s| s.snapshot_id());
-                *held = Some((Instant::now(), sid, f.clone()));
+                *held = Some((read_at, sid, f.clone()));
                 (table, f)
             };
             if let Some((after, events)) = tried.take() {
                 let since = directory_rows(&table, Some(after)).await?;
                 if events.iter().all(|e| since.contains(e)) {
-                    return self.directory_written(base, events).await;
+                    return self.directory_written(read_at, base, events).await;
                 }
             }
             // Fail closed: a change planned against a directory that stops short of the log could
@@ -4740,7 +4753,9 @@ impl Store {
                 Ok(()) => {
                     let mut after = (*base).clone();
                     after.apply(&events);
-                    return self.directory_written(Arc::new(after), events).await;
+                    return self
+                        .directory_written(read_at, Arc::new(after), events)
+                        .await;
                 }
                 Err(e) if is_commit_conflict(&e) => {
                     self.dir.metrics.commit_retries.inc();
@@ -4759,9 +4774,12 @@ impl Store {
     }
 
     /// `events` landed and `after` is the directory with them: keep it (this server reads its own
-    /// changes at once), and write a snapshot if one is due.
+    /// changes at once), and write a snapshot if one is due. `read_at`: when the read `after` was planned
+    /// against began (the compare-and-set let nothing else commit between that read and these events), which
+    /// dates the fold kept: another server's change committed since isn't in it.
     async fn directory_written(
         &self,
+        read_at: Instant,
         after: Arc<directory::Folded>,
         events: Vec<directory::Event>,
     ) -> Result<Vec<directory::Event>> {
@@ -4772,7 +4790,7 @@ impl Store {
                 .as_ref()
                 .is_none_or(|(_, _, f)| f.events <= after.events)
             {
-                *held = Some((Instant::now(), None, after.clone()));
+                *held = Some((read_at, None, after.clone()));
             }
         }
         let every = snapshot_every();
@@ -5134,8 +5152,20 @@ impl Store {
         Ok(())
     }
 
-    /// Record that keys were used: `(sha256, org, name, µs since the epoch)`, one append for all.
+    /// Record that keys were used: `(sha256, org, name, µs since the epoch)`, one append for all. The uses of a
+    /// key the directory, read now, no longer has in that org (the org deleted, or created again since) are left
+    /// out ([`audit::key_use_stays`]); any whose org's delete committed while they were written are taken out
+    /// again, as the audit's are ([`Store::append_audit`]).
     pub async fn append_key_usage(&self, uses: &[KeyUse]) -> Result<()> {
+        if uses.is_empty() {
+            return Ok(());
+        }
+        let dir = directory::Directory::fresh(self).await?;
+        let uses: Vec<KeyUse> = uses
+            .iter()
+            .filter(|u| audit::key_use_stays(&dir, &u.1, &u.0))
+            .cloned()
+            .collect();
         if uses.is_empty() {
             return Ok(());
         }
@@ -5164,6 +5194,9 @@ impl Store {
         )
         .await?;
         self.invalidate(SYSTEM_NS, KEY_USAGE);
+        let written: BTreeSet<(String, String)> =
+            uses.iter().map(|u| (u.1.clone(), u.0.clone())).collect();
+        self.unwrite_gone(KEY_USAGE, written).await;
         Ok(())
     }
 
@@ -5809,7 +5842,6 @@ impl Store {
             self.rows(&ns, EPISODES),
             self.rows(&ns, FACTS)
         )?;
-        let prefix = format!("{REMEMBER_SOURCE}:{}:", people::directory::user_id(user));
         let mine = format!(
             "{PERSONAL_ADVICE_SOURCE}{}",
             auth::acl::norm_id(user.trim())
@@ -5823,7 +5855,7 @@ impl Store {
             );
             for i in 0..b.num_rows() {
                 if vis.committed.contains(&commit[i])
-                    && (source[i].to_lowercase().starts_with(&prefix) || source[i] == mine)
+                    && (remembered_by(&source[i], user) || source[i] == mine)
                 {
                     from.insert(id[i].clone());
                 }

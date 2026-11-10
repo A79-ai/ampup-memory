@@ -6,11 +6,26 @@
 //! bucket holds `burst` requests and refills at the rate; a request that finds it empty is answered 429
 //! with `Retry-After`.
 //!
+//! A batch costs what its requests one at a time would: a `/search` of 100 rows takes 100 tokens (at most a
+//! full bucket, so any batch the route takes can get through once the bucket refills).
+//!
 //! The buckets live in this server's memory: each replica limits on its own, so behind a load balancer
 //! with N replicas a caller gets up to N times the limit.
+//!
+//! Apart from the rate, how much a server takes on at once (`off` lifts a cap):
+//! - `MEMSTORE_MAX_CONNECTIONS` (default 4096): open connections per port. Past it a new connection is answered
+//!   503 and closed.
+//! - `MEMSTORE_MAX_IN_FLIGHT` (default 1024): requests being answered at once per port. Past it a request is
+//!   answered 503 with `Retry-After`, before its body is read. The probes (`/ready`, `/health`, `/healthz`) are
+//!   always answered.
+//! - `MEMSTORE_MAX_IN_FLIGHT_PER_CALLER` (default 64): requests one caller (the same key or person as the rate)
+//!   has under way at once. Past it a request is answered 429 with `Retry-After`, before its body is read.
+//! - `MEMSTORE_HEADER_TIMEOUT_SECS` (default 660): how long a connection may take to send a request's headers,
+//!   idle ones included. Longer than load balancers keep idle connections to a backend (600 s), so the balancer
+//!   always closes first; a server reached directly can take less.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -90,6 +105,74 @@ pub struct Limiter {
     default: Option<Limit>,
     ingest: Option<Limit>,
     buckets: Mutex<Buckets>,
+    caps: Caps,
+    /// Requests each caller has under way, by the same id as its bucket.
+    under_way: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// How much a server takes on at once: see the module's notes. None: no cap.
+#[derive(Clone, Copy, Debug)]
+pub struct Caps {
+    pub connections: Option<usize>,
+    pub in_flight: Option<usize>,
+    pub per_caller: Option<usize>,
+    pub header_timeout: Option<Duration>,
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Caps {
+            connections: Some(4096),
+            in_flight: Some(1024),
+            per_caller: Some(64),
+            header_timeout: Some(Duration::from_secs(660)),
+        }
+    }
+}
+
+impl Caps {
+    /// From `MEMSTORE_MAX_CONNECTIONS`, `MEMSTORE_MAX_IN_FLIGHT`, `MEMSTORE_MAX_IN_FLIGHT_PER_CALLER` and
+    /// `MEMSTORE_HEADER_TIMEOUT_SECS`, each a positive number (`off`: no cap), else the defaults.
+    pub fn from_env() -> Result<Caps> {
+        let d = Caps::default();
+        let cap = |k: &str, default: Option<usize>| -> Result<Option<usize>> {
+            match std::env::var(k).ok().map(|v| v.trim().to_string()) {
+                None => Ok(default),
+                Some(v) if v.is_empty() => Ok(default),
+                Some(v) if v.eq_ignore_ascii_case("off") => Ok(None),
+                Some(v) => match v.parse::<usize>() {
+                    Ok(n) if n > 0 => Ok(Some(n)),
+                    _ => anyhow::bail!("{k} is a positive number, or off"),
+                },
+            }
+        };
+        let secs = d.header_timeout.map(|t| t.as_secs() as usize);
+        Ok(Caps {
+            connections: cap("MEMSTORE_MAX_CONNECTIONS", d.connections)?,
+            in_flight: cap("MEMSTORE_MAX_IN_FLIGHT", d.in_flight)?,
+            per_caller: cap("MEMSTORE_MAX_IN_FLIGHT_PER_CALLER", d.per_caller)?,
+            header_timeout: cap("MEMSTORE_HEADER_TIMEOUT_SECS", secs)?
+                .map(|s| Duration::from_secs(s as u64)),
+        })
+    }
+}
+
+/// One of a caller's requests under way: counted until dropped.
+pub struct UnderWay {
+    who: String,
+    under_way: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl Drop for UnderWay {
+    fn drop(&mut self) {
+        let mut m = self.under_way.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.who) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.who);
+            }
+        }
+    }
 }
 
 impl Limiter {
@@ -98,7 +181,28 @@ impl Limiter {
             default,
             ingest,
             buckets: Mutex::new((HashMap::new(), PRUNE_AT)),
+            caps: Caps::default(),
+            under_way: Default::default(),
         }
+    }
+
+    pub fn caps(&self) -> Caps {
+        self.caps
+    }
+
+    /// Count one more request under way for `who` (the id its bucket has); None when it already has the most
+    /// a caller may (`MEMSTORE_MAX_IN_FLIGHT_PER_CALLER`).
+    pub fn begin(&self, who: &str) -> Option<UnderWay> {
+        let mut m = self.under_way.lock().unwrap();
+        let n = m.entry(who.to_string()).or_default();
+        if self.caps.per_caller.is_some_and(|cap| *n >= cap) {
+            return None;
+        }
+        *n += 1;
+        Some(UnderWay {
+            who: who.to_string(),
+            under_way: self.under_way.clone(),
+        })
     }
 
     /// From `MEMSTORE_RATE_LIMIT` and `MEMSTORE_INGEST_RATE_LIMIT` (or the specs given in their place).
@@ -121,7 +225,11 @@ impl Limiter {
                 ))
             );
         }
-        Ok(Limiter::new(default, ingest))
+        let caps = Caps::from_env()?;
+        Ok(Limiter {
+            caps,
+            ..Limiter::new(default, ingest)
+        })
     }
 
     fn limit(&self, class: Class) -> Option<Limit> {
@@ -131,8 +239,9 @@ impl Limiter {
         }
     }
 
-    /// Take one request from `who`'s bucket; if it is empty, how long until it holds one.
-    pub fn take(&self, class: Class, who: &str) -> std::result::Result<(), Duration> {
+    /// Take `cost` requests (a batch's rows; at least one, at most a full bucket) from `who`'s bucket; if it
+    /// holds fewer, how long until it holds them.
+    pub fn take(&self, class: Class, who: &str, cost: usize) -> std::result::Result<(), Duration> {
         let Some(limit) = self.limit(class) else {
             return Ok(());
         };
@@ -154,11 +263,12 @@ impl Limiter {
         b.tokens =
             (b.tokens + now.duration_since(b.at).as_secs_f64() * limit.per_sec).min(limit.burst);
         b.at = now;
-        if b.tokens >= 1.0 {
-            b.tokens -= 1.0;
+        let cost = (cost.max(1) as f64).min(limit.burst);
+        if b.tokens >= cost {
+            b.tokens -= cost;
             Ok(())
         } else {
-            Err(Duration::from_secs_f64((1.0 - b.tokens) / limit.per_sec))
+            Err(Duration::from_secs_f64((cost - b.tokens) / limit.per_sec))
         }
     }
 }

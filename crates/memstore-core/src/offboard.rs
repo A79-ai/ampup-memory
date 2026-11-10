@@ -1875,7 +1875,7 @@ impl Store {
             .rewrite_table(ns, QA_LOG, &mut |b| {
                 Ok(strings(b, "asker")
                     .iter()
-                    .map(|a| Some(user_id(a) != user_id(user)))
+                    .map(|a| Some(!crate::people::directory::forgets(a, user)))
                     .collect())
             })
             .await?;
@@ -1884,7 +1884,7 @@ impl Store {
             .rewrite_table(ns, FEEDBACK, &mut |b| {
                 Ok(strings(b, "giver")
                     .iter()
-                    .map(|g| Some(user_id(g) != user_id(user)))
+                    .map(|g| Some(!crate::people::directory::forgets(g, user)))
                     .collect())
             })
             .await?;
@@ -1892,7 +1892,6 @@ impl Store {
         // entity is unowned afterwards (the admin assigns another), and a proposal of theirs goes with the
         // decisions on it.
         self.forget_governance(ns, user).await?;
-        let prefix = format!("{}:{}:", crate::REMEMBER_SOURCE, user_id(user));
         // Their own learned advice is theirs too: its source names them (`advice:mine:<id>`).
         // The id as the ACL names them (`norm_id`), compared exactly: ids that differ in case are two people.
         let mine = format!(
@@ -1900,7 +1899,7 @@ impl Store {
             crate::PERSONAL_ADVICE_SOURCE,
             crate::auth::acl::norm_id(user.trim())
         );
-        let authored = |source: &str| source.to_lowercase().starts_with(&prefix) || source == mine;
+        let authored = |source: &str| crate::remembered_by(source, user) || source == mine;
         let episodes = self.table(ns, EPISODES).await?;
         let rows = read_files(&episodes, HashMap::new()).await?;
         let (mut theirs, mut others) = (HashSet::new(), HashSet::new());
@@ -1970,7 +1969,7 @@ impl Store {
     /// Who owns what now is read as the engine reads it (`governance_state`): the rows whose commit is visible on
     /// main, in the ledger's order, not the table's own clock.
     async fn forget_governance(&self, ns: &str, user: &str) -> Result<()> {
-        let them = |u: &str| user_id(u) == user_id(user);
+        let them = |u: &str| crate::people::directory::forgets(u, user);
         let bodies = self.governance_bodies(ns).await?;
         if bodies.is_empty() {
             return Ok(());
@@ -2906,20 +2905,44 @@ pub async fn forget_user(
                     .rsplit_once('@')
                     .is_some_and(|(_, d)| org.domains.contains_key(d))
                     || !org.groups.is_empty();
-                Ok(match org.members.contains_key(&user) || joins {
-                    true => vec![Event::new(&me, "member.remove", o).user(&user)],
+                let remove = Event::new(&me, "member.remove", o).user(&user);
+                // Keys imported in their name go with them, member or not (one imported before their
+                // removal revoked nothing).
+                let revokes = crate::people::directory::import_revokes(
+                    dir,
+                    &me,
+                    std::slice::from_ref(&remove),
+                );
+                let mut out = match org.members.contains_key(&user) || joins {
+                    true => vec![remove],
                     false => vec![],
-                })
+                };
+                out.extend(revokes);
+                Ok(out)
             })
             .await?;
         changes.extend(removal.iter().map(|e| e.describe()));
+        // The rights again before each step that follows, against the directory as it is then: an admin
+        // demoted after the removal deletes nothing more and leaves no tombstone. What is left is safe (the
+        // person is out of the org, nothing of theirs is half-deleted in a scope: each scope's forget is whole)
+        // and the forget can be run again by someone who may.
+        let still = |dir: &Directory| {
+            may_manage(dir, actor, o, &format!("forget {user}")).map_err(|e| {
+                refused(format!(
+                    "{e:#}: {user} is out of org {o}, but what they wrote there is not all deleted yet; \
+                     an admin of {o} can run the forget again to finish it"
+                ))
+            })
+        };
         let mut total = Forgotten::default();
         for ns in store.org_namespaces(o).await? {
+            still(&Directory::fresh(store).await?)?;
             total.add(&store.forget_in(&ns, &user).await?);
         }
         let detail = serde_json::to_string(&total)?;
         let tomb = store
-            .append_directory_with(|_| {
+            .append_directory_with(|dir| {
+                still(dir)?;
                 Ok(vec![
                     Event::new(&me, "member.forget", o)
                         .user(&user)

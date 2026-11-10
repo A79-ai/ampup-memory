@@ -1791,7 +1791,11 @@ impl Target<'_> {
                 // Straight to the catalog: this machine seals a client secret, with the server's key.
                 let key = crate::auth::secret::SecretKey::from_env()?;
                 directory::seal_secrets(&mut change, key.as_ref())?;
-                let actor = owner();
+                let mut actor = owner();
+                // One key, one caller: a new key is none of the keys file's, here as on a server.
+                if matches!(change, Change::CreateKey { .. }) {
+                    actor.file_keys = direct_file_keys()?;
+                }
                 let events = if dry_run {
                     directory::plan(&Directory::load(store).await?, &actor, &change)?
                 } else {
@@ -1914,6 +1918,24 @@ impl Target<'_> {
         }
         Ok(())
     }
+}
+
+/// sha256 of the keys in this machine's keys file (`MEMSTORE_API_KEYS`), if it names one: what a key made with
+/// --direct may not be. A keys file named but unreadable refuses the change, rather than skipping the check.
+fn direct_file_keys() -> Result<std::collections::BTreeSet<String>> {
+    let Some(path) = std::env::var("MEMSTORE_API_KEYS")
+        .ok()
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(Default::default());
+    };
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("MEMSTORE_API_KEYS {path}"))?;
+    Ok(directory::parse_file_keys(&text)
+        .with_context(|| format!("MEMSTORE_API_KEYS {path}"))?
+        .into_iter()
+        .map(|k| k.sha256.to_ascii_lowercase())
+        .collect())
 }
 
 /// Reaching the catalog directly is owning it.

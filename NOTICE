@@ -1,9 +1,11 @@
 AmpUp Memory
 Copyright 2026 The AmpUp Memory Authors
 
-This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+This product includes software developed at
+The Apache Software Foundation (https://www.apache.org/).
 
-It is built on third-party open source software, including Apache Arrow, Apache DataFusion and Apache Iceberg
-(Apache License 2.0, The Apache Software Foundation), Lance (Apache License 2.0), and ONNX Runtime (MIT License,
-Microsoft Corporation), which the release binaries link statically through the `ort` crate. Each dependency's
-license is in its own source distribution; Cargo.lock lists every crate the binaries are built from.
+This product includes ONNX Runtime, Copyright (c) Microsoft Corporation, under the MIT License.
+
+The memstore and memstore-client binaries include third-party software, each under its own license. Their license
+texts, the NOTICE files of the Apache License 2.0 works among them, and ONNX Runtime's own third-party notices are
+in THIRD-PARTY-NOTICES.txt, distributed with this product.

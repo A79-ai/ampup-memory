@@ -12,7 +12,7 @@ over the server's variables where both exist; a team's setting wins over its org
 | `MEMSTORE_WAREHOUSE`, `MEMSTORE_REST_URI`, `MEMSTORE_REST_PROPS` | The `rest` (and `local`) catalog. |
 | `MEMSTORE_INDEX_URI` | Where search indexes live: a path, `gs://…`, `s3://…` (`~/.cache/memstore/index`). |
 | `MEMSTORE_SERVE_BIND` | The address to listen on (127.0.0.1). `serve --local` refuses anything else. |
-| `MEMSTORE_PUBLIC_URL` | The URL the server advertises in OAuth metadata. |
+| `MEMSTORE_PUBLIC_URL` | The server's public URL (like `https://memory.example.com`), named in sign-in discovery and every 401's `WWW-Authenticate`; never taken from a request's `Host`. With `token` identity a server that listens beyond loopback refuses to start without it. |
 | `MEMSTORE_CALLER_IDENTITY` | How callers are identified: unset, `token`, `google`, `snowflake`, or a list ([security-model.md](security-model.md)). |
 | `MEMSTORE_METRICS_PORT` | Serve `/metrics` on its own port. |
 | `MEMSTORE_MAX_STALENESS_MS` (1000), `MEMSTORE_HARD_STALENESS_MS` (60000) | How stale a cached read may be before a background refresh, and before a read blocks. |
@@ -23,7 +23,10 @@ over the server's variables where both exist; a team's setting wins over its org
 | `MEMSTORE_SHUTDOWN_DRAIN_SECS` (5), `MEMSTORE_SHUTDOWN_WAIT_SECS` (60) | Drain and wait on SIGTERM. |
 | `MEMSTORE_SLOW_REQUEST_MS` (1000) | Log requests at least this slow. |
 | `MEMSTORE_MAX_EPISODES` | Cap the episodes a deployment holds. |
-| `MEMSTORE_RATE_LIMIT`, `MEMSTORE_INGEST_RATE_LIMIT` | Per-caller token buckets, e.g. `60/min:120`; `off` for none. |
+| `MEMSTORE_RATE_LIMIT`, `MEMSTORE_INGEST_RATE_LIMIT` | Per-caller token buckets, e.g. `60/min:120`; `off` for none. A batch costs a token per item. |
+| `MEMSTORE_MAX_CONNECTIONS` (4096), `MEMSTORE_MAX_IN_FLIGHT` (1024) | Open connections and requests being answered at once, per port; past either a request is answered 503 with `Retry-After: 1`. `off` lifts a cap. |
+| `MEMSTORE_MAX_IN_FLIGHT_PER_CALLER` (64) | One caller's requests under way at once; past it 429. `off` lifts it. |
+| `MEMSTORE_HEADER_TIMEOUT_SECS` (660) | How long a connection may take to send a request's headers, idle keep-alive ones too. Keep it above the load balancer's idle timeout. |
 | `MEMSTORE_SERVE_WORKSPACES=1` | Serve every workspace side by side (as `serve --workspaces`). |
 
 ## Models
@@ -133,7 +136,7 @@ Requests carry `X-Title: memstore`, so their spend shows apart on a shared key.
 
 | Variable | What it does |
 |---|---|
-| `MEMSTORE_API_KEYS` | A keys file (deprecated for everything but admin keys; use `memstore apikey`). |
+| `MEMSTORE_API_KEYS` | A keys file (deprecated for everything but admin keys; use `memstore apikey`). Read again within 2 seconds when it changes; keep it the same on every server. |
 | `MEMSTORE_JWT_JWKS_URL`, `MEMSTORE_JWT_PUBLIC_KEY`, `MEMSTORE_JWT_SECRET`, `MEMSTORE_JWT_ISSUER`, `MEMSTORE_JWT_AUDIENCE`, `MEMSTORE_JWT_ORG_CLAIM`, `MEMSTORE_JWT_GROUPS_CLAIM`, `MEMSTORE_JWT_USER_CLAIMS` | JWT callers. |
 | `MEMSTORE_OIDC_ISSUER`, `MEMSTORE_OIDC_AUDIENCE`, `MEMSTORE_OIDC_CLI_CLIENT_ID`, `MEMSTORE_OIDC_CLI_CLIENT_SECRET`, `MEMSTORE_OIDC_CLI_CALLBACK_PORT` | People's sign-in through the server's identity provider. Serve a client secret only for a public client. |
 | `MEMSTORE_IAP_AUDIENCE` | People through Google's Identity-Aware Proxy. |

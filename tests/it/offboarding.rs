@@ -5,6 +5,8 @@
 //!   acme's facts, entities and episodes, nothing of globex's, no key or key hash;
 //! - callers who must be refused are: globex's admin forgetting an acme member, a plain member forgetting
 //!   anyone, acme's admin deleting acme, acme's admin exporting globex, a service key exporting;
+//! - acme's admin demoted in the middle of forgetting carol (after carol is out of acme) deletes nothing of hers
+//!   and leaves no tombstone; made an admin again, she runs the forget again and it finishes:
 //! - acme's admin forgets carol: her episodes are gone from search, queries and episode reads, through pins taken
 //!   before the forget too (a forget wins over a pin), and from every file in the warehouse and the search index;
 //!   everyone else's memory stays; a tombstone is in acme's audit and carol no longer belongs to acme;
@@ -12,20 +14,26 @@
 //!   `org delete` is run again, which finishes it;
 //! - `memstore org delete acme --confirm acme` (the operator): acme's key and people are refused, its
 //!   tags are in no file under the warehouse or the index, its rows are gone from the audit and key usage
-//!   tables, and globex is untouched; all along the server's maintenance window compacts the ledger, and
+//!   tables, and stay gone when a server that heard of the delete late flushes what it held for acme (or for
+//!   acme created again since), and globex is untouched; all along the server's maintenance window compacts the ledger, and
 //!   a compaction after the delete leaves no ledger file naming acme's scopes;
 //! - on a catalog that can't rename a table, put a second table at one location, or delete a purged table's
 //!   files (as some REST catalogs can't), a forget and a delete are refused before anything changes.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use http_body_util::Full;
 use hyper::body::Bytes;
+use iceberg::table::Table;
+use iceberg::{Catalog, NamespaceIdent, TableCommit, TableCreation, TableIdent};
 use memstore::audit::{Entry, Kind};
 use memstore::auth::{self, OidcConfig, TokenAuth};
-use memstore::people::directory::Event;
+use memstore::people::directory::{Directory, Event};
 use memstore::server::{Options, serve_with};
 use memstore::{AclTarget, Episode, Fact, Scope, Store, platform};
 use serde_json::{Value, json};
@@ -34,6 +42,102 @@ use sha2::Digest;
 const CLIENT_ID: &str = "memstore-cli";
 const ADMIN_KEY: &str = "msk_platform_admin_for_offboarding";
 const ALICE_FILE_KEY: &str = "msk_plain_file_key_in_alices_name";
+
+/// The server's catalog, which, once armed, demotes alice from acme's admins right after the directory commit
+/// that takes carol out of acme: an admin demoted between a forget's removal and the deletion that follows it.
+struct DemoteMidForget {
+    inner: Arc<dyn Catalog>,
+    /// The demotion's writer, straight on `inner`.
+    store: Store,
+    armed: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for DemoteMidForget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DemoteMidForget")
+    }
+}
+
+#[async_trait::async_trait]
+impl Catalog for DemoteMidForget {
+    async fn list_namespaces(
+        &self,
+        parent: Option<&NamespaceIdent>,
+    ) -> iceberg::Result<Vec<NamespaceIdent>> {
+        self.inner.list_namespaces(parent).await
+    }
+    async fn create_namespace(
+        &self,
+        ns: &NamespaceIdent,
+        props: HashMap<String, String>,
+    ) -> iceberg::Result<iceberg::Namespace> {
+        self.inner.create_namespace(ns, props).await
+    }
+    async fn get_namespace(&self, ns: &NamespaceIdent) -> iceberg::Result<iceberg::Namespace> {
+        self.inner.get_namespace(ns).await
+    }
+    async fn namespace_exists(&self, ns: &NamespaceIdent) -> iceberg::Result<bool> {
+        self.inner.namespace_exists(ns).await
+    }
+    async fn update_namespace(
+        &self,
+        ns: &NamespaceIdent,
+        props: HashMap<String, String>,
+    ) -> iceberg::Result<()> {
+        self.inner.update_namespace(ns, props).await
+    }
+    async fn drop_namespace(&self, ns: &NamespaceIdent) -> iceberg::Result<()> {
+        self.inner.drop_namespace(ns).await
+    }
+    async fn list_tables(&self, ns: &NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
+        self.inner.list_tables(ns).await
+    }
+    async fn create_table(
+        &self,
+        ns: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> iceberg::Result<Table> {
+        self.inner.create_table(ns, creation).await
+    }
+    async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+        self.inner.load_table(table).await
+    }
+    async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+        self.inner.drop_table(table).await
+    }
+    async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+        self.inner.purge_table(table).await
+    }
+    async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
+        self.inner.table_exists(table).await
+    }
+    async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
+        self.inner.rename_table(src, dest).await
+    }
+    async fn register_table(&self, table: &TableIdent, location: String) -> iceberg::Result<Table> {
+        self.inner.register_table(table, location).await
+    }
+    async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
+        let id = commit.identifier();
+        let directory =
+            id.namespace().to_url_string() == "memory_system" && id.name() == "directory";
+        let table = self.inner.update_table(commit).await?;
+        if directory && self.armed.load(Ordering::SeqCst) {
+            let dir = Directory::fresh(&self.store).await.unwrap();
+            let carol_out = dir
+                .orgs
+                .get("acme")
+                .is_some_and(|o| !o.members.contains_key("carol@acme.com"));
+            if carol_out && self.armed.swap(false, Ordering::SeqCst) {
+                let mut demote = Event::new("svc:platform", "member.add", "acme");
+                demote.user = Some("alice@acme.com".into());
+                demote.role = Some("member".into());
+                self.store.append_directory(&[demote]).await.unwrap();
+            }
+        }
+        Ok(table)
+    }
+}
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -327,6 +431,13 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         .unwrap();
     let store = Store::new(catalog.clone());
     store.ensure_scope(&Scope::Org).await.unwrap();
+    // The server reads and writes through a catalog that demotes alice in the middle of a forget, once armed.
+    let demote_mid_forget = Arc::new(AtomicBool::new(false));
+    let served: Arc<dyn Catalog> = Arc::new(DemoteMidForget {
+        inner: catalog.clone(),
+        store: Store::new(catalog.clone()),
+        armed: demote_mid_forget.clone(),
+    });
     // The operator's admin key, and a plain file key the keys file gives alice's name.
     let keys = json!([{"id": "platform", "sha256": auth::hex(&sha2::Sha256::digest(ADMIN_KEY.as_bytes())),
                        "user": "svc:platform", "admin": true},
@@ -346,7 +457,7 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         Scope::Org,
         vec![],
         Options {
-            catalog: Some(catalog.clone()),
+            catalog: Some(served),
             token_auth: Some(token_auth),
             audit_flush: Some(Duration::from_millis(500)),
             ..Default::default()
@@ -1140,6 +1251,45 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         assert_eq!(status, 403, "{what} reads acme's advice traces: {body}");
         assert!(!body.contains("xqcarolprefix"), "{body}");
     }
+    // Acme's admin is demoted as she forgets Carol: right after the directory takes Carol out of acme, before
+    // anything of hers is deleted. The forget stops there, refused, and says how to finish it: Carol is out of
+    // acme, nothing of hers is deleted, and no tombstone is left. Made an admin again, Alice runs it again below,
+    // and it finishes.
+    demote_mid_forget.store(true, Ordering::SeqCst);
+    let (status, body) = admin_as(
+        s,
+        &alice,
+        json!({"op": "forget_user", "user": "Carol@acme.com", "org": "acme"}),
+    )
+    .await;
+    assert!(
+        !demote_mid_forget.load(Ordering::SeqCst),
+        "the forget never took carol out of acme: {body}"
+    );
+    assert_eq!(status, 403, "a demoted admin finished a forget: {body}");
+    assert!(
+        body.contains("may not forget") && body.contains("run the forget again"),
+        "{body}"
+    );
+    for t in carol_tags.iter().chain(&["xqgovsource", "xqcarolprefix"]) {
+        assert!(!in_files(t).is_empty(), "{t} deleted by a demoted admin");
+    }
+    assert!(
+        !store
+            .directory_events()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.op == "member.forget"
+                && e.org == "acme"
+                && e.user.as_deref() == Some("carol@acme.com")),
+        "a demoted admin left a tombstone"
+    );
+    admin(
+        s,
+        json!({"op": "add_member", "org": "acme", "user": "alice@acme.com", "role": "admin"}),
+    )
+    .await;
     // Acme's admin forgets Carol.
     let (status, body) = admin_as(
         s,
@@ -1435,6 +1585,43 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     let lagging = Store::new(catalog.clone());
     seed(&lagging, &Scope::org("initech").unwrap(), "xqlatewrite").await;
     assert!(!in_files("xqlatewrite").is_empty());
+    // Its audit buffer held a sign-in to initech too, flushed now: the delete took initech's rows, and none comes
+    // after it.
+    let initech_at = store
+        .directory_events()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| e.org == "initech" && e.op == "org.create")
+        .map(|e| e.at)
+        .max()
+        .unwrap();
+    lagging
+        .append_audit(&[Entry {
+            at: chrono::Utc::now().timestamp_micros(),
+            kind: Kind::Signin,
+            org: Some("initech".into()),
+            actor: "xqlateida@initech.com".into(),
+            scope: Some("initech".into()),
+            path: Some("/search".into()),
+            detail: None,
+            status: None,
+            count: 1,
+            reads: 0,
+            writes: 0,
+            incarnation: Some(initech_at),
+        }])
+        .await
+        .unwrap();
+    assert!(
+        !Store::new(catalog.clone())
+            .audit_rows()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.org.as_deref() == Some("initech")),
+        "the deleted initech's rows stored after its delete"
+    );
     admin(
         s,
         json!({"op": "create_org", "org": "initech", "admin": "ivy@initech.com"}),
@@ -1603,6 +1790,28 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         ])
         .await
         .unwrap();
+    lagging
+        .append_key_usage(&[(a_key_sha.clone(), "acme".into(), "dash".into(), now)])
+        .await
+        .unwrap();
+    // None of it is stored: the old acme's delete removed its rows, and a server that hears of the delete late
+    // writes it no more of them, nor its key's uses.
+    let fresh = Store::new(catalog.clone());
+    let stored: Vec<Entry> = fresh
+        .audit_rows()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.org.as_deref() == Some("acme") && e.incarnation == Some(old_acme))
+        .collect();
+    assert!(
+        stored.is_empty(),
+        "the deleted acme's rows stored after its delete: {stored:?}"
+    );
+    assert!(
+        !fresh.key_usage().await.unwrap().contains_key(&a_key_sha),
+        "the deleted acme's key's use stored after its delete"
+    );
     // Nor its audit: the new acme's admin sees the new org's history only, never who ran the old one,
     // whom it forgot or which keys it had (the directory's log keeps the old org's changes forever),
     // whenever a server wrote it.

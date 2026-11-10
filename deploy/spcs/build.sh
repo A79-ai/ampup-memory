@@ -13,6 +13,7 @@ cp target/release/memstore "$ctx/" && strip "$ctx/memstore"
 MEMSTORE_MODEL_DIR="$ctx/fetch" "$ctx/memstore" embed warmup >/dev/null
 cp -rL "$ctx/fetch" "$ctx/models" && rm -rf "$ctx/fetch"
 find "$ctx/models" -name '*.lock' -delete
+mkdir "$ctx/doc" && cp LICENSE NOTICE THIRD-PARTY-NOTICES.txt "$ctx/doc/"
 docker build -q -t "$T" -f deploy/spcs/Dockerfile "$ctx" >/dev/null
 docker run --rm --network none --user 65532:65532 --read-only "$T" embed offline check
 echo "built $T"

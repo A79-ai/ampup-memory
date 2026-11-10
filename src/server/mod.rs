@@ -65,6 +65,9 @@ const MAX_DEPTH: usize = 2000;
 pub(crate) const SERVICE_PRINCIPAL: &str = "service caller";
 
 struct State {
+    /// The URL callers reach this server at, as sign-in discovery names it (`resource`, `WWW-Authenticate`):
+    /// `MEMSTORE_PUBLIC_URL`, never a request's own `Host` ([`public_url`]).
+    public_url: String,
     /// See [`Options::loopback_only`].
     loopback_only: bool,
     /// See [`Options::writes_here`].
@@ -437,6 +440,18 @@ pub async fn serve_with(
         .identity
         .or_else(|| std::env::var("MEMSTORE_CALLER_IDENTITY").ok());
     let sources = sources_from(spec.as_deref(), options.token_auth).await?;
+    // Loopback unless told otherwise: the caller identity header is only trustworthy behind
+    // Snowflake's service-function ingress (a non-public SPCS endpoint sets MEMSTORE_SERVE_BIND).
+    let bind = match options.bind {
+        Some(b) => b,
+        None => std::env::var("MEMSTORE_SERVE_BIND").unwrap_or_else(|_| "127.0.0.1".into()),
+    };
+    let shown_port = public
+        .as_ref()
+        .and_then(|l| l.local_addr().ok())
+        .map_or(port, |a| a.port());
+    let token_on = sources.iter().any(|i| matches!(i, Identity::Token(_)));
+    let public_url = public_url(&bind, shown_port, token_on)?;
     let disabled_file = options
         .disabled_file
         .or_else(|| std::env::var("MEMSTORE_DISABLED_FILE").ok().map(Into::into));
@@ -488,6 +503,8 @@ pub async fn serve_with(
     metrics.register(Box::new(crate::extract::cache::CALLS.clone()));
     metrics.register(Box::new(crate::metrics::STORE_COMMIT_FAILURES.clone()));
     metrics.register(Box::new(crate::metrics::EXPIRED_KEY_REFUSALS.clone()));
+    metrics.register(Box::new(crate::metrics::KEYS_FILE_FAILING.clone()));
+    metrics.register(Box::new(crate::metrics::KEYS_FILE_RELOADS.clone()));
     metrics.register(Box::new(routing::SLOW_ROUTES.clone()));
     metrics.register(Box::new(crate::metrics::EXTRACTION_BACKLOG.clone()));
     metrics.register(Box::new(crate::metrics::CACHE_BYTES.clone()));
@@ -519,6 +536,7 @@ pub async fn serve_with(
     };
     let store = Arc::new(store);
     let state = Arc::new(State {
+        public_url,
         loopback_only: options.loopback_only,
         writes_here: options.writes_here,
         any_scope: options.any_scope
@@ -592,6 +610,9 @@ pub async fn serve_with(
         }
     }
     tokio::spawn(flush_key_uses(state.clone()));
+    if state.token_auth().is_some_and(|a| a.keys_file().is_some()) {
+        tokio::spawn(keys_file_watch(state.clone()));
+    }
     // Session rows are committed in batches, never per step (`crate::sessions::flush`).
     tokio::spawn(crate::sessions::flush_every());
     // What this process counts (usage, alert readings), written for whichever process sends telemetry.
@@ -1442,12 +1463,6 @@ pub async fn serve_with(
             tokio::time::sleep(every).await;
         }
     });
-    // Loopback unless told otherwise: the caller identity header is only trustworthy behind
-    // Snowflake's service-function ingress (a non-public SPCS endpoint sets MEMSTORE_SERVE_BIND).
-    let bind = match options.bind {
-        Some(b) => b,
-        None => std::env::var("MEMSTORE_SERVE_BIND").unwrap_or_else(|_| "127.0.0.1".into()),
-    };
     anyhow::ensure!(
         !state.any_scope
             || (state.fixed() && ["127.0.0.1", "localhost", "::1"].contains(&bind.as_str())),
@@ -1696,6 +1711,14 @@ async fn listen(
         }
     );
     let slow = slow_after();
+    // How much this port takes on at once (`ratelimit::Caps`): connections, and requests being answered.
+    let caps = state.limiter.caps();
+    let open = caps
+        .connections
+        .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+    let answering = caps
+        .in_flight
+        .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
     loop {
         // A client that gave up before we accepted, or no file descriptors left for a moment: keep
         // serving everyone else.
@@ -1707,12 +1730,32 @@ async fn listen(
                 continue;
             }
         };
+        let held = match &open {
+            None => None,
+            Some(open) => match open.clone().try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    tokio::spawn(too_many_connections(conn));
+                    continue;
+                }
+            },
+        };
         let state = state.clone();
+        let answering = answering.clone();
         let mut closing = state.closing.subscribe();
         tokio::spawn(async move {
+            let _held = held;
             let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let state = state.clone();
+                let answering = answering.clone();
                 async move {
+                    // Past the cap a request is answered at once, unread; the probes always are, so a busy
+                    // server isn't restarted as a dead one.
+                    let probe = matches!(req.uri().path(), "/ready" | "/health" | "/healthz");
+                    let _answering = match answering.map(|a| a.try_acquire_owned()) {
+                        Some(Err(_)) if !probe => return Ok(busy(StatusCode::SERVICE_UNAVAILABLE)),
+                        a => a,
+                    };
                     // Counted and timed by route template and status: never the caller's own path.
                     // `/mcp/hook` is `/mcp` (the hooks' address for it), counted with it.
                     let route = match req.uri().path() {
@@ -1729,10 +1772,13 @@ async fn listen(
                             .flatten()
                             .filter(|org| cell::elsewhere(org));
                         let req = match to {
-                            Some(org) => {
-                                Ok(cell::forward(&org, req, MAX_RUNS_BODY.max(MAX_INGEST_BODY))
-                                    .await)
-                            }
+                            Some(org) => Ok(match may_forward(&state, &req).await {
+                                Some(refused) => refused,
+                                None => {
+                                    cell::forward(&org, req, MAX_RUNS_BODY.max(MAX_INGEST_BODY))
+                                        .await
+                                }
+                            }),
                             None => Err(req),
                         };
                         // Boxed: the request's future is large, and held in the timer's it would be on the stack.
@@ -1782,6 +1828,8 @@ async fn listen(
                 }
             });
             let conn = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(caps.header_timeout)
                 .serve_connection(TokioIo::new(conn), svc);
             tokio::pin!(conn);
             tokio::select! {
@@ -1796,6 +1844,31 @@ async fn listen(
     }
 }
 
+/// A connection past `MEMSTORE_MAX_CONNECTIONS`: answered 503 and closed, without reading it.
+async fn too_many_connections(mut conn: tokio::net::TcpStream) {
+    use tokio::io::AsyncWriteExt;
+    let answer = b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\ncontent-type: application/json\r\n\
+        content-length: 40\r\nconnection: close\r\n\r\n{\"error\": \"too many connections, retry\"}";
+    let _ = tokio::time::timeout(Duration::from_secs(1), conn.write_all(answer)).await;
+    let _ = conn.shutdown().await;
+}
+
+/// The answer past a cap on requests at once (`ratelimit::Caps`): 503 for this server's, 429 for a caller's.
+fn busy(status: StatusCode) -> Response<Full<Bytes>> {
+    let body = match status {
+        StatusCode::TOO_MANY_REQUESTS => {
+            json!({"error": "too many of your requests under way at once", "retry_after_secs": 1})
+        }
+        _ => json!({"error": "this server is busy, retry", "retry_after_secs": 1}),
+    };
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header(hyper::header::RETRY_AFTER, "1")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .unwrap()
+}
+
 /// Who made a request on the public port.
 struct Authed {
     who: Principal,
@@ -1803,6 +1876,165 @@ struct Authed {
     via: SignIn,
     /// Holds an admin API key.
     admin: bool,
+}
+
+/// A token shown to be BigQuery's service agent, whose caller is the body's `sessionUser`: the one sign-in the
+/// headers alone don't finish ([`handle`] reads the body for it once the token is shown to be the agent's).
+#[derive(Debug)]
+struct NeedsSessionUser;
+
+impl std::fmt::Display for NeedsSessionUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BigQuery call without sessionUser")
+    }
+}
+
+impl std::error::Error for NeedsSessionUser {}
+
+/// A refusal for the audit: the org it is recorded under, the caller, the status and why ([`handle`]'s).
+type Refuse<'a> = dyn Fn(Option<(String, i64)>, &str, u16, audit::Reason) + Sync + 'a;
+
+/// One more request under way for `a` (`MEMSTORE_MAX_IN_FLIGHT_PER_CALLER`), counted by the same id as its rate
+/// limit; when it already has the most a caller may, the 429 that answers it, recorded as a rate limit is.
+async fn begin(
+    state: &State,
+    a: &Authed,
+    org: Option<&str>,
+    refused: &Refuse<'_>,
+) -> Result<Option<ratelimit::UnderWay>, Box<Response<Full<Bytes>>>> {
+    let Some((class, id)) = limit_key(state, &a.who, &a.via, a.admin) else {
+        return Ok(None);
+    };
+    if let Some(u) = state.limiter.begin(&id) {
+        return Ok(Some(u));
+    }
+    let org = member_org(state, Some(&a.who), &a.via, org).await;
+    refused(org, a.who.user(), 429, audit::Reason::RateLimited);
+    state
+        .metrics
+        .rate_limited
+        .with_label_values(&[class.as_str()])
+        .inc();
+    Err(Box::new(busy(StatusCode::TOO_MANY_REQUESTS)))
+}
+
+/// What a request costs in rate-limit tokens: one for each row, episode, run, reward or fact a batch route
+/// carries (at least one), so a batch costs what its requests one at a time would.
+fn request_cost(path: &str, body: &[u8]) -> usize {
+    use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+    /// How many items a value holds if it is a list (anything else: none), counted without keeping them.
+    struct Len(usize);
+    impl<'de> serde::Deserialize<'de> for Len {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Len;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("any value")
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Len, A::Error> {
+                    let mut n = 0;
+                    while a.next_element::<IgnoredAny>()?.is_some() {
+                        n += 1;
+                    }
+                    Ok(Len(n))
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Len, A::Error> {
+                    while a.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                    Ok(Len(0))
+                }
+                fn visit_bool<E: de::Error>(self, _: bool) -> Result<Len, E> {
+                    Ok(Len(0))
+                }
+                fn visit_i64<E: de::Error>(self, _: i64) -> Result<Len, E> {
+                    Ok(Len(0))
+                }
+                fn visit_u64<E: de::Error>(self, _: u64) -> Result<Len, E> {
+                    Ok(Len(0))
+                }
+                fn visit_f64<E: de::Error>(self, _: f64) -> Result<Len, E> {
+                    Ok(Len(0))
+                }
+                fn visit_str<E: de::Error>(self, _: &str) -> Result<Len, E> {
+                    Ok(Len(0))
+                }
+                fn visit_unit<E: de::Error>(self) -> Result<Len, E> {
+                    Ok(Len(0))
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+    let fields: &[&str] = match path {
+        "/search" | "/episode" | "/document" | "/query" => &["data", "calls"],
+        "/ingest" => &["episodes"],
+        "/runs" => &["runs"],
+        "/runs/reward" => &["rewards"],
+        "/facts" => &["facts"],
+        _ => return 1,
+    };
+    // Each top-level field's length, the last of a repeated one as the route reads it.
+    let top: HashMap<String, Len> = serde_json::from_slice(body).unwrap_or_default();
+    fields
+        .iter()
+        .filter_map(|f| top.get(*f).map(|l| l.0))
+        .max()
+        .unwrap_or(0)
+        .max(1)
+}
+
+/// Who refusals of a caller an org's own identity provider signed in are counted under once that provider has
+/// many refused ([`audit::Recorder::refusal_via`]): it can mint any name, so its names alone can't fill the audit.
+fn refusal_voucher(via: &SignIn) -> Option<String> {
+    let orgs =
+        |o: &std::collections::BTreeSet<String>| o.iter().cloned().collect::<Vec<_>>().join(",");
+    match (&via.orgs, &via.auth0_org) {
+        (_, Some(o)) if via.auth0 => Some(format!("auth0:{o}")),
+        (Some(o), _) if via.person => Some(format!("idp:{}", orgs(o))),
+        _ => None,
+    }
+}
+
+/// Whether a request for another cell's org may be sent there: one with a body only once its caller has signed
+/// in here (the cells share the directory), so no one's body is read before they are known.
+async fn may_forward(state: &State, req: &Request<Incoming>) -> Option<Response<Full<Bytes>>> {
+    let h = req.headers();
+    let body = h.contains_key(hyper::header::TRANSFER_ENCODING)
+        || h.get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+            .is_some_and(|n| n > 0);
+    if !body {
+        return None;
+    }
+    let (source, token, via_iap) = state.pick(h);
+    let why = match source {
+        None => audit::Reason::NoCredential,
+        Some(src) => match request_principal(state, src, token.as_deref(), via_iap, None).await {
+            Ok(_) => return None,
+            Err(e) if e.is::<NeedsSessionUser>() => return None,
+            Err(e) if upstream_failure(&e) => {
+                let mut r = json_reply(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"error": "sign-in is unavailable for a moment, try again"}),
+                );
+                r.headers_mut()
+                    .insert(hyper::header::RETRY_AFTER, "5".parse().unwrap());
+                return Some(r);
+            }
+            Err(e) => audit::Reason::of_401(&e.to_string()),
+        },
+    };
+    let route = audit::route(req.uri().path());
+    state
+        .metrics
+        .refusals
+        .with_label_values(&[why.code()])
+        .inc();
+    state.audit.refusal(None, "-", route, 401, why);
+    Some(json_reply(
+        StatusCode::UNAUTHORIZED,
+        json!({"error": "unauthorized"}),
+    ))
 }
 
 /// The principal for a request on the public port.
@@ -1919,7 +2151,7 @@ async fn request_principal(
             let user = if bigquery.as_deref() == Some(sub.as_str()) {
                 session_user
                     .filter(|u| !u.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("BigQuery call without sessionUser"))?
+                    .ok_or_else(|| anyhow::Error::new(NeedsSessionUser))?
                     .to_string()
             } else {
                 email.ok_or_else(|| anyhow::anyhow!("token has no verified email"))?
@@ -1964,6 +2196,16 @@ async fn request_principal(
                                 "api key {} was revoked from the directory",
                                 f.id
                             );
+                            // A directory key made with this bearer (on a server whose keys file
+                            // doesn't hold it, or with --direct) is another caller: the bearer names
+                            // two, so it names neither, here or there (where it is that key alone,
+                            // and is refused here: never one caller on one server and another
+                            // elsewhere).
+                            anyhow::ensure!(
+                                !d.keys.iter().any(|k| k.sha256 == f.sha256),
+                                "api key {} is also a directory key: it names two callers, so neither",
+                                f.id
+                            );
                             as_file_key = Some(f.sha256.clone());
                             auth.authenticate(token).await?
                         } else {
@@ -2000,7 +2242,17 @@ async fn request_principal(
             let who = if c.person || via.key.is_some() {
                 // Anyone an identity provider knows can sign in, and an org's key reads its own scope:
                 // they hold nothing until the directory says so, not even the deployment's groups.
-                Principal::from_parts(c.user.clone(), state.closures.apply(&c.user, vec![]))
+                // Closures (`/closure`, the team csv) name people by their email alone, so they hold only
+                // for a sign-in whose email the deployment trusts: its own provider, the Auth0 tenant's own
+                // connections, a key. An org's own provider (or an Auth0 Organization's enterprise
+                // connection) says what the email is, and could name anyone's to get their groups.
+                let org_says_who =
+                    via.key.is_none() && via.orgs.is_some() && !(via.auth0 && via.verified_email);
+                let groups = match org_says_who {
+                    true => vec![],
+                    false => state.closures.apply(&c.user, vec![]),
+                };
+                Principal::from_parts(c.user.clone(), groups)
             } else {
                 token_principal(state, c.user, c.groups)
             };
@@ -2024,6 +2276,34 @@ async fn request_principal(
         cache.insert(key, (std::time::Instant::now(), p.clone()));
     }
     Ok(plain(p))
+}
+
+/// Reads the keys file again whenever it changes, for as long as the server runs: its keys take effect at once,
+/// whole, so a key taken out of the file is refused here within a poll. One that can't be read or doesn't
+/// parse keeps the keys last read, and says so (the log, `memstore_keys_file_failing`).
+async fn keys_file_watch(state: Arc<State>) {
+    let Some((path, every)) = state
+        .token_auth()
+        .and_then(|a| a.keys_file())
+        .map(|(p, e)| (p.display().to_string(), e))
+    else {
+        return;
+    };
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Some(auth) = state.token_auth() else {
+            return;
+        };
+        match auth.reload_keys_file() {
+            Ok(Some((keys, admins))) => {
+                eprintln!("keys file {path} changed: {keys} keys now ({admins} admin)")
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("ALERT keys file {path}: {e:#}"),
+        }
+    }
 }
 
 /// The identity providers orgs connected (`memstore auth setup`) and their service keys (`memstore
@@ -2200,14 +2480,11 @@ async fn token_auth_from_env() -> Result<auth::TokenAuth> {
             Some(auth::JwtConfig::new(keys, opts)?)
         }
     };
-    let keys = match var("MEMSTORE_API_KEYS") {
-        Some(path) => Some(
-            std::fs::read_to_string(&path)
-                .map_err(|e| anyhow::anyhow!("MEMSTORE_API_KEYS {path}: {e}"))?,
-        ),
-        None => None,
+    // Read again whenever it changes (`keys_file_watch`): a key taken out of it stops working with no restart.
+    let mut auth = match var("MEMSTORE_API_KEYS") {
+        Some(path) => auth::TokenAuth::from_keys_file(std::path::Path::new(&path), jwt)?,
+        None => auth::TokenAuth::new(None, jwt)?,
     };
-    let mut auth = auth::TokenAuth::new(keys.as_deref(), jwt)?;
     if var("MEMSTORE_ALLOW_LOCAL_ISSUERS").is_some_and(|v| v == "1") {
         auth = auth.allow_local_issuers();
     }
@@ -4225,7 +4502,7 @@ async fn handle(
         return Ok(reply(code, v));
     }
     let req_query = req.uri().query().unwrap_or_default().to_string();
-    let base = public_url(&req);
+    let base = state.public_url.clone();
     // MCP authorization discovery (RFC 9728): where clients, `memstore auth login` among them, sign in.
     let (sel_org, sel_team) = selection(&req);
     let view = View::of(&req);
@@ -4261,6 +4538,8 @@ async fn handle(
     // Every 401 and 403 goes to the audit log: the caller (`-`: no credential proved who), the route (never
     // the caller's text), the status and a reason code. An org's only when the caller belongs to it.
     let route = audit::route(&path);
+    // The org provider that signed the caller in, once known (`refusal_voucher`).
+    let voucher = std::sync::OnceLock::<String>::new();
     let refused = |org: Option<(String, i64)>, actor: &str, status: u16, why: audit::Reason| {
         state
             .metrics
@@ -4268,7 +4547,8 @@ async fn handle(
             .with_label_values(&[why.code()])
             .inc();
         let org = org.as_ref().map(|(o, i)| (o.as_str(), *i));
-        state.audit.refusal(org, actor, route, status, why)
+        let by = voucher.get().map(String::as_str);
+        state.audit.refusal_via(org, actor, by, route, status, why)
     };
     // DNS-rebinding guard (MCP spec): browsers send Origin, MCP clients and Snowflake/BigQuery
     // don't. Refuse any Origin that isn't explicitly allowed.
@@ -4614,6 +4894,48 @@ async fn handle(
             json!({"error": "request too large"}),
         ));
     }
+    // Who the caller is, from the headers alone, before the body is read: a request no credential proves is
+    // refused here, its body never read. Only BigQuery's service agent names its caller in the body
+    // (`sessionUser`), so for it the body is read once its token is shown to be the agent's.
+    let mut signed_in = None;
+    let mut _under_way = None;
+    if !internal {
+        let Some(src) = source else {
+            eprintln!("refused {path} (header user {user}): no caller credential (app {app})");
+            refused(None, "-", 401, audit::Reason::NoCredential);
+            return Ok(unauthorized("unauthorized"));
+        };
+        match request_principal(&state, src, caller_token.as_deref(), via_iap, None).await {
+            Ok(a) => signed_in = Some(a),
+            Err(e) if e.is::<NeedsSessionUser>() => {}
+            Err(e) if upstream_failure(&e) => {
+                eprintln!("sign-in unavailable for {path} (header user {user}): {e:#}");
+                let mut r = reply(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"error": "sign-in is unavailable for a moment, try again"}),
+                );
+                r.headers_mut()
+                    .insert(hyper::header::RETRY_AFTER, "5".parse().unwrap());
+                return Ok(r);
+            }
+            Err(e) => {
+                eprintln!("refused {path} (header user {user}): {e:#} (app {app})");
+                refused(None, "-", 401, audit::Reason::of_401(&e.to_string()));
+                return Ok(unauthorized("unauthorized"));
+            }
+        }
+    }
+    // A caller with as many requests under way as one may have is answered now, unread.
+    let named_in_body = !internal && signed_in.is_none();
+    if let Some(a) = &signed_in {
+        if let Some(v) = refusal_voucher(&a.via) {
+            let _ = voucher.set(v);
+        }
+        match begin(&state, a, sel_org.as_deref(), &refused).await {
+            Ok(u) => _under_way = u,
+            Err(r) => return Ok(*r),
+        }
+    }
     // Kept where this server forwards to other cells: a request that turns out to be another cell's org though
     // it didn't name it is sent there once its scope is known (`cell::forward_read`).
     let head = (!internal && cell::forwards()).then(|| {
@@ -4792,15 +5114,21 @@ async fn handle(
             refused(None, "-", 401, audit::Reason::NoCredential);
             return Ok(unauthorized("unauthorized"));
         };
-        match request_principal(
-            &state,
-            source,
-            caller_token.as_deref(),
-            via_iap,
-            session_user.as_deref(),
-        )
-        .await
-        {
+        // Signed in from the headers above, unless the caller is named in the body.
+        let signed_in = match signed_in {
+            Some(a) => Ok(a),
+            None => {
+                request_principal(
+                    &state,
+                    source,
+                    caller_token.as_deref(),
+                    via_iap,
+                    session_user.as_deref(),
+                )
+                .await
+            }
+        };
+        match signed_in {
             Ok(a) => Some(a),
             // A 401 tells a client its credential is bad, and an MCP client then drops it and signs in again:
             // when what failed was ours or an upstream's, the credential stands and the client retries.
@@ -4821,6 +5149,16 @@ async fn handle(
             }
         }
     };
+    // A caller named in the body: its refusals and requests under way are counted now.
+    if let Some(a) = authed.as_ref().filter(|_| named_in_body) {
+        if let Some(v) = refusal_voucher(&a.via) {
+            let _ = voucher.set(v);
+        }
+        match begin(&state, a, sel_org.as_deref(), &refused).await {
+            Ok(u) => _under_way = u,
+            Err(r) => return Ok(*r),
+        }
+    }
     let (who, via, superuser) = match authed {
         Some(a) => (Some(a.who), a.via, a.admin),
         None => (None, SignIn::default(), false),
@@ -4830,7 +5168,7 @@ async fn handle(
     // verified identity), never by anything the request merely says.
     if let Some(w) = &who
         && let Some((class, id)) = limit_key(&state, w, &via, superuser)
-        && let Err(wait) = state.limiter.take(class, &id)
+        && let Err(wait) = state.limiter.take(class, &id, request_cost(&path, &body))
     {
         let org = member_org(&state, Some(w), &via, sel_org.as_deref()).await;
         refused(org, w.user(), 429, audit::Reason::RateLimited);
@@ -6296,20 +6634,37 @@ fn addressed_to_this_machine(headers: &hyper::HeaderMap) -> bool {
     host_ok && origin_ok
 }
 
-/// The base URL callers reach this server at: `MEMSTORE_PUBLIC_URL`, else the request's host (https
-/// unless it's this machine).
-fn public_url(req: &Request<Incoming>) -> String {
-    if let Ok(u) = std::env::var("MEMSTORE_PUBLIC_URL") {
-        return u.trim_end_matches('/').to_string();
+/// The base URL callers reach this server at, for sign-in discovery: `MEMSTORE_PUBLIC_URL`. Never a request's
+/// `Host`, which whoever sends it sets. Required with token auth, but on a loopback address (`serve --local`),
+/// where only this machine reaches the server: there it is `http://127.0.0.1:<port>`.
+fn public_url(bind: &str, port: u16, token_auth: bool) -> Result<String> {
+    if let Some(u) = std::env::var("MEMSTORE_PUBLIC_URL")
+        .ok()
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+    {
+        anyhow::ensure!(
+            u.starts_with("https://") || u.starts_with("http://"),
+            "MEMSTORE_PUBLIC_URL is the URL callers reach this server at, like https://memory.example.com"
+        );
+        return Ok(u);
     }
-    let host = req
-        .headers()
-        .get(hyper::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost");
-    let local =
-        host.starts_with("127.0.0.1") || host.starts_with("localhost") || host.starts_with("[::1]");
-    format!("{}://{host}", if local { "http" } else { "https" })
+    let host = match bind {
+        "127.0.0.1" | "localhost" => "127.0.0.1",
+        "::1" | "[::1]" => "[::1]",
+        _ => {
+            anyhow::ensure!(
+                !token_auth,
+                "token auth needs MEMSTORE_PUBLIC_URL, the URL callers reach this server at (like \
+                 https://memory.example.com): sign-in clients are told to sign in there, and without it the only \
+                 other source is each request's Host header, which the caller sets. Only a server on a loopback \
+                 address (MEMSTORE_SERVE_BIND=127.0.0.1) goes without it"
+            );
+            // Nothing is signed in to here: no caller is ever told this URL.
+            "127.0.0.1"
+        }
+    };
+    Ok(format!("http://{host}:{port}"))
 }
 
 /// The org and team a request selects: `x-memstore-org` / `x-memstore-team` headers, or `?org=&team=` on
@@ -6717,7 +7072,7 @@ fn audit_refusal(
     state: &State,
     route: &'static str,
     org: Option<(String, i64)>,
-    actor: &str,
+    (actor, via): (&str, &SignIn),
     why: audit::Reason,
 ) {
     state
@@ -6726,7 +7081,10 @@ fn audit_refusal(
         .with_label_values(&[why.code()])
         .inc();
     let org = org.as_ref().map(|(o, i)| (o.as_str(), *i));
-    state.audit.refusal(org, actor, route, 403, why)
+    let by = refusal_voucher(via);
+    state
+        .audit
+        .refusal_via(org, actor, by.as_deref(), route, 403, why)
 }
 
 /// The 403 for a request on `path` whose caller `who` (`via`) may not do what `x-memstore-as` (`acting_as`)
@@ -6750,7 +7108,7 @@ fn recorder_refusal<'a>(
             );
             eprintln!("refused {path} for {w}: {why}");
             let mine = member_org(state, who, via, sel_org).await;
-            audit_refusal(state, route, mine, w, audit::Reason::AsDenied);
+            audit_refusal(state, route, mine, (w, via), audit::Reason::AsDenied);
             return Some(json_reply(StatusCode::FORBIDDEN, json!({"error": why})));
         }
         if let (Some(w), Some(k), None) = (who, via.recorder_key(), acting_as)
@@ -6765,7 +7123,13 @@ fn recorder_refusal<'a>(
             );
             eprintln!("refused {path} for {}: {why}", w.user());
             let mine = member_org(state, Some(w), via, None).await;
-            audit_refusal(state, route, mine, w.user(), audit::Reason::RecorderAlone);
+            audit_refusal(
+                state,
+                route,
+                mine,
+                (w.user(), via),
+                audit::Reason::RecorderAlone,
+            );
             return Some(json_reply(StatusCode::FORBIDDEN, json!({"error": why})));
         }
         None
@@ -6820,7 +7184,13 @@ fn acting_for<'a>(
                 eprintln!("refused {path} for {}: {why}", w.user());
                 if status == StatusCode::FORBIDDEN {
                     let mine = member_org(state, Some(w), via, None).await;
-                    audit_refusal(state, route, mine, w.user(), audit::Reason::AsNotMember);
+                    audit_refusal(
+                        state,
+                        route,
+                        mine,
+                        (w.user(), via),
+                        audit::Reason::AsNotMember,
+                    );
                 }
                 Err(json_reply(status, json!({"error": why})))
             }
@@ -7182,9 +7552,24 @@ async fn directory_change(
             .with_usage(&state.key_usage(&store).await);
         let access = dir.access(who.user(), via);
         let mine = |o: &str| superuser || via.operator || access.contains_key(o);
+        // The whole org: the operator, its admins (a person: a file key in an admin's name manages nothing),
+        // and its directory key (a SCIM bridge syncs its members). Anyone else in it sees themselves.
+        let whole = |o: &str| {
+            superuser
+                || via.operator
+                || access.get(o).is_some_and(|a| {
+                    via.directory_key().is_some()
+                        || (via.file_key.is_none()
+                            && a.role == crate::people::directory::Role::Admin)
+                })
+        };
         return Ok(match req["org"].as_str() {
             None => json!({"view": dir.orgs.keys().filter(|o| mine(o)).collect::<Vec<_>>()}),
-            Some(o) if mine(o) => json!({"view": dir.orgs.get(o)}),
+            Some(o) if whole(o) => json!({"view": dir.orgs.get(o)}),
+            Some(o) if mine(o) => match (dir.orgs.get(o), access.get(o)) {
+                (Some(org), Some(a)) => json!({"view": org.member_view(who.user(), a)}),
+                _ => json!({"view": null}),
+            },
             Some(o) => {
                 return Err(Refused(format!("{} is not a member of org {o}", who.user())).into());
             }
@@ -7869,6 +8254,7 @@ async fn directory_change(
             via: via.clone(),
             owner: false,
             vouched_keys: Default::default(),
+            file_keys: Default::default(),
         };
         let org = req["org"].as_str();
         if req["op"] == "export_org" {
@@ -7961,12 +8347,6 @@ async fn directory_change(
     // An imported row must be the key this server holds under that sha256, if it holds one: nobody can
     // pass off an operator's file key (an admin key above all) as a lesser one and so take it over.
     let mut vouched = std::collections::BTreeSet::new();
-    // One key, one caller: a new key may not be one of this server's file keys.
-    if let (Change::CreateKey { key, .. }, Some(auth)) = (&change, state.token_auth())
-        && auth.file_key(&key.sha256()).is_some()
-    {
-        return Err(Refused("that key is already in use".into()).into());
-    }
     if let (Change::ImportKeys { keys, .. }, Some(auth)) = (&change, state.token_auth()) {
         use crate::people::directory::user_id;
         for k in keys {
@@ -7986,12 +8366,17 @@ async fn directory_change(
             }
         }
     }
+    // One key, one caller: a new key may not be one of this server's file keys (`plan`, `CreateKey`).
     let actor = Actor {
         user: who.user().to_string(),
         superuser,
         via: via.clone(),
         owner: false,
         vouched_keys: vouched,
+        file_keys: state
+            .token_auth()
+            .map(|a| a.file_key_hashes())
+            .unwrap_or_default(),
     };
     let dry_run = req["dry_run"] == true;
     // The operators' Organization makes operators; bound to an org, it would also sign them in there.
@@ -13157,10 +13542,11 @@ async fn commit_remembered(
     Ok((id, readers))
 }
 
-/// Where `remember_memory` and `/remember` write for this caller. The inbox where there is one; else the served
-/// scope on a single person's store ([`Options::writes_here`]); else an org's or team's memory the directory gave
-/// the caller. The default org is the catalog's existing memory, whose episodes carry their sources' ACLs: it is
-/// written through ingest only.
+/// Where `remember_memory` and `/remember` write for this caller. An org's or team's memory the directory gave
+/// the caller takes their writes, inbox or not: the inbox is one per deployment, drained into the default org's
+/// memory (`deploy/gcp/ingest.sh`), so an org's writes never go there. Else the inbox where there is one; else the
+/// served scope on a single person's store ([`Options::writes_here`]). The default org is the catalog's existing
+/// memory, whose episodes carry their sources' ACLs: it is written through ingest (or the inbox) only.
 fn writes_for(
     state: &State,
     via: &SignIn,
@@ -13169,15 +13555,16 @@ fn writes_for(
     sel_team: Option<&str>,
 ) -> Writes {
     // A person's own scope (`?scope=mine`, the only way a person reaches a user scope but on the dev
-    // loop's server) takes their writes directly, whatever else this server writes to.
-    if matches!(scope, Scope::User(_)) && (via.person || state.fixed()) {
-        Writes::Scope
-    } else if inbox_table().is_some() {
-        Writes::Inbox
-    } else if state.writes_here
+    // loop's server) takes their writes directly, whatever else this server writes to; so does an org's or
+    // team's memory the directory routed the caller to.
+    if (matches!(scope, Scope::User(_)) && (via.person || state.fixed()))
         || (through_directory(state, via, sel_org, sel_team)
             && scope.org_name().is_some_and(|o| o != crate::DEFAULT_ORG))
     {
+        Writes::Scope
+    } else if inbox_table().is_some() {
+        Writes::Inbox
+    } else if state.writes_here {
         Writes::Scope
     } else {
         Writes::No
