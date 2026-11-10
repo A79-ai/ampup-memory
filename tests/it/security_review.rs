@@ -29,6 +29,9 @@
 //! - a batch costs its rows in rate-limit tokens, and how many requests a caller (and the server) has under
 //!   way at once is capped;
 //! - an org's identity provider, which can mint any name, can't fill the audit's refusals with its names;
+//! - a non-admin file key is imported into the directory only as a key reading just what it reads (its user in
+//!   one org, none of its teams, no groups), on a server reading every request through the directory; revoked
+//!   there it is refused with no restart and never imported again; the others stay the file's, reported by id;
 //! - sign-in discovery names the server's configured URL, never the request's `Host`, and a server with
 //!   sign-in won't start beyond this machine without one.
 
@@ -1211,6 +1214,171 @@ async fn closure_groups_don_t_reach_a_sign_in_through_an_org_s_own_provider() {
         !posed.as_array().unwrap().contains(&json!("group:board")),
         "acme's provider got gary's pushed groups: {posed}"
     );
+}
+
+/// Non-admin file keys are being retired. A server that reads every request through the directory imports each
+/// one a directory key reads exactly as much as (its user in one org and in none of its teams, no groups): the
+/// same bearer, now the directory's key. Revoked there, it is refused with no restart and never imported again.
+/// A key no directory key would read just as much as stays the file's, named by the server, never its key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_key_becomes_the_directory_s_only_as_what_it_reads() {
+    let (s, issuer, dir) = start_tuned(true, |o| Options {
+        directory_only: true,
+        ..o
+    })
+    .await;
+    let alice = id_token(&issuer, "alice@acme.com");
+    let user_of = |key: &'static str| {
+        let s = s.clone();
+        async move {
+            let (status, me) = post(&s, "/me", key, &json!({})).await;
+            (status, me["user"].as_str().unwrap_or_default().to_string())
+        }
+    };
+    // Bob is a member of acme only: his key is acme's from now on.
+    assert!(
+        within(|| async { user_of(BOB_FILE_KEY).await.1 == "key:acme/bobfile" }).await,
+        "a file key a directory key reads just as much as wasn't imported"
+    );
+    let (status, me) = me_in(&s, BOB_FILE_KEY, "acme").await;
+    assert_eq!(
+        (status, me["scope"].clone()),
+        (200, json!("org:acme")),
+        "{me}"
+    );
+
+    // People whose keys no directory key reads just as much as: hal is also in a team, ivy in two orgs, jay's
+    // key holds groups. Len is in no org yet.
+    for (change, by) in [
+        (
+            json!({"op": "create_team", "org": "acme", "team": "deals"}),
+            &alice,
+        ),
+        (
+            json!({"op": "invite", "org": "acme", "members": [
+                {"user": "hal@acme.com", "teams": ["deals"]}, {"user": "ivy@acme.com"}, {"user": "jay@acme.com"}]}),
+            &alice,
+        ),
+        (
+            json!({"op": "invite", "org": "globex", "members": [{"user": "ivy@acme.com"}]}),
+            &ADMIN_KEY.to_string(),
+        ),
+    ] {
+        let (status, body) = post(&s, "/admin", by, &change).await;
+        assert_eq!(status, 200, "{change}: {body}");
+    }
+    const HAL: &str = "msk_file_key_of_hal_who_is_in_a_team_too";
+    const IVY: &str = "msk_file_key_of_ivy_who_is_in_two_orgs";
+    const JAY: &str = "msk_file_key_of_jay_which_holds_groups";
+    const LEN: &str = "msk_file_key_of_len_not_yet_a_member";
+    let mut rows = keys_file_rows().as_array().unwrap().clone();
+    rows.extend([
+        json!({"id": "halfile", "sha256": sha(HAL), "user": "hal@acme.com"}),
+        json!({"id": "ivyfile", "sha256": sha(IVY), "user": "ivy@acme.com"}),
+        json!({"id": "jayfile", "sha256": sha(JAY), "user": "jay@acme.com", "groups": ["group:sales"]}),
+        json!({"id": "lenfile", "sha256": sha(LEN), "user": "len@acme.com"}),
+    ]);
+    std::fs::write(dir.path().join("keys.json"), json!(rows).to_string()).unwrap();
+    assert!(
+        within(|| async { user_of(LEN).await == (200, "len@acme.com".into()) }).await,
+        "a key put in the keys file doesn't work"
+    );
+    // Len joins acme: the same bearer, working as his file key a moment ago, is acme's key now.
+    let (status, body) = post(
+        &s,
+        "/admin",
+        &alice,
+        &json!({"op": "invite", "org": "acme", "members": [{"user": "len@acme.com"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        within(|| async { user_of(LEN).await == (200, "key:acme/lenfile".into()) }).await,
+        "a file key whose user joined one org wasn't imported"
+    );
+    // The others stay the file's, and the server says so for each, by id and user only.
+    let metrics = || {
+        let s = s.clone();
+        async move {
+            let r = reqwest::Client::new()
+                .get(format!("{s}/metrics"))
+                .bearer_auth(ADMIN_KEY)
+                .send()
+                .await
+                .unwrap();
+            r.text().await.unwrap()
+        }
+    };
+    let line = |id: &str, user: &str, state: &str| {
+        format!("memstore_file_keys{{id=\"{id}\",state=\"{state}\",user=\"{user}\"}} 1")
+    };
+    assert!(
+        within(|| async {
+            let m = metrics().await;
+            m.contains(&line("halfile", "hal@acme.com", "file"))
+                && m.contains(&line("ivyfile", "ivy@acme.com", "file"))
+                && m.contains(&line("jayfile", "jay@acme.com", "file"))
+                && m.contains(&line("bobfile", "bob@acme.com", "imported"))
+        })
+        .await,
+        "the file keys aren't reported: {}",
+        metrics().await
+    );
+    for (key, user) in [
+        (HAL, "hal@acme.com"),
+        (IVY, "ivy@acme.com"),
+        (JAY, "jay@acme.com"),
+    ] {
+        assert_eq!(
+            user_of(key).await,
+            (200, user.to_string()),
+            "a file key no directory key reads just as much as was imported"
+        );
+    }
+    let m = metrics().await;
+    for key in [BOB_FILE_KEY, HAL, IVY, JAY, LEN, ADMIN_KEY] {
+        assert!(
+            !m.contains(key) && !m.contains(&sha(key)),
+            "/metrics names a key"
+        );
+    }
+
+    // Revoked in the directory: refused on its next requests, no restart, and not imported again from the file.
+    let (status, body) = post(
+        &s,
+        "/admin",
+        &alice,
+        &json!({"op": "revoke_key", "org": "acme", "name": "bobfile"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        within(|| async { user_of(BOB_FILE_KEY).await.0 == 401 }).await,
+        "an imported file key revoked in the directory still works"
+    );
+    assert!(
+        within(|| async {
+            metrics()
+                .await
+                .contains(&line("bobfile", "bob@acme.com", "refused"))
+        })
+        .await,
+        "a revoked file key isn't reported refused"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        user_of(BOB_FILE_KEY).await.0,
+        401,
+        "a revoked file key was imported again"
+    );
+    let (_, v) = post(
+        &s,
+        "/admin",
+        ADMIN_KEY,
+        &json!({"op": "show", "org": "acme"}),
+    )
+    .await;
+    assert!(v["view"]["keys"].get("bobfile").is_none(), "{v}");
 }
 
 /// User ids fold ASCII letters only: an email that only Unicode case rules fold into a member's (a Kelvin sign

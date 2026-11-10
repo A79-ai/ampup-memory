@@ -781,6 +781,21 @@ impl TokenAuth {
         self.keys.read().unwrap().clone()
     }
 
+    /// Every key the keys file holds now, as the caller each proves (its sha256 lower-case): what a server
+    /// reports and imports of them (`memstore serve`'s file-key retirement), never the key itself.
+    pub fn file_key_callers(&self) -> Vec<KeyCaller> {
+        self.file_keys()
+            .iter()
+            .map(|k| KeyCaller {
+                id: k.id.clone(),
+                user: k.user.clone(),
+                groups: k.groups.clone(),
+                admin: k.admin,
+                sha256: k.sha256.to_ascii_lowercase(),
+            })
+            .collect()
+    }
+
     /// sha256 (hex, lower-case) of every key the keys file holds now.
     pub fn file_key_hashes(&self) -> std::collections::BTreeSet<String> {
         self.file_keys()

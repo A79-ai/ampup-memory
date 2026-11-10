@@ -31,6 +31,7 @@ mod cards;
 pub mod cell;
 pub mod compaction;
 mod episode_page;
+mod file_keys;
 mod governance;
 mod join;
 mod lobby;
@@ -152,6 +153,8 @@ struct State {
     ready: std::sync::atomic::AtomicBool,
     /// Whether this server does the background writing (`writer`): one server per catalog at a time.
     writer: Arc<writer::Lease>,
+    /// What this server says of its non-admin file keys, being retired (`file_keys`).
+    file_keys: file_keys::Report,
     /// What this server does (`MEMSTORE_ROLE`), read once as it starts.
     role: Role,
     /// Scopes from the directory whose tables the background loops' walks ([`ScopeWalk`]) have completed
@@ -577,6 +580,7 @@ pub async fn serve_with(
         byok: byok_from_env()?,
         ready: Default::default(),
         writer: writer_lease(role),
+        file_keys: Default::default(),
         role,
         walked: Default::default(),
         background: Default::default(),
@@ -602,15 +606,11 @@ pub async fn serve_with(
         options.audit_flush.unwrap_or_else(audit::flush_interval),
         move || writer.store.read().unwrap().clone(),
     ));
-    if let Some(auth) = state.token_auth() {
-        let (keys, admins) = auth.key_counts();
-        if keys > admins {
-            eprintln!(
-                "deprecated: {} API keys come from a keys file (MEMSTORE_API_KEYS); move them into the directory with `memstore apikey import --org <org> --from <file>` (admin keys stay in the file)",
-                keys - admins
-            );
-        }
-    }
+    // Non-admin file keys, being retired: each is named in the log (`ALERT` while it is read from the file) and
+    // in `memstore_file_keys` once the directory is read, and the writer imports those it can (`file_keys`).
+    state
+        .metrics
+        .register(Box::new(state.file_keys.gauge.clone()));
     tokio::spawn(flush_key_uses(state.clone()));
     if state.token_auth().is_some_and(|a| a.keys_file().is_some()) {
         tokio::spawn(keys_file_watch(state.clone()));
@@ -2293,6 +2293,7 @@ async fn keys_file_watch(state: Arc<State>) {
     };
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut failed = Default::default();
     loop {
         tick.tick().await;
         let Some(auth) = state.token_auth() else {
@@ -2305,6 +2306,8 @@ async fn keys_file_watch(state: Arc<State>) {
             Ok(None) => {}
             Err(e) => eprintln!("ALERT keys file {path}: {e:#}"),
         }
+        // Its non-admin keys against the directory as it is now: said when that changes, imported where they can be.
+        file_keys::pass(&state, &mut failed).await;
     }
 }
 
@@ -2544,8 +2547,9 @@ fn iap_set() -> bool {
 
 pub async fn identity_check() -> Vec<Check> {
     let mut out = Vec::new();
-    // Non-admin keys in a keys file: they belong in the directory now.
+    // Non-admin keys in a keys file: being retired, each is judged against the directory below.
     let mut file_keys: Option<String> = None;
+    let mut file_rows: Vec<auth::KeyCaller> = vec![];
     let mut check = |what: &str, r: Result<String>| {
         out.push(Check {
             what: what.to_string(),
@@ -2647,9 +2651,10 @@ pub async fn identity_check() -> Vec<Check> {
                     let (keys, admins) = auth.key_counts();
                     if let Some(p) = var("MEMSTORE_API_KEYS").filter(|_| keys > admins) {
                         file_keys = Some(format!(
-                            "{p} holds {} non-admin keys: keys files are deprecated, move them into the directory with `memstore apikey import --org <org> --from {p}`",
+                            "{p} holds {} non-admin keys, which are being retired: move them into the directory with `memstore apikey import --org <org> --from {p}` (a server reading through the directory, MEMSTORE_DIRECTORY=required, imports those it can itself)",
                             keys - admins
                         ));
+                        file_rows = auth.file_key_callers();
                     }
                     check(
                         "MEMSTORE_API_KEYS",
@@ -2719,12 +2724,36 @@ pub async fn identity_check() -> Vec<Check> {
     }
     }
     if let Some(detail) = file_keys {
-        out.push(Check {
-            what: "file keys".into(),
-            ok: true,
-            warn: true,
-            detail,
-        });
+        // Each key against the directory, as a server here would judge it, less the groups a server gives callers
+        // (its `serve` groups, closures pushed while it runs), which only it knows.
+        let dir = match std::env::var("MEMSTORE_PLATFORM") {
+            Ok(_) => match platform::catalog_from_env().await {
+                Ok(c) => crate::people::directory::Directory::load(&Store::new(c))
+                    .await
+                    .ok(),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+        match dir {
+            Some(dir) => {
+                let through = std::env::var("MEMSTORE_DIRECTORY").is_ok_and(|v| v == "required");
+                for (k, f) in file_keys::fates(&dir, file_rows, through, |_| vec![]) {
+                    out.push(Check {
+                        what: format!("file key {}", k.id),
+                        ok: true,
+                        warn: true,
+                        detail: f.line(&k).trim_start_matches("ALERT ").to_string(),
+                    });
+                }
+            }
+            None => out.push(Check {
+                what: "file keys".into(),
+                ok: true,
+                warn: true,
+                detail,
+            }),
+        }
     }
     out.extend(secrets_check().await);
     out
