@@ -23,12 +23,14 @@
 //!   note's, else the quote stands in. Doubt needs a quote of the session the note was said in or a later one.
 //!   Two notes are the same only when the kept one holds every number of the other. At most [`PER_KIND`] of each a
 //!   person a pass, and a record already standing isn't written again.
-//! - **Read by their person.** A record is read as any document of theirs is (`get_episode` by its key or id).
-//!   `start_session` doesn't hand notes as the records leave them yet.
+//! - **Reads use what stands.** `start_session` hands a person's own notes as the records that still stand make them
+//!   ([`current`]): a replaced note as what replaced it (and what it was, until when), unless a note said since
+//!   says it again; two in conflict as one line marked a conflict; a duplicate once; doubt marked. A record stands
+//!   only while every note and session it names is one its person may still read.
 //! - **Forgetting reaches it.** A forgotten note or session leaves every record naming it at once (each is
-//!   forgotten too, [`forgotten`]), and one gone any other way (past its retention, deleted at its source) has the
-//!   next pass release them. A purge of a note or a session deletes every record naming it (`Store::purgeable_in`),
-//!   and forgetting the person deletes them all (their source names them).
+//!   forgotten too, [`forgotten`]), and so does one gone any other way (past its retention, deleted at its source):
+//!   reads stop applying it at once, and the next pass releases it. A purge of a note or a session deletes every
+//!   record naming it (`Store::purgeable_in`), and forgetting the person deletes them all (their source names them).
 //! - **One person at a time.** The model sees one person's notes and sessions in a call, and nothing it concludes
 //!   reaches anyone else.
 //! - **Cadence and cost.** A pass weighs only people with a note or a session newer than their last pass, at most
@@ -46,6 +48,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::extract::{Extractor, fence, train_log};
+use crate::keep::Handed;
 use crate::profile::{Theirs, day};
 use crate::{AclTarget, FORGOTTEN, Scope, Store};
 
@@ -400,6 +403,200 @@ fn readable(theirs: &Theirs) -> HashSet<&str> {
         .map(String::as_str)
         .chain(theirs.sessions.iter().map(|m| m.id.as_str()))
         .collect()
+}
+
+/// What a person is handed of their own (`entries`, newest first, from their notes or their profile) as the records
+/// of theirs that stand make it (`dreamed`; `said`: when each note they may read was said; `readable`: every
+/// episode of theirs they may read). A record stands while every episode it names is readable.
+pub(crate) async fn current(
+    store: &Store,
+    scope: &Scope,
+    entries: Vec<Handed>,
+    dreamed: &[String],
+    said: &HashMap<String, i64>,
+    readable: &HashSet<String>,
+) -> Result<Vec<Handed>> {
+    let standing: Vec<Decision> = decisions(store, scope, dreamed.to_vec())
+        .await?
+        .into_iter()
+        .map(|(_, d)| d)
+        .filter(|d| d.rests_on().iter().all(|id| readable.contains(*id)))
+        .collect();
+    if standing.is_empty() {
+        return Ok(entries);
+    }
+    // The words of a note a conflict names that nothing handed holds.
+    let held = |id: &str| entries.iter().any(|h| h.notes.iter().any(|n| n == id));
+    let missing: Vec<String> = standing
+        .iter()
+        .filter_map(|d| match d {
+            Decision::Conflict {
+                with, quote: None, ..
+            } if !held(with) => Some(with.clone()),
+            _ => None,
+        })
+        .collect();
+    let texts = crate::profile::texts(store, scope, missing).await?;
+    Ok(apply(entries, &standing, said, &texts))
+}
+
+/// `entries` with `standing` applied: duplicates once, a replaced note as what replaced it (unless a note said
+/// since says it again), a conflict as one entry marked a conflict, doubt marked. Newest first.
+fn apply(
+    entries: Vec<Handed>,
+    standing: &[Decision],
+    said: &HashMap<String, i64>,
+    texts: &HashMap<String, String>,
+) -> Vec<Handed> {
+    // Each entry, and whether a decision changed it already (one decision an entry).
+    let mut slots: Vec<Option<(Handed, bool)>> =
+        entries.into_iter().map(|h| Some((h, false))).collect();
+    let find = |slots: &[Option<(Handed, bool)>], id: &str| {
+        slots.iter().position(|s| {
+            s.as_ref()
+                .is_some_and(|(h, _)| h.notes.iter().any(|n| n == id))
+        })
+    };
+    for d in standing {
+        if let Decision::Same { keep, dup } = d
+            && let (Some(k), Some(x)) = (find(&slots, keep), find(&slots, dup))
+            && k != x
+        {
+            let (gone, _) = slots[x].take().expect("found");
+            let (h, _) = slots[k].as_mut().expect("found");
+            h.notes.extend(gone.notes);
+            h.at = h.at.max(gone.at);
+        }
+    }
+    for d in standing {
+        if let Decision::Replaced {
+            note,
+            by,
+            at,
+            now,
+            quote,
+        } = d
+            && let Some(i) = find(&slots, note)
+            && let Some((h, changed)) = slots[i].as_mut()
+            && !*changed
+            && h.at < *at
+        {
+            h.text = format!(
+                "{now} (Replaces \"{}\", said {}: in the session of {} they said \"{}\"; get_episode {by}.)",
+                h.text,
+                day(h.at),
+                day(*at),
+                quoted(quote, 160)
+            );
+            h.at = *at;
+            *changed = true;
+        }
+    }
+    for d in standing {
+        let Decision::Conflict {
+            note,
+            with,
+            at,
+            quote,
+            from,
+        } = d
+        else {
+            continue;
+        };
+        let Some(i) = find(&slots, note) else {
+            continue;
+        };
+        if slots[i].as_ref().is_some_and(|(_, c)| *c) {
+            continue;
+        }
+        let (first, first_at) = slots[i]
+            .as_ref()
+            .map(|(h, _)| {
+                (
+                    h.text.clone(),
+                    said.get(note.as_str()).copied().unwrap_or(h.at),
+                )
+            })
+            .expect("found");
+        let other = match (quote, find(&slots, with)) {
+            (Some(q), _) => format!(
+                "{} \"{}\" (get_episode {with})",
+                match from.as_deref() {
+                    Some("person") => format!("in the session of {} they said", day(*at)),
+                    Some("assistant") =>
+                        format!("in the session of {} the assistant said", day(*at)),
+                    Some("tool") => format!("a tool's result in the session of {} says", day(*at)),
+                    _ => format!("the session of {} says", day(*at)),
+                },
+                quoted(q, 160)
+            ),
+            (None, Some(j)) if j == i => continue,
+            (None, Some(j)) => {
+                if slots[j].as_ref().is_some_and(|(_, c)| *c) {
+                    continue;
+                }
+                let (o, _) = slots[j].take().expect("found");
+                let (h, _) = slots[i].as_mut().expect("found");
+                h.notes.extend(o.notes);
+                h.at = h.at.max(o.at);
+                format!("\"{}\" (said {})", o.text, day(o.at))
+            }
+            (None, None) => match texts.get(with).filter(|t| !t.is_empty()) {
+                Some(t) => format!(
+                    "\"{t}\" (said {})",
+                    day(said.get(with).copied().unwrap_or(*at))
+                ),
+                None => continue,
+            },
+        };
+        let (h, changed) = slots[i].as_mut().expect("found");
+        h.text = format!(
+            "CONFLICT, neither is plainly the later correction, so ask before relying on either: \"{first}\" (said \
+             {}); {other}.",
+            day(first_at)
+        );
+        *changed = true;
+    }
+    for d in standing {
+        if let Decision::Unsure {
+            note,
+            at,
+            quote,
+            from,
+            ..
+        } = d
+            && let Some(i) = find(&slots, note)
+            && let Some((h, changed)) = slots[i].as_mut()
+            && !*changed
+            && h.at <= *at
+        {
+            h.text = format!(
+                "{} (Unsure: {}: \"{}\".)",
+                h.text,
+                match from.as_deref() {
+                    Some("assistant") => format!(
+                        "in the session of {} the assistant cast doubt on it",
+                        day(*at)
+                    ),
+                    Some("tool") => format!(
+                        "a tool's result in the session of {} casts doubt on it",
+                        day(*at)
+                    ),
+                    _ => format!("the session of {} showed doubt", day(*at)),
+                },
+                quoted(quote, 160)
+            );
+            *changed = true;
+        }
+    }
+    let mut out: Vec<Handed> = slots.into_iter().flatten().map(|(h, _)| h).collect();
+    out.sort_by_key(|h| std::cmp::Reverse(h.at));
+    out
+}
+
+/// A quote as a sentence holds it: cut to `max` characters, without its own closing stop.
+fn quoted(s: &str, max: usize) -> String {
+    short(s.trim_end_matches(['.', ' ']), max)
 }
 
 /// `s` cut to `max` characters.

@@ -2100,8 +2100,8 @@ async fn agent_model() -> String {
 /// id and by key. Carol reads hers: by a start that says what she asked, and by the first ask in a session that
 /// started with nothing asked, whose start hands none. So is what dreaming over her notes concluded
 /// (`memstore::notes_dream`): a session of hers says her first note changed, in a record the agent wrote, so the
-/// replacement proposed stands as a conflict; the record that says so (which quotes the session) is read by her alone,
-/// on every path.
+/// replacement proposed stands as a conflict; the record that says so (which quotes the session) is handed and read by
+/// her alone, on every path.
 /// The server has a BigQuery inbox (`AMPUP_MEMORY_INBOX_TABLE`, as a GCP deployment does): the deployment's one inbox,
 /// drained into the default org's memory, takes the served scope's writes only. What acme's members remember goes
 /// into acme's memory, never the inbox; acme's reader key is refused a write still.
@@ -2327,9 +2327,10 @@ async fn a_persons_profile_reaches_no_one_else() {
             &[],
         );
     }
-    // And what her notes dream concluded: the record reads, by its key and its id, once the server reads past it
-    // (its snapshot is up to a second old).
+    // And what her notes dream concluded: her start hands the note in conflict with the session's words, and the
+    // record reads, by its key and its id, once the server reads past it (its snapshot is up to a second old).
     for (tool, args) in [
+        ("start_session", json!({"harness": "test", "context": task})),
         ("get_episode", json!({"document": dream_key})),
         (
             "get_episode",

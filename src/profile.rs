@@ -414,14 +414,14 @@ fn repair(p: &mut Profile, live: &HashMap<String, i64>, bodies: &HashMap<String,
 }
 
 /// What `start_session` hands a person of their own with profiles on: their profile's lines, repaired against the
-/// notes they may still read (`notes`), and the newest [`RAW_BESIDE`] notes it doesn't cite, newest first, each led
-/// by the day it was said. None where the profile can't be read.
+/// notes they may still read (`notes`), and the newest [`RAW_BESIDE`] notes it doesn't cite, newest first, each with
+/// the day it was said and the notes that say it. None where the profile can't be read.
 pub(crate) async fn handed(
     session: &Session,
     store: &Store,
     notes: &HashMap<String, i64>,
     profile: &str,
-) -> Result<Option<Vec<String>>> {
+) -> Result<Option<Vec<crate::keep::Handed>>> {
     let scope = session.scope();
     let mut newest_notes: Vec<(&String, &i64)> = notes.iter().collect();
     newest_notes.sort_by_key(|(_, t)| std::cmp::Reverse(**t));
@@ -435,7 +435,15 @@ pub(crate) async fn handed(
     let bodies = texts(store, scope, ids).await?;
     repair(&mut p, notes, &bodies);
     let cited = p.cited();
-    let mut out: Vec<(i64, String)> = p.lines.iter().map(|l| (l.said, l.text.clone())).collect();
+    let mut out: Vec<crate::keep::Handed> = p
+        .lines
+        .iter()
+        .map(|l| crate::keep::Handed {
+            at: l.said,
+            text: l.text.clone(),
+            notes: l.notes.clone(),
+        })
+        .collect();
     let mut raw: Vec<String> = vec![];
     for (id, at) in newest_notes {
         if raw.len() == RAW_BESIDE {
@@ -451,14 +459,14 @@ pub(crate) async fn handed(
             continue;
         }
         raw.push(t.clone());
-        out.push((*at, t.clone()));
+        out.push(crate::keep::Handed {
+            at: *at,
+            text: t.clone(),
+            notes: vec![id.clone()],
+        });
     }
-    out.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
-    Ok(Some(
-        out.into_iter()
-            .map(|(at, t)| format!("({}) {t}", day(at)))
-            .collect(),
-    ))
+    out.sort_by_key(|h| std::cmp::Reverse(h.at));
+    Ok(Some(out))
 }
 
 /// `2026-04-15`, UTC.

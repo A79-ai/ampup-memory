@@ -629,11 +629,22 @@ const HANDED: usize = 20;
 /// The longest note of their own a session is handed: a session's own note (a hook's) is longer, and isn't one.
 pub(crate) const HANDED_CHARS: usize = 600;
 
+/// One thing a session's start hands a person of their own: its words, when it was last said, and the notes that say
+/// it.
+#[derive(Clone, Debug)]
+pub(crate) struct Handed {
+    pub at: i64,
+    pub text: String,
+    pub notes: Vec<String>,
+}
+
 /// What `who` asked to be remembered and what their team shares, newest first, to hand them at a session's start:
 /// their own notes (by them, readable by them alone, or on a server with one caller by everyone), sessions' notes
 /// and traces aside, and what [`share`] shared. Read from the episode rows the store keeps in memory, then the
 /// bodies of the newest [`HANDED`] of each. Where the scope folds profiles (`crate::profile`) and `who` has one,
-/// their own are its lines and the newest few notes it doesn't cite instead.
+/// their own are its lines and the newest few notes it doesn't cite instead. Where their notes were dreamed over
+/// (`crate::notes_dream`), their own are as its records that still stand make them: a note a later session
+/// replaced handed as what replaced it, two that can't both be true as one conflict, a duplicate once.
 pub async fn for_session(
     session: &crate::Session,
     store: &crate::Store,
@@ -651,6 +662,10 @@ pub async fn for_session(
     let (mut mine, mut team): (HashMap<String, i64>, HashMap<String, i64>) = Default::default();
     // Their profile's newest version (`crate::profile`): by the server, under their own source, theirs alone.
     let mut profile: Option<(String, i64)> = None;
+    // Their notes dream's records (`crate::notes_dream`), and every episode of their own they may read (what a
+    // record rests on must be one).
+    let mut dreamed: Vec<String> = vec![];
+    let mut readable: HashSet<String> = HashSet::new();
     for b in snap.rows.iter() {
         let (ids, sources) = (crate::strings(b, "episode_id"), crate::strings(b, "source"));
         let (commits, at) = (
@@ -664,6 +679,34 @@ pub async fn for_session(
                 let acl = acl.map(Vec::as_slice).unwrap_or_default();
                 acl == alone.as_slice() || (one_caller && acl == ["*"])
             };
+            // A session of the one caller of a server that identifies no one is kept to its groups.
+            let one_callers = || {
+                one_caller
+                    && source
+                        .strip_prefix(&own)
+                        .and_then(crate::notes_dream::session_of)
+                        .is_some()
+                    && vis
+                        .acls
+                        .get(id)
+                        .is_some_and(|a| !crate::notes_dream::one_callers(a).is_empty())
+            };
+            if source.starts_with(&own)
+                && (theirs(vis.acls.get(id)) || one_callers())
+                && vis.committed.contains(&commits[i])
+                && vis.can_see_episode(id, who)
+            {
+                readable.insert(id.clone());
+                if source.strip_prefix(&own) == Some(crate::notes_dream::SOURCE_TAIL)
+                    && documents[i]
+                        .as_deref()
+                        .is_some_and(crate::notes_dream::is_decision)
+                    && crate::notes_dream::by_dreamer(vis.actor(&commits[i]))
+                {
+                    dreamed.push(id.clone());
+                    continue;
+                }
+            }
             // What the share pass wrote: under its own author, which no caller is ([`SHARER`]), for everyone.
             let to = if *source == shared_source {
                 if vis.acls.get(id).map(Vec::as_slice) != Some(&["*".to_string()][..]) {
@@ -709,6 +752,7 @@ pub async fn for_session(
         }
         _ => None,
     };
+    let said = mine.clone();
     // A few more than are handed, so the ones a newer note repeats leave room for others.
     let newest = |m: HashMap<String, i64>| {
         let mut v: Vec<(String, i64)> = m.into_iter().collect();
@@ -717,7 +761,7 @@ pub async fn for_session(
         v
     };
     // With a profile handed, their notes' bodies are read there.
-    let mine = match folded {
+    let raw = match folded {
         Some(_) => vec![],
         None => newest(mine),
     };
@@ -725,9 +769,14 @@ pub async fn for_session(
     let bodies = store
         .episode_bodies(
             session.scope(),
-            mine.iter().chain(&team).map(|(id, _)| id.clone()).collect(),
+            raw.iter().chain(&team).map(|(id, _)| id.clone()).collect(),
         )
         .await?;
+    let day = |at: i64| {
+        chrono::DateTime::from_timestamp_micros(at)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default()
+    };
     // Newest first, each with the day it was said: where two disagree (a prefix changed), the agent can tell which
     // stands. One a newer note says the same as ([`says_same`]) is left out, so a preference said in many sessions,
     // or said again in other words, is one line: the newest. A team sentence that says nothing is left out too.
@@ -749,10 +798,7 @@ pub async fn for_session(
             if kept.iter().any(|k| k.says(&read)) {
                 continue;
             }
-            let day = chrono::DateTime::from_timestamp_micros(*at)
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .unwrap_or_default();
-            out.push(format!("({day}) {t}"));
+            out.push(format!("({}) {t}", day(*at)));
             kept.push(read);
             if out.len() == HANDED {
                 break;
@@ -760,7 +806,50 @@ pub async fn for_session(
         }
         out
     };
-    let mine = folded.unwrap_or_else(|| texts(&mine, false));
+    // Their own, the same way, each with the notes that say it: the newest cites the ones left out (a notes dream's
+    // record may name any of them).
+    let entries = match folded {
+        Some(f) => f,
+        None => {
+            let mut out: Vec<(Handed, Said)> = vec![];
+            for (id, at) in &raw {
+                let Some(t) = bodies
+                    .get(id)
+                    .map(|b| String::from_utf8_lossy(b).trim().to_string())
+                else {
+                    continue;
+                };
+                if t.is_empty() || t.chars().count() > HANDED_CHARS {
+                    continue;
+                }
+                let read = Said::of(&t);
+                match out.iter_mut().find(|(_, k)| k.says(&read)) {
+                    Some((h, _)) => h.notes.push(id.clone()),
+                    None => out.push((
+                        Handed {
+                            at: *at,
+                            text: t,
+                            notes: vec![id.clone()],
+                        },
+                        read,
+                    )),
+                }
+            }
+            out.into_iter().map(|(h, _)| h).collect()
+        }
+    };
+    let entries = match dreamed.is_empty() {
+        true => entries,
+        false => {
+            crate::notes_dream::current(store, session.scope(), entries, &dreamed, &said, &readable)
+                .await?
+        }
+    };
+    let mine: Vec<String> = entries
+        .into_iter()
+        .take(HANDED)
+        .map(|h| format!("({}) {}", day(h.at), h.text))
+        .collect();
     // What the user's own notes say already (theirs may be one the team's sentence was made from) isn't handed again.
     let own: Vec<Said> = mine.iter().map(|m| Said::of(undated(m))).collect();
     let team = texts(&team, true)
@@ -851,8 +940,8 @@ const BEARING: usize = 8;
 /// ones that bear on `task`, newest first, at most [`BEARING`] of each: the ones a decisions model finds the agent
 /// should know or honour doing it (one request for all of them), or, with no decisions model or when it fails, the
 /// ones that share a word with the task. Handed whole, the newest twenty were mostly about other work: replaying 8
-/// real Claude Code sessions from one team, each began with the same 13, on topics far from the task, whatever the
-/// task was.
+/// real Claude Code sessions on the ampup org, each began with the same 13, from competitor positioning to a blog's
+/// tone, whatever the task was.
 pub async fn bearing_on(
     task: &str,
     (mine, team): (Vec<String>, Vec<String>),

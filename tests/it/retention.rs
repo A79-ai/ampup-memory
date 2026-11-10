@@ -1120,6 +1120,21 @@ async fn the_nightly_window_purges_the_profile_versions_naming_what_it_purges() 
         conflict["note"] == "xprofagednote preference: indent with tabs",
         "{conflict}"
     );
+    // She is handed the conflict, with the session's words, once the server reads past the record (its snapshot is up
+    // to a second old).
+    let t = Instant::now();
+    loop {
+        let handed = tool(
+            "start_session",
+            json!({"harness": "test", "context": "how should I indent this file, with spaces?"}),
+        )
+        .await;
+        if handed.contains("xprofdreamsaid") {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "{handed}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 
     // Her oldest note ages out, and her source deletes another.
     let (status, body) = admin_as(

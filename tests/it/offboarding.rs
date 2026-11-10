@@ -2030,9 +2030,10 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
 /// deletes it. Carol tells her agent five things in acme, which folds profiles; then she forgets one of them
 /// (`forget_memory`): the profile she is handed and reads holds the other four and nothing of it, and the version
 /// folded before, which held it, is read by no one. Her notes are dreamed over (`memstore::notes_dream`) against a
-/// session of hers that says her first note changed, and she reads the record that says so (a conflict, as the
-/// session's record is the agent's text); she forgets the session, and the record (which quotes the session) goes
-/// with it at once. Then acme's admin forgets Carol: every version of her profile is gone
+/// session of hers that says her first note changed (a conflict, as the session's record is the agent's text), and
+/// she is handed the conflict; she forgets the session, and the record that concluded it (which quotes the session)
+/// goes with it at once: she is handed her note as she said it, and reads no record. Then acme's admin forgets Carol:
+/// every version of her profile is gone
 /// from every file in the warehouse and the index, with her notes and her notes dream's record, and Bob's note
 /// stays.
 #[tokio::test(flavor = "multi_thread")]
@@ -2253,7 +2254,8 @@ async fn a_forgotten_note_leaves_its_owners_profile() {
         assert!(!raw.contains("xpfold"), "{raw}");
     }
 
-    // A session of hers says her first note changed: dreamed over, she reads the record that says so.
+    // A session of hers says her first note changed: dreamed over, she is handed the conflict, with the session's
+    // words.
     let decided = crate::isolation::dream_notes(
         s,
         "?org=acme",
@@ -2272,25 +2274,39 @@ async fn a_forgotten_note_leaves_its_owners_profile() {
     // Once the server reads past the record (its snapshot is up to a second old).
     let t = Instant::now();
     loop {
-        let read = tool(&carol, "get_episode", json!({"document": dream_key})).await;
-        if read.contains("xpdreamsaid") {
+        let handed = tool(
+            &carol,
+            "start_session",
+            json!({"harness": "test", "context": task}),
+        )
+        .await;
+        if handed.contains("xpdreamsaid") {
             break;
         }
-        assert!(t.elapsed() < Duration::from_secs(10), "{read}");
+        assert!(t.elapsed() < Duration::from_secs(10), "{handed}");
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    // She forgets the session: the record that concluded from it goes at once (as the server reads).
+    // She forgets the session: what the dream concluded from it goes at once (as the server reads), and so does its
+    // record.
     let said = tool(&carol, "forget_memory", json!({"episode_id": session})).await;
     assert!(said.starts_with("forgot episode"), "{said}");
     let t = Instant::now();
     loop {
-        let read = tool(&carol, "get_episode", json!({"document": dream_key})).await;
-        if !read.contains("xpdreamsaid") {
+        let handed = tool(
+            &carol,
+            "start_session",
+            json!({"harness": "test", "context": task}),
+        )
+        .await;
+        assert!(handed.contains("xpfoldzero"), "{handed}");
+        if !handed.contains("xpdreamsaid") {
             break;
         }
-        assert!(t.elapsed() < Duration::from_secs(10), "{read}");
+        assert!(t.elapsed() < Duration::from_secs(10), "{handed}");
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    let read = tool(&carol, "get_episode", json!({"document": dream_key})).await;
+    assert!(!read.contains("xpdreamsaid"), "{read}");
 
     // Acme's admin forgets Carol: every version of her profile goes from every file, with her notes.
     assert!(
