@@ -1548,7 +1548,7 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         json!({"op": "create_org", "org": "initech", "admin": "ida@initech.com"}),
     )
     .await;
-    seed(&store, &Scope::org("initech").unwrap(), "xqinitech").await;
+    let initech_note = seed(&store, &Scope::org("initech").unwrap(), "xqinitech").await;
     let mut halfway = Event {
         at: 0,
         actor: "svc:platform".into(),
@@ -1570,6 +1570,25 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     .await;
     assert!(status == 403 && body.contains("isn't purged yet"), "{body}");
     assert!(!in_files("xqinitech").is_empty());
+    // An engine from before purging plans as if the name were free: it creates initech again, with an
+    // admin of its own. No server serves that org, which would read the old initech's memory.
+    let mut ghost_admin =
+        Event::new("svc:platform", "member.add", "initech").user("eve@initech.com");
+    ghost_admin.role = Some("admin".into());
+    store
+        .append_directory(&[
+            Event::new("svc:platform", "org.create", "initech"),
+            ghost_admin,
+        ])
+        .await
+        .unwrap();
+    let eve = id_token(&issuer, "eve@initech.com");
+    tokio::time::sleep(Duration::from_millis(1500)).await; // past the server's directory staleness
+    let got = reads(s, "?org=initech", &eve, &[&initech_note]).await;
+    assert!(
+        got.is_none(),
+        "an org re-created while purging was served: {got:?}"
+    );
     let (ok, out, err) = memstore(&home, &["org", "delete", "initech", "--confirm", "initech"]);
     assert!(
         ok && out.contains("purge the memory of org initech"),
@@ -1653,6 +1672,22 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         out.contains("delete org acme") && out.contains("purge the memory of org acme"),
         "{out}"
     );
+    // The delete is of a version an engine from before purging doesn't read: it stops there, so it can't
+    // plan acme again (as if the name were free) while acme's memory is purged.
+    let deletes: Vec<i64> = store
+        .directory_events()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| e.org == "acme" && e.op == "org.delete")
+        .map(|e| e.version)
+        .collect();
+    assert_eq!(
+        deletes,
+        vec![memstore::people::directory::PURGE_VERSION],
+        "an engine from before purging would read the delete"
+    );
+    const { assert!(memstore::people::directory::PURGE_VERSION > 1) };
     // Its key and its people are refused; nothing of it is readable.
     for (who, sel) in [
         (&a_key, ""),
@@ -1812,6 +1847,12 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         !fresh.key_usage().await.unwrap().contains_key(&a_key_sha),
         "the deleted acme's key's use stored after its delete"
     );
+    // A stray `org.create` in the log (no planner writes one for an org that exists; the directory keeps
+    // the org as it was): the audit's incarnation is the directory's, the one its rows were stamped with.
+    store
+        .append_directory(&[Event::new("svc:platform", "org.create", "acme")])
+        .await
+        .unwrap();
     // Nor its audit: the new acme's admin sees the new org's history only, never who ran the old one,
     // whom it forgot or which keys it had (the directory's log keeps the old org's changes forever),
     // whenever a server wrote it.

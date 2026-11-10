@@ -1917,6 +1917,9 @@ struct DirState {
     snapshot_events: std::sync::atomic::AtomicU64,
     /// Load latency, commit retries, and whether the log holds a change this engine can't read.
     metrics: metrics::DirMetrics,
+    /// The key snapshots are sealed with and checked against (`MEMSTORE_SECRET_KEY`, or the server's own:
+    /// [`Store::with_directory_key`]). Taken from the environment on first use if no one set it.
+    key: std::sync::OnceLock<Option<auth::secret::SecretKey>>,
 }
 
 /// A directory change is re-read, re-planned and tried again at most this many times when other
@@ -1989,6 +1992,21 @@ impl Store {
     pub fn sharing_directory(mut self, other: &Store) -> Self {
         self.dir = other.dir.clone();
         self
+    }
+
+    /// Seal directory snapshots with `key`, and load only those it sealed without reading the log before
+    /// them (none: every snapshot is checked against the log). A store's first use of its directory
+    /// fixes this: unless a server set it before, it is `MEMSTORE_SECRET_KEY`.
+    pub fn with_directory_key(self, key: Option<auth::secret::SecretKey>) -> Self {
+        let _ = self.dir.key.set(key);
+        self
+    }
+
+    fn directory_key(&self) -> Option<&auth::secret::SecretKey> {
+        self.dir
+            .key
+            .get_or_init(|| auth::secret::SecretKey::from_env().ok().flatten())
+            .as_ref()
     }
 
     /// The current catalog: the newest one a store sharing these caches came in with.
@@ -4519,6 +4537,15 @@ impl Store {
         }
     }
 
+    /// The directory's changes made at `at` (µs since the epoch) or after, in order, read from the
+    /// catalog now: the log's files before then are skipped.
+    pub async fn directory_events_since(&self, at: i64) -> Result<Vec<directory::Event>> {
+        match self.directory_table().await? {
+            Some(t) => directory_rows(&t, Some(at.saturating_sub(1))).await,
+            None => Ok(vec![]),
+        }
+    }
+
     /// Whether a table exists: not when its namespace doesn't (a fresh catalog has none of the
     /// system tables, nor their namespace, and some catalogs answer that with an error).
     pub async fn has_table(&self, ident: &TableIdent) -> Result<bool> {
@@ -4651,18 +4678,50 @@ impl Store {
         let base = match held {
             Some((_, _, f)) => Some(f.clone()),
             None => match self.directory_snapshot().await {
-                Ok(Some(s)) => match s.folded() {
-                    Ok(f) => {
+                // Sealed by a server holding this server's key, from its own fold: loading starts there.
+                Ok(Some(s)) if self.directory_key().is_some_and(|k| s.sealed(k)) => {
+                    match s.folded() {
+                        Ok(f) => {
+                            self.dir
+                                .snapshot_events
+                                .fetch_max(s.events, std::sync::atomic::Ordering::Relaxed);
+                            Some(Arc::new(f))
+                        }
+                        Err(e) => {
+                            eprintln!("directory snapshot unusable, replaying the log: {e:#}");
+                            None
+                        }
+                    }
+                }
+                // Nothing vouches for it (anyone who can write the catalog can write a snapshot): the log
+                // is replayed, and the snapshot only checked against it.
+                Ok(Some(s)) => {
+                    let events = directory_rows(&table, None).await?;
+                    let problems = directory::snapshot_problems(&events, &s);
+                    if problems.is_empty() {
                         self.dir
                             .snapshot_events
                             .fetch_max(s.events, std::sync::atomic::Ordering::Relaxed);
-                        Some(Arc::new(f))
+                        if s.seal.is_some() {
+                            eprintln!(
+                                "directory: the newest snapshot's seal doesn't open with this server's {} (another key on another replica?); it agrees with the log",
+                                auth::secret::KEY_ENV
+                            );
+                        }
+                    } else {
+                        self.dir.metrics.snapshot_refused.inc();
+                        eprintln!(
+                            "ALERT directory: the newest snapshot (taken {} by {}, {} changes) is not what the log folds to, so it is not loaded and the log is replayed: {}. Someone who can write the catalog may have written it",
+                            s.taken_at,
+                            s.actor,
+                            s.events,
+                            problems.join("; ")
+                        );
                     }
-                    Err(e) => {
-                        eprintln!("directory snapshot unusable, replaying the log: {e:#}");
-                        None
-                    }
-                },
+                    let mut f = directory::Folded::empty();
+                    f.apply(&events);
+                    return Ok((Some(table), Arc::new(f)));
+                }
                 Ok(None) => None,
                 Err(e) => {
                     eprintln!("directory snapshot unreadable, replaying the log: {e:#}");
@@ -4730,8 +4789,8 @@ impl Store {
             // undo or contradict what the newer change did.
             if let Some((version, _)) = base.blocked {
                 anyhow::bail!(
-                    "the directory holds a change of version {version}, newer than this engine reads ({}): upgrade it before changing the directory",
-                    directory::EVENT_VERSION
+                    "the directory holds {}: upgrade this engine before changing the directory",
+                    directory::blocked_why(version)
                 );
             }
             let mut events = plan(&base.dir)?;
@@ -4799,7 +4858,8 @@ impl Store {
             .snapshot_events
             .load(std::sync::atomic::Ordering::Relaxed);
         if every > 0 && after.events >= known + every {
-            let snap = directory::Snapshot::of(&after, "memstore", self.now());
+            let snap = directory::Snapshot::of(&after, "memstore", self.now())
+                .sealed_with(self.directory_key());
             match self.append_directory_snapshot(&snap).await {
                 Ok(()) => {
                     self.dir
@@ -4939,10 +4999,11 @@ impl Store {
         let f = self.directory_loaded_after(Some(Instant::now())).await?;
         if let Some((version, _)) = f.blocked {
             anyhow::bail!(
-                "the directory holds a change of version {version}, newer than this engine reads: snapshot it with an engine that reads it"
+                "the directory holds {}: snapshot it with an engine that reads it",
+                directory::blocked_why(version)
             );
         }
-        let snap = directory::Snapshot::of(&f, actor, self.now());
+        let snap = directory::Snapshot::of(&f, actor, self.now()).sealed_with(self.directory_key());
         self.append_directory_snapshot(&snap).await?;
         self.dir
             .snapshot_events
@@ -4971,6 +5032,10 @@ impl Store {
                 ("state", s(&snap.state)),
                 ("taken_at", ts([Some(snap.taken_at)])),
                 ("actor", s(&snap.actor)),
+                (
+                    "seal",
+                    Arc::new(StringArray::from(vec![snap.seal.as_deref()])) as ArrayRef,
+                ),
             ],
             OnConflict::Recommit,
         )
@@ -5026,11 +5091,12 @@ impl Store {
                 longs(&b, "events"),
                 longs(&b, "format"),
             );
-            let (digest, state, taken, actor) = (
+            let (digest, state, taken, actor, seal) = (
                 strings(&b, "digest"),
                 strings(&b, "state"),
                 timestamps(&b, "taken_at"),
                 strings(&b, "actor"),
+                optional_strings(&b, "seal"),
             );
             for i in 0..b.num_rows() {
                 if ats[i] == Some(at)
@@ -5046,6 +5112,7 @@ impl Store {
                         state: state[i].clone(),
                         taken_at: t,
                         actor: actor[i].clone(),
+                        seal: seal[i].clone(),
                     }));
                 }
             }
@@ -7475,6 +7542,8 @@ fn directory_snapshot_schema() -> Result<Schema> {
         ("state", true, PrimitiveType::String),
         ("taken_at", true, PrimitiveType::Timestamptz),
         ("actor", true, PrimitiveType::String),
+        // `directory::Snapshot::seal`; none: unsealed.
+        ("seal", false, PrimitiveType::String),
     ])
 }
 

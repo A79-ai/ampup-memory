@@ -86,12 +86,73 @@ pub const ADVICE_SKILLS: &[&str] = &["", "fallback", "together", "off"];
 
 /// The newest directory change format this engine understands, and the one it writes. Bump it when a
 /// change's meaning changes in a way an older engine would get wrong (a new field it would ignore, a
-/// new op whose absence would widen access). Rolling deploys upgrade every reader before any writer
-/// writes the new version: an older reader that meets it stops folding there (it serves the directory
-/// as of the change before, refuses directory writes, and raises `memstore_directory_blocked`). Only a
-/// change that needs it is written at it ([`SOURCES_VERSION`]); every other change stays at 1, so an
-/// older reader folds on until a change it would get wrong.
-pub const EVENT_VERSION: i64 = 3;
+/// new meaning of an op it knows). Rolling deploys upgrade every reader before any writer writes the new
+/// version: an older reader that meets it stops folding there (it serves the directory as of the change
+/// before, signs no one in, refuses directory writes, and raises `memstore_directory_blocked`). Only a
+/// change that needs it is written at it ([`SOURCES_VERSION`], [`PURGE_VERSION`], [`USERS_VERSION`]); every
+/// other change stays at 1, so an older reader folds on until a change it would get wrong. An op this
+/// engine doesn't know stops the fold too, whatever its version ([`OPS`]).
+pub const EVENT_VERSION: i64 = 4;
+
+/// The version of a change whose op is newer than this engine ([`OPS_VERSION`] and up). From this engine on,
+/// every engine stops folding at an op it doesn't know, at any version; an engine before it reads at most
+/// version 3 and skipped such an op, so a new op is written at this version for that engine to stop too.
+pub const OPS_VERSION: i64 = 4;
+
+/// Every op this engine folds (`member.forget` is a record only: it changes nothing). A change of any other
+/// op stops the fold there, as a change of a newer version does ([`Folded::apply`]): an engine that skipped
+/// it would serve a directory the change may have narrowed (a new kind of revoke or removal).
+pub const OPS: &[&str] = &[
+    "org.create",
+    "org.delete",
+    "org.purged",
+    "org.profile",
+    "org.settings",
+    "org.auth0",
+    "workspace.set",
+    "team.create",
+    "team.delete",
+    "team.add",
+    "team.remove",
+    "member.add",
+    "member.remove",
+    "member.forget",
+    "member.request",
+    "member.decline",
+    "auth.provider",
+    "domain.add",
+    "domain.remove",
+    "group.map",
+    "group.unmap",
+    "key.create",
+    "key.revoke",
+    "key.sources",
+    "user.disable",
+    "user.enable",
+    "closure.set",
+    "team.csv",
+];
+
+/// Whether this engine folds `e`: a version it reads, of an op it knows.
+pub fn readable(e: &Event) -> bool {
+    e.version <= EVENT_VERSION && OPS.contains(&e.op.as_str())
+}
+
+/// Why the fold stopped at a change of `version` ([`Folded::blocked`]).
+pub fn blocked_why(version: i64) -> String {
+    if version > EVENT_VERSION {
+        format!("a change of version {version}, newer than this engine reads ({EVENT_VERSION})")
+    } else {
+        format!(
+            "a change of an op this engine doesn't know (at version {version}: a newer engine wrote it)"
+        )
+    }
+}
+
+/// The version of `org.delete`. An engine from before purging (it reads version 1 only) would let the name
+/// be created again while its old memory is still there, and the new org would read it: that engine stops
+/// at the delete instead, and plans nothing more. Every engine that reads version 2 knows purging.
+pub const PURGE_VERSION: i64 = 2;
 
 /// The version of a change that holds a key to source prefixes (`key.create` with sources, `key.sources`):
 /// an engine before it would fold the key without them, free to write any source.
@@ -1152,9 +1213,9 @@ pub struct Folded {
     pub digest: String,
     /// The changes the newest snapshot this fold knows of covers (0: none).
     pub snapshot_events: u64,
-    /// The first change this engine can't fold (its version is newer than [`EVENT_VERSION`]): the
-    /// fold stops before it, and every change after it waits too, since changes apply in order. Its
-    /// version and time. None: every change was folded.
+    /// The first change this engine can't fold (its version is newer than [`EVENT_VERSION`], or its op
+    /// isn't one of [`OPS`]): the fold stops before it, and every change after it waits too, since
+    /// changes apply in order. Its version and time. None: every change was folded.
     pub blocked: Option<(i64, i64)>,
 }
 
@@ -1171,15 +1232,15 @@ impl Folded {
         }
     }
 
-    /// Fold in `events`: all after what is folded in already, in order. Fails closed on a change of a
-    /// version newer than this engine reads: it and everything after it are left out (never applied in
-    /// part, never skipped over), and [`Folded::blocked`] says so. The fold is then the directory as of
-    /// the change before: the last state this engine knows to be right.
+    /// Fold in `events`: all after what is folded in already, in order. Fails closed on a change this
+    /// engine can't read (a newer version, or an op it doesn't know): it and everything after it are left
+    /// out (never applied in part, never skipped over), and [`Folded::blocked`] says so. The fold is then
+    /// the directory as of the change before: the last state this engine knows to be right.
     pub fn apply(&mut self, events: &[Event]) {
         self.blocked = None;
         let known = events
             .iter()
-            .position(|e| e.version > EVENT_VERSION)
+            .position(|e| !readable(e))
             .unwrap_or(events.len());
         if let Some(e) = events.get(known) {
             self.blocked = Some((e.version, e.at));
@@ -1209,7 +1270,7 @@ fn chain(prev: &str, e: &Event) -> String {
 
 /// What a snapshot's state means changes when the fold does: a snapshot of another format is never
 /// loaded (the log is replayed instead). Bump it with any change to what [`Directory::apply_events`] does.
-pub const SNAPSHOT_FORMAT: i64 = 9;
+pub const SNAPSHOT_FORMAT: i64 = 10;
 
 /// A folded snapshot of the directory log (`memory_system.directory_snapshot`): the state after the log's
 /// first `events` changes, the last of them at `at`.
@@ -1225,6 +1286,10 @@ pub struct Snapshot {
     /// µs since the epoch.
     pub taken_at: i64,
     pub actor: String,
+    /// What vouches for it: a seal under the server's `MEMSTORE_SECRET_KEY` over its format, extent,
+    /// digest and state ([`Snapshot::sealed`]). None: written by a server without the key, or before
+    /// snapshots were sealed. A snapshot this server can't vouch for is checked against the log.
+    pub seal: Option<String>,
 }
 
 impl Snapshot {
@@ -1237,7 +1302,34 @@ impl Snapshot {
             state: f.dir.snapshot_json(),
             taken_at: now,
             actor: actor.into(),
+            seal: None,
         }
+    }
+
+    /// What the seal covers: everything loading takes from the snapshot.
+    fn sealed_text(&self) -> String {
+        let state = crate::auth::hex(&<sha2::Sha256 as sha2::Digest>::digest(
+            self.state.as_bytes(),
+        ));
+        format!(
+            "memstore directory snapshot\n{}\n{}\n{}\n{}\n{state}",
+            self.format, self.at, self.events, self.digest
+        )
+    }
+
+    /// This snapshot, sealed under `key` (none: left unsealed).
+    pub fn sealed_with(mut self, key: Option<&crate::auth::secret::SecretKey>) -> Self {
+        self.seal = key.map(|k| k.seal(&self.sealed_text(), ""));
+        self
+    }
+
+    /// Whether `key` sealed this snapshot as it is: a server holding the key wrote it from its own fold,
+    /// so loading may start from it without reading the log before it.
+    pub fn sealed(&self, key: &crate::auth::secret::SecretKey) -> bool {
+        self.seal.as_deref().is_some_and(|s| {
+            key.unseal(&self.sealed_text(), s)
+                .is_ok_and(|p| p.is_empty())
+        })
     }
 
     /// The fold this snapshot stands for.
@@ -1278,26 +1370,33 @@ pub fn check_snapshot(events: &[Event], snap: Option<&Snapshot>) -> SnapshotChec
         snapshot: snap.map(|s| (s.events, s.at)),
         problems: vec![],
     };
-    if let Some(e) = events.iter().find(|e| e.version > EVENT_VERSION) {
+    if let Some(e) = events.iter().find(|e| !readable(e)) {
         out.problems.push(format!(
-            "the log has a change of version {} at {}, newer than this engine reads ({EVENT_VERSION}): it serves the directory as of the change before",
-            e.version, e.at
+            "the log has {} at {}: this engine serves the directory as of the change before, and signs no one in",
+            blocked_why(e.version),
+            e.at
         ));
     }
-    let Some(snap) = snap else {
-        return out;
-    };
+    if let Some(snap) = snap {
+        out.problems.extend(snapshot_problems(events, snap));
+    }
+    out
+}
+
+/// What is wrong with `snap` as the start of the log `events` (the whole log, in order); empty: it is the
+/// log's first changes folded, and loading from it gives what replaying the whole log gives.
+pub fn snapshot_problems(events: &[Event], snap: &Snapshot) -> Vec<String> {
+    let mut out = vec![];
     let from_snap = match snap.folded() {
         Ok(f) => f,
         Err(e) => {
-            out.problems
-                .push(format!("the snapshot can't be read: {e:#}"));
+            out.push(format!("the snapshot can't be read: {e:#}"));
             return out;
         }
     };
     let covered = events.iter().take_while(|e| e.at <= snap.at).count();
     if covered as u64 != snap.events || events[covered..].iter().any(|e| e.at <= snap.at) {
-        out.problems.push(format!(
+        out.push(format!(
             "the snapshot folds {} changes up to {}, but the log has {covered} there (loading ignores it and replays the log)",
             snap.events, snap.at
         ));
@@ -1306,22 +1405,17 @@ pub fn check_snapshot(events: &[Event], snap: Option<&Snapshot>) -> SnapshotChec
     let mut upto = Folded::empty();
     upto.apply(&events[..covered]);
     if upto.digest != snap.digest {
-        out.problems.push(
-            "the snapshot's digest is not the log's: it was folded from other changes".into(),
-        );
+        out.push("the snapshot's digest is not the log's: it was folded from other changes".into());
     }
     if upto.dir.snapshot_json() != snap.state {
-        out.problems
-            .push("the snapshot's state is not what the log's changes fold to".into());
+        out.push("the snapshot's state is not what the log's changes fold to".into());
     }
     let mut full = upto;
     full.apply(&events[covered..]);
     let mut loaded = from_snap;
     loaded.apply(&events[covered..]);
     if loaded.dir.snapshot_json() != full.dir.snapshot_json() {
-        out.problems.push(
-            "loading from the snapshot gives another directory than replaying the log".into(),
-        );
+        out.push("loading from the snapshot gives another directory than replaying the log".into());
     }
     out
 }
@@ -1434,6 +1528,11 @@ impl Directory {
                 _ => {}
             }
             if e.op == "org.create" {
+                // A name whose old memory isn't purged yet is never taken again, whoever planned it (an
+                // engine from before purging doesn't know to refuse it): the new org would read the old one.
+                if purging.contains(&e.org) {
+                    continue;
+                }
                 orgs.entry(e.org.clone()).or_insert_with(|| Org {
                     created_at: e.at,
                     ..Default::default()
@@ -1614,7 +1713,9 @@ impl Directory {
                         retired.insert(k.sha256);
                     }
                 }
-                _ => {} // a change from a newer engine: ignored
+                // A known op missing what it acts on (no user, no team), or `member.forget` (a record only).
+                // An op this engine doesn't know never gets here: the fold stops before it.
+                _ => {}
             }
         }
     }
@@ -3020,7 +3121,11 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
     };
     Ok(match change {
         Change::CreateOrg { .. } | Change::CreateWorkspace { .. } => unreachable!(),
-        Change::DeleteOrg { .. } => vec![ev("org.delete")],
+        Change::DeleteOrg { .. } => {
+            let mut e = ev("org.delete");
+            e.version = PURGE_VERSION;
+            vec![e]
+        }
         Change::CreateTeam { team, .. } => {
             team_ok(team)?;
             if org.teams.contains_key(team) {

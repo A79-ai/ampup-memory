@@ -140,7 +140,7 @@ Requests carry `X-Title: memstore`, so their spend shows apart on a shared key.
 | `MEMSTORE_JWT_JWKS_URL`, `MEMSTORE_JWT_PUBLIC_KEY`, `MEMSTORE_JWT_SECRET`, `MEMSTORE_JWT_ISSUER`, `MEMSTORE_JWT_AUDIENCE`, `MEMSTORE_JWT_ORG_CLAIM`, `MEMSTORE_JWT_GROUPS_CLAIM`, `MEMSTORE_JWT_USER_CLAIMS` | JWT callers. |
 | `MEMSTORE_OIDC_ISSUER`, `MEMSTORE_OIDC_AUDIENCE`, `MEMSTORE_OIDC_CLI_CLIENT_ID`, `MEMSTORE_OIDC_CLI_CLIENT_SECRET`, `MEMSTORE_OIDC_CLI_CALLBACK_PORT` | People's sign-in through the server's identity provider. Serve a client secret only for a public client. |
 | `MEMSTORE_IAP_AUDIENCE` | People through Google's Identity-Aware Proxy. |
-| `MEMSTORE_SECRET_KEY` | 32 bytes (base64 or hex) that seal identity-provider secrets. Same on every server. |
+| `MEMSTORE_SECRET_KEY` | 32 bytes (base64 or hex) that seal identity-provider secrets and directory snapshots. Same on every server. Without it every snapshot is checked against the directory log on load. |
 | `MEMSTORE_DIRECTORY=required` | Every caller must select an org. |
 | `MEMSTORE_DISABLED_FILE`, `MEMSTORE_TEAM_CSV` | A server's own disabled-users list and team csv. |
 | `MEMSTORE_ALLOW_LOCAL_ISSUERS=1` | Allow an identity provider on this machine (development). |

@@ -11,7 +11,7 @@ Code is cited as `file:function`, because line numbers go stale.
 | Table (`memory_system.`) | What it holds | Written by | Read by |
 |---|---|---|---|
 | `directory` | The log: one row per change (`at, actor, op, org, team, user, role, detail, version`). Rows are only ever appended. | `Store::append_directory_with` (a CAS commit) | `Store::directory` (the fold), `Store::directory_events` (the whole log: audit, checks) |
-| `directory_snapshot` | The log folded: `at, events, digest, format, state, taken_at, actor` | `Store::directory_written` (every 500 changes, `MEMSTORE_DIRECTORY_SNAPSHOT_EVERY`), `/admin {"op":"snapshot"}` | `Store::fold_directory_from`, on a server's first load only |
+| `directory_snapshot` | The log folded: `at, events, digest, format, state, taken_at, actor, seal` | `Store::directory_written` (every 500 changes, `MEMSTORE_DIRECTORY_SNAPSHOT_EVERY`), `/admin {"op":"snapshot"}` | `Store::fold_directory_from`, on a server's first load only |
 | `key_usage` | When each key was last used: `sha256, org, name, at`. Kept apart from the log so the log stays small. | `server::flush_key_uses`, at most once per key per hour, through `Store::append_key_usage`, which writes no use of a key the directory (read then) no longer has in its org | `Directory::with_usage` (`show`, `apikey list`) |
 | `audit` | Sign-ins, refusals, key use, each stamped with `org` and `org_created_at` (the incarnation) | `audit::Audit::flush` (every 60 s, `MEMSTORE_AUDIT_FLUSH_SECS`), through `Store::append_audit`, which writes no row of an org the directory (read then) no longer has as that incarnation (`audit::row_stays`) | `audit::collect`, `audit::collect_operator` |
 
@@ -20,14 +20,17 @@ Code is cited as `file:function`, because line numbers go stale.
 ### Events
 
 Each change is planned into events by `directory::plan`, and the events are folded by
-`Directory::apply_events`. Every event is at version 1 (`EVENT_VERSION = 1`); a row from before
-versions also counts as 1. The `role` and `team` columns are set on `key.create` too, but the fold reads
-only `detail` for keys.
+`Directory::apply_events`. An event is written at version 1 unless an older engine would get it wrong:
+then at the version that gave it its meaning (`SOURCES_VERSION`, `PURGE_VERSION`, `USERS_VERSION`). This
+engine reads up to `EVENT_VERSION = 4`; a row from before versions counts as 1. The fold stops at the first
+change it can't read: a newer version, or an op not in `directory::OPS` at any version (`readable`,
+`Folded::apply`). The `role` and `team` columns are set on `key.create` too, but the fold reads only
+`detail` for keys.
 
 | op | Fields used | Fold effect | Written by (`Change` / function) |
 |---|---|---|---|
-| `org.create` | org | Adds the org if absent, with `created_at = at` (its incarnation). Removes the name from `purged`. | `CreateOrg` |
-| `org.delete` | org | Removes the org. Adds the name to `purging`. Its verified-import keys go into `retired_keys`. | `DeleteOrg` |
+| `org.create` | org | Adds the org if absent, with `created_at = at` (its incarnation). Removes the name from `purged`. Not folded while the name is `purging`, whoever wrote it. | `CreateOrg` |
+| `org.delete` (version 2) | org | Removes the org. Adds the name to `purging`. Its verified-import keys go into `retired_keys`. | `DeleteOrg` |
 | `org.purged` | org | Moves the name from `purging` to `purged`. | `directory::apply`, after `offboard::purge_org` |
 | `team.create` | org, team | Adds an empty team. | `CreateTeam`, `Sync` (for teams it names) |
 | `team.delete` | org, team | Removes the team and its keys. Verified imports among them are retired. | `DeleteTeam` |
@@ -46,11 +49,11 @@ only `detail` for keys.
 | `key.create` | org, detail = `KeyDetail {name, sha256, team, role, expires_at, sources?, created_by, imported_from?, verified?, imported_user?}` (version 2 when it has `sources`) | Inserts the key by name, replacing any key with that name. A verified import (`imported_from` and `verified`) removes its sha256 from `retired_keys`. An import keeps the user it acted as (`imported_user`, or on older rows the user `imported_from` names). A detail that doesn't parse (an unknown role, say) is skipped. | `CreateKey`, `ImportKeys` |
 | `key.revoke` | org, detail = key name | Removes the key. A verified import goes into `retired_keys`. | `RevokeKey` |
 | `key.sources` (version 2) | org, detail = `KeySources {name, sources}` | Sets the key's source prefixes (empty: any source). A key not there is skipped. | `SetKeySources` |
-| anything else | | Ignored | |
+| anything else | | Stops the fold, as a change of a newer version does | |
 
 The fold also keeps state that belongs to no single org: `retired_keys`, `purging`, `purged`, and each
 org's `removed` and `created_at`. Snapshots keep all of it (`SnapOrg`, `SnapKey`,
-`Directory::snapshot_json`). `SNAPSHOT_FORMAT` is 9 (an imported key's user is kept since 9).
+`Directory::snapshot_json`). `SNAPSHOT_FORMAT` is 10 (an imported key's user is kept since 9; since 10 an `org.create` while the name is purging isn't folded, and an unknown op stops the fold).
 
 ### Invariants and where each is enforced
 
@@ -90,9 +93,9 @@ directory as it is when the change commits. The fold does not re-check them.
 | An admin can't remove their own admin role | `plan` (`keeps_me`) |
 | Changes apply in commit order: each is stamped after the last change it was planned against | `append_directory_with` (`start = max(now, last_at + 1)`) |
 | No commit is planned against a stale directory. A CAS conflict re-reads and re-plans the change, up to 50 times. A commit whose answer was lost is detected. | `append_directory_with`; `ensure_directory_cas` (Iceberg's automatic retry is set to 0) |
-| A change of a newer version is never folded. Writes and snapshots are refused while the fold is blocked. | `Folded::apply`; `append_directory_with`; `snapshot_directory` |
-| A snapshot is loaded only if its format is current, it is not dated in the future, and its event count matches the log. Its digest is not checked. | `Store::directory_snapshot`; `Store::fold_directory_from` |
-| Audit rows belong to one incarnation of an org | `server/mod.rs:member_org` and `key_caller` (the stamp); `audit::collect` (the filter) |
+| A change of a newer version, or of an op this engine doesn't know, is never folded. While the fold is blocked, no one is signed in (no key, no person, no admin key), writes and snapshots are refused, and the server reports not ready. | `Folded::apply`; `server/mod.rs:sync_closures` (from `request_principal` and `require_admin`); `append_directory_with`; `snapshot_directory`; `/ready` |
+| A snapshot is loaded only if its format is current, it is not dated in the future, and its event count matches the log. On a first load, it is used without reading the log before it only if this server's `MEMSTORE_SECRET_KEY` sealed it. Any other snapshot is checked against the log (count, digest, state) and the log is replayed; one that doesn't match is refused with an alert. | `Store::directory_snapshot`; `Store::fold_directory_from`; `Snapshot::sealed`; `directory::snapshot_problems` |
+| Audit rows belong to one incarnation of an org, the one the fold names | `server/mod.rs:member_org` and `key_caller` (the stamp); `audit::collect` (the filter, from `Org::created_at`) |
 
 ### An org's lifecycle
 
@@ -103,7 +106,7 @@ directory as it is when the change commits. The fold does not re-check them.
 | State | What is refused or done | Where |
 |---|---|---|
 | live | Normal operation. `created_at` names this incarnation. | `apply_events` |
-| purging | Nothing is served. Every key, provider and member is gone. `CreateOrg` is refused. Running `DeleteOrg` again finishes the purge. | `plan` (`CreateOrg`, `DeleteOrg`); `directory::apply` |
+| purging | Nothing is served. Every key, provider and member is gone. `CreateOrg` is refused, and an `org.create` some other planner wrote is not folded. Running `DeleteOrg` again finishes the purge. An engine from before purging stops at the `org.delete` (version 2), so it can't plan the name again. | `plan` (`CreateOrg`, `DeleteOrg`); `apply_events` (`org.create`); `PURGE_VERSION`; `directory::apply` |
 | purged | The memory is gone. A lagging replica may still have written to it. `CreateOrg` purges the namespaces again before creating. | `directory::apply` (`purge_memory`, before `append_directory_with`) |
 | re-created | This is a new org. Old audit rows and old changes are hidden from it. | `audit::collect` (the incarnation filter) |
 
@@ -159,10 +162,14 @@ Callers are the ones in the review's threat model. In the table, ✓ means allow
 
 Anyone who can write `memory_system` is fully trusted. Nothing in the engine defends against them, and
 this document does not try to. They can:
-- append any directory event at version 1, which skips every check above, or at a higher version, which
-  freezes every server;
-- write a snapshot whose state doesn't match the log. It is trusted on first load if the event count
-  matches. `check_directory` would catch it, but nothing runs that check on its own.
+- append any directory event at version 1, which skips every check above, or one a server can't read (a
+  higher version, an unknown op). That stops every server older than it: each signs no one in, refuses
+  directory writes and reports not ready until it is upgraded, and says so (an `ALERT` line, the
+  `memstore_directory_blocked` metric, the `directory_blocked` alert, `/ready`, `identity check`). It
+  denies service; it never serves a directory the change may have narrowed.
+- write a snapshot whose state doesn't match the log. A first load doesn't use it: without a seal this
+  server's key opens, the snapshot is checked against the log and the log is replayed. A mismatch is an
+  `ALERT` line and `memstore_directory_snapshot_refused_total`.
 - rewrite the audit and key-usage tables, and memory.
 
 So `memory_system` must be writable only by the servers and the operator. Read access to the bucket
@@ -174,8 +181,8 @@ or referenced, and why key hashes are sha256 of keys with at least 32 random cha
 | It protects | It does not protect |
 |---|---|
 | Org IdP client secrets stored as `sealed:…`, against anyone who reads the bucket. They are sealed with AES-256-GCM, with the org name as AAD, so a sealed value pasted into another org won't open. (`secret.rs:SecretKey::seal`, `open`) | The same secrets against anonymous callers: `protected_resource` hands out a public client's resolved secret, and an undeclared one's (which `identity check` flags). A confidential client's secret is never taken. |
-| | `env:` secrets, which live in the server's environment |
-| | The integrity of the log or of snapshots. Nothing is signed. |
+| Directory snapshots. A server holding the key seals each snapshot it writes (AES-256-GCM over its format, extent, digest and a hash of its state), and a first load starts from a snapshot without reading the log before it only if the seal opens here. (`Snapshot::sealed_with`, `Snapshot::sealed`) | `env:` secrets, which live in the server's environment |
+| | The integrity of the log. Nothing in it is signed. |
 | | Key hashes, key usage, the audit |
 
 It must be the same on every replica, and on every machine that runs `--direct auth setup` (the CLI seals
@@ -199,7 +206,7 @@ There is no key rotation: to rotate, change the key everywhere, then run `auth s
 | The keys file (`MEMSTORE_API_KEYS`) | Looked at every 2 s (`KEYS_FILE_POLL`) and read again when it changes. The new keys take effect whole, so a key taken out is refused within about 2 s, with no restart. | `TokenAuth::reload_keys_file`, `server::keys_file_watch` | A file that can't be read or doesn't parse keeps the keys last read; `memstore_keys_file_failing` is 1 and the log says `ALERT` until it reads again |
 | Audit buffer | 60 s. Refusals hold half of it; the people one org's IdP signed in hold at most 100 rows of their own, the rest counted in one row under the IdP (`idp:<org>`), so its minted names can't push out anyone else's. | `audit::flush_interval`, `Recorder::refusal_via` | Retried. An org delete flushes the deleting server's buffer before its purge. Another server's buffer may still hold the deleted org's rows: its flush drops them (`audit::row_stays`, against the directory read at the flush), and after writing it reads the directory again and removes any rows of an org deleted meanwhile (`Store::unwrite_gone`), so a delete that raced the write leaves none of them stored. |
 | Key usage | 1 h | `KEY_USE_FLUSH` | Retried every minute. A deleted org's key uses are dropped and removed again as the audit's are (`audit::key_use_stays`). |
-| A blocked fold (a newer version) | Until the server is upgraded | `Folded::apply` | Serves the directory as of the change before. Refuses writes. |
+| A blocked fold (a newer version, or an unknown op) | Until the server is upgraded | `Folded::apply` | Fails closed: signs no one in, refuses writes, `/ready` answers 503 with `directory_blocked`. |
 
 ### Read paths and what they trust
 
@@ -209,19 +216,19 @@ There is no key rotation: to rotate, change the key everywhere, then run `auth s
 | Scope selection (`select_scope` → `Directory::resolve`) | The 1 s fold | The catalog. A caller with no selection and no directory route gets the served scope. |
 | Memory reads (`/search`, `/query`, `/episode`, MCP) | The scope, then episode ACLs (`acl.rs`), then `may_read` | The catalog grants on namespaces. Facts are visible only if every cited episode is. |
 | `/me`, `show` | The fold, plus `key_usage` for `show` | The catalog. `/me` is reduced for ingest keys, and refused to directory keys. |
-| Audit (`audit::collect`) | The audit table, the **raw log** (to find the incarnation), and this server's buffer | The catalog, and the incarnation stamps |
+| Audit (`audit::collect`) | The audit table, the fold (the incarnation, `Org::created_at`), the log's changes since that incarnation, and this server's buffer | The catalog, and the incarnation stamps |
 | `protected_resource` (anonymous) | The fold; it resolves the secret of a client that isn't confidential. The `resource` it names, and every 401's `WWW-Authenticate`, come from `MEMSTORE_PUBLIC_URL` (`public_url`, at start) | Nothing about the caller, its `Host` header included |
-| A server's first load | The newest snapshot plus the log after it | The snapshot, if its count matches |
+| A server's first load | The newest snapshot plus the log after it, if this server's key sealed it; else the whole log, with the snapshot checked against it | The log; a snapshot only under its seal |
 | `check_directory`, `identity check` | A replay of the whole log, compared with the snapshot | The log |
 
 ## 4. Deploy and upgrade rules
 
 | Rule | Why | Enforced by |
 |---|---|---|
-| **Upgrade readers before writers.** A release that writes a new event version reaches every server, and every `--direct` CLI, before any of them writes it. | An old reader freezes at the first newer row (fails closed). It never misreads it. | `Folded::apply`, the `memstore_directory_blocked` metric |
-| Bump `EVENT_VERSION` when an event gains a field or meaning an old fold would ignore, or for a new op whose absence would widen access | Unknown ops and fields at a known version are silently skipped | Review only |
+| **Upgrade readers before writers.** A release that writes a new event version reaches every server, and every `--direct` CLI, before any of them writes it. | An old reader stops at the first newer row (fails closed): it signs no one in and reports not ready until it is upgraded. It never misreads it. | `Folded::apply`, `sync_closures`, `/ready`, the `memstore_directory_blocked` metric |
+| Bump `EVENT_VERSION` when an event gains a field or meaning an old fold would ignore. Write a new op at `OPS_VERSION` (4) or later. | An unknown op stops the fold at any version, but engines before that rule read up to version 3 and skipped unknown ops. Unknown fields at a known version are still skipped. | `readable`, `Folded::apply`; review for fields |
 | Bump `SNAPSHOT_FORMAT` whenever `apply_events`, `SnapOrg` or `SnapKey` change | An old snapshot would load as the wrong state | Review only. A mismatched format means the log is replayed. |
-| A new plan rule that depends on new fold state can't be protected by the version gate. Old binaries keep planning without it. Ship it with a version bump on the event the old planners would mis-handle, or stop old CLIs some other way. | The gate stops old *folds*, not old *planners* | — |
+| A new plan rule that depends on new fold state can't be protected by the version gate alone. Old binaries keep planning without it. Ship it with a version bump on the event the old planners would mis-handle, and refuse the old planners' result in the fold where you can. `purging` is done this way: `org.delete` is at version 2, and an `org.create` while purging isn't folded. | The gate stops old *folds*, not old *planners* | `PURGE_VERSION`; `apply_events` (`org.create`) |
 | Wire: `create_key` sends the key itself, `{"key": "msk_…"}`, and the server hashes it. A request with `sha256` is refused. **Upgrade servers before CLIs.** A CLI from before this change can't create keys against a server from after it, and the reverse fails too (the change doesn't parse). | A client-named hash allowed key takeover | `Change::CreateKey`, `directory_change` |
 | Wire and fold: the `ingest` role. A server from before it can't parse a `KeyDetail` with `role: ingest`. It skips the `key.create`, so the key is unknown there, which fails closed. That is serde's doing, not the version gate's. **Upgrade servers before creating ingest keys.** | — | `apply_events` (`.ok()` on the detail) |
 | Wire and fold: the `directory` role. As with `ingest`, an older server can't parse a `KeyDetail` with `role: directory`, skips the `key.create`, and so refuses the key (fails closed). **Upgrade servers before creating directory keys.** A snapshot an older server takes leaves the key out; a newer server that loads it doesn't know the key until it is made again. | — | `apply_events` (`.ok()` on the detail) |
@@ -268,9 +275,6 @@ There is no key rotation: to rotate, change the key everywhere, then run `auth s
 |---|---|---|---|
 | Retire non-admin file keys once operator keys live in the directory: import every one, then stop reading them | `SignIn::file_key`, `replaces_file_key`, `verified_import`, `retired_keys`, `KeyDetail.verified` and `imported_from` on new rows, `--self`, `vouched_keys`, the row match, the file-key op allow-list, `key_caller`'s `file:` branch | Medium. A migration (`apikey import` per deployment), then one release that still reads legacy rows | Removes a class of key-handling bugs, and the file keys that differ per replica. One key system in fact. |
 | Model the caller as one enum (`Operator`, `Person{via}`, `OrgKey`, `FileKey`) instead of `superuser`, `owner`, `via.key`, `via.file_key` and `via.person`, and make `plan` the only gate | Gates split across `directory_change`, `offboard::may_manage` and `plan` | Medium refactor; the tests stay as they are | §2 becomes one `match`. A new op can't forget a caller kind. |
-| Treat an unknown op at a known version as blocking, like a newer version | The silent `_ => {}` in `apply_events` | Small, but it needs a version bump itself | Fails closed when someone forgets the bump |
-| Take the audit incarnation from the fold (`Org::created_at`), not from the raw log | `audit::collect`'s full log scan | Small | One source of truth, and the audit stops reading the whole log on every call |
 | One cache for authentication: index the 1 s fold by sha256, and drop `directory_auth`'s separate 5 s cache | `PROVIDERS_TTL`, `DirectoryAuth` | Small to medium. Authentication then reads the catalog once a second, as `resolve` already does. | Revocation latency becomes one number, 1 s |
 | Fold `purging` and `purged` into one `OrgState` per name, kept with the deleted incarnation | Two sets plus `created_at` handling | Small, plus `SNAPSHOT_FORMAT` 4 | The lifecycle in §1 becomes a real state machine |
 | Derive `key_usage` from the audit's hourly `Key` rows | The `key_usage` table, its flusher, its purge | Small to medium. `apikey list` reads the audit instead. | One table fewer to purge on org delete |
-| Verify the snapshot's digest on first load, or sign snapshots | Unchecked snapshot digests on first load | Small: one replay at startup, or an HMAC with a new secret | Snapshot tampering is detected |

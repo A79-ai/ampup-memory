@@ -423,10 +423,12 @@ pub async fn serve_with(
         Some(k) => Some(k),
         None => auth::secret::SecretKey::from_env()?,
     };
+    // Directory snapshots are sealed with the same key, and only one it sealed loads without the log.
     let mut store = Store::new(match &catalog {
         Some(c) => c.clone(),
         None => platform::catalog_from_env().await?,
-    });
+    })
+    .with_directory_key(secret_key.clone());
     if let Some(base) = &options.index_base {
         store = store.with_index_base(base.clone());
     }
@@ -2768,12 +2770,14 @@ async fn secrets_check() -> Vec<Check> {
                 ok: r.problems.is_empty(),
                 warn: false,
                 detail: match (&r.snapshot, r.problems.is_empty()) {
-                    (None, _) => format!("none yet: loading replays the log's {} changes", r.events),
+                    (_, false) => r.problems.join("; "),
+                    (None, true) => {
+                        format!("none yet: loading replays the log's {} changes", r.events)
+                    }
                     (Some((n, _)), true) => format!(
                         "covers {n} of the log's {} changes, and loads to what replaying the log does",
                         r.events
                     ),
-                    (Some(_), false) => r.problems.join("; "),
                 },
             },
             Err(e) => Check {
@@ -4329,8 +4333,8 @@ async fn sync_closures(state: &State) -> Result<()> {
         .context("the directory (who is disabled) can't be read")?;
     if let Some((version, _)) = f.blocked {
         anyhow::bail!(
-            "the directory holds a change of version {version}, newer than this engine reads ({}): no one is signed in until a newer engine serves",
-            crate::people::directory::EVENT_VERSION
+            "the directory holds {}: no one is signed in until a newer engine serves",
+            crate::people::directory::blocked_why(version)
         );
     }
     state.closures.sync(f.events, &f.digest, &f.dir)
@@ -4482,7 +4486,20 @@ async fn handle(
         let stopping = state.stopping.load(std::sync::atomic::Ordering::Acquire);
         let unplaceable = state.writer.unplaceable();
         let mut v = state.writer.status();
-        v["ready"] = json!(ready && !stopping && unplaceable.is_none());
+        // A directory this engine stops folding short of signs no one in: traffic belongs on a server that
+        // reads it (a rolling deploy's newer one), and an operator must see it.
+        let blocked = state
+            .store
+            .read()
+            .unwrap()
+            .directory_metrics()
+            .blocked
+            .get()
+            != 0;
+        v["ready"] = json!(ready && !stopping && unplaceable.is_none() && !blocked);
+        if blocked {
+            v["directory_blocked"] = json!(true);
+        }
         if stopping {
             v["stopping"] = json!(true);
         } else if !ready {

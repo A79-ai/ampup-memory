@@ -1605,3 +1605,154 @@ async fn sign_in_discovery_never_names_the_caller_s_host() {
     };
     assert!(err.contains("MEMSTORE_PUBLIC_URL"), "{err}");
 }
+
+/// A server on `catalog` holding `secret_key`, as [`start`] makes one: the operator's admin key, people
+/// through `issuer`.
+async fn serve_keyed(
+    catalog: std::sync::Arc<dyn iceberg::Catalog>,
+    issuer: &str,
+    secret_key: Option<auth::secret::SecretKey>,
+) -> String {
+    let keys = json!([{"id": "platform", "sha256": sha(ADMIN_KEY), "user": "svc:platform", "admin": true}]);
+    let token_auth = TokenAuth::new(Some(&keys.to_string()), None)
+        .unwrap()
+        .allow_local_issuers()
+        .with_oidc(
+            OidcConfig::discover(issuer, vec![CLIENT_ID.into()])
+                .await
+                .unwrap(),
+        );
+    let port = free_port();
+    tokio::spawn(serve_with(
+        port,
+        Scope::Org,
+        vec![],
+        Options {
+            catalog: Some(catalog),
+            token_auth: Some(token_auth),
+            secret_key,
+            ..Default::default()
+        },
+    ));
+    let s = format!("http://127.0.0.1:{port}");
+    let up = Instant::now();
+    while reqwest::get(&s).await.is_err() {
+        assert!(
+            up.elapsed() < Duration::from_secs(30),
+            "server never came up"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    s
+}
+
+/// What the catalog holds is served only as far as the directory's log says. Someone who can write the
+/// catalog writes a snapshot that adds a key of their own and makes mallory acme's admin, with no change in
+/// the log: a server loading it checks it against the log (or, holding `MEMSTORE_SECRET_KEY`, against the
+/// seal a server put on it) and serves neither. A change of an op no engine here knows, written at a version
+/// it reads (a newer engine that forgot to bump the version), stops the fold as a newer version does: no
+/// key is served from a directory that change may have narrowed, and the server says it isn't ready.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_serves_the_directory_its_log_says_and_no_further() {
+    use memstore::people::directory::{Event, Snapshot};
+    let dir = tempfile::tempdir().unwrap();
+    let issuer = start_idp().await;
+    let catalog = platform::local(&format!("file://{}", dir.path().display()))
+        .await
+        .unwrap();
+    let store = Store::new(catalog.clone()).with_directory_key(None);
+    store.ensure_scope(&Scope::Org).await.unwrap();
+    let s = serve_keyed(catalog.clone(), &issuer, None).await;
+    let (status, body) = post(
+        &s,
+        "/admin",
+        ADMIN_KEY,
+        &json!({"op": "create_org", "org": "acme", "admin": "alice@acme.com"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let key = format!("msk_{}acmereader", uuid::Uuid::new_v4().simple());
+    let planted = format!("msk_{}planted", uuid::Uuid::new_v4().simple());
+    let (status, body) = post(
+        &s,
+        "/admin",
+        ADMIN_KEY,
+        &json!({"op": "create_key", "org": "acme", "name": "dash", "role": "reader", "key": key}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let mallory = id_token(&issuer, "mallory@evil.com");
+    // A snapshot of the directory as it is, with a key and an admin added that the log never had.
+    let forge = |real: &Snapshot| {
+        let mut state: Value = serde_json::from_str(&real.state).unwrap();
+        let acme = &mut state["orgs"]["acme"];
+        let mut k = acme["keys"]["dash"].clone();
+        k["sha256"] = json!(sha(&planted));
+        k["role"] = json!("writer");
+        acme["keys"]["planted"] = k;
+        acme["members"]["mallory@evil.com"] = acme["members"]["alice@acme.com"].clone();
+        let mut forged = real.clone();
+        forged.state = state.to_string();
+        forged.taken_at = chrono::Utc::now().timestamp_micros();
+        forged
+    };
+    let served = async |s: &str| {
+        let (key_status, _) = post(s, "/me", &planted, &json!({})).await;
+        let (admin_status, body) =
+            post(s, "/admin", &mallory, &json!({"op": "show", "org": "acme"})).await;
+        (key_status, admin_status, body)
+    };
+
+    // Unsealed (a server without the key wrote it, or anyone): checked against the log, and refused.
+    let real = Snapshot::of(&store.directory().await.unwrap(), "memstore", 0);
+    store
+        .append_directory_snapshot(&forge(&real))
+        .await
+        .unwrap();
+    let fresh = serve_keyed(catalog.clone(), &issuer, None).await;
+    let (key_status, admin_status, body) = served(&fresh).await;
+    assert_eq!(key_status, 401, "a key the log never made was served");
+    assert_eq!(admin_status, 403, "an admin the log never made: {body}");
+    let (status, _) = post(&fresh, "/me", &key, &json!({})).await;
+    assert_eq!(status, 200, "acme's own key");
+
+    // Sealed by a server holding the key, then changed: the seal no longer opens, so it is checked against
+    // the log too, and refused.
+    let secret = auth::secret::SecretKey::parse(&"ab".repeat(32)).unwrap();
+    let sealing = Store::new(catalog.clone()).with_directory_key(Some(secret.clone()));
+    let real = sealing.snapshot_directory("memstore").await.unwrap();
+    assert!(real.sealed(&secret));
+    store
+        .append_directory_snapshot(&forge(&real))
+        .await
+        .unwrap();
+    let keyed = serve_keyed(catalog.clone(), &issuer, Some(secret.clone())).await;
+    let (key_status, admin_status, body) = served(&keyed).await;
+    assert_eq!(key_status, 401, "a key the log never made was served");
+    assert_eq!(admin_status, 403, "an admin the log never made: {body}");
+    let (status, _) = post(&keyed, "/me", &key, &json!({})).await;
+    assert_eq!(status, 200, "acme's own key");
+
+    // A change of an op this engine doesn't know, at a version it reads: no key is served, on any server,
+    // and none of them is ready to take traffic.
+    store
+        .append_directory(&[Event::new("svc:platform", "key.someday", "acme").detail("dash")])
+        .await
+        .unwrap();
+    for server in [&s, &fresh, &keyed] {
+        let t = Instant::now();
+        while post(server, "/me", &key, &json!({})).await.0 != 401 {
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "{server} still serves acme's key past a change it can't read"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let alice = id_token(&issuer, "alice@acme.com");
+        assert_eq!(post(server, "/me", &alice, &json!({})).await.0, 401);
+        let ready = reqwest::get(format!("{server}/ready")).await.unwrap();
+        assert_eq!(ready.status().as_u16(), 503, "{server} says it is ready");
+        let ready: Value = ready.json().await.unwrap();
+        assert_eq!(ready["directory_blocked"], true, "{ready}");
+    }
+}

@@ -190,9 +190,13 @@ headers ([configuration.md](configuration.md)).
 
 - Keep the `memory_system` namespace writable by the servers and the operator alone: whoever can write it can
   write directory changes.
-- Directory changes carry a format version. A server that meets a newer one stops folding the directory, refuses
-  directory changes, logs `ALERT directory: …` and sets `memstore_directory_blocked` to 1. Upgrade readers before
-  writers: ship the code that reads a new change version before the code that writes it.
+- Directory changes carry a format version. A server that meets a newer one, or an op it doesn't know, stops
+  folding the directory: it signs no one in, refuses directory changes, answers `/ready` with 503, logs
+  `ALERT directory: …` and sets `memstore_directory_blocked` to 1. Upgrade readers before writers: ship the code
+  that reads a new change version before the code that writes it.
+- Directory snapshots are sealed with `MEMSTORE_SECRET_KEY`. A server starts from a snapshot without reading the
+  log before it only if its own key sealed it; any other snapshot is checked against the log, and one that doesn't
+  match is refused with an alert (`memstore_directory_snapshot_refused_total`).
 - `/metrics` labels come from fixed sets the server owns; no user, key, token or raw path is ever a label.
 - Known gaps: Entra's groups overage (a token over its group limit carries none) and Google ID tokens carry no
   groups, so those callers get none.

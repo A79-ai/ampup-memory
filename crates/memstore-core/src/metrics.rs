@@ -22,13 +22,16 @@ pub struct DirMetrics {
     pub refresh_seconds: Histogram,
     /// Directory commits that lost a compare-and-set to another server and were re-planned.
     pub commit_retries: IntCounter,
-    /// 1 while the directory log holds a change newer than this engine reads (the fold stops before
-    /// it); 0 otherwise.
+    /// 1 while the directory log holds a change this engine can't read, of a newer version or an op it
+    /// doesn't know (the fold stops before it, and no one is signed in); 0 otherwise.
     pub blocked: IntGauge,
     /// The version of that change (0: none).
     pub blocked_version: IntGauge,
-    /// Loads that met a change newer than this engine reads.
+    /// Loads that met a change this engine can't read.
     pub unsupported_events: IntCounter,
+    /// First loads whose newest snapshot was not what the log folds to (so not loaded: the log was
+    /// replayed). Someone who can write the catalog wrote it, or a bug did.
+    pub snapshot_refused: IntCounter,
 }
 
 impl Default for DirMetrics {
@@ -49,7 +52,7 @@ impl Default for DirMetrics {
             .unwrap(),
             blocked: IntGauge::new(
                 "memstore_directory_blocked",
-                "1 while the directory log holds a change newer than this server reads: it serves the directory as of the change before and refuses directory writes",
+                "1 while the directory log holds a change this server can't read (a newer version, or an op it doesn't know): it signs no one in and refuses directory writes",
             )
             .unwrap(),
             blocked_version: IntGauge::new(
@@ -59,7 +62,12 @@ impl Default for DirMetrics {
             .unwrap(),
             unsupported_events: IntCounter::new(
                 "memstore_directory_unsupported_events_total",
-                "Directory loads that met a change newer than this server reads",
+                "Directory loads that met a change this server can't read",
+            )
+            .unwrap(),
+            snapshot_refused: IntCounter::new(
+                "memstore_directory_snapshot_refused_total",
+                "First directory loads whose snapshot was not what the log folds to: it was ignored and the log replayed",
             )
             .unwrap(),
         }
@@ -74,8 +82,8 @@ impl DirMetrics {
                 self.unsupported_events.inc();
                 if self.blocked.get() == 0 || self.blocked_version.get() != version {
                     eprintln!(
-                        "ALERT directory: a change of version {version} at {at} is newer than this server reads ({}): serving the directory as of the change before it and refusing directory writes until this server is upgraded",
-                        crate::people::directory::EVENT_VERSION
+                        "ALERT directory: the log has {} at {at}: this server signs no one in, refuses directory writes and reports not ready until it is upgraded",
+                        crate::people::directory::blocked_why(version)
                     );
                 }
                 self.blocked.set(1);
@@ -192,6 +200,7 @@ impl Metrics {
         self.register(Box::new(d.blocked.clone()));
         self.register(Box::new(d.blocked_version.clone()));
         self.register(Box::new(d.unsupported_events.clone()));
+        self.register(Box::new(d.snapshot_refused.clone()));
     }
 
     /// The Prometheus text format.

@@ -1202,28 +1202,28 @@ pub async fn collect(
     let wants = |k: Kind| kind.is_none_or(|w| w == k);
     let mut out = vec![];
     let mut warnings = vec![];
-    let changes = store.directory_events().await?;
     // A name taken again is another org, another incarnation: the time the log stamped on its latest
-    // `org.create` (0: the default org), as the directory fold has it ([`Org::created_at`]). The log's
-    // times only grow, so its changes before that are the deleted org's. Audit rows carry the
-    // incarnation they were recorded for, whenever and by whichever server they were written (a lagging
-    // replica's rows for the deleted org, written after its purge, are not this org's).
+    // `org.create` (0: the default org), as the directory fold has it ([`Org::created_at`]): the same fold
+    // that stamped the audit rows when they were recorded. Audit rows carry the incarnation they were
+    // recorded for, whenever and by whichever server they were written (a lagging replica's rows for the
+    // deleted org, written after its purge, are not this org's).
     //
     // [`Org::created_at`]: crate::people::directory::Org::created_at
-    let incarnation = changes
-        .iter()
-        .filter(|e| e.org == org && e.op == "org.create")
-        .map(|e| e.at)
-        .max()
-        .unwrap_or(0);
+    let folded = store.directory().await?;
+    let Some(incarnation) = folded.dir.orgs.get(org).map(|o| o.created_at) else {
+        // Deleted (its audit rows went with it), or never made: no incarnation's rows are its.
+        warnings.push(format!("the directory has no org {org}"));
+        return Ok((out, warnings));
+    };
     let ours = |e: &Entry| match e.incarnation {
         Some(i) => i == incarnation,
         // Written before rows carried one: only after this org's creation (a key row's whole hour).
         None => e.at >= incarnation,
     };
     if wants(Kind::Change) {
-        for e in changes {
-            if e.org != org || e.at < since.max(incarnation) {
+        // Only this incarnation's changes, read from the log's files since then.
+        for e in store.directory_events_since(since.max(incarnation)).await? {
+            if e.org != org {
                 continue;
             }
             // What changed, in words: never the event's raw detail, which holds a key's hash or a
