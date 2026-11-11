@@ -1,5 +1,6 @@
-//! Owner review operations use the signed-in person and the ordinary scope resolver. In particular,
-//! an org admin cannot review as an owner, or read a team they do not belong to.
+//! Owner review operations use the signed-in person and the ordinary scope resolver. An org admin may decide any
+//! proposal in their org for its owners (the decision names them as an admin), but still reads no team they do not
+//! belong to, and no proposal whose evidence they may not read.
 
 use super::*;
 
@@ -21,7 +22,11 @@ pub(super) async fn handle(
         req["team"].as_str().filter(|t| !t.is_empty()),
     )?;
     let reader = as_member(who, org);
+    let admin = dir.is_admin(who.user(), via, org);
     let result = match field("op") {
+        "add_fact" | "check_conflicts" | "list_conflicts" | "resolve_conflict" => {
+            Ok(super::conflict_ops::handle(store, &reader, admin, &scope, req).await?)
+        }
         "set_entity_owner" => serde_json::to_value(
             store
                 .set_entity_owner(
@@ -76,6 +81,7 @@ pub(super) async fn handle(
                         &reader,
                         approve,
                         req["note"].as_str(),
+                        admin,
                     )
                     .await?,
             )

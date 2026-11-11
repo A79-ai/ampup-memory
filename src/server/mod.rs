@@ -30,6 +30,7 @@ mod agent_run;
 mod cards;
 pub mod cell;
 pub mod compaction;
+mod conflict_ops;
 mod episode_page;
 mod file_keys;
 mod governance;
@@ -7761,6 +7762,10 @@ async fn directory_change(
                 | "get_proposal"
                 | "review_proposal"
                 | "entity_graph"
+                | "add_fact"
+                | "check_conflicts"
+                | "list_conflicts"
+                | "resolve_conflict"
         )
     ) {
         // A malformed request stays one (400); anything else is refused (403) with its reason.

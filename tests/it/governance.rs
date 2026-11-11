@@ -202,7 +202,8 @@ async fn only_the_owner_publishes_the_reviewed_revision() {
         e.proposed("refund-update").await["proposal"]["id"],
         p["proposal"]["id"]
     );
-    for token in [&e.alice, &e.carol, &e.foreign] {
+    // Neither a member who isn't its owner nor another org's admin decides it (an admin of its org may: below).
+    for token in [&e.carol, &e.foreign] {
         let (status, body) = e.decide(token, &p, "approve").await;
         assert_eq!(status, 403, "{body}");
     }
@@ -878,4 +879,119 @@ async fn retiring_a_version_waits_only_for_the_owners_of_the_facts_it_supports()
         "{answer}"
     );
     e.reads(&fact.fact_id, "no such fact").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_org_admin_decides_for_owners_and_owners_settle_conflicts() {
+    let e = Env::start().await;
+    let entity = "policy:refund-window";
+    let (_, old) = e.seed(entity, "thirty").await;
+    e.ok(
+        &e.alice,
+        json!({"op":"set_entity_owner","entity":entity,"owner":"bob@acme.com"}),
+    )
+    .await;
+    // An org admin approves what waits for its owner: it publishes, and the decision names them as an admin.
+    let (_, drafted) = e.draft("admin-approves", entity, "fourteen").await;
+    let p = e.proposed("admin-approves").await;
+    for token in [&e.carol, &e.foreign] {
+        assert_eq!(e.decide(token, &p, "approve").await.0, 403);
+    }
+    let (status, body) = e.decide(&e.alice, &p, "approve").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["status"], "published", "{body}");
+    assert_eq!(body["result"]["decisions"][0]["user"], "alice@acme.com");
+    assert_eq!(body["result"]["decisions"][0]["admin"], true);
+    e.reads(&drafted.fact_id, &old.fact_id).await;
+
+    // Only an admin adds a fact or checks for conflicts; a fact they add on an owned thing publishes at once.
+    let add = json!({"op":"add_fact","entity":entity,"predicate":"refund_days","value":"sixty","source":"finance-sheet"});
+    for token in [&e.bob, &e.carol, &e.foreign] {
+        assert_eq!(e.call(token, add.clone()).await.0, 403);
+        assert_eq!(e.call(token, json!({"op":"check_conflicts"})).await.0, 403);
+    }
+    let added = e.ok(&e.alice, add).await;
+    assert_eq!(added["review"]["status"], "published", "{added}");
+    let sixty = added["fact_id"].as_str().unwrap().to_string();
+    e.reads(&sixty, "\"no such fact\"").await;
+    // Three open values of one attribute from three sources: each pair is recorded.
+    let checked = e.ok(&e.alice, json!({"op":"check_conflicts"})).await;
+    assert_eq!(checked["recorded"], 3, "{checked}");
+    assert_eq!(
+        checked["conflicts"][2]["facts"],
+        json!([drafted.fact_id, sixty])
+    );
+    // Checked again, nothing new is recorded.
+    assert_eq!(
+        e.ok(&e.alice, json!({"op":"check_conflicts"})).await["recorded"],
+        0
+    );
+
+    // A member sees the conflict but may not settle it; its owner may, and nobody of another org sees it.
+    let listed = e.ok(&e.carol, json!({"op":"list_conflicts"})).await;
+    assert_eq!(listed["conflicts"].as_array().unwrap().len(), 3, "{listed}");
+    let c = listed["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| {
+            c["facts"][1]["fact_id"] == sixty.as_str() && c["facts"][0]["value"] == "fourteen"
+        })
+        .unwrap();
+    assert_eq!(c["entity"], entity, "{listed}");
+    assert_eq!(c["owner"], "bob@acme.com");
+    assert_eq!(c["can_resolve"], false);
+    let mine = e
+        .ok(&e.bob, json!({"op":"list_conflicts","mine":true}))
+        .await;
+    assert_eq!(mine["conflicts"][0]["can_resolve"], true, "{mine}");
+    assert_eq!(
+        e.call(&e.foreign, json!({"op":"list_conflicts"})).await.0,
+        403
+    );
+    let settle =
+        json!({"op":"resolve_conflict","facts":[drafted.fact_id, sixty],"value":"forty-five"});
+    for token in [&e.carol, &e.foreign] {
+        assert_eq!(e.call(token, settle.clone()).await.0, 403);
+    }
+    let settled = e.ok(&e.bob, settle).await;
+    assert_eq!(settled["status"], "published", "{settled}");
+    let added = settled["added"].as_str().unwrap().to_string();
+    // The attribute is settled: both sides end, and so does the older value still open beside them.
+    assert_eq!(
+        settled["ended"],
+        json!([drafted.fact_id, sixty, old.fact_id])
+    );
+    e.reads(&added, &sixty).await;
+    e.reads(&added, &drafted.fact_id).await;
+    assert_eq!(
+        e.ok(&e.carol, json!({"op":"list_conflicts"})).await["conflicts"],
+        json!([])
+    );
+
+    // An admin settles one by keeping a side: the other ends.
+    let late = e
+        .ok(
+            &e.alice,
+            json!({"op":"add_fact","entity":entity,"predicate":"refund_days","value":"ninety"}),
+        )
+        .await["fact_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        e.ok(&e.alice, json!({"op":"check_conflicts"})).await["recorded"],
+        1
+    );
+    let kept = e
+        .ok(
+            &e.alice,
+            json!({"op":"resolve_conflict","facts":[added, late],"keep":added}),
+        )
+        .await;
+    assert_eq!(kept["status"], "published", "{kept}");
+    // What it keeps is older than what ends: it is stated again, so reads serve it, and its first statement ends.
+    assert_eq!(kept["ended"], json!([late, added]));
+    let again = kept["added"].as_str().unwrap();
+    e.reads(again, &late).await;
 }

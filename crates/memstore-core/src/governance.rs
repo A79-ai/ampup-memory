@@ -106,6 +106,9 @@ pub struct Decision {
     /// Why, for a rejection: the proposer reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Decided by an org admin who isn't one of its required owners: it decides for all of them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admin: bool,
 }
 
 /// An episode a proposal rests on, as the reader may know it. A proposal is shown only to someone
@@ -207,6 +210,10 @@ enum Event {
         approve: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        /// `user` decided as an org admin, not as a required owner ([`Store::review_proposal`]): the server checked
+        /// they administer the org before recording it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        admin: bool,
     },
     /// A decisions model's decision, in an org that has them decide ([`Store::auto_review`]): it stands in for the
     /// owners until one of them decides. `confidence` is how sure the model was of its decision.
@@ -224,6 +231,8 @@ struct State {
     owners: BTreeMap<String, Owner>,
     proposals: BTreeMap<String, Proposal>,
     approvals: BTreeMap<String, BTreeSet<String>>,
+    /// The proposals an org admin approved: approved for every required owner.
+    admin_approved: BTreeSet<String>,
     rejected: BTreeSet<String>,
     /// A decisions model's decision on each proposal ([`Event::AutoDecision`]): whether it approved.
     auto: BTreeMap<String, bool>,
@@ -286,6 +295,7 @@ impl State {
                 .approvals
                 .get(&p.id)
                 .is_some_and(|a| p.required_owners.is_subset(a))
+                || self.admin_approved.contains(&p.id)
                 || self.auto.get(&p.id) == Some(&true))
     }
 
@@ -589,13 +599,14 @@ impl Store {
                     user,
                     approve,
                     note,
+                    admin,
                 } => {
                     // A decision on a proposal no longer stored (its evidence was erased) or that doesn't fit
                     // its proposal grants nothing and is left out.
                     let Some(p) = state.proposals.get(&proposal) else {
                         continue;
                     };
-                    if p.digest == digest && p.required_owners.contains(&user) {
+                    if p.digest == digest && (admin || p.required_owners.contains(&user)) {
                         state.updated.insert(proposal.clone(), row.recorded_at);
                         state
                             .decisions
@@ -606,8 +617,12 @@ impl Store {
                                 approve,
                                 at: row.recorded_at,
                                 note,
+                                admin,
                             });
                         if approve {
+                            if admin {
+                                state.admin_approved.insert(proposal.clone());
+                            }
                             state.approvals.entry(proposal).or_default().insert(user);
                         } else {
                             state.rejected.insert(proposal);
@@ -647,6 +662,7 @@ impl Store {
                                 "decided by {model}, {:.0}% sure",
                                 confidence * 100.0
                             )),
+                            admin: false,
                         });
                     state.auto.insert(proposal, approve);
                 }
@@ -2135,6 +2151,9 @@ impl Store {
 
     /// Store the authenticated owner's decision. Publishing is a separate idempotent merge, so a lost
     /// HTTP response or a restart after approval can safely retry it through the ordinary merge gate.
+    /// `admin`: the caller administers the scope's org (the server checked it). An admin who isn't a required
+    /// owner decides for all of them: their approval publishes, their rejection rejects. The decision names them.
+    #[allow(clippy::too_many_arguments)]
     pub async fn review_proposal(
         &self,
         scope: &Scope,
@@ -2143,6 +2162,7 @@ impl Store {
         who: &Principal,
         approve: bool,
         note: Option<&str>,
+        admin: bool,
     ) -> Result<Review> {
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
@@ -2151,10 +2171,12 @@ impl Store {
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("no such proposal"))?;
         let user = auth::norm_id(who.user());
+        let owner = p.required_owners.contains(&user);
         anyhow::ensure!(
-            p.required_owners.contains(&user),
-            "only a required owner may review this proposal"
+            owner || admin,
+            "only a required owner or an org admin may review this proposal"
         );
+        let admin = admin && !owner;
         anyhow::ensure!(
             note.is_none_or(|n| n.len() <= 2000),
             "note is too long (2000 bytes at most)"
@@ -2181,6 +2203,7 @@ impl Store {
                     note: note
                         .filter(|n| !n.trim().is_empty())
                         .map(|n| n.trim().to_string()),
+                    admin,
                 },
                 sorted(ledger.heads(MAIN)),
             )
@@ -2192,6 +2215,78 @@ impl Store {
                 .await?;
         }
         self.proposal(scope, id, who).await
+    }
+
+    /// Commits `episodes`, `facts` and `closures` on main as `who`, in one commit. Where that changes what an owner
+    /// holds (main refuses it, [`OwnerApprovalRequired`]), they are committed on `branch` instead (made if it
+    /// isn't there; a retry finds it), proposed by `who` and decided by them at once when they may: a required
+    /// owner's approval, or an org admin's (`admin`, checked by the caller), which publishes as soon as it is
+    /// enough. Otherwise the proposal waits for its owners. Answers the review where it went through one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_reviewed(
+        &self,
+        scope: &Scope,
+        who: &Principal,
+        admin: bool,
+        branch: &str,
+        episodes: &[Episode],
+        facts: &[Fact],
+        closures: &[Closure],
+    ) -> Result<Option<Review>> {
+        episode_types::check_stored(episodes)?;
+        not_held(branch)?;
+        anyhow::ensure!(
+            branch != MAIN,
+            "a reviewed change needs a branch of its own"
+        );
+        match self
+            .commit_full(
+                scope,
+                MAIN,
+                who.user(),
+                episodes,
+                facts,
+                &[],
+                closures,
+                None,
+            )
+            .await
+        {
+            Ok(_) => return Ok(None),
+            Err(e) if OwnerApprovalRequired::caused(&e) => {}
+            Err(e) => return Err(e),
+        }
+        // The approval below covers the whole branch, so it must hold only this change: never reuse one.
+        let ledger = self.governance_ledger(scope).await?;
+        anyhow::ensure!(
+            ledger.base(branch).is_none(),
+            "branch {branch} already exists; a reviewed change needs a new branch"
+        );
+        self.make_branch(scope, branch, who.user()).await?;
+        self.commit_full(
+            scope,
+            branch,
+            who.user(),
+            episodes,
+            facts,
+            &[],
+            closures,
+            None,
+        )
+        .await?;
+        let review = self
+            .propose_as(scope, branch, who, true, None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("proposal made without a review"))?;
+        let me = auth::norm_id(who.user());
+        if review.status == "published" || !(admin || review.proposal.required_owners.contains(&me))
+        {
+            return Ok(Some(review));
+        }
+        let (id, digest) = (review.proposal.id.clone(), review.proposal.digest.clone());
+        Ok(Some(
+            Box::pin(self.review_proposal(scope, &id, &digest, who, true, None, admin)).await?,
+        ))
     }
 
     /// Publishes what the decisions model approved but didn't reach main (its merge failed after the decision was
