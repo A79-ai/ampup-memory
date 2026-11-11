@@ -674,6 +674,8 @@ pub struct TokenAuth {
     /// Orgs' providers may be on this machine, over http too (a provider running locally, in tests).
     /// Never on the private network, link-local (the cloud's metadata service) and the like.
     local_issuers: bool,
+    /// How the keys file reads ([`Self::reload_keys_file`]), for the server's `/metrics`: this one's alone.
+    keys_file_metrics: crate::metrics::KeysFileMetrics,
 }
 
 pub use memstore_client::KEY_PREFIX;
@@ -692,6 +694,7 @@ impl TokenAuth {
             auth0: None,
             org_issuers: Default::default(),
             local_issuers: false,
+            keys_file_metrics: Default::default(),
         })
     }
 
@@ -720,6 +723,12 @@ impl TokenAuth {
         self
     }
 
+    /// Its keys file's metrics (`memstore_keys_file_failing`, `memstore_keys_file_reloads_total`), for the server
+    /// reading it to serve: at 0 while it has none.
+    pub fn keys_file_metrics(&self) -> &crate::metrics::KeysFileMetrics {
+        &self.keys_file_metrics
+    }
+
     /// The keys file and how often it is looked at, if the keys came from one.
     pub fn keys_file(&self) -> Option<(&std::path::Path, std::time::Duration)> {
         self.keys_file.as_ref().map(|f| (f.path.as_path(), f.every))
@@ -743,7 +752,7 @@ impl TokenAuth {
             });
         let mut seen = f.seen.lock().unwrap();
         let failed = |seen: &mut ([u8; 32], Option<String>), e: anyhow::Error| {
-            crate::metrics::KEYS_FILE_FAILING.set(1);
+            self.keys_file_metrics.failing.set(1);
             let said = format!("{e:#}");
             let again = seen.1.as_deref() == Some(said.as_str());
             seen.1 = Some(said);
@@ -772,8 +781,8 @@ impl TokenAuth {
         let counts = (keys.len(), keys.iter().filter(|k| k.admin).count());
         *self.keys.write().unwrap() = Arc::new(keys);
         *seen = (digest, None);
-        crate::metrics::KEYS_FILE_FAILING.set(0);
-        crate::metrics::KEYS_FILE_RELOADS.inc();
+        self.keys_file_metrics.failing.set(0);
+        self.keys_file_metrics.reloads.inc();
         Ok(Some(counts))
     }
 

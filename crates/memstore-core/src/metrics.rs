@@ -275,24 +275,42 @@ pub static EXPIRED_KEY_REFUSALS: std::sync::LazyLock<IntCounter> = std::sync::La
     .unwrap()
 });
 
-/// 1 while the keys file (`AMPUP_MEMORY_API_KEYS`) as it is now can't be read or doesn't parse: the server keeps
-/// the keys it last read, so a key removed from the file since still works here. 0 once the file reads again.
-pub static KEYS_FILE_FAILING: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
-    IntGauge::new(
-        "memstore_keys_file_failing",
-        "1 while the keys file can't be read or parsed (the keys last read are kept)",
-    )
-    .unwrap()
-});
+/// A server's keys file metrics (`AMPUP_MEMORY_API_KEYS`), its own: kept with the keys it read
+/// (`TokenAuth::keys_file_metrics`), so each server says how its own file reads, whatever other servers share its
+/// process.
+#[derive(Clone)]
+pub struct KeysFileMetrics {
+    /// 1 while the keys file as it is now can't be read or doesn't parse: the server keeps the keys it last read,
+    /// so a key removed from the file since still works here. 0 once the file reads again.
+    pub failing: IntGauge,
+    /// Times the keys file was read again because it changed, and its new keys took effect.
+    pub reloads: IntCounter,
+}
 
-/// Times the keys file was read again because it changed, and its new keys took effect.
-pub static KEYS_FILE_RELOADS: std::sync::LazyLock<IntCounter> = std::sync::LazyLock::new(|| {
-    IntCounter::new(
-        "memstore_keys_file_reloads_total",
-        "Times a changed keys file was read and its keys took effect",
-    )
-    .unwrap()
-});
+impl Default for KeysFileMetrics {
+    fn default() -> Self {
+        KeysFileMetrics {
+            failing: IntGauge::new(
+                "memstore_keys_file_failing",
+                "1 while the keys file can't be read or parsed (the keys last read are kept)",
+            )
+            .unwrap(),
+            reloads: IntCounter::new(
+                "memstore_keys_file_reloads_total",
+                "Times a changed keys file was read and its keys took effect",
+            )
+            .unwrap(),
+        }
+    }
+}
+
+impl Metrics {
+    /// Register a server's keys file metrics.
+    pub fn register_keys_file(&self, k: &KeysFileMetrics) {
+        self.register(Box::new(k.failing.clone()));
+        self.register(Box::new(k.reloads.clone()));
+    }
+}
 
 /// 1 while this server holds the writer lease (does the background writing: extraction, summarising, index
 /// updates), else 0; 1 too with `AMPUP_MEMORY_WRITER_LEASE=off`. Summed over a catalog's servers it is 1: 0 for

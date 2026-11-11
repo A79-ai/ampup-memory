@@ -135,11 +135,16 @@ pub fn from_env() -> bool {
 }
 
 /// Whether reads in `scope` mark freshness: its team's `freshness` setting, else its org's, else [`ENV`]. Off
-/// unless one of them turns it on, until an A/B shows it helps.
+/// unless one of them turns it on, until an A/B shows it helps. A directory that can't be read now answers as this
+/// server last read it, and off before it ever has: never [`ENV`] alone, which a scope's own setting may
+/// contradict, so an error can't turn the setting over for one read.
 pub async fn on(store: &crate::Store, scope: &crate::Scope) -> bool {
     match store.directory().await {
         Ok(d) => d.dir.marks_freshness(scope),
-        Err(_) => from_env(),
+        Err(_) => store
+            .directory_held()
+            .await
+            .is_some_and(|d| d.dir.marks_freshness(scope)),
     }
 }
 

@@ -514,8 +514,16 @@ pub async fn serve_with(
     metrics.register(Box::new(crate::extract::cache::CALLS.clone()));
     metrics.register(Box::new(crate::metrics::STORE_COMMIT_FAILURES.clone()));
     metrics.register(Box::new(crate::metrics::EXPIRED_KEY_REFUSALS.clone()));
-    metrics.register(Box::new(crate::metrics::KEYS_FILE_FAILING.clone()));
-    metrics.register(Box::new(crate::metrics::KEYS_FILE_RELOADS.clone()));
+    // This server's own keys file, whichever other servers share the process (tests run many in one).
+    metrics.register_keys_file(
+        &sources
+            .iter()
+            .find_map(|i| match i {
+                Identity::Token(a) => Some(a.keys_file_metrics().clone()),
+                _ => None,
+            })
+            .unwrap_or_default(),
+    );
     metrics.register(Box::new(routing::SLOW_ROUTES.clone()));
     metrics.register(Box::new(crate::metrics::EXTRACTION_BACKLOG.clone()));
     metrics.register(Box::new(crate::metrics::CACHE_BYTES.clone()));
@@ -12034,7 +12042,7 @@ async fn open_session(
         {
             Err(e) if e.downcast_ref::<ToolError>().is_some() => None,
             Err(e) => {
-                crate::sessions::abandon(session.scope(), &l);
+                crate::sessions::abandon(store, session.scope(), &l);
                 return Err(e);
             }
             Ok(found) => found,

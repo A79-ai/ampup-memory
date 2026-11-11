@@ -64,9 +64,11 @@ pub const MAX_PENDING: usize = 10_000;
 /// Buffered `read` rows a server holds at most, apart from [`MAX_PENDING`] so a burst of reads can't push
 /// out sign-ins and refusals.
 pub const MAX_READS: usize = 10_000;
-/// Distinct callers one org's identity provider has refusals of in the buffer, each a row of their own; past
-/// them, its callers' refusals are counted together in one row under the provider ([`Recorder::refusal_via`]).
-/// The provider can mint any name, so its names alone can't take the refusals' half from everyone else's.
+/// Rows of their own one org's identity provider's refused callers get in an hour on a server, whatever the
+/// writes in between; past them, its callers' refusals are counted together in one row under the provider
+/// ([`Recorder::refusal_via`]). The provider can mint any name, so its names alone can't take the refusals' half
+/// of the buffer from everyone else's, nor fill the audit a buffer at a time (one written every minute, or every
+/// [`FORCED_GAP`] while someone reads the audit).
 pub const MAX_REFUSED_PER_PROVIDER: usize = 100;
 /// Episode ids one `read` row names at most; its item count says how many there were.
 pub const MAX_READ_IDS: usize = 100;
@@ -578,8 +580,9 @@ type KeyUseKey = (
 #[derive(Default)]
 struct Pending {
     refusals: HashMap<RefusalKey, (i64, i64)>,
-    /// Refusal rows of their own each provider's callers hold ([`MAX_REFUSED_PER_PROVIDER`]).
-    vouched: HashMap<String, usize>,
+    /// Per provider: when its callers' first refusal row of their own in this hour was made, and how many they
+    /// have had since ([`MAX_REFUSED_PER_PROVIDER`]). Kept across writes: a write empties the buffer, not the count.
+    vouched: HashMap<String, (i64, usize)>,
     signins: Vec<Entry>,
     /// (user, org) first seen in `seen_hour`.
     seen: std::collections::HashSet<(String, Option<(String, i64)>)>,
@@ -675,8 +678,8 @@ impl Recorder {
     }
 
     /// [`Recorder::refusal`] of a caller `provider` vouched for (an org's own identity provider, as
-    /// `idp:<org>`): once that provider's callers hold [`MAX_REFUSED_PER_PROVIDER`] rows, the refusals of
-    /// any other caller of it are counted in one row whose caller is `provider`.
+    /// `idp:<org>`): once that provider's callers have had [`MAX_REFUSED_PER_PROVIDER`] rows in an hour, across
+    /// writes, the refusals of any other caller of it are counted in one row whose caller is `provider`.
     pub fn refusal_via(
         &self,
         org: OrgOf,
@@ -694,10 +697,11 @@ impl Recorder {
             return;
         }
         let provider = provider.filter(|_| actor != "-").map(clean);
+        let now = now_us();
         let full = provider.as_ref().is_some_and(|v| {
             p.vouched
                 .get(v)
-                .is_some_and(|n| *n >= MAX_REFUSED_PER_PROVIDER)
+                .is_some_and(|(since, n)| now - since < HOUR_US && *n >= MAX_REFUSED_PER_PROVIDER)
         });
         let (key, own) = match provider {
             Some(v) if full => ((key.0, v, route, status as i64, why), None),
@@ -706,9 +710,13 @@ impl Recorder {
         if let Some((_, n)) = p.refusals.get_mut(&key) {
             *n += 1;
         } else if p.room(true) {
-            p.refusals.insert(key, (now_us(), 1));
+            p.refusals.insert(key, (now, 1));
             if let Some(v) = own {
-                *p.vouched.entry(v).or_default() += 1;
+                let (since, n) = p.vouched.entry(v).or_insert((now, 0));
+                if now - *since >= HOUR_US {
+                    (*since, *n) = (now, 0);
+                }
+                *n += 1;
             }
         }
     }
@@ -864,7 +872,9 @@ impl Recorder {
         p.support.clear();
         p.reads.clear();
         p.refusals.clear();
-        p.vouched.clear();
+        // Each provider's count outlives the write, until its hour is up.
+        let now = now_us();
+        p.vouched.retain(|_, (since, _)| now - *since < HOUR_US);
         p.keys.clear();
         (rows, retried, std::mem::take(&mut p.dropped))
     }

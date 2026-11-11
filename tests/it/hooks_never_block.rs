@@ -137,7 +137,16 @@ fn flaky_memory(
     port
 }
 
-/// Runs hook `event` with `input`, as the harness would: its output and how long it took.
+/// A person's home for one test, under cargo's temp directory for these tests rather than the system's. A session's
+/// start runs git where its session is, and on a machine whose system temp directory other processes fill and empty
+/// by the thousand every lookup there can wait: git there took 0.2 s to 1.9 s a call against 3 ms here, which put a
+/// hook that waits on nothing over its limit. That is the machine's time, not the hook's.
+fn temp_home() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
+}
+
+/// Runs hook `event` with `input`, as the harness would: its output and how long it took from when it was started.
+/// Starting a process isn't the hook's time: under load, a spawn here took 1.7 s to return before the hook ran.
 fn hook(port: u16, home: &Path, event: &str, input: Value) -> (String, Duration) {
     hook_in(port, home, event, input, None)
 }
@@ -151,13 +160,14 @@ fn hook_in(
     org: Option<&str>,
 ) -> (String, Duration) {
     warm_up();
-    let started = Instant::now();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ampup-memory"));
     cmd.args(["hook", event])
         .env("AMPUP_MEMORY_URL", format!("http://127.0.0.1:{port}"))
         .env("AMPUP_MEMORY_TOKEN", "test")
         .env("AMPUP_MEMORY_CONFIG_DIR", home.join("config"))
         .env("TMPDIR", home.join("tmp"))
+        // Git finds no repository above the person's home: the one these tests are built in is not theirs.
+        .env("GIT_CEILING_DIRECTORIES", home.parent().unwrap())
         .env_remove("AMPUP_MEMORY_HOOK_DETACHED")
         .env_remove("MEMSTORE_HOOK_DETACHED")
         .env_remove("AMPUP_MEMORY_ORG")
@@ -174,6 +184,7 @@ fn hook_in(
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    let started = Instant::now();
     child
         .stdin
         .take()
@@ -229,7 +240,7 @@ fn inbox_has_mail(home: &Path, session: &str) -> bool {
 
 #[test]
 fn a_slow_memory_holds_up_no_hook() {
-    let home = tempfile::tempdir().unwrap();
+    let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let port = fake_memory(Duration::from_secs(10));
     let sid = "slow-1";
@@ -279,7 +290,7 @@ fn a_slow_memory_holds_up_no_hook() {
 
 #[test]
 fn what_a_copy_finds_reaches_the_next_hook() {
-    let home = tempfile::tempdir().unwrap();
+    let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let port = fake_memory(Duration::from_millis(300));
     let sid = "fast-1";
@@ -350,7 +361,7 @@ fn input(sid: &str, cwd: &Path, extra: Value) -> Value {
 
 #[test]
 fn a_prompt_hands_on_the_open_session_at_once() {
-    let home = tempfile::tempdir().unwrap();
+    let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let port = fake_memory(Duration::from_millis(10));
     let (sid, cwd) = ("open-1", home.path());
@@ -391,7 +402,7 @@ fn a_prompt_hands_on_the_open_session_at_once() {
 
 #[test]
 fn a_session_the_memory_ended_is_dropped_and_reopened() {
-    let home = tempfile::tempdir().unwrap();
+    let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let port = fake_memory(Duration::from_millis(10));
     let (sid, cwd) = ("dead-1", home.path());
@@ -418,7 +429,7 @@ fn a_session_the_memory_ended_is_dropped_and_reopened() {
 
 #[test]
 fn a_long_last_answer_ends_within_the_servers_outcome_cap() {
-    let home = tempfile::tempdir().unwrap();
+    let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let port = fake_memory(Duration::from_millis(10));
     let (sid, cwd) = ("long-1", home.path());
@@ -448,7 +459,7 @@ fn a_long_last_answer_ends_within_the_servers_outcome_cap() {
 fn an_end_the_memory_couldnt_take_is_sent_again_where_it_was_going() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    let home = tempfile::tempdir().unwrap();
+    let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let down = Arc::new(AtomicBool::new(true));
     let seen = Arc::new(std::sync::Mutex::new(vec![]));
@@ -520,7 +531,7 @@ fn an_end_the_memory_couldnt_take_is_sent_again_where_it_was_going() {
 fn a_run_that_kept_no_transcript_ends_its_session_discarded() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    let home = tempfile::tempdir().unwrap();
+    let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let seen = Arc::new(std::sync::Mutex::new(vec![]));
     let port = flaky_memory(Arc::new(AtomicBool::new(false)), seen.clone());
@@ -553,7 +564,7 @@ fn a_run_that_kept_no_transcript_ends_its_session_discarded() {
 fn a_prompt_the_memory_couldnt_answer_is_asked_again() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    let home = tempfile::tempdir().unwrap();
+    let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let down = Arc::new(AtomicBool::new(true));
     let seen = Arc::new(std::sync::Mutex::new(vec![]));
@@ -595,7 +606,7 @@ fn a_prompt_the_memory_couldnt_answer_is_asked_again() {
 fn a_session_is_remembered_whole_with_what_it_wrote() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    let home = tempfile::tempdir().unwrap();
+    let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let seen = Arc::new(std::sync::Mutex::new(vec![]));
     let port = flaky_memory(Arc::new(AtomicBool::new(false)), seen.clone());
@@ -642,7 +653,7 @@ fn a_session_is_remembered_whole_with_what_it_wrote() {
 
 #[test]
 fn the_inbox_hands_on_what_the_context_takes() {
-    let home = tempfile::tempdir().unwrap();
+    let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let port = fake_memory(Duration::from_millis(10));
     let (sid, cwd) = ("full-1", home.path());
@@ -672,7 +683,7 @@ fn the_inbox_hands_on_what_the_context_takes() {
 
 #[test]
 fn a_session_start_hands_on_the_repos_last_recall() {
-    let home = tempfile::tempdir().unwrap();
+    let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let repo = home.path().join("demo-repo");
     std::fs::create_dir_all(&repo).unwrap();

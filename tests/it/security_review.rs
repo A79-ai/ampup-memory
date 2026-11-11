@@ -319,9 +319,19 @@ async fn within<F: std::future::Future<Output = bool>>(mut check: impl FnMut() -
     false
 }
 
+/// One client for every request. Building one loads the system's root certificates, which on a loaded machine took
+/// 1 s to 7 s: a test timing a request timed that, and a check polled [`within`] its 10 s got a poll or two. It keeps
+/// no connection between requests, as a client per request didn't.
+static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap()
+});
+
 /// A POST with `bearer`: the HTTP status and the JSON answer.
 async fn post(server: &str, path: &str, bearer: &str, body: &Value) -> (u16, Value) {
-    let r = reqwest::Client::new()
+    let r = CLIENT
         .post(format!("{server}{path}"))
         .bearer_auth(bearer)
         .body(body.to_string())
@@ -530,7 +540,7 @@ async fn an_org_s_schema_is_read_by_its_members_and_set_by_its_admins() {
     let browse = |bearer: String| {
         let s = s.clone();
         async move {
-            let r = reqwest::Client::new()
+            let r = CLIENT
                 .post(format!("{s}/browse"))
                 .bearer_auth(bearer)
                 .header("x-memstore-org", "acme")
@@ -633,12 +643,15 @@ async fn counting_listener(addr: &str) -> Option<(u16, Count)> {
 /// acme's admin points acme's provider at hosts only the server can reach. Each is refused
 /// before anything is fetched (a host that is up sees no connection), quickly (an unreachable private
 /// address doesn't wait for a timeout), and in the same words whether the host is up, down or never
-/// tried, so the refusals map nothing.
+/// tried, so the refusals map nothing. The time is the refusal's alone: alice is signed in first, as reading
+/// the server's own provider for her first token takes as long as the machine makes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_org_admin_can_t_point_the_provider_at_internal_hosts() {
     // As deployed: no AMPUP_MEMORY_ALLOW_LOCAL_ISSUERS.
     let (s, issuer, _dir) = start_with(false).await;
     let alice = id_token(&issuer, "alice@acme.com");
+    let (status, body) = post(&s, "/me", &alice, &json!({})).await;
+    assert_eq!(status, 200, "{body}");
     let (up, connections) = counting_listener("127.0.0.1:0").await.unwrap();
     // The same port on ::1, where the machine has IPv6.
     let up6 = counting_listener(&format!("[::1]:{up}")).await;
@@ -710,22 +723,25 @@ async fn an_org_admin_can_t_point_the_provider_at_internal_hosts() {
 
 /// A stand-in provider whose discovery documents, under `/<case>/`, each try to send the server
 /// somewhere else: through their keys' URL, or a redirect. `/good/` is a working provider, reached by a
-/// redirect from `/hop/`. Returns its base URL.
-async fn start_tricky_idp() -> String {
+/// redirect from `/hop/`. `up`: a port this machine listens on, sent to as `0.0.0.0` (which reaches it, and
+/// which the server must refuse like any address that isn't public). Returns its base URL and when it last
+/// answered.
+async fn start_tricky_idp(up: u16) -> (String, std::sync::Arc<std::sync::Mutex<Instant>>) {
     let port = free_port();
     let base = format!("http://127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .unwrap();
-    let b = base.clone();
+    let answered = std::sync::Arc::new(std::sync::Mutex::new(Instant::now()));
+    let (b, last) = (base.clone(), answered.clone());
     tokio::spawn(async move {
         loop {
             let (conn, _) = listener.accept().await.unwrap();
-            let b = b.clone();
+            let (b, last) = (b.clone(), last.clone());
             tokio::spawn(async move {
                 let svc = hyper::service::service_fn(
                     move |req: hyper::Request<hyper::body::Incoming>| {
-                        let b = b.clone();
+                        let (b, last) = (b.clone(), last.clone());
                         async move {
                             let doc =
                                 |jwks: &str| (200, None, json!({"issuer": "x", "jwks_uri": jwks}));
@@ -748,6 +764,10 @@ async fn start_tricky_idp() -> String {
                                 "/redirect-private" => {
                                     to("https://10.0.0.1/.well-known/openid-configuration")
                                 }
+                                "/jwks-unspecified" => doc(&format!("https://0.0.0.0:{up}/jwks")),
+                                "/redirect-unspecified" => to(&format!(
+                                    "https://0.0.0.0:{up}/.well-known/openid-configuration"
+                                )),
                                 "/hop" => to("/good/.well-known/openid-configuration"),
                                 "/good" => doc(&format!("{b}/jwks")),
                                 "/jwks" => (
@@ -764,6 +784,7 @@ async fn start_tricky_idp() -> String {
                             if let Some(l) = location {
                                 r = r.header("location", l);
                             }
+                            *last.lock().unwrap() = Instant::now();
                             Ok::<_, hyper::Error>(
                                 r.body(Full::new(Bytes::from(body.to_string()))).unwrap(),
                             )
@@ -776,18 +797,21 @@ async fn start_tricky_idp() -> String {
             });
         }
     });
-    base
+    (base, answered)
 }
 
 /// With providers on this machine allowed (as these tests run them), a provider's own answers
 /// still can't send the server to the private network or the metadata service: not through the keys'
-/// URL its discovery document names (maybe on another host), nor through a redirect. Each hop is vetted,
-/// so a redirect to a good place is still followed.
+/// URL its discovery document names (maybe on another host), nor through a redirect. Each hop is vetted
+/// before it's tried: a host that is up sees no connection, and an unreachable private address isn't
+/// waited on (the server answers quickly after the provider's last answer, however long reading the
+/// provider took). A redirect to a good place is still followed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_s_answers_can_t_send_the_server_to_internal_hosts() {
     let (s, issuer, _dir) = start().await;
     let alice = id_token(&issuer, "alice@acme.com");
-    let idp = start_tricky_idp().await;
+    let (up, connections) = counting_listener("127.0.0.1:0").await.unwrap();
+    let (idp, answered) = start_tricky_idp(up).await;
     let set = |issuer: String| {
         json!({"op": "set_provider", "org": "acme", "provider": {"kind": "oidc",
             "issuer": issuer, "client_ids": ["acme-cli"], "groups_claim": "groups", "required": false}})
@@ -801,19 +825,21 @@ async fn a_provider_s_answers_can_t_send_the_server_to_internal_hosts() {
         "jwks-redirect",
         "redirect-metadata",
         "redirect-private",
+        "jwks-unspecified",
+        "redirect-unspecified",
     ] {
         let target = format!("{idp}/{case}");
-        let t = Instant::now();
         let (status, body) = post(&s, "/admin", &alice, &set(target.clone())).await;
+        let after = answered.lock().unwrap().elapsed();
         assert_eq!(status, 403, "{case}: {body}");
         assert!(
-            t.elapsed() < Duration::from_secs(5),
-            "{case}: {:?}",
-            t.elapsed()
+            after < Duration::from_secs(5),
+            "{case}: refused {after:?} after the provider's last answer: was the host it named tried?"
         );
         said.insert(refusal(&body, &target));
     }
     assert_eq!(said.len(), 1, "the refusals differ: {said:#?}");
+    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 0);
     let (_, view) = post(
         &s,
         "/admin",
@@ -866,7 +892,7 @@ async fn the_keys_file_is_read_again_when_it_changes() {
     let failing = || {
         let s = s.clone();
         async move {
-            let r = reqwest::Client::new()
+            let r = CLIENT
                 .get(format!("{s}/metrics"))
                 .bearer_auth(ADMIN_KEY)
                 .send()
@@ -1317,7 +1343,7 @@ async fn a_file_key_becomes_the_directory_s_only_as_what_it_reads() {
     let metrics = || {
         let s = s.clone();
         async move {
-            let r = reqwest::Client::new()
+            let r = CLIENT
                 .get(format!("{s}/metrics"))
                 .bearer_auth(ADMIN_KEY)
                 .send()
@@ -1479,7 +1505,7 @@ async fn under_way(server: &str, path: &str, headers: &[(&str, &str)]) -> tokio:
 /// A `/search` of `rows` queries in acme, as `bearer`: the status and the `retry-after` header.
 async fn search_rows(server: &str, bearer: &str, rows: usize) -> (u16, Option<String>) {
     let data: Vec<Value> = (0..rows).map(|i| json!([i, "who owns billing"])).collect();
-    let r = reqwest::Client::new()
+    let r = CLIENT
         .post(format!("{server}/search"))
         .bearer_auth(bearer)
         .header("x-memstore-org", "acme")
@@ -1596,6 +1622,11 @@ async fn requests_under_way_are_capped_and_another_cell_s_body_waits_for_its_sen
         ("authorization", as_alice.as_str()),
         ("x-memstore-org", "acme"),
     ];
+    // A request is under way once its caller is known. The server's first token has it read its provider's keys,
+    // which takes as long as the machine makes it (seconds under load), so that is done before the two are held:
+    // they are then under way well within the half second the third waits.
+    let (status, body) = post(&s, "/me", &alice, &json!({})).await;
+    assert_eq!(status, 200, "{body}");
 
     let held = [
         under_way(&s, "/search", &alices).await,
@@ -1652,7 +1683,8 @@ async fn requests_under_way_are_capped_and_another_cell_s_body_waits_for_its_sen
 /// Acme's own identity provider can sign in any name it likes, and each one it signs in that acme doesn't hold
 /// is refused and audited (under no org: they aren't acme's). Past a hundred of them, the rest are counted in one
 /// row under the provider, so its names can't take the audit's room for refusals from anyone else's: an
-/// outsider's refusal is still there, and so is bob's in acme's own audit.
+/// outsider's refusal is still there, and so is bob's in acme's own audit. Writing the audit halfway (as a read
+/// of it does) doesn't give the provider another hundred.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_org_s_provider_can_t_fill_the_audit_with_names_it_mints() {
     let (s, issuer, _dir) = start().await;
@@ -1669,6 +1701,11 @@ async fn an_org_s_provider_can_t_fill_the_audit_with_names_it_mints() {
     .await;
     assert_eq!(status, 200, "{body}");
     for i in 0..150 {
+        if i == 75 {
+            let (status, body) =
+                post(&s, "/admin", &alice, &json!({"op": "audit", "org": "acme"})).await;
+            assert_eq!(status, 200, "{body}");
+        }
         let minted = id_token(&acme_idp, &format!("minted{i}@acme.com"));
         let (status, _) = search_rows(&s, &minted, 1).await;
         assert_eq!(status, 403, "minted{i}");

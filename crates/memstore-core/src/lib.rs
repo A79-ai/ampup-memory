@@ -2145,6 +2145,14 @@ impl Store {
         self
     }
 
+    /// Which server this store is: the same for a store and every store that replaced it sharing its directory
+    /// ([`Store::sharing_directory`]: a server's catalog connection is made again at each refresh), another for each
+    /// store made apart, on the same catalog or not. For what a process holds per server, as session rows not yet
+    /// written are: one server never sees another's, as with servers in processes of their own.
+    pub fn server_id(&self) -> usize {
+        Arc::as_ptr(&self.dir) as usize
+    }
+
     /// Seal directory snapshots with `key`, and load only those it sealed without reading the log before
     /// them (none: every snapshot is checked against the log). A store's first use of its directory
     /// fixes this: unless a server set it before, it is `AMPUP_MEMORY_SECRET_KEY`.

@@ -434,18 +434,19 @@ pub async fn start(
     };
     // Counted with the ones not committed yet, and held under the same lock, so a burst of starts can't pass the
     // cap while their rows wait for the flush.
-    let ns = scope.namespace();
+    let (server, ns) = (store.server_id(), scope.namespace());
     let mut buffer = BUFFER.lock().unwrap();
     logged.retain(|id| {
         !buffer
-            .get(&(ns.clone(), id.clone()))
+            .get(&key(store, scope, id))
             .is_some_and(|h| discarded(&h.l))
     });
     let today = logged.len()
         + buffer
             .iter()
-            .filter(|((n, id), h)| {
-                *n == ns
+            .filter(|((s, n, id), h)| {
+                *s == server
+                    && *n == ns
                     && h.l.asker == who.user()
                     && h.l.kind.as_deref() == Some(KIND)
                     && h.l.asked_at >= since
@@ -465,19 +466,19 @@ pub async fn start(
             buffer.len()
         )));
     }
-    if named.is_some() && buffer.contains_key(&(ns, l.answer_id.clone())) {
+    if named.is_some() && buffer.contains_key(&key(store, scope, &l.answer_id)) {
         return Err(refuse(format!("session {} is open already", l.answer_id)));
     }
     hold(&mut buffer, store, scope, who.user(), l.clone());
     Ok(l)
 }
 
-/// Drops session `l` that [`start`] opened but whose opening failed: it is never written.
-pub fn abandon(scope: &Scope, l: &Logged) {
+/// Drops session `l` that [`start`] opened on `store` but whose opening failed: it is never written.
+pub fn abandon(store: &Store, scope: &Scope, l: &Logged) {
     BUFFER
         .lock()
         .unwrap()
-        .remove(&(scope.namespace(), l.answer_id.clone()));
+        .remove(&key(store, scope, &l.answer_id));
 }
 
 /// Records the advice `found` in session `l` that [`start`] just opened. Its row is committed with the next flush.
@@ -491,7 +492,7 @@ pub async fn opened(
     let served = match serve(store, scope, s, found).await {
         Ok((served, _)) => served,
         Err(e) => {
-            abandon(scope, &l);
+            abandon(store, scope, &l);
             return Err(e);
         }
     };
@@ -562,13 +563,20 @@ struct Held {
     version: u64,
 }
 
-type Buffer = std::collections::HashMap<(String, String), Held>;
+/// A held row's key: the server it is held for ([`Store::server_id`]), its namespace and its session's id.
+type Key = (usize, String, String);
 
-/// Session rows not committed yet, by namespace and id: one per session, its newest. Every session step holds its
-/// row here, and [`flush`] commits them together every `AMPUP_MEMORY_SESSION_FLUSH_SECS` (one Iceberg commit per
-/// scope a minute, not one per step, each of which takes seconds on GCS), so no step waits on a commit. Reads
-/// ([`list`], [`find`]) see them over the log. Held in this process: a cell's sessions are served by one, a server
-/// stopping flushes first, and one that dies loses at most the last interval's steps.
+fn key(store: &Store, scope: &Scope, id: &str) -> Key {
+    (store.server_id(), scope.namespace(), id.to_string())
+}
+
+type Buffer = std::collections::HashMap<Key, Held>;
+
+/// Session rows not committed yet, by server, namespace and id: one per session, its newest. Every session step
+/// holds its row here, and [`flush`] commits them together every `AMPUP_MEMORY_SESSION_FLUSH_SECS` (one Iceberg
+/// commit per scope a minute, not one per step, each of which takes seconds on GCS), so no step waits on a commit.
+/// Reads ([`list`], [`find`]) see their own server's over the log. Held in this process: a cell's sessions are
+/// served by one, a server stopping flushes first, and one that dies loses at most the last interval's steps.
 static BUFFER: std::sync::LazyLock<std::sync::Mutex<Buffer>> =
     std::sync::LazyLock::new(Default::default);
 static VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -590,7 +598,7 @@ fn hold(buffer: &mut Buffer, store: &Store, scope: &Scope, actor: &str, mut l: L
     l.updated_at = now_micros();
     let version = VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     buffer.insert(
-        (scope.namespace(), l.answer_id.clone()),
+        key(store, scope, &l.answer_id),
         Held {
             l,
             store: store.clone(),
@@ -607,7 +615,7 @@ fn hold(buffer: &mut Buffer, store: &Store, scope: &Scope, actor: &str, mut l: L
 /// Holds session row `l` (written by `actor`) for the next flush.
 fn put(store: &Store, scope: &Scope, actor: &str, l: Logged) {
     let mut buffer = BUFFER.lock().unwrap();
-    if let Some(h) = buffer.get(&(scope.namespace(), l.answer_id.clone())) {
+    if let Some(h) = buffer.get(&key(store, scope, &l.answer_id)) {
         // A routing job or idle sweep can finish after its snapshot's owner returned or ended the session.
         // Neither completion may undo an explicit end, and an idle sweep must not undo newer activity.
         if (ended_final(&h.l) && !ended_final(&l))
@@ -661,11 +669,10 @@ pub async fn clear_empty(
     // that is the one checked and replaced, under the buffer's lock, so a newer row is never overwritten.
     let settling = SETTLING.read().await;
     let logged = crate::qa_log::list(store, scope, None).await?;
-    let ns = scope.namespace();
     let mut counts = BTreeMap::new();
     let mut buffer = BUFFER.lock().unwrap();
     for l in logged {
-        let mut l = match buffer.get(&(ns.clone(), l.answer_id.clone())) {
+        let mut l = match buffer.get(&key(store, scope, &l.answer_id)) {
             Some(h) => h.l.clone(),
             None => l,
         };
@@ -716,11 +723,10 @@ pub async fn name_tasks(
                 .collect(),
         )
         .await?;
-    let ns = scope.namespace();
     let mut counts = BTreeMap::new();
     let mut buffer = BUFFER.lock().unwrap();
     for l in logged {
-        let mut l = match buffer.get(&(ns.clone(), l.answer_id.clone())) {
+        let mut l = match buffer.get(&key(store, scope, &l.answer_id)) {
             Some(h) => h.l.clone(),
             None => l,
         };
@@ -760,8 +766,7 @@ pub fn flush_interval() -> Duration {
 
 /// What one flush commits: per catalog (its index among the flush's), namespace and actor, the store, scope, rows,
 /// and their keys and versions.
-type Groups =
-    BTreeMap<(usize, String, String), (Store, Scope, Vec<Logged>, Vec<((String, String), u64)>)>;
+type Groups = BTreeMap<(usize, String, String), (Store, Scope, Vec<Logged>, Vec<(Key, u64)>)>;
 
 /// Commits the held session rows, one commit per catalog, scope and actor; returns how many. Each row goes to the
 /// catalog it was held for, checked against that catalog's directory: a process serving several (as the tests run
@@ -772,7 +777,7 @@ type Groups =
 pub async fn flush() -> Result<usize> {
     let _one = FLUSHING.lock().await;
     recheck().await;
-    let held: Vec<((String, String), Held)> = BUFFER
+    let held: Vec<(Key, Held)> = BUFFER
         .lock()
         .unwrap()
         .iter()
@@ -816,7 +821,7 @@ pub async fn flush() -> Result<usize> {
             continue;
         }
         let g = groups
-            .entry((at, key.0.clone(), h.actor))
+            .entry((at, key.1.clone(), h.actor))
             .or_insert_with(|| (h.store, h.scope, vec![], vec![]));
         g.2.push(h.l);
         g.3.push((key, h.version));
@@ -906,7 +911,7 @@ async fn recheck() {
 }
 
 /// Drops the rows `done` from the buffer, each unless it changed since it was read for the flush.
-async fn settle(done: &[((String, String), u64)]) {
+async fn settle(done: &[(Key, u64)]) {
     let _settling = SETTLING.write().await;
     let mut buffer = BUFFER.lock().unwrap();
     for (k, v) in done {
@@ -962,12 +967,12 @@ fn ended_final(l: &Logged) -> bool {
 pub async fn list(store: &Store, scope: &Scope) -> Result<Vec<Logged>> {
     let settling = SETTLING.read().await;
     let mut all = crate::qa_log::list(store, scope, None).await?;
-    let ns = scope.namespace();
+    let (server, ns) = (store.server_id(), scope.namespace());
     let held: Vec<Logged> = BUFFER
         .lock()
         .unwrap()
         .iter()
-        .filter(|((n, _), _)| *n == ns)
+        .filter(|((s, n, _), _)| *s == server && *n == ns)
         .map(|(_, h)| h.l.clone())
         .collect();
     drop(settling);
@@ -1019,7 +1024,7 @@ pub async fn active(store: &Store, scope: &Scope, who: &Principal, id: &str) -> 
     // A step or an end may have landed while find read the catalog. Keep that newer row, except that the
     // catalog's explicit end always wins over an open row, as it does in list.
     if !ended_final(&l)
-        && let Some(h) = buffer.get(&(scope.namespace(), id.to_string()))
+        && let Some(h) = buffer.get(&key(store, scope, id))
     {
         l = h.l.clone();
     }
@@ -1228,11 +1233,7 @@ pub async fn note_lookup(
     let Some(lookup) = lookup else { return };
     match Box::pin(find(store, scope, who, id)).await {
         Ok(mut l) => {
-            if let Some(h) = BUFFER
-                .lock()
-                .unwrap()
-                .get(&(scope.namespace(), id.to_string()))
-            {
+            if let Some(h) = BUFFER.lock().unwrap().get(&key(store, scope, id)) {
                 l = h.l.clone();
             }
             let Some(s) = l.session.as_mut() else { return };
@@ -1298,7 +1299,7 @@ pub async fn advise(
     // keeps the conversation while its step routes (the hook sends both at once), and the row read before would
     // undo that, leaving a session that then ends idle with no transcript to judge. This step's changes go on top.
     let mut fresh = Box::pin(find(store, scope, who, &id)).await?;
-    if let Some(h) = BUFFER.lock().unwrap().get(&(scope.namespace(), id.clone())) {
+    if let Some(h) = BUFFER.lock().unwrap().get(&key(store, scope, &id)) {
         fresh = h.l.clone();
     }
     let s = l.session.as_ref().expect("a session");
@@ -2503,11 +2504,10 @@ pub async fn mark_automated(
 ) -> Result<BTreeMap<String, usize>> {
     let settling = SETTLING.read().await;
     let logged = crate::qa_log::list(store, scope, None).await?;
-    let ns = scope.namespace();
     let mut counts = BTreeMap::new();
     let mut buffer = BUFFER.lock().unwrap();
     for l in logged.into_iter().filter(|l| ids.contains(&l.answer_id)) {
-        let mut l = match buffer.get(&(ns.clone(), l.answer_id.clone())) {
+        let mut l = match buffer.get(&key(store, scope, &l.answer_id)) {
             Some(h) => h.l.clone(),
             None => l,
         };
