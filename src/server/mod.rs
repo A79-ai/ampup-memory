@@ -3127,8 +3127,9 @@ fn scoped_models(
     }
 }
 
-/// `/installations` (public port, an admin API key): who owns each connector installation, kept in
-/// `memory_system.installations`. Body `{"op": ...}`:
+/// `/installations` (public port, an admin API key, or an org's own org-wide ingest key for that org's
+/// installations only: the connector service holds just that key for a hosted org): who owns each
+/// connector installation, kept in `memory_system.installations`. Body `{"op": ...}`:
 /// - `register` `{installation_id, provider, group_ref}`: `group_ref` is `<org>` or `<org>:<user>`; the
 ///   org must be in the directory once it has any. Registering again exactly so changes nothing; an
 ///   installation's owner never changes and a revoked one is never registered again (409).
@@ -3140,7 +3141,15 @@ fn scoped_models(
 ///
 /// Answers `{"installation": ...}` (`list`: `{"installations": [...]}`), `revoked_at` set once revoked.
 /// Reads are fresh: a registration on one server is seen at once on every other.
-async fn installation_op(state: &State, actor: &str, body: &[u8]) -> Result<Value> {
+///
+/// With `only_org` (an org's ingest key): `register` only under that org, `list` only that org, and
+/// `get`/`revoke` of another org's installation answer 404, as for one never registered.
+async fn installation_op(
+    state: &State,
+    actor: &str,
+    only_org: Option<&str>,
+    body: &[u8],
+) -> Result<Value> {
     use crate::people::installations::{self as inst, Refused};
     let req: Value =
         serde_json::from_slice(body).map_err(|_| BadRequest("body is not JSON".into()))?;
@@ -3159,6 +3168,10 @@ async fn installation_op(state: &State, actor: &str, body: &[u8]) -> Result<Valu
         }
         Some(_) => return Err(BadRequest("on_behalf_of is 1 to 200 characters".into()).into()),
     };
+    // The org an installation belongs to, by its group_ref; None for one that names no org.
+    let org_of = |group_ref: &str| inst::parse_group_ref(group_ref).map(|(o, _)| o.to_string());
+    let other_org =
+        |group_ref: &str| only_org.is_some_and(|o| org_of(group_ref).as_deref() != Some(o));
     match op {
         "register" | "revoke" => {
             let id = field("installation_id")?;
@@ -3167,6 +3180,15 @@ async fn installation_op(state: &State, actor: &str, body: &[u8]) -> Result<Valu
             } else {
                 Default::default()
             };
+            if let Some(o) = only_org
+                && op == "register"
+                && other_org(&group_ref)
+            {
+                return Err(Forbidden(format!(
+                    "an ingest key of {o} registers only {o}'s installations"
+                ))
+                .into());
+            }
             let known_orgs: Option<Vec<String>> = if op == "register" {
                 let dir = crate::people::directory::Directory::load(&store).await?;
                 // Only the default org: this deployment has no directory, and orgs are its callers' own.
@@ -3176,6 +3198,18 @@ async fn installation_op(state: &State, actor: &str, body: &[u8]) -> Result<Valu
             };
             store
                 .append_installations_with(|current| {
+                    // Another org's installation says nothing to an org's key, not even who owns
+                    // it: revoking it reads as never registered, registering it as taken.
+                    if let Some(i) = current.get(&id)
+                        && other_org(&i.group_ref)
+                    {
+                        return Err(match op {
+                            "register" => Refused::Conflict(format!(
+                                "installation {id} can't be registered here"
+                            )),
+                            _ => Refused::NotFound(format!("installation {id} is not registered")),
+                        });
+                    }
                     let mut events = match op {
                         "register" => inst::plan_register(
                             current,
@@ -3203,7 +3237,7 @@ async fn installation_op(state: &State, actor: &str, body: &[u8]) -> Result<Valu
         "get" => {
             let id = field("installation_id")?;
             let now = inst::fold(&store.installation_events().await?);
-            match now.get(&id) {
+            match now.get(&id).filter(|i| !other_org(&i.group_ref)) {
                 Some(i) => Ok(json!({"installation": i})),
                 None => {
                     Err(Refused::NotFound(format!("installation {id} is not registered")).into())
@@ -3212,6 +3246,14 @@ async fn installation_op(state: &State, actor: &str, body: &[u8]) -> Result<Valu
         }
         "list" => {
             let org = req["org"].as_str();
+            if let Some(o) = only_org
+                && org != Some(o)
+            {
+                return Err(Forbidden(format!(
+                    "an ingest key of {o} lists only {o}'s installations: send org"
+                ))
+                .into());
+            }
             let now = inst::fold(&store.installation_events().await?);
             let list: Vec<_> = now
                 .values()
@@ -3225,6 +3267,61 @@ async fn installation_op(state: &State, actor: &str, body: &[u8]) -> Result<Valu
         }
         _ => Err(BadRequest("op is register, revoke, get or list".into()).into()),
     }
+}
+
+/// Who may use `/installations`: an admin API key (any org), or an org's own org-wide ingest key from
+/// the directory, which then acts on that org's installations alone (the org is returned). A team's
+/// ingest key, a writer or reader key, and a person's sign-in are refused.
+async fn installations_caller(
+    state: &State,
+    token: Option<&str>,
+) -> Result<(String, Option<String>)> {
+    let admin = require_admin(state, token).await;
+    let Some(token) = token.filter(|t| t.starts_with(auth::KEY_PREFIX)) else {
+        return admin.map(|a| (a, None));
+    };
+    if let Ok(a) = admin {
+        return Ok((a, None));
+    }
+    let Some(auth) = state.token_auth() else {
+        anyhow::bail!("this needs AMPUP_MEMORY_CALLER_IDENTITY=token");
+    };
+    let d = directory_auth(state).await?;
+    // As `request_principal` resolves it: a file key's bearer is the directory key that replaced it,
+    // and a bearer that is both a file key and another directory key names neither.
+    let c = match auth.key_caller(token) {
+        Some(f) => {
+            let mine: Vec<auth::OrgKey> = d
+                .keys
+                .iter()
+                .filter(|k| k.replaces_file_key && k.sha256 == f.sha256)
+                .cloned()
+                .collect();
+            anyhow::ensure!(!mine.is_empty(), "a file key that isn't an admin key");
+            auth::org_key_caller(token, &mine)?
+        }
+        None => auth::org_key_caller(token, &d.keys)?,
+    };
+    let k = c.key.as_ref().context("not an org key")?;
+    anyhow::ensure!(
+        k.role == crate::people::directory::KeyRole::Ingest
+            && k.team.is_none()
+            && k.sources.is_empty(),
+        "{} is a {} key{}: only an admin key or an org's own ingest key manages installations",
+        k.user(),
+        k.role.as_str(),
+        if k.team.is_some() {
+            " of a team"
+        } else if !k.sources.is_empty() {
+            " for some sources"
+        } else {
+            ""
+        }
+    );
+    sync_closures(state).await?;
+    anyhow::ensure!(!state.closures.any_disabled(&c.aliases), "user is disabled");
+    state.key_used(k);
+    Ok((c.user, Some(k.org.clone())))
 }
 
 /// The caller must hold an admin API key (token identity only).
@@ -5129,7 +5226,7 @@ async fn handle(
         });
     }
     if installations {
-        let actor = match require_admin(&state, caller_token.as_deref()).await {
+        let (actor, only_org) = match installations_caller(&state, caller_token.as_deref()).await {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("installations refused: {e:#}");
@@ -5140,29 +5237,35 @@ async fn handle(
                 ));
             }
         };
-        return Ok(match installation_op(&state, &actor, &body).await {
-            Ok(v) => reply(StatusCode::OK, v),
-            Err(e) => {
-                use crate::people::installations::Refused;
-                let (status, msg) =
-                    match (e.downcast_ref::<Refused>(), e.downcast_ref::<BadRequest>()) {
-                        (Some(Refused::Bad(m)), _) | (None, Some(BadRequest(m))) => {
-                            (StatusCode::BAD_REQUEST, m.clone())
-                        }
-                        (Some(Refused::Conflict(m)), _) => (StatusCode::CONFLICT, m.clone()),
-                        (Some(Refused::NotFound(m)), _) => (StatusCode::NOT_FOUND, m.clone()),
-                        (None, None) => {
-                            eprintln!("installation change by {actor} failed: {e:#}");
-                            crate::report::failure("installation change", &e);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "installation change failed".to_string(),
-                            )
-                        }
-                    };
-                reply(status, json!({"error": msg}))
-            }
-        });
+        return Ok(
+            match installation_op(&state, &actor, only_org.as_deref(), &body).await {
+                Ok(v) => reply(StatusCode::OK, v),
+                Err(e) => {
+                    use crate::people::installations::Refused;
+                    if let Some(Forbidden(m)) = e.downcast_ref::<Forbidden>() {
+                        refused(None, &actor, 403, audit::Reason::AsDenied);
+                        return Ok(reply(StatusCode::FORBIDDEN, json!({"error": m})));
+                    }
+                    let (status, msg) =
+                        match (e.downcast_ref::<Refused>(), e.downcast_ref::<BadRequest>()) {
+                            (Some(Refused::Bad(m)), _) | (None, Some(BadRequest(m))) => {
+                                (StatusCode::BAD_REQUEST, m.clone())
+                            }
+                            (Some(Refused::Conflict(m)), _) => (StatusCode::CONFLICT, m.clone()),
+                            (Some(Refused::NotFound(m)), _) => (StatusCode::NOT_FOUND, m.clone()),
+                            (None, None) => {
+                                eprintln!("installation change by {actor} failed: {e:#}");
+                                crate::report::failure("installation change", &e);
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "installation change failed".to_string(),
+                                )
+                            }
+                        };
+                    reply(status, json!({"error": msg}))
+                }
+            },
+        );
     }
     if team_csv {
         return Ok(
