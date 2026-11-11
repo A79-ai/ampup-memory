@@ -72,7 +72,7 @@ export function Tools({ sel, tool, onFocus }: { sel: Selection; tool?: string; o
   if (tools.error) return <div className="pad error">{tools.error}</div>;
   const list = tools.list ?? [];
   const current = list.find((t) => t.name === tool) ?? list[0];
-  if (!current) return <div className="pad muted">This memstore offers no tools to this caller.</div>;
+  if (!current) return <div className="pad muted">This AmpUp Memory server offers no tools to this caller.</div>;
   const text = args[current.name] ?? JSON.stringify(example(current), null, 2);
   let parsed: unknown;
   let parseError: string | null = null;
@@ -119,7 +119,7 @@ export function Tools({ sel, tool, onFocus }: { sel: Selection; tool?: string; o
           </button>
         ))}
         <p className="muted tool-note">
-          The MCP tools this memstore offers this caller, in the scope picked above. Results are what an agent
+          The MCP tools this AmpUp Memory server offers this caller, in the scope picked above. Results are what an agent
           gets.
         </p>
       </aside>

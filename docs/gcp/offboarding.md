@@ -16,7 +16,7 @@ and stop the connectors or pipelines that write to the inbox or call the engine.
 ## 2. Export what you want to keep
 
 The memory is Iceberg tables and the engine's ledger in your bucket, readable by any Iceberg reader through the
-BigLake catalog, and the `<name>_api` dataset's inbox in BigQuery. Nothing is in a format only memstore reads.
+BigLake catalog, and the `<name>_api` dataset's inbox in BigQuery. Nothing is in a format only AmpUp Memory reads.
 To keep a copy elsewhere:
 
 ```sh

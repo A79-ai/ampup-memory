@@ -1,7 +1,7 @@
 {
   "name": "corpus",
   "version": 1,
-  "description": "The synthetic verification corpus (memstore gen): people, teams, projects, accounts and tickets, with ids like p000123.",
+  "description": "The synthetic verification corpus (ampup-memory gen): people, teams, projects, accounts and tickets, with ids like p000123.",
   "types": {
     "person": {
       "id_prefix": "p",

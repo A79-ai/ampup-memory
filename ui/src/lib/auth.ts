@@ -4,7 +4,7 @@ import type { NextAuthOptions } from "next-auth";
 import { getToken } from "next-auth/jwt";
 import GoogleProvider from "next-auth/providers/google";
 
-// Google sign-in, for a UI hosted against one memstore (`MEMSTORE_URL`, e.g. on Vercel). Each request to
+// Google sign-in, for a UI hosted against one memstore (`AMPUP_MEMORY_URL`, e.g. on Vercel). Each request to
 // memstore carries the signed-in person's own Google ID token, so memstore decides what they may read, as for
 // any other caller. The token stays in the encrypted session cookie and is read only on the server: the
 // browser's session holds just the email.

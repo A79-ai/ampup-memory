@@ -194,10 +194,10 @@ export function Browser() {
           <span className="logo" aria-hidden>
             ◆
           </span>
-          memstore
+          AmpUp Memory
         </div>
         {nss?.hosted && (nss.list?.length ?? 0) <= 1 ? (
-          <div className="scope mono" title="The memstore this UI reads">
+          <div className="scope mono" title="The AmpUp Memory server this UI reads">
             {nss.list?.[0]?.namespace}
           </div>
         ) : (
@@ -235,7 +235,7 @@ export function Browser() {
           </select>
         ) : (
           <div className="scope mono" title="The memory you are reading">
-            memstore://{scope ?? "…"}
+            ampup-memory://{scope ?? "…"}
           </div>
         )}
         {orgs.length > 0 && (
@@ -360,7 +360,7 @@ export function Browser() {
         <section className="pane">
           <div className="crumbs mono">
             <button className="link" onClick={() => go({ kind: "folder", path: [] })}>
-              memstore://{scope ?? "…"}
+              ampup-memory://{scope ?? "…"}
             </button>
             {reveal?.map((seg, i) => (
               <span key={i}>
@@ -402,7 +402,7 @@ function BranchInput({ branch, onPick }: { branch: string; onPick: (b: string) =
       <input
         className="picker mono"
         aria-label="Branch"
-        title="The branch you are reading (this memstore can't list them): a build may compile skills on a branch of its own"
+        title="The branch you are reading (this server can't list them): a build may compile skills on a branch of its own"
         placeholder="branch: main"
         value={v}
         onChange={(e) => setV(e.target.value)}
@@ -418,7 +418,7 @@ function SignIn({ loading }: { loading: boolean }) {
     <div className="signin">
       <h2 className="title">Sign in to read memory</h2>
       <p className="muted">
-        memstore shows you what your Google account may read: your orgs and teams, and the episodes shared with
+        AmpUp Memory shows you what your Google account may read: your orgs and teams, and the episodes shared with
         you.
       </p>
       <button className="run" disabled={loading} onClick={() => signIn("google")}>

@@ -11356,7 +11356,7 @@ async fn skills_text(
     })
 }
 
-/// `GET /doctor`: how the caller's memory in `scope` runs, for `memstore doctor` and `/memstore:status`: what
+/// `GET /doctor`: how the caller's memory in `scope` runs, for `memstore doctor` and `/ampup-memory:status`: what
 /// they may do there, whether a model extracts, routes advice and learns it, whether skills compile and advice is
 /// learned on its own there, and the notes the caller may read (how many passed the evidence bar), with the bar
 /// and the session arms.

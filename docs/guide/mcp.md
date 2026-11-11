@@ -1,12 +1,12 @@
 # MCP
 
-`memstore serve` speaks MCP over streamable HTTP at `/mcp` (POST only; the server is stateless). `memstore mcp`
-and `memstore-client mcp` bridge the same endpoint over stdio, signed in as the CLI is, for hosts that start a
+`ampup-memory serve` speaks MCP over streamable HTTP at `/mcp` (POST only; the server is stateless). `ampup-memory mcp`
+and `ampup-memory-client mcp` bridge the same endpoint over stdio, signed in as the CLI is, for hosts that start a
 command.
 
 ```bash
-memstore serve --local
-claude mcp add --transport http memstore http://localhost:8080/mcp
+ampup-memory serve --local
+claude mcp add --transport http ampup-memory http://localhost:8080/mcp
 ```
 
 For a server with sign-in, select the org and team with headers (`x-memstore-org`, `x-memstore-team`) or, for
@@ -32,12 +32,12 @@ A caller is offered only the tools it may call: an ingest key gets `remember_mem
 (`readOnlyHint`; writes say whether they are destructive).
 
 `search_memory` also takes `as_of`, `format: "json"`, `predicates`, `episode_type`, `tags`, `order` and
-`max_chars` by name; `MEMSTORE_MCP_TOOLS=all` lists them.
+`max_chars` by name; `AMPUP_MEMORY_MCP_TOOLS=all` lists them.
 
 ## Other tools
 
 Not listed by default, but callable by name: `record_run`, `reward_run`, `query_memory`, `get_entity`,
-`ask_memory`, `skills`, `log_answer`, `feedback_memory`, `close_memory`. `MEMSTORE_MCP_TOOLS` changes the listing,
+`ask_memory`, `skills`, `log_answer`, `feedback_memory`, `close_memory`. `AMPUP_MEMORY_MCP_TOOLS` changes the listing,
 never the rights:
 
 - `all`: every tool the caller may call.
@@ -55,13 +55,13 @@ Hosts without hooks (Claude Desktop, ChatGPT, an IDE) don't always call `remembe
 reach the server in `start_session`'s context and `end_session`'s transcript. After a session call answers, one
 small model call finds the preferences, corrections, decisions and procedures the user stated, and the server
 remembers each as the caller's own note. Only a caller with a `user:` entry of their own has anything kept, so
-`serve --local` and service keys keep nothing this way. `MEMSTORE_KEEP=off` turns it off.
+`serve --local` and service keys keep nothing this way. `AMPUP_MEMORY_KEEP=off` turns it off.
 
 **Shared once three people said it.** A personal note stays the author's until at least three distinct people
 have each said the same thing. Then one sentence, built only from words all their notes share, is written as a
 note everyone in the scope reads, naming no one. The authors are counted by the server, not the model.
 
-**Profiles (opt-in).** With `profile: true` on an org or team (or `MEMSTORE_PROFILE=1`), each person's notes are
+**Profiles (opt-in).** With `profile: true` on an org or team (or `AMPUP_MEMORY_PROFILE=1`), each person's notes are
 folded into one deduplicated profile (at most 40 lines, 8,000 characters) that `start_session` hands them with
 their newest 5 notes. Forgetting a note repairs the profile at once.
 

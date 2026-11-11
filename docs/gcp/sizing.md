@@ -1,12 +1,12 @@
 # Sizing
 
 Three sizes. Each names what runs, the quota it takes in the region (by the quota's own name, so an increase can
-be filed from the row), and the monthly cost before model use at list prices in `us-central1`. `memstore
+be filed from the row), and the monthly cost before model use at list prices in `us-central1`. `ampup-memory
 preflight gcp` checks the quota of the **team** size unless told otherwise.
 
 | | Trial | Team (default) | Org |
 |---|---|---|---|
-| Who it's for | one person trying memstore for 30 days | a team, always on | several teams, scheduled ingest from your sources |
+| Who it's for | one person trying AmpUp Memory for 30 days | a team, always on | several teams, scheduled ingest from your sources |
 | Module | `deploy/gcp/trial` | `deploy/gcp/terraform` | `deploy/gcp/terraform` with a bigger engine |
 | Engine | Cloud Run, 1 vCPU / 2 GiB, scales to zero | Cloud Run, 2 vCPU / 4 GiB, one instance always on | Cloud Run, 4 vCPU / 8 GiB, one instance always on |
 | Load job (first index of a corpus) | none | Cloud Run job, 4 vCPU / 8 GiB, runs on demand | the same |
@@ -28,7 +28,7 @@ from a warm instance.
 
 Only when policy forbids Cloud Run. The template's cluster is three `n2-standard-4` nodes in one zone by
 default: `N2_CPUS` 12, `SSD_TOTAL_GB` 300, `IN_USE_ADDRESSES` 2, plus a Cloud NAT. Autopilot bills a minimum per
-pod; a cluster of your own costs about $300 a month before memstore runs on it. `memstore preflight gcp --runtime
+pod; a cluster of your own costs about $300 a month before AmpUp Memory runs on it. `ampup-memory preflight gcp --runtime
 gke` checks those three quotas with usage.
 
 ## When to move up a size

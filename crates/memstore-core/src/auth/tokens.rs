@@ -516,7 +516,7 @@ impl Auth0 {
     /// `org_id` is, if exactly one. A token naming no Organization, issued through one of the platform's own
     /// connections (Google, the tenant's database, passwordless), signs its holder in as the directory's
     /// member wherever it lists them: people sign in first and the directory says which orgs are theirs
-    /// (`memstore join`, the plugin's `/memstore:login`). One naming an Organization no org is bound to
+    /// (`memstore join`, the plugin's `/ampup-memory:login`). One naming an Organization no org is bound to
     /// is a person bound to no org: they sign in, and reach nothing.
     async fn caller(&self, token: &str, bound: &[(String, String)]) -> Result<Caller> {
         let mut claims = self

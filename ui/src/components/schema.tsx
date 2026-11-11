@@ -76,7 +76,7 @@ export function Schema({ sel }: { sel: Selection }) {
     const old = /unknown op/i.test(current.error);
     return (
       <main className="schema-main pad error">
-        {old ? "This memstore predates schema browsing: redeploy it from main." : current.error}
+        {old ? "This AmpUp Memory server predates schema browsing: redeploy it from main." : current.error}
       </main>
     );
   }
@@ -87,7 +87,7 @@ export function Schema({ sel }: { sel: Selection }) {
           <h2 className="schema-name">No schema</h2>
           <p className="muted">
             This memory is untyped: nothing is read with a schema, and facts take whatever predicates they come with.
-            An admin sets one with <span className="mono">memstore schema set</span>.
+            An admin sets one with <span className="mono">ampup-memory schema set</span>.
           </p>
         </div>
       </main>

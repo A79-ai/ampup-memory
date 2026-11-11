@@ -15,7 +15,7 @@ async function Page() {
   // Read at request time: the same build runs as the UI and as the Kubernetes gateway.
   await connection();
   if (process.env.GATEWAY_AUDIENCE) {
-    return <p style={{ padding: 24 }}>memstore Kubernetes gateway: API only, for the memory UI.</p>;
+    return <p style={{ padding: 24 }}>AmpUp Memory Kubernetes gateway: API only, for the memory UI.</p>;
   }
   return (
     <Session>

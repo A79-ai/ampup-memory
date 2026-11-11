@@ -1,6 +1,6 @@
 # Network
 
-Nothing of the vendor's connects into your project. Everything memstore does on the network is outbound from
+Nothing of the vendor's connects into your project. Everything AmpUp Memory does on the network is outbound from
 the engine and its agent, or inside Google's own network between your services.
 
 ## What goes out, and to where
@@ -11,16 +11,16 @@ the engine and its agent, or inside Google's own network between your services.
 | the agent and Cloud Run | the image registry (`--image-registry`, e.g. `us-docker.pkg.dev`) | 443 | pulls the engine image and reads its cosign signature | upgrades stop at the current image |
 | the engine | Google APIs: `storage`, `biglake`, `bigquery`, `aiplatform`, `secretmanager`, `cloudidentity` (`*.googleapis.com`) | 443 | the memory, the catalog, the SQL surface, extraction, the model key, group lookups | the engine doesn't start |
 | the engine | your model provider, when you bring a key (`api.anthropic.com` or `openrouter.ai`) | 443 | extraction | extraction stops; search goes on |
-| the engine | the control plane | 443 | the telemetry contract's fields (`memstore telemetry schema` prints every one) | the console shows the deployment stale |
+| the engine | the control plane | 443 | the telemetry contract's fields (`ampup-memory telemetry schema` prints every one) | the console shows the deployment stale |
 
-The exact control-plane and registry hosts are on the page the vendor gives you with your org. `memstore
+The exact control-plane and registry hosts are on the page the vendor gives you with your org. `ampup-memory
 preflight gcp --control-plane … --image-registry …` tries both from your shell; the nodes need the same path.
 
 ## What comes in
 
 - **Cloud Run:** the engine's ingress is `internal`, and only principals with `roles/run.invoker` on it may
   call it: your BigQuery connection's service account (for the SQL functions), and the users or groups you grant
-  for MCP. `memstore preflight gcp --installed` fails if `allUsers` or `allAuthenticatedUsers` is among them.
+  for MCP. `ampup-memory preflight gcp --installed` fails if `allUsers` or `allAuthenticatedUsers` is among them.
 - **GKE:** the engine is a ClusterIP service behind an internal load balancer; the thin Cloud Run proxy for
   BigQuery reaches it over Direct VPC egress. No public address.
 - The vendor's support session is not an inbound connection: the agent polls for it and runs read-only

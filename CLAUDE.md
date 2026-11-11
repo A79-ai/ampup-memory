@@ -15,33 +15,33 @@
 
 - `crates/memstore-core` is the store: `Store` (its `lib.rs`), storage, search, query, auth, people, offboard,
   usage, workspace, audit, metrics, episode types, platform, retention.
-- The root `memstore` crate is what runs on it: the server, agent, advice, sessions, extraction, hooks, telemetry
-  and the CLI. Core never depends on memstore, and memstore re-exports core (`pub use memstore_core::*`), so
-  `crate::X` and `memstore::X` paths reach core items from either side. An edit in memstore doesn't rebuild core:
-  put new code there unless the store itself needs it. A method on `Store` defined in memstore is an extension
+- The root `memstore` crate (its binary `ampup-memory`) is what runs on it: the server, agent, advice, sessions, extraction, hooks, telemetry
+  and the CLI. Core never depends on `memstore`, and `memstore` re-exports core (`pub use memstore_core::*`), so
+  `crate::X` and `memstore::X` paths reach core items from either side. An edit in `memstore` doesn't rebuild core:
+  put new code there unless the store itself needs it. A method on `Store` defined in `memstore` is an extension
   trait (see `qa_log::StoreQaLog`).
-- `crates/memstore-client` is the small client binary the editor plugins run (`plugins/memstore`).
+- `crates/memstore-client` is the small client binary the editor plugins run (`plugins/ampup-memory`).
 - `schemas/` holds the built-in scope schemas; they are compiled into the binary (`include_str!`).
 - `harness/` is the local stack (Apache Polaris over SeaweedFS in Docker), verification scripts and benchmarks. The
   release check CI runs on each build is `.github/scripts/release-check.sh`.
 - `deploy/` holds self-hosting material: container images (`deploy/docker`, `deploy/spcs`), the GCP modules and
   scripts (`deploy/gcp`), least-privilege IAM templates (`deploy/iam`), the Snowflake Native App (`deploy/native`),
   Databricks notes and the deployment agent's manifests.
-- `ui/` is a Next.js browser for a memstore's memory (see `ui/README.md`).
+- `ui/` is a Next.js browser for an AmpUp Memory server (see `ui/README.md`).
 
 ## Run it locally
 
 - No cloud and no Docker: `cargo run --features dylib -- serve --local` keeps tables, index and catalog under
-  `~/.memstore`, serves one caller, and exposes MCP at `http://127.0.0.1:8080/mcp`.
+  `~/.ampup-memory`, serves one caller, and exposes MCP at `http://127.0.0.1:8080/mcp`.
 - Against a real Iceberg REST catalog: `docker compose -f harness/docker-compose.yml up -d`, then
-  `source harness/env.sh` before running `memstore` commands. `tilt up` runs that stack plus a build, a load and
-  `memstore serve` in one loop (see the `Tiltfile`).
+  `source harness/env.sh` before running `ampup-memory` commands. `tilt up` runs that stack plus a build, a load and
+  `ampup-memory serve` in one loop (see the `Tiltfile`).
 
 ## Tests
 
-- `cargo test` (or `cargo nextest run --profile ci`, as CI does, with `MEMSTORE_CHECK_PLAN=1`) must pass before
+- `cargo test` (or `cargo nextest run --profile ci`, as CI does, with `AMPUP_MEMORY_CHECK_PLAN=1`) must pass before
   you open a PR, together with `cargo fmt --all --check` and `cargo clippy --all-targets --locked -- -D warnings`.
-- Tests drive a user flow end to end (a real `memstore serve` over HTTP and a real store on a local catalog), not a
+- Tests drive a user flow end to end (a real `ampup-memory serve` over HTTP and a real store on a local catalog), not a
   function in isolation. There are no in-module unit tests besides the two fail-closed principal checks in
   memstore-core.
 - `tests/it/` is one test binary (a binary per file would relink the whole crate per file): a new flow is a file
@@ -66,6 +66,6 @@
 
 ## Pull requests
 
-- Verify a change against a real `memstore serve` and store before opening a PR (a local catalog is fine), and for
+- Verify a change against a real `ampup-memory serve` and store before opening a PR (a local catalog is fine), and for
   a bug, reproduce it first and watch the fix clear it. Say in the PR what you ran and what you saw.
 - Keep each PR to one change, with a description a reviewer can follow without the conversation that produced it.

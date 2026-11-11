@@ -42,7 +42,7 @@ fn how_to_name(org: &str) -> String {
         [mcp_servers.ampup-memory]\n\
         url = \"{server}/mcp\"\n\
         http_headers = {{ \"x-memstore-org\" = \"{org}\" }}\n\n\
-        Claude Code: /memstore:login --org {org}"
+        Claude Code: /ampup-memory:login --org {org}"
     )
 }
 

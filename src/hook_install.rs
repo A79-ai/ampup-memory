@@ -14,7 +14,7 @@
 //! Every harness records its sessions as runs when they compact or end, as the Claude Code plugin does; its
 //! session-end hook hands the work to a copy of itself, so a harness's short session-end budget never cuts it off.
 //!
-//! Claude Code installs through its plugin (`/plugin install memstore@memstore`) instead.
+//! Claude Code installs through its plugin (`/plugin install ampup-memory@ampup-memory`) instead.
 //!
 //! Everything else in those files is kept: the installer adds its own entries (every hook command it writes runs
 //! `ampup-memory hook … --harness <name>`, which is how it finds them again, `memstore`'s commands too) and backs a file up before its first
@@ -424,7 +424,7 @@ pub fn apply_with(
     match harness {
         Harness::ClaudeCode => bail!(
             "Claude Code installs AmpUp Memory as a plugin: run /plugin marketplace add {MARKETPLACE_REPO}, then \
-             /plugin install memstore@memstore, in Claude Code"
+             /plugin install {PLUGIN}, in Claude Code"
         ),
         Harness::Codex => {
             let path = home.join(".codex/hooks.json");
@@ -609,20 +609,25 @@ pub fn writes_token(harness: Harness) -> bool {
     matches!(harness, Harness::Gemini | Harness::Copilot)
 }
 
-/// Where Claude Code finds the memstore plugin: the public repository each release publishes it to.
-const MARKETPLACE: &str = "memstore";
+/// Where Claude Code finds the AmpUp Memory plugin: the public repository, whose root is its marketplace.
+const MARKETPLACE: &str = "ampup-memory";
 const MARKETPLACE_REPO: &str = "A79-ai/ampup-memory";
-const PLUGIN: &str = "memstore@memstore";
+const PLUGIN: &str = "ampup-memory@ampup-memory";
+/// The plugin's name before the rename, and its marketplace's.
+const OLD_MARKETPLACE: &str = "memstore";
+const OLD_PLUGIN: &str = "memstore@memstore";
 
-/// Declares the memstore plugin in Claude Code's user settings (`~/.claude/settings.json`): its marketplace in
+/// Declares the AmpUp Memory plugin in Claude Code's user settings (`~/.claude/settings.json`): its marketplace in
 /// `extraKnownMarketplaces` and the plugin in `enabledPlugins`. At its next start Claude Code clones the
 /// marketplace (a public repository) and installs the plugin, with no prompt. With `remove`, takes both out.
-/// Everything else in the file is kept, and it's backed up first.
+/// Either way the plugin under its old name (`memstore@memstore`) comes out of the file too, so a session isn't
+/// recorded twice. Everything else in the file is kept, and it's backed up first.
 pub fn claude_code(remove: bool, dry: bool) -> Result<Vec<Change>> {
     let path = home()?.join(".claude/settings.json");
     let mut doc = read_json(&path)?;
     let markets = object_at(&mut doc, "extraKnownMarketplaces", &path)?;
     markets.remove(MARKETPLACE);
+    markets.remove(OLD_MARKETPLACE);
     if !remove {
         markets.insert(
             MARKETPLACE.into(),
@@ -632,6 +637,7 @@ pub fn claude_code(remove: bool, dry: bool) -> Result<Vec<Change>> {
     prune(&mut doc, "extraKnownMarketplaces");
     let plugins = object_at(&mut doc, "enabledPlugins", &path)?;
     plugins.remove(PLUGIN);
+    plugins.remove(OLD_PLUGIN);
     if !remove {
         plugins.insert(PLUGIN.into(), json!(true));
     }

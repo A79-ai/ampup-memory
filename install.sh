@@ -185,7 +185,7 @@ case ":$PATH:" in
 esac
 if [ "$kind" = client ]; then
   echo "next: ampup-memory-client join <your team's server> --org <your org>, then install the Claude Code plugin"
-  echo "  (/plugin marketplace add $repo, then /plugin install memstore@memstore)"
+  echo "  (/plugin marketplace add $repo, then /plugin install ampup-memory@ampup-memory)"
 else
   echo "next: ampup-memory setup <your team's server> --org <your org>"
   echo "  (signs you in and sets up Claude Code, Codex, Gemini CLI, Cursor and Copilot, whichever are installed)"

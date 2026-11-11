@@ -31,7 +31,7 @@ control plane says. The previous image stays in the registry for a rollback. The
 running and its history, and rolls back to the previous generation.
 
 Rollback is the previous generation's image; the memory is unchanged (the engine reads an append-only ledger
-and the index is rebuilt from it if the layout changed). After any change, `memstore preflight gcp --installed`
+and the index is rebuilt from it if the layout changed). After any change, `ampup-memory preflight gcp --installed`
 is the check.
 
 ## Audit
@@ -40,7 +40,7 @@ Two logs, both yours:
 
 - **The engine's audit**, in your bucket, written by the engine and the agent: every upgrade, rollback, action,
   support session and command, and each admin change of a schema or an org. Read it as the operator with the
-  admin key: `memstore audit --operator`, or `--kind support` for support alone.
+  admin key: `ampup-memory audit --operator`, or `--kind support` for support alone.
 - **Cloud Audit Logs** in your project record what the vendor's management identity did through GCP IAM:
   filter `protoPayload.authenticationInfo.principalEmail="<vendor management service account>"`.
 
@@ -68,7 +68,7 @@ to see one, end one or turn them off: [vendor-access.md](vendor-access.md).
 For a ticket, make a bundle yourself and read it before you send it:
 
 ```sh
-memstore support-bundle --engine <engine URL> --admin-key-file ops.key \
+ampup-memory support-bundle --engine <engine URL> --admin-key-file ops.key \
   --project <project> --region <region> --service <name>-engine --since-minutes 120
 # or, on GKE: kubectl -n memstore logs deploy/memstore --since=2h > engine.log; … --logs-file engine.log
 ```

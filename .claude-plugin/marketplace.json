@@ -1,12 +1,12 @@
 {
-  "name": "memstore",
-  "description": "Team memory for coding agents",
+  "name": "ampup-memory",
+  "description": "AmpUp Memory: team memory for coding agents",
   "owner": { "name": "AmpUp" },
   "plugins": [
     {
-      "name": "memstore",
-      "source": "./plugins/memstore",
-      "description": "Advice from memstore at each Claude Code session's first prompt, sessions recorded as runs to learn from, and what the team knows recalled into new ones"
+      "name": "ampup-memory",
+      "source": "./plugins/ampup-memory",
+      "description": "Advice from AmpUp Memory at each Claude Code session's first prompt, sessions recorded as runs to learn from, and what the team knows recalled into new ones"
     }
   ]
 }

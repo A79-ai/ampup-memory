@@ -1,4 +1,4 @@
-//! `memstore hook <event>`: the Claude Code plugin's hooks (`plugins/memstore`). Each reads the hook's
+//! `memstore hook <event>`: the Claude Code plugin's hooks (`plugins/ampup-memory`). Each reads the hook's
 //! JSON on stdin and talks to a running `memstore serve` over HTTP, as any client would:
 //!
 //! - `session-end` (PreCompact), `end` (SessionEnd) and `stop` (Stop, every [`EVERY`] prompts): the session so far, condensed to what was asked, what Claude
@@ -26,10 +26,10 @@
 //!   1.5 s together, so `end` hands its work to a copy of itself that runs on.
 //! - `session-end`, `stop` (at most every [`KEEP_EVERY`]) and `end`, where the scope keeps them: what the session's
 //!   transcript gained since the last part the memory took, whole (each tool call with its input and its result;
-//!   never thinking, nor what memstore's own tools returned or its hooks added, which are references), secrets
+//!   never thinking, nor what AmpUp Memory's own tools returned or its hooks added, which are references), secrets
 //!   redacted, is kept as the caller's own episode for later passes to check notes against (`transcripts`,
 //!   `POST /transcripts`). The note and the trace above stay as they were.
-//! - `outcome` (`/memstore:outcome good|bad [why]`, no stdin): rewards this session, which advice learns from.
+//! - `outcome` (`/ampup-memory:outcome good|bad [why]`, no stdin): rewards this session, which advice learns from.
 //! - `status`: where the memory is and whether it answers.
 //!
 //! A hook never gets in the session's way: whatever fails is said on stderr and the hook exits 0 with no
@@ -1227,7 +1227,7 @@ pub async fn metric(
     Ok(())
 }
 
-/// `memstore doctor` (and `memstore hook status`, `/memstore:status`): where the memory is and whether it's up,
+/// `memstore doctor` (and `memstore hook status`, `/ampup-memory:status`): where the memory is and whether it's up,
 /// who is calling and until when, the org, what the caller may do there, what the memory runs (extraction,
 /// compiling, advice and its evidence bar), and how the last hook went. Fails when the server can't be used.
 pub async fn doctor() -> Result<()> {
@@ -1778,7 +1778,7 @@ fn recalled_or_none(recalled: Result<Option<String>>) -> Option<String> {
 fn sign_in_hint(client: &Client) -> String {
     format!(
         "AmpUp Memory (the team memory) is off here: nobody is signed in to {} on this machine. Tell the user \
-         once, briefly, to run /memstore:login (or {} in a terminal), then carry on with their request.",
+         once, briefly, to run /ampup-memory:login (or {} in a terminal), then carry on with their request.",
         client.url,
         crate::client::sign_in_hint()
     )
@@ -2501,7 +2501,7 @@ fn detach(_: &str, _: &str, _: Harness) -> Result<()> {
     bail!("runs in the hook itself")
 }
 
-/// `memstore hook outcome <good|bad> [why...]` (`/memstore:outcome`): rewards this session's memstore session, +1 or
+/// `memstore hook outcome <good|bad> [why...]` (`/ampup-memory:outcome`): rewards this session's memstore session, +1 or
 /// -1 with the reason given; advice learns from it once the session ends. With no arguments, they are read from
 /// stdin: the command hands over what was typed in a quoted heredoc, since Claude Code puts it into the shell line
 /// as it stands and a quote in it would break the line. The command gets no hook input, so the session is the one
@@ -2697,7 +2697,7 @@ fn segment(entries: &[Value], harness: Harness) -> Segment {
                         }
                         Some("tool_use") => {
                             let name = b["name"].as_str().unwrap_or("tool");
-                            // `/memstore:outcome` run as a tool is about the run, not part of it.
+                            // `/ampup-memory:outcome` run as a tool is about the run, not part of it.
                             if b["input"]["command"].as_str().is_some_and(|c| {
                                 let c = c.trim_start();
                                 [

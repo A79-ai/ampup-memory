@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "memstore": {
-      "command": "memstore-client",
-      "args": ["mcp"]
-    }
-  }
-}

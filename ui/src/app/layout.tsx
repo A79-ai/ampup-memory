@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "memstore",
-  description: "Browse and inspect what memstore remembers: episodes by source, facts by entity.",
+  title: "AmpUp Memory",
+  description: "Browse and inspect what AmpUp Memory remembers: episodes by source, facts by entity.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

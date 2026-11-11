@@ -1,6 +1,6 @@
 # Privilege reference: BYOC and BYOVPC
 
-Every permission memstore holds in a customer's GCP project or AWS account, who holds it, on what, why, and
+Every permission AmpUp Memory holds in a customer's GCP project or AWS account, who holds it, on what, why, and
 what stops working if the customer takes it away. The Terraform that grants them is in
 [`deploy/iam`](../deploy/iam): one module per cloud and variant.
 
@@ -16,8 +16,8 @@ else's.
 ## Principles
 
 1. **Two kinds of identity.** The *vendor management* identity is what the vendor's people and automation act
-   as to install and upgrade. The *runtime* identities (engine, ingest, agent, nodes) are what memstore runs as.
-   Revoking the first leaves the second, so the customer's memstore keeps working without the vendor.
+   as to install and upgrade. The *runtime* identities (engine, ingest, agent, nodes) are what AmpUp Memory runs as.
+   Revoking the first leaves the second, so the customer's AmpUp Memory keeps working without the vendor.
 2. **The customer owns the data.** The memory bucket (and on GCP the BigQuery dataset) is created by the
    customer's module with `force_destroy = false` / `delete_contents_on_destroy = false`. The vendor can't read
    or write its objects, read a secret's value, read table data, or delete a data store.
@@ -35,7 +35,7 @@ else's.
    every create must carry the install's tag (`memstore-install = <name>`) while every change or delete needs a
    resource that already carries it. `ec2:CreateTags` is allowed only as part of a create
    (`ec2:CreateAction`), so the vendor can't adopt one of the customer's resources by tagging it.
-5. **A project (GCP) of memstore's own.** See [Workload Identity and the dedicated project](#workload-identity-and-the-dedicated-project).
+5. **A project (GCP) of AmpUp Memory's own.** See [Workload Identity and the dedicated project](#workload-identity-and-the-dedicated-project).
 6. **No wildcard actions.** Every action is named. `Resource "*"` appears only where AWS defines no resource type
    for the action, listed in [Wildcards](#wildcards-and-resource-), plus one `Deny` on the bucket.
 
@@ -56,7 +56,7 @@ The template's `terraform_vars` output is those inputs, ready to pass:
 
 ```sh
 terraform -chdir=deploy/iam/gcp/byoc output -raw terraform_vars
-#   -var project=acme-memstore -var region=us-central1 -var name=memstore -var existing_bucket=acme-memstore-memory
+#   -var project=acme-memstore -var region=us-central1 -var name=ampup-memory -var existing_bucket=acme-memstore-memory
 #   -var existing_dataset=memstore_api -var existing_engine_sa=memstore-engine@acme-memstore.iam.gserviceaccount.com
 #   -var existing_ingest_sa=memstore-ingest@acme-memstore.iam.gserviceaccount.com
 terraform -chdir=deploy/gcp/terraform apply -var image=<engine image> $(terraform -chdir=deploy/iam/gcp/byoc output -raw terraform_vars)
@@ -67,7 +67,7 @@ output carries the same inputs as flags for the hosted service's onboarding wiza
 repo.)
 
 Routines the hosted onboarding wizard creates carry its marker as their description
-(`Created by memstore init; replaced on each apply.`); in an adopted dataset it replaces only routines carrying
+(`Created by ampup-memory init; replaced on each apply.`); in an adopted dataset it replaces only routines carrying
 it, and stops rather than replace a `search`, `episode` or `_whoami` without it. `deploy/gcp/terraform` manages
 only the routines in its own state. The BigQuery connection is created by the install and named after `name`.
 
@@ -81,7 +81,7 @@ dataset). With the template's accounts the module makes no grant on the bucket; 
 engine's object access there is the template's `<name>_engine_objects` grant. Re-running it changes nothing once
 applied.
 
-The module names its resources after `name` (default `memstore`): `<name>-engine`, `<name>-load`,
+The module names its resources after `name` (default `ampup-memory`): `<name>-engine`, `<name>-load`,
 `<name>-ingest`, the connection `<name>`, the names the template's Cloud Run grants are made on, so pass the
 template's `name` (its `terraform_vars` does).
 
@@ -97,7 +97,7 @@ template has already done what needs one, so the module doesn't redo it:
 | Engine (and ingest) account | created | the template's `<name>-engine@` (and `<name>-ingest@`), read, never created |
 | Project grants to the engine | made (`roles/biglake.editor`, `roles/bigquery.jobUser`, `roles/aiplatform.user`) | none made: the template's `<name>_engine_catalog`, `<name>_model_predict`, `<name>_bq_connection_use` and `roles/bigquery.jobUser` |
 | Grants on the engine service, the jobs, and to the connection's account | made | the template's second apply (`cloud_run_deployed = true`, `bigquery_connection_service_account`), once the vendor has deployed; the module's `template_grants` check reads the service's policy (`run.services.getIamPolicy`) and warns until they are there, and its `template_next` output is the two `-var`s |
-| The org (`memstore org create … --direct`, run after the apply) | created by whoever installs | **the customer's**: it writes the memory catalog, which the vendor role can't read or write by design. The project's owner runs it as themselves |
+| The org (`ampup-memory org create … --direct`, run after the apply) | created by whoever installs | **the customer's**: it writes the memory catalog, which the vendor role can't read or write by design. The project's owner runs it as themselves |
 
 The module runs scheduled ingest, so the template is applied with `scheduled_ingest = true` (the default; the
 module refuses `existing_engine_sa` without `existing_ingest_sa`). In order:
@@ -109,7 +109,7 @@ module refuses `existing_engine_sa` without `existing_ingest_sa`). In order:
 3. The customer applies the template again with `after_vendor_deploys` added (`-var cloud_run_deployed=true
    -var bigquery_connection_service_account=<the connection's account>`; the module's `template_next` output has
    it).
-4. The customer creates the org (`memstore org create <org> --admin <you> --direct`), as themselves.
+4. The customer creates the org (`ampup-memory org create <org> --admin <you> --direct`), as themselves.
 
 ## Revoking access
 
@@ -161,7 +161,7 @@ Impersonated by `var.vendor_principal` (`roles/iam.serviceAccountTokenCreator` o
 | `compute.globalOperations.get`, `compute.regionOperations.get`, `compute.zoneOperations.get` | project | Poll the long-running operations its creates return (network, subnet, router, GKE node pools) | Creates time out unconfirmed |
 | `container.clusters.list` | project | Terraform and `gcloud` list clusters (read-only). Create, update, delete and credentials are in `<name>_vendor_cluster`, below | Plans that list clusters fail |
 | `container.operations.get`, `.list` | project | Wait for cluster operations | Cluster changes time out unconfirmed |
-| `container.namespaces.create`, `.get` | every namespace (GKE IAM has no per-namespace scope) | The `memstore` namespace | First install fails |
+| `container.namespaces.create`, `.get` | every namespace (GKE IAM has no per-namespace scope) | The `ampup-memory` namespace | First install fails |
 | `container.serviceAccounts.create`, `.delete`, `.get`, `.update` | every namespace | The engine's and the agent's Kubernetes service accounts (`deploy/agent/k8s/agent.yaml`) | Install fails |
 | `container.roles.create`, `.delete`, `.get`, `.update`, `.bind`, `.escalate` | every namespace | The agent's Role (get/patch on the engine's Deployment only). Kubernetes refuses to create a Role granting rights the creator lacks unless it holds `escalate`; `bind` lets it bind that Role. `.escalate` is a TESTING-stage permission in custom roles | Agent can't be installed |
 | `container.roleBindings.create`, `.delete`, `.get`, `.update` | every namespace | Bind the agent's Role to its service account | Agent can't act |
@@ -196,7 +196,7 @@ With `cloud_run = true` it also holds:
 
 **`<name>_vendor_run`** (Cloud Run only), project, **no condition**. Cloud Run gives IAM conditions no resource
 attributes, and a create can only be granted on the project, so this covers every Cloud Run service and job in
-the project. That is one reason the project must be memstore's own. (The earlier draft narrowed it with
+the project. That is one reason the project must be AmpUp Memory's own. (The earlier draft narrowed it with
 `resource.type != "run.googleapis.com/Service" || …`, which matched everything and narrowed nothing.)
 
 | Permissions | Why | If revoked |
@@ -262,7 +262,7 @@ grants Google's service agents what Shared VPC requires: `roles/compute.networkU
 |---|---|---|---|
 | `<name>_engine_objects`: `storage.objects.create`, `.delete`, `.get`, `.list` | the memory bucket | Iceberg data and metadata, episode bodies, the Lance search index under `_index/` | The engine can't read or write memory |
 | `<name>_engine_catalog`: `biglake.catalogs.get`; `biglake.namespaces.create`, `.delete`, `.get`, `.list`, `.update`; `biglake.tables.create`, `.delete`, `.get`, `.list`, `.lock`, `.update` | project (BigLake has no documented name conditions) | The Iceberg REST catalog (`src/platform.rs`, `gcp_props`): commit snapshots, create scopes' namespaces and tables, drop them on `workspace delete`. `roles/biglake.editor` minus catalog create/update/delete and IAM reads | No commits, no reads of table metadata |
-| `<name>_model_predict`: `aiplatform.endpoints.predict` | project (publisher models have no per-model IAM) | `ask` answers through Gemini `generateContent`; extraction with `MEMSTORE_EXTRACT=vertex` | No Gemini answers or extraction |
+| `<name>_model_predict`: `aiplatform.endpoints.predict` | project (publisher models have no per-model IAM) | `ask` answers through Gemini `generateContent`; extraction with `AMPUP_MEMORY_EXTRACT=vertex` | No Gemini answers or extraction |
 | `roles/secretmanager.secretAccessor` | condition: secret id starts with `<secret_prefix>` | Model API keys (`ANTHROPIC_API_KEY`) and the deployment credential, mounted from Secret Manager (`deploy/gcp/trial`) | Engine can't start with those secrets |
 | Workload Identity: `roles/iam.workloadIdentityUser` for `<project>.svc.id.goog[memstore/memstore]` | this account; matches that namespace and service account in **every** GKE cluster of the project (see below) | The engine's pods act as this account on GKE (set with `gke_workload_identity_ready = true` once the cluster exists) | Engine pods have no Google identity |
 
@@ -322,7 +322,7 @@ GKE Workload Identity Federation has no principal that names one service account
 service account is recreated), and `namespace/<ns>` or `kubernetes.cluster/<url>` (wider: every pod in a
 namespace or a cluster). So the modules don't try to narrow the binding. Instead:
 
-- **The project must be memstore's alone.** No one else may create GKE clusters (or Cloud Run services, which
+- **The project must be AmpUp Memory's alone.** No one else may create GKE clusters (or Cloud Run services, which
   the vendor's role covers project-wide) in it. The GCP modules refuse to plan until you set
   `dedicated_project = true` to say so.
 - **The vendor can create only one cluster**, the one named `<name>` (`<name>_vendor_cluster`, above).
@@ -423,7 +423,7 @@ own comes from EKS's creator entry (see [Revoking access](#revoking-access)).
 ### Engine role `<name>-engine`
 
 Trust: EKS Pod Identity (`pods.eks.amazonaws.com`) from this account, and `sts:TagSession` only when the session
-tags say cluster `<name>`, namespace `memstore`, service account `memstore`. Another pod, or another cluster,
+tags say cluster `<name>`, namespace `ampup-memory`, service account `ampup-memory`. Another pod, or another cluster,
 can't assume it even if an association names it.
 
 | Actions | Resource | Condition | Why | If revoked |

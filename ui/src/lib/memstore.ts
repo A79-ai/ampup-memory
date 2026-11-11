@@ -7,19 +7,20 @@ import { baseUrl, forget, validNamespace } from "./gke";
 // The memstores this UI reads, called only from route handlers (the browser never talks to memstore, so
 // memstore needs no CORS):
 // - hosted (e.g. on Vercel), as the signed-in person with their own Google ID token (./auth.ts): the memstore
-//   at `MEMSTORE_URL`, and a Kubernetes cluster's namespaces through the gateway at `MEMSTORE_GATEWAY_URL`
+//   at `AMPUP_MEMORY_URL`, and a Kubernetes cluster's namespaces through the gateway at `AMPUP_MEMORY_GATEWAY_URL`
 //   (./gateway.ts), either or both;
 // - otherwise a Kubernetes cluster's, one per `memstore-*` namespace, through port-forwards from where this runs
 //   (./gke.ts): a laptop, or the gateway itself.
-const HOSTED = process.env.MEMSTORE_URL?.replace(/\/$/, "");
+// Each setting is AMPUP_MEMORY_*, still read under its old name (MEMSTORE_*) when the new one isn't set.
+const HOSTED = (process.env.AMPUP_MEMORY_URL ?? process.env.MEMSTORE_URL)?.replace(/\/$/, "");
 
 /** How this UI reaches memstore, as the page needs to know it. */
 export function mode(): { hosted: boolean; label: string } {
-  if (HOSTED) return { hosted: true, label: process.env.MEMSTORE_LABEL ?? new URL(HOSTED).host };
+  if (HOSTED) return { hosted: true, label: process.env.AMPUP_MEMORY_LABEL ?? process.env.MEMSTORE_LABEL ?? new URL(HOSTED).host };
   return { hosted: viaGateway(), label: "Kubernetes" };
 }
 
-/** The namespace value that names `MEMSTORE_URL`'s memstore, beside the gateway's memstore-* ones. */
+/** The namespace value that names `AMPUP_MEMORY_URL`'s memstore, beside the gateway's memstore-* ones. */
 export const hostedLabel = (): string | null => (HOSTED ? mode().label : null);
 
 /** The paths a hosted UI may send through the gateway, and the gateway may forward. */
@@ -68,7 +69,7 @@ export async function memstore(
     if (r.status === 599) {
       forget(ns);
       if (attempt === 0) continue;
-      return Response.json({ error: `${ns}'s memstore isn't answering` }, { status: 502 });
+      return Response.json({ error: `${ns}'s AmpUp Memory server isn't answering` }, { status: 502 });
     }
     return r;
   }
@@ -104,7 +105,7 @@ async function call(
   }
   // A memstore built before /browse answers unknown paths with {"ok": true}.
   if (path === "/browse" && r.ok && (json as { ok?: boolean })?.ok === true) {
-    return Response.json({ error: `${name} runs a memstore without /browse: redeploy it from main` }, { status: 501 });
+    return Response.json({ error: `${name} runs an AmpUp Memory server without /browse: redeploy it from main` }, { status: 501 });
   }
   return Response.json(json, { status: r.status });
 }

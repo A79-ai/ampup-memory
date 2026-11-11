@@ -14,29 +14,29 @@
 
 ## Who a caller is
 
-`MEMSTORE_CALLER_IDENTITY` picks how callers are identified. It takes a comma-separated list; the first source
+`AMPUP_MEMORY_CALLER_IDENTITY` picks how callers are identified. It takes a comma-separated list; the first source
 whose credential a request carries decides, and a credential that source refuses is refused, never tried on the
 next.
 
 | Value | Callers |
 |---|---|
 | unset | No identity: every request reads as one principal with the groups `serve` was given. `serve --local` works this way and binds to 127.0.0.1 only. |
-| `token` | API keys (`msk_…`), signed JWTs, and people's ID tokens from an OIDC provider (`MEMSTORE_OIDC_ISSUER`, `MEMSTORE_OIDC_AUDIENCE`). |
-| `google` | Google ID tokens behind Cloud Run IAM, or people through Identity-Aware Proxy (`MEMSTORE_IAP_AUDIENCE`). |
+| `token` | API keys (`msk_…`), signed JWTs, and people's ID tokens from an OIDC provider (`AMPUP_MEMORY_OIDC_ISSUER`, `AMPUP_MEMORY_OIDC_AUDIENCE`). |
+| `google` | Google ID tokens behind Cloud Run IAM, or people through Identity-Aware Proxy (`AMPUP_MEMORY_IAP_AUDIENCE`). |
 | `snowflake` | The Snowflake user who made the request, inside Snowpark Container Services. |
 
-JWTs: keys from `MEMSTORE_JWT_JWKS_URL` (RS256 by `kid`, refetched on rotation), `MEMSTORE_JWT_PUBLIC_KEY` (RS256
-PEM) or `MEMSTORE_JWT_SECRET` (HS256). The algorithm comes from the key source, never the token. Claims are
-configurable (`MEMSTORE_JWT_ISSUER`, `_AUDIENCE`, `_ORG_CLAIM`, `_GROUPS_CLAIM`, `_USER_CLAIMS`). A token whose
+JWTs: keys from `AMPUP_MEMORY_JWT_JWKS_URL` (RS256 by `kid`, refetched on rotation), `AMPUP_MEMORY_JWT_PUBLIC_KEY` (RS256
+PEM) or `AMPUP_MEMORY_JWT_SECRET` (HS256). The algorithm comes from the key source, never the token. Claims are
+configurable (`AMPUP_MEMORY_JWT_ISSUER`, `_AUDIENCE`, `_ORG_CLAIM`, `_GROUPS_CLAIM`, `_USER_CLAIMS`). A token whose
 `email_verified` is false is refused.
 
 Emails compare case-insensitively everywhere; other ids are exact.
 
-With `token` identity, set `MEMSTORE_PUBLIC_URL` to the server's public URL: sign-in discovery and every 401's
+With `token` identity, set `AMPUP_MEMORY_PUBLIC_URL` to the server's public URL: sign-in discovery and every 401's
 `WWW-Authenticate` name it, never a request's `Host` header (which the caller sets). A server that listens beyond
 loopback refuses to start without it.
 
-`memstore identity check` reports what `serve` makes of the environment and exits non-zero when a part fails. Run
+`ampup-memory identity check` reports what `serve` makes of the environment and exits non-zero when a part fails. Run
 it in a deploy's smoke step.
 
 ## ACLs and groups
@@ -57,23 +57,23 @@ One catalog holds orgs; each org holds teams. People belong to several orgs and 
 they read. The server checks the selection against their memberships on every request.
 
 ```bash
-memstore create-org acme --admin alice@acme.com
-memstore join https://memory.example.com              # Alice signs in
-memstore org init                                     # a memory profile: what acme does, what never to keep
-memstore create-team sales
-memstore invite --email bob@acme.com --team sales     # or --file people.csv
+ampup-memory create-org acme --admin alice@acme.com
+ampup-memory join https://memory.example.com              # Alice signs in
+ampup-memory org init                                     # a memory profile: what acme does, what never to keep
+ampup-memory create-team sales
+ampup-memory invite --email bob@acme.com --team sales     # or --file people.csv
 ```
 
-- `invite` sends no email: it prints the `memstore join` and `claude mcp add` lines to share.
+- `invite` sends no email: it prints the `ampup-memory join` and `claude mcp add` lines to share.
 - `org sync people.csv [--dry-run] [--keep-absent]` makes the org match an IdP export.
-- An org can connect its own identity provider (`memstore auth setup --provider google|okta|entra|oidc …`,
+- An org can connect its own identity provider (`ampup-memory auth setup --provider google|okta|entra|oidc …`,
   `--require` to make it the only sign-in that counts there: not the server's provider, a gateway, an app's JWT or a
   keys-file key; services use the org's own keys), map provider groups to teams (`auth map-group`) and admit verified email
   domains (`auth domain add`). A sign-in through an org's own provider counts in that org only.
 - Every URL the server fetches for an org's provider must be https and resolve to public addresses only; loopback,
   private, link-local (including the cloud metadata service) and CGNAT ranges are refused, and the connection is
   pinned to the checked address.
-- A provider's client secret is sealed with `MEMSTORE_SECRET_KEY` (AES-256-GCM, 32 bytes) before it reaches the
+- A provider's client secret is sealed with `AMPUP_MEMORY_SECRET_KEY` (AES-256-GCM, 32 bytes) before it reaches the
   directory. Keep the same key on every server that shares a catalog.
 
 Every directory change is a row in `memory_system.directory` with who made it and when. Changes commit by
@@ -82,11 +82,11 @@ compare-and-set; of two racing creates of one name, exactly one succeeds.
 ## Service accounts (API keys)
 
 ```bash
-memstore apikey create --name dash --team sales                    # a reader of acme/sales
-memstore apikey create --name feed --role ingest --sources slack:   # writes Slack episodes only
-memstore apikey create --name ci --role recorder                    # records runs as a member it names
-memstore apikey list
-memstore apikey revoke dash
+ampup-memory apikey create --name dash --team sales                    # a reader of acme/sales
+ampup-memory apikey create --name feed --role ingest --sources slack:   # writes Slack episodes only
+ampup-memory apikey create --name ci --role recorder                    # records runs as a member it names
+ampup-memory apikey list
+ampup-memory apikey revoke dash
 ```
 
 | Role | May |
@@ -118,23 +118,23 @@ memstore apikey revoke dash
 ## Audit log
 
 ```bash
-memstore audit --org acme                                  # last 24 hours
-memstore audit --org acme --since 7d --kind refusal --json # change | signin | refusal | key
+ampup-memory audit --org acme                                  # last 24 hours
+ampup-memory audit --org acme --since 7d --kind refusal --json # change | signin | refusal | key
 ```
 
 It records access changes, sign-ins (first per hour per org), every 401 and 403 with a reason code, and per-key
 reads and writes per hour. Only the org's admins (signed in as people) and the operator's admin key read it.
 Nothing a caller types is stored: routes are templates, reasons are codes, ids are cleaned, and tokens, keys,
-queries and memory are never written. Servers buffer events and append them every `MEMSTORE_AUDIT_FLUSH_SECS` (60)
+queries and memory are never written. Servers buffer events and append them every `AMPUP_MEMORY_AUDIT_FLUSH_SECS` (60)
 and on shutdown.
 
 ## Deletion
 
 ```bash
-memstore org export acme --out ./acme-export      # org admins, or the operator
-memstore users forget carol@acme.com --org acme   # delete what she wrote, and remove her
-memstore org purge acme                           # delete from storage what was retracted or aged out
-memstore org delete acme --confirm acme           # the operator only; no undo
+ampup-memory org export acme --out ./acme-export      # org admins, or the operator
+ampup-memory users forget carol@acme.com --org acme   # delete what she wrote, and remove her
+ampup-memory org purge acme                           # delete from storage what was retracted or aged out
+ampup-memory org delete acme --confirm acme           # the operator only; no undo
 ```
 
 - **Forget** removes the person from the org and its teams, then deletes every episode they authored, every fact
@@ -143,7 +143,7 @@ memstore org delete acme --confirm acme           # the operator only; no undo
 - **What forget can't find:** memory that doesn't name its author (episodes ingested from Slack, calls, email or
   a CRM). Those go with the source's own deletion (`POST /retract`) and a purge.
 - **Purge** deletes from storage what `POST /retract` hid and what aged out under retention.
-  `set_settings {purge: true}` has the nightly window do it once hidden for `MEMSTORE_PURGE_GRACE` (7 days).
+  `set_settings {purge: true}` has the nightly window do it once hidden for `AMPUP_MEMORY_PURGE_GRACE` (7 days).
 - **Delete** drops every table of the org's namespaces with purge, then its rows in the ledger, audit and key-usage
   tables.
 - Every step skips what is done, so a stopped forget or delete is finished by running it again.
@@ -156,9 +156,9 @@ memstore org delete acme --confirm acme           # the operator only; no undo
 ## Retention
 
 ```bash
-memstore org retention acme                                        # show
-memstore org retention acme slack:=90d slack:C-legal:=forever =2y  # set (replaces the old policy)
-memstore org retention acme --team a1 --clear
+ampup-memory org retention acme                                        # show
+ampup-memory org retention acme slack:=90d slack:C-legal:=forever =2y  # set (replaces the old policy)
+ampup-memory org retention acme --team a1 --clear
 ```
 
 An episode follows the rule with the longest matching source prefix and is kept when none matches. Age counts from
@@ -174,16 +174,16 @@ against someone hiding one on purpose.
 
 ## Rate limits
 
-`MEMSTORE_RATE_LIMIT=60/min:120` (rate and burst) and `MEMSTORE_INGEST_RATE_LIMIT` give each caller a token bucket,
+`AMPUP_MEMORY_RATE_LIMIT=60/min:120` (rate and burst) and `AMPUP_MEMORY_INGEST_RATE_LIMIT` give each caller a token bucket,
 keyed by what authenticated them. Over the limit: 429 with `Retry-After`. Buckets live in each server's memory, so
 with N replicas a caller gets up to N times the limit. The operator's admin key and unauthenticated callers (who get
 no further than 401) aren't limited; put a per-address limit at the load balancer. A batch costs its items: a
 `/search` or `/query` with 100 rows costs what 100 requests would.
 
 A request's body is read only once its headers prove who sent it: without a credential, or with one the server
-refuses, it is answered 401 unread. Past `MEMSTORE_MAX_CONNECTIONS` or `MEMSTORE_MAX_IN_FLIGHT` a request is
-answered 503, and past `MEMSTORE_MAX_IN_FLIGHT_PER_CALLER` 429, both unread and with `Retry-After: 1`; `/ready` and
-the health probes are always answered. `MEMSTORE_HEADER_TIMEOUT_SECS` closes connections slow to send their
+refuses, it is answered 401 unread. Past `AMPUP_MEMORY_MAX_CONNECTIONS` or `AMPUP_MEMORY_MAX_IN_FLIGHT` a request is
+answered 503, and past `AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER` 429, both unread and with `Retry-After: 1`; `/ready` and
+the health probes are always answered. `AMPUP_MEMORY_HEADER_TIMEOUT_SECS` closes connections slow to send their
 headers ([configuration.md](configuration.md)).
 
 ## Operating rules
@@ -194,7 +194,7 @@ headers ([configuration.md](configuration.md)).
   folding the directory: it signs no one in, refuses directory changes, answers `/ready` with 503, logs
   `ALERT directory: …` and sets `memstore_directory_blocked` to 1. Upgrade readers before writers: ship the code
   that reads a new change version before the code that writes it.
-- Directory snapshots are sealed with `MEMSTORE_SECRET_KEY`. A server starts from a snapshot without reading the
+- Directory snapshots are sealed with `AMPUP_MEMORY_SECRET_KEY`. A server starts from a snapshot without reading the
   log before it only if its own key sealed it; any other snapshot is checked against the log, and one that doesn't
   match is refused with an alert (`memstore_directory_snapshot_refused_total`).
 - `/metrics` labels come from fixed sets the server owns; no user, key, token or raw path is ever a label.

@@ -11,7 +11,8 @@ import { door, verifyGoogle } from "./google-token";
 //   AUTH_ALLOWED_DOMAINS  who may call it (e.g. example.com,example.org)
 //
 // And on the hosted UI:
-//   MEMSTORE_GATEWAY_URL  the gateway's public URL: its namespaces are listed next to MEMSTORE_URL's memstore
+//   AMPUP_MEMORY_GATEWAY_URL  the gateway's public URL (or MEMSTORE_GATEWAY_URL, its old name): its namespaces are
+//                             listed next to AMPUP_MEMORY_URL's memstore
 
 export const GATEWAY_AUDIENCE = process.env.GATEWAY_AUDIENCE;
 
@@ -30,7 +31,7 @@ export async function guard(req: Request): Promise<Response | null> {
   return Response.json({ error: r.reason }, { status: r.status });
 }
 
-const GATEWAY_URL = process.env.MEMSTORE_GATEWAY_URL?.replace(/\/$/, "");
+const GATEWAY_URL = (process.env.AMPUP_MEMORY_GATEWAY_URL ?? process.env.MEMSTORE_GATEWAY_URL)?.replace(/\/$/, "");
 
 /** Whether the hosted UI also lists the gateway's namespaces. */
 export const viaGateway = (): boolean => !!GATEWAY_URL;

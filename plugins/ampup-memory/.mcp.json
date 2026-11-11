@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ampup-memory": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/ampup-memory-client",
+      "args": ["mcp"]
+    }
+  }
+}

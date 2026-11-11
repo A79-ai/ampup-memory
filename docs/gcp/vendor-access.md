@@ -26,8 +26,8 @@ has no key either (`iam.disableServiceAccountKeyCreation` may stay enforced).
 
 ## What leaves your project
 
-- **Telemetry**: the fields in the contract, and only those. `memstore telemetry schema` prints every one;
-  `memstore telemetry check` refuses a payload with any other. Counts, states, versions, timings. No memory,
+- **Telemetry**: the fields in the contract, and only those. `ampup-memory telemetry schema` prints every one;
+  `ampup-memory telemetry check` refuses a payload with any other. Counts, states, versions, timings. No memory,
   no names of orgs, teams, users or scopes, no log lines.
 - **Support diagnostics**, when a session is open: `health`, `telemetry`, `metrics` (summed, labels dropped),
   `index_status` (counts), `config` (variable names; values only for a fixed non-secret set). Never `/query`,
@@ -41,7 +41,7 @@ and each command in it is written to your engine's audit log with who asked, who
 its outcome:
 
 ```sh
-memstore audit --operator --kind support
+ampup-memory audit --operator --kind support
 ```
 
 A session exists only because one of your admins approved it: an engineer asks, the control plane refuses the
@@ -51,7 +51,7 @@ altogether, set the deployment's support policy to `off` in the console.
 No session can then be asked for, and the agent answers anything it is sent with `refused` (`support_off`),
 audited in your engine. Back on with `on-request`.
 
-Instead of a session, you can make a **support bundle** yourself and attach it to a ticket: `memstore
+Instead of a session, you can make a **support bundle** yourself and attach it to a ticket: `ampup-memory
 support-bundle` writes a directory on your machine with what a session's diagnostics would read (health,
 telemetry through the contract's types, metric families with labels dropped, index counts, config names) and a
 redacted summary of the engine's logs (counts by severity, the error and warning lines with emails, keys and URL

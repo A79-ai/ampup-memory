@@ -818,7 +818,7 @@ pub async fn join(
                     ))?
                     else {
                         anyhow::bail!(
-                            "{} isn't a member of any org on {server} yet: name the org to ask to join (--org <org>; the plugin: /memstore:login --org <org>), and its admins are emailed to approve",
+                            "{} isn't a member of any org on {server} yet: name the org to ask to join (--org <org>; the plugin: /ampup-memory:login --org <org>), and its admins are emailed to approve",
                             creds.user
                         )
                     };
@@ -832,7 +832,7 @@ pub async fn join(
                     )? {
                         Some(o) => o,
                         None => anyhow::bail!(
-                            "{} is in several orgs ({list}): name one (--org <org>; the plugin: /memstore:login --org <org>)",
+                            "{} is in several orgs ({list}): name one (--org <org>; the plugin: /ampup-memory:login --org <org>)",
                             creds.user
                         ),
                     }

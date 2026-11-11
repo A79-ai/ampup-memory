@@ -1,5 +1,5 @@
 //! Joining an org by asking: a person signed in through an identity provider, whom the directory doesn't
-//! hold in the org they want (`memstore join`, the plugin's `/memstore:login`), asks to join it (`/admin`
+//! hold in the org they want (`memstore join`, the plugin's `/ampup-memory:login`), asks to join it (`/admin`
 //! op `request_join`: [`crate::people::directory::Change::RequestJoin`]). The request is recorded in the
 //! directory (`pending`, granting nothing), and each admin of the org is emailed ([`crate::mail`]) a link
 //! that approves it: the person becomes a member, as `memstore invite` makes them. `memstore requests`
@@ -468,7 +468,7 @@ pub(super) async fn approve(state: &State, token: Option<&str>) -> Shown {
                 200,
                 "Approved",
                 &format!(
-                    "<p>Done: <b>{}</b> is a member of <b>{}</b>. They sign in with <code>/memstore:login</code> (or <code>ampup-memory join</code>) and memory is on from their next session.</p>",
+                    "<p>Done: <b>{}</b> is a member of <b>{}</b>. They sign in with <code>/ampup-memory:login</code> (or <code>ampup-memory join</code>) and memory is on from their next session.</p>",
                     mail::esc(&a.user),
                     mail::esc(&a.org)
                 ),

@@ -1,0 +1,144 @@
+#!/bin/sh
+# What the plugin runs for every hook, its MCP server and its commands: ampup-memory-client where it is installed,
+# and where it isn't, it installs it from the public releases (bin/install.sh) and runs that. Never a full
+# `ampup-memory` on the PATH instead: that one is whatever its owner last built or installed, often older than the
+# plugin.
+#
+# Never in the person's way: a hook with nothing installed doesn't wait for a download. A session's start installs
+# in the background and says once that the memory is on from the next session; the other hooks do nothing. The MCP
+# server and the commands, which can't run without it, install first (a few MB) and then run. A machine that has
+# only the client under its old name (memstore-client, from before the rename) keeps running that one until the
+# session's start has installed ampup-memory-client in the background.
+#
+#   ampup-memory-client <args>   as ampup-memory-client would run them
+#   ampup-memory-client login [<server>] [--org <org>]
+#                                signs in as you (Google, a password): the server defaults to AMPUP_MEMORY_URL,
+#                                else the plugin's own (default_server below; with none, the memory is a local
+#                                server, ampup-memory serve --local on http://127.0.0.1:8080, which needs no
+#                                sign-in). The org defaults to AMPUP_MEMORY_ORG, else the one org holding you
+#                                (several: name one; none: name the one to ask to join). Not a member of the org
+#                                yet: asks to join it, and its admins are emailed to approve
+#
+# Each AMPUP_MEMORY_* variable is also read under its old name (MEMSTORE_*) when the new one isn't set.
+default_server=
+here=$(cd "$(dirname "$0")" && pwd)
+dir=${AMPUP_MEMORY_INSTALL_DIR:-${MEMSTORE_INSTALL_DIR:-$HOME/.local/bin}}
+# The installer's lock and log, in the user's own directory: never a fixed name in a shared /tmp.
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/ampup-memory
+
+# A client binary, not a launcher: this script, or another plugin's (an older plugin's bin/ may be on PATH as
+# memstore-client), is a shell script.
+is_client() {
+  [ -n "$1" ] && [ -x "$1" ] && [ "$(cd "$(dirname "$1")" && pwd)" != "$here" ] && [ "$(head -c 2 "$1" 2>/dev/null)" != '#!' ]
+}
+
+find_bin() {
+  for b in "$dir/ampup-memory-client" "$(command -v ampup-memory-client 2>/dev/null)"; do
+    is_client "$b" && { echo "$b"; return; }
+  done
+}
+
+# The client under its old name, installed before the rename: used only until ampup-memory-client is.
+find_old_bin() {
+  for b in "$dir/memstore-client" "$(command -v memstore-client 2>/dev/null)"; do
+    is_client "$b" && { echo "$b"; return; }
+  done
+}
+
+install() {
+  # One install at a time: every hook of every open session may find it missing at once.
+  mkdir -p "$cache" && chmod 700 "$cache" || return 1
+  lock=$cache/install.lock
+  # A lock an install killed midway left behind doesn't block the next for good.
+  find "$lock" -maxdepth 0 -mmin +10 -exec rmdir {} \; 2>/dev/null
+  mkdir "$lock" 2>/dev/null || return 1
+  trap 'rmdir "$lock" 2>/dev/null' EXIT
+  sh "$here/install.sh" >"$cache/install.log" 2>&1
+  status=$?
+  rmdir "$lock" 2>/dev/null
+  trap - EXIT
+  return $status
+}
+
+# A client from v0.1.7 on keeps itself current (hourly at a session's start, and before every sign-in), so this
+# launcher checks only for one older than that, which can't: its first update brings one that can.
+selfupdates() {
+  "$1" update --help >/dev/null 2>&1
+}
+
+# Keeps an older client current: where the newest client release (a client-v* tag, which install.sh --latest
+# names) isn't the one installed (`ampup-memory-client --version` names it without the client- prefix), installs
+# it. With a number, at most once in that many minutes (a session's start, in the background, hourly); without,
+# every time (a sign-in, which waits for it). A pinned AMPUP_MEMORY_VERSION, or AMPUP_MEMORY_CLIENT_UPDATE=off,
+# leaves it as it is.
+update() {
+  [ -z "${AMPUP_MEMORY_VERSION:-${MEMSTORE_VERSION:-}}" ] &&
+    [ "${AMPUP_MEMORY_CLIENT_UPDATE:-${MEMSTORE_CLIENT_UPDATE:-on}}" != off ] || return 0
+  mkdir -p "$cache" && chmod 700 "$cache" || return 0
+  stamp=$cache/update-checked
+  [ -z "$2" ] || [ -z "$(find "$stamp" -mmin -"$2" 2>/dev/null)" ] || return 0
+  : >"$stamp"
+  latest=$(sh "$here/install.sh" --latest 2>/dev/null)
+  [ -n "$latest" ] || return 0
+  [ "$("$1" --version 2>/dev/null | cut -d' ' -f2)" = "${latest#client-}" ] && return 0
+  AMPUP_MEMORY_VERSION=$latest install
+}
+
+bin=$(find_bin)
+if [ -n "$bin" ] && [ "$1 $2" = "hook session-start" ] && ! selfupdates "$bin"; then
+  (update "$bin" 60 </dev/null >/dev/null 2>&1 &)
+fi
+if [ -z "$bin" ]; then
+  old=$(find_old_bin)
+  case "$1 $2" in
+    "hook session-start")
+      # The installer outlives this hook: the person's session starts at once.
+      (install </dev/null >/dev/null 2>&1 &)
+      if [ -n "$old" ]; then
+        # The old client runs this session, signed in as before; the next one runs the new.
+        exec "$old" "$@"
+      fi
+      printf '%s\n' "AmpUp Memory (the team memory) is being installed in the background (ampup-memory-client, to $dir). Tell the user once, briefly: it is on from their next session, and if they haven't signed in to the team's memory on this machine, /ampup-memory:login does it. Then carry on with their request."
+      exit 0
+      ;;
+    hook\ *)
+      [ -n "$old" ] && exec "$old" "$@"
+      exit 0
+      ;;
+  esac
+  install && bin=$(find_bin)
+  # Where the install failed, the old client still serves, signed in as before.
+  [ -n "$bin" ] || bin=$old
+  [ -n "$bin" ] || {
+    echo "ampup-memory-client isn't installed and installing it failed: see $cache/install.log, or install it with: curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/plugins/ampup-memory/bin/install.sh | sh" >&2
+    exit 1
+  }
+fi
+
+if [ "$1" = login ]; then
+  shift
+  selfupdates "$bin" || {
+    update "$bin" </dev/null >/dev/null 2>&1
+    bin=$(find_bin)
+  }
+  # The server is the one named, else AMPUP_MEMORY_URL (an admin can set it and AMPUP_MEMORY_ORG for everyone in
+  # managed settings), else the plugin's own. You sign in as yourself: the org is the one holding you, or the one
+  # you name (--org) to ask to join.
+  server=${AMPUP_MEMORY_URL:-${MEMSTORE_URL:-$default_server}}
+  case "$1" in http*) server=$1; shift ;; esac
+  if [ -z "$server" ]; then
+    # No team server: the hooks and the MCP server use a local one (ampup-memory serve --local), which serves only
+    # this machine and needs no sign-in.
+    echo "No server named and AMPUP_MEMORY_URL isn't set, so the memory is a local server on this machine (http://127.0.0.1:8080, started with: ampup-memory serve --local), which needs no sign-in. To use your team's server: /ampup-memory:login <server> --org <org>, or set AMPUP_MEMORY_URL and AMPUP_MEMORY_ORG."
+    exit 0
+  fi
+  case " $* " in
+    *" --org "*) exec "$bin" join "$server" "$@" ;;
+  esac
+  org=${AMPUP_MEMORY_ORG:-${MEMSTORE_ORG:-}}
+  if [ -n "$org" ]; then
+    exec "$bin" join "$server" --org "$org" "$@"
+  fi
+  exec "$bin" join "$server" "$@"
+fi
+exec "$bin" "$@"

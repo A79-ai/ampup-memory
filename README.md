@@ -16,19 +16,19 @@ Build from source; there are no public release binaries yet. You need `rustup` (
 `rust-toolchain.toml`) and `protoc` on your `PATH`. macOS on Apple Silicon or Linux on arm64/x86_64.
 
 ```bash
-cargo install --locked --path .                                        # memstore: server and CLI
-cargo install --locked --path crates/memstore-client --root ~/.local   # memstore-client: hooks for coding agents
+cargo install --locked --path .                                        # ampup-memory: server and CLI
+cargo install --locked --path crates/memstore-client --root ~/.local   # ampup-memory-client: hooks for coding agents
 ```
 
 For Claude Code, add this checkout as a plugin marketplace: `/plugin marketplace add /path/to/ampup-memory`, then
-`/plugin install memstore@memstore` ([coding agents](docs/guide/coding-agents.md)). The command is `memstore` for
-now; it will become `ampup-memory`.
+`/plugin install ampup-memory@ampup-memory` ([coding agents](docs/guide/coding-agents.md)). The command was `memstore`
+before the rename, and `memstore` still works as a link to it.
 
 ## Run it locally
 
 ```bash
-OPENROUTER_API_KEY=... MEMSTORE_EXTRACT_GOAL_BLIND=1 memstore serve --local   # ~/.memstore, http://127.0.0.1:8080
-claude mcp add --transport http memstore http://localhost:8080/mcp
+OPENROUTER_API_KEY=... AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1 ampup-memory serve --local   # ~/.ampup-memory, http://127.0.0.1:8080
+claude mcp add --transport http ampup-memory http://localhost:8080/mcp
 ```
 
 `--local` needs no Docker, catalog service or sign-in, and binds to 127.0.0.1. Without a model key it stores and

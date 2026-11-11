@@ -1,11 +1,11 @@
 # Troubleshooting
 
 The failures seen in real installs, each with what you see, why, and what to do. Most are caught earlier by
-`memstore preflight gcp` (the check's id is given); run it first, and `--installed` after.
+`ampup-memory preflight gcp` (the check's id is given); run it first, and `--installed` after.
 
 | What you see | Why | Do | Preflight |
 |---|---|---|---|
-| `terraform apply` of the template refuses to plan: `dedicated_project` must be true | Workload Identity trusts the engine's identity in every cluster of the project | confirm the project is memstore's alone and set `-var dedicated_project=true` | `project` |
+| `terraform apply` of the template refuses to plan: `dedicated_project` must be true | Workload Identity trusts the engine's identity in every cluster of the project | confirm the project is AmpUp Memory's alone and set `-var dedicated_project=true` | `project` |
 | The template's apply fails with `Editor` refused on a service account binding | Editor can't grant on service accounts | apply as Owner, or add Project IAM Admin, Role Administrator and Service Account Admin | `permissions` |
 | A grant to the vendor principal fails: "not a member of the allowed domains" | domain-restricted sharing | an org-policy exception on the project for `iam.allowedPolicyMemberDomains` with the vendor's customer id | `org-policy` |
 | A first install fails with a 403 from BigLake | new IAM bindings take up to a minute to propagate | apply again a minute later | |
@@ -25,7 +25,7 @@ The failures seen in real installs, each with what you see, why, and what to do.
 ## Getting help
 
 Run the preflight with `--json` and attach the file to the ticket; it has no memory, names or secrets in it,
-only what each check found. For a running install, make a bundle (`memstore support-bundle`, see
+only what each check found. For a running install, make a bundle (`ampup-memory support-bundle`, see
 [operations.md](operations.md)), read it, and attach it. Or the vendor may ask to open a support session, which
 one of your admins approves: what it can and can't read is in [vendor-access.md](vendor-access.md), and you see
-every command in `memstore audit --operator --kind support`.
+every command in `ampup-memory audit --operator --kind support`.

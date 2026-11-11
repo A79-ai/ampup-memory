@@ -13,7 +13,7 @@ Report it privately through GitHub's private vulnerability reporting: open the r
 
 Please include:
 
-- the version or commit you tested (`memstore --version`);
+- the version or commit you tested (`ampup-memory --version`);
 - what an attacker can do, and what they need first (a sign-in, a token, network access to the server);
 - the steps or a proof of concept to reproduce it;
 - any logs or output that show it.
@@ -35,7 +35,7 @@ Security fixes go into the newest release only. Upgrade to it to get them
 
 ## Scope
 
-In scope: the code in this repository (the `memstore` server and CLI, `memstore-client`, the plugins) and the
+In scope: the code in this repository (the `ampup-memory` server and CLI, `ampup-memory-client`, the plugins) and the
 release binaries built from it. Out of scope: issues in third-party dependencies with no impact on AmpUp Memory
 (report those upstream), and deployments you run yourself that change its configuration in ways the documentation
 warns against.

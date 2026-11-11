@@ -15,8 +15,8 @@ You need:
   prebuilt during the build; there is none for Intel macOS.
 
 ```bash
-cargo install --locked --path .                                    # memstore: server and CLI
-cargo install --locked --path crates/memstore-client --root ~/.local   # memstore-client: hooks and MCP bridge
+cargo install --locked --path .                                    # ampup-memory: server and CLI
+cargo install --locked --path crates/memstore-client --root ~/.local   # ampup-memory-client: hooks and MCP bridge
 ```
 
 There are no public release binaries yet.
@@ -24,21 +24,21 @@ There are no public release binaries yet.
 ## 2. Run it
 
 ```bash
-memstore serve --local
-# memstore: serving memory_org from ~/.memstore on http://127.0.0.1:8080/mcp (as group:local)
+ampup-memory serve --local
+# ampup-memory: serving memory_org from ~/.ampup-memory on http://127.0.0.1:8080/mcp (as group:local)
 ```
 
-Everything lives under `~/.memstore` (pass a directory to `--local` for another). Nobody signs in; the server binds
+Everything lives under `~/.ampup-memory` (pass a directory to `--local` for another). Nobody signs in; the server binds
 to 127.0.0.1 only. `curl localhost:8080/ready` answers `{"ready":true,…}` once it has warmed up.
 
 With no model key, the server stores and searches but extracts, compiles and learns nothing. To turn the model work
 on, start it with a key:
 
 ```bash
-OPENROUTER_API_KEY=... MEMSTORE_EXTRACT_GOAL_BLIND=1 memstore serve --local
+OPENROUTER_API_KEY=... AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1 ampup-memory serve --local
 ```
 
-`MEMSTORE_EXTRACT_GOAL_BLIND=1` reads every episode into facts. Other providers (Anthropic, OpenAI-compatible,
+`AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1` reads every episode into facts. Other providers (Anthropic, OpenAI-compatible,
 Bedrock, Vertex AI, a local Ollama) are in [configuration.md](configuration.md#models).
 
 ## 3. A first memory
@@ -64,7 +64,7 @@ the source text no fact cites yet.
 ## 5. Connect an agent
 
 ```bash
-claude mcp add --transport http memstore http://localhost:8080/mcp
+claude mcp add --transport http ampup-memory http://localhost:8080/mcp
 ```
 
 The agent is offered `start_session`, `end_session`, `search_memory`, `get_episode`, `remember_memory` and
@@ -93,13 +93,13 @@ procedure before any runs exist. Notes sent to `/remember` are stored under the 
 `mcp:remember_memory:<caller>:<source>`, so this compiles every remembered note:
 
 ```bash
-OPENROUTER_API_KEY=... MEMSTORE_COMPILE_SOURCES=mcp:remember_memory: memstore serve --local
+OPENROUTER_API_KEY=... AMPUP_MEMORY_COMPILE_SOURCES=mcp:remember_memory: ampup-memory serve --local
 curl -s localhost:8080/remember --data-binary @- <<'EOF'
 {"source": "note:runbook", "body": "To deploy billing: run ./deploy.sh billing from CI, check /healthz, then post in #deploys."}
 EOF
 ```
 
-The server compiles new sources every `MEMSTORE_COMPILE_SECS` (60). Compiling runs on the learning model (Claude
+The server compiles new sources every `AMPUP_MEMORY_COMPILE_SECS` (60). Compiling runs on the learning model (Claude
 Opus 5.5 by default), so name sources narrowly.
 
 **Notes learned from rewarded runs.** Record runs with their outcomes, then learn:
@@ -110,19 +110,19 @@ cat > runs.jsonl <<'EOF'
 {"task": "deploy billing on Friday", "trace": "deployed from a laptop", "outcome": "rolled back", "reward": -1, "reason": "never deploy from a laptop"}
 EOF
 # with the server stopped
-memstore runs load org runs.jsonl --local ~/.memstore --as amy@example.com
-memstore runs load org runs.jsonl --local ~/.memstore --as ben@example.com
-OPENROUTER_API_KEY=... memstore advice org --local ~/.memstore
-OPENROUTER_API_KEY=... MEMSTORE_ADVICE_EVIDENCE=0 memstore serve --local
+ampup-memory runs load org runs.jsonl --local ~/.ampup-memory --as amy@example.com
+ampup-memory runs load org runs.jsonl --local ~/.ampup-memory --as ben@example.com
+OPENROUTER_API_KEY=... ampup-memory advice org --local ~/.ampup-memory
+OPENROUTER_API_KEY=... AMPUP_MEMORY_ADVICE_EVIDENCE=0 ampup-memory serve --local
 ```
 
 Rules this example works around, on purpose:
 
-- A team note is learned only from runs of at least 2 people (`MEMSTORE_ADVICE_LEARN_PEOPLE`, default 3, never
+- A team note is learned only from runs of at least 2 people (`AMPUP_MEMORY_ADVICE_LEARN_PEOPLE`, default 3, never
   below 2). `serve --local` has one anonymous caller, so the runs are loaded as two people.
 - A situation needs at least 2 runs that went wrong (`--min-wrong`) or enough that went right.
 - A new note is a candidate, served only in 20% of sessions, until it has helped 3 people.
-  `MEMSTORE_ADVICE_EVIDENCE=0` serves it everywhere on this laptop.
+  `AMPUP_MEMORY_ADVICE_EVIDENCE=0` serves it everywhere on this laptop.
 
 On a running `serve --local`, the same happens on its own: rewarded sessions and runs come in, and every 10 minutes
 the server learns once 10 new rewarded ones are waiting. See [advice.md](advice.md).

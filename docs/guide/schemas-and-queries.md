@@ -15,14 +15,14 @@ default, where a newer value replaces the older; or `many`, where values accumul
 - Three ship built in: `sales`, `engineering`, `corpus` (`schemas/`). Any JSON file in the same shape works.
 
 ```bash
-memstore schema list                                      # the built-in schemas
-memstore schema check my-schema.json                      # check a file, no catalog needed
-memstore schema set org:acme sales                        # a built-in name, or a file
-memstore schema set org:acme my-schema.json --branch try  # try it on a branch; main keeps its own
-memstore schema set org:acme my-schema.json --dry-run     # every check a set would make; commit nothing
-memstore schema set org:acme my-schema.json --breaking    # a breaking change on main (raise `version` too)
-memstore schema get org:acme
-memstore schema set org ./my-schema.json --local ~/.memstore   # a laptop store (server stopped)
+ampup-memory schema list                                      # the built-in schemas
+ampup-memory schema check my-schema.json                      # check a file, no catalog needed
+ampup-memory schema set org:acme sales                        # a built-in name, or a file
+ampup-memory schema set org:acme my-schema.json --branch try  # try it on a branch; main keeps its own
+ampup-memory schema set org:acme my-schema.json --dry-run     # every check a set would make; commit nothing
+ampup-memory schema set org:acme my-schema.json --breaking    # a breaking change on main (raise `version` too)
+ampup-memory schema get org:acme
+ampup-memory schema set org ./my-schema.json --local ~/.ampup-memory   # a laptop store (server stopped)
 ```
 
 A schema is committed through the ledger like any write. A scope without one stays untyped. Additive changes (new
@@ -40,7 +40,7 @@ A model reads episodes into facts. Which episodes:
   schema's types and its episode type's catalog; each fact cites the unit it comes from.
 - **Starter documents** (a repo's `CLAUDE.md` and rules), always.
 - **Everything else**, goal-blind, only where turned on: `set_settings {extract: true}` for an org or team, or
-  `MEMSTORE_EXTRACT_GOAL_BLIND=1` for the whole server. On `serve --local` use the variable.
+  `AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1` for the whole server. On `serve --local` use the variable.
 
 No episode is read by both. The goal-blind prompt keeps nine kinds of fact (decision, issue, owner, how_it_works,
 how_to_enable, supports, shipped_in, changed_in, requested_by), and a fact is kept only if its quote, at least 12
@@ -60,9 +60,9 @@ characters, occurs in the text.
 - `"outcomes": true` (or a list of source prefixes) also asks for what the text reports happened, dated.
 - `"style": "statements"` writes each fact as one self-contained sentence under one subject, its predicate a kind
   (`decision`, `commitment`, `plan`, `fix`, …).
-- Each episode is read once per schema version. `memstore backfill <scope>` reads the history with the schema as it
-  stands (`--dry-run` estimates tokens and dollars with `MEMSTORE_EXTRACT_PRICE`; `--max-episodes`, `--max-usd`).
-- `memstore extract [scope] [--limit N] [--dry-run] [--branch b] [--local DIR]` runs once. `--dry-run` prints what
+- Each episode is read once per schema version. `ampup-memory backfill <scope>` reads the history with the schema as it
+  stands (`--dry-run` estimates tokens and dollars with `AMPUP_MEMORY_EXTRACT_PRICE`; `--max-episodes`, `--max-usd`).
+- `ampup-memory extract [scope] [--limit N] [--dry-run] [--branch b] [--local DIR]` runs once. `--dry-run` prints what
   it would add and end, one JSON line per episode: audit it before turning extraction on over real data.
 
 New facts are reconciled with what is known before they are committed. The model sees only facts every reader of
@@ -77,7 +77,7 @@ Entity names are normalised: `BillingExport`, `billing-export` and `the billing 
 
 ## Typed queries
 
-Queries are JSON, the same over `POST /query`, MCP `query_memory` and `memstore query <scope> <user> <json>`:
+Queries are JSON, the same over `POST /query`, MCP `query_memory` and `ampup-memory query <scope> <user> <json>`:
 
 ```json
 {"type": "deal",
@@ -107,7 +107,7 @@ Queries are JSON, the same over `POST /query`, MCP `query_memory` and `memstore 
  "evidence": {"source": ["email", "call"], "occurred": {"gte": "2026-09-01"}}, "limit": 10}
 ```
 
-- Bodies are cut into chunks of about 1,500 bytes (`MEMSTORE_CHUNK_BYTES`, `MEMSTORE_CHUNK_OVERLAP` 150) at
+- Bodies are cut into chunks of about 1,500 bytes (`AMPUP_MEMORY_CHUNK_BYTES`, `AMPUP_MEMORY_CHUNK_OVERLAP` 150) at
   paragraph or sentence boundaries.
 - Each episode ranks by its best chunk, so one long transcript can't fill the page. A page spreads over kinds of
   source (`"diverse": false` turns that off). Newer sources win near-ties (`"recency": false` turns that off).
@@ -123,7 +123,7 @@ Queries are JSON, the same over `POST /query`, MCP `query_memory` and `memstore 
 - **Time:** a query that names a time (`Q3 2026`, `last year`, `2026-03-02`) also takes facts stated in that
   window as candidates and ranks them first.
 - A search takes the best 300 rows of each list, so its first hits are the same at every `k`.
-- `MEMSTORE_RANK_<knob>` overrides each weight for experiments.
+- `AMPUP_MEMORY_RANK_<knob>` overrides each weight for experiments.
 
 ## Supersession, closures and stale values
 
@@ -138,8 +138,8 @@ Queries are JSON, the same over `POST /query`, MCP `query_memory` and `memstore 
   "status":     {"type": "enum", "values": ["open", "won", "lost"], "pending": ["open"]}
   ```
 
-  With `freshness: true` on an org or team (or `MEMSTORE_FRESHNESS=1`), reads mark a value a newer fact restates
-  (`later on <date>: "…"`) and a plan whose date passed while still pending. `MEMSTORE_FRESHNESS_MARKS` (`later`,
+  With `freshness: true` on an org or team (or `AMPUP_MEMORY_FRESHNESS=1`), reads mark a value a newer fact restates
+  (`later on <date>: "…"`) and a plan whose date passed while still pending. `AMPUP_MEMORY_FRESHNESS_MARKS` (`later`,
   `overdue`, `stale`) picks the kinds. Marks are derived at read time; nothing is written. Off by default.
 
 ## Aggregation and briefs
@@ -159,10 +159,10 @@ flagged.
 ```
 
 - A subject is summarised again after `every` new episodes about it, or after `max_wait_minutes`. `serve` checks
-  hourly (`MEMSTORE_AGGREGATE_SECS`). `memstore aggregate [scope] [--now] [--subject s] [--dry-run]` runs it now.
-- One model call per batch (`MEMSTORE_AGGREGATE_MODEL`, else the extraction model); every answer cites fact ids.
+  hourly (`AMPUP_MEMORY_AGGREGATE_SECS`). `ampup-memory aggregate [scope] [--now] [--subject s] [--dry-run]` runs it now.
+- One model call per batch (`AMPUP_MEMORY_AGGREGATE_MODEL`, else the extraction model); every answer cites fact ids.
 - A row is readable by whoever may read every episode of its batch.
-- `get_brief`, `POST /brief {subject, refresh?}` and `memstore brief <scope> <user> <subject>` read where a
+- `get_brief`, `POST /brief {subject, refresh?}` and `ampup-memory brief <scope> <user> <subject>` read where a
   subject stands in one answer of at most 4,000 tokens.
 
 ## Dreaming (opt-in)
@@ -174,50 +174,50 @@ attribute under two predicate names, two facts saying the same thing, one thing 
 - It runs per shared audience (`*`, `group:`, `role:`), widest first, so the model never sees another audience's
   facts. A person's own memory isn't dreamed over.
 - Code checks every decision: a list-valued or role predicate is never ended, a record of an event is never ended.
-- It runs only on scopes `MEMSTORE_DREAM_ON` names, once a day (`MEMSTORE_DREAM_SECS`) when at least
-  `MEMSTORE_DREAM_FACTS` (200) new facts wait, within `MEMSTORE_DREAM_CALLS` (100) model calls.
-- `memstore dream [scope] [--dry-run] [--calls N] [--local DIR]` runs a pass now.
-- Undo: `memstore retract-facts <scope> --extractor dream:<model>@s2` takes back everything a dreamer wrote.
+- It runs only on scopes `AMPUP_MEMORY_DREAM_ON` names, once a day (`AMPUP_MEMORY_DREAM_SECS`) when at least
+  `AMPUP_MEMORY_DREAM_FACTS` (200) new facts wait, within `AMPUP_MEMORY_DREAM_CALLS` (100) model calls.
+- `ampup-memory dream [scope] [--dry-run] [--calls N] [--local DIR]` runs a pass now.
+- Undo: `ampup-memory retract-facts <scope> --extractor dream:<model>@s2` takes back everything a dreamer wrote.
 
 ## Indexes
 
-Each scope has a derived index at `MEMSTORE_INDEX_URI` (a path, `gs://…` or `s3://…`; default
+Each scope has a derived index at `AMPUP_MEMORY_INDEX_URI` (a path, `gs://…` or `s3://…`; default
 `~/.cache/memstore/index`, or `<dir>/index` under `serve --local`). It holds the open facts, the closed (superseded)
 facts and the passages, as Lance datasets. Rows are trusted only for data files still in the table's current
 snapshot, so a deleted row is never served.
 
 ```bash
-memstore index org:acme                          # bring the indexes up to date
-memstore index status org:acme                   # covered heads, the unindexed tail, the configuration
-memstore index org:acme --wait --timeout 600     # wait for a server's background update
-memstore index rebuild org:acme --to /tmp/rebuilt
-memstore index verify org:acme                   # incremental index against a rebuild
-memstore index list org:acme
-memstore index drop org:acme <dir>               # an index of another configuration
+ampup-memory index org:acme                          # bring the indexes up to date
+ampup-memory index status org:acme                   # covered heads, the unindexed tail, the configuration
+ampup-memory index org:acme --wait --timeout 600     # wait for a server's background update
+ampup-memory index rebuild org:acme --to /tmp/rebuilt
+ampup-memory index verify org:acme                   # incremental index against a rebuild
+ampup-memory index list org:acme
+ampup-memory index drop org:acme <dir>               # an index of another configuration
 ```
 
 A change of embedding model or chunking builds a new index beside the old one; switching back finds the old one.
 
 ## Embeddings
 
-| `MEMSTORE_EMBED` | Backend | Default model |
+| `AMPUP_MEMORY_EMBED` | Backend | Default model |
 |---|---|---|
-| `local` | fastembed in-process; files fetched once into `MEMSTORE_MODEL_DIR` (`~/.cache/memstore/models`) | `bge-small-en-v1.5`, 384 dims |
-| `openai` | OpenAI's embeddings API or any server with the same `/embeddings` shape (`MEMSTORE_EMBED_URL`) | `text-embedding-3-small`, 1,536 dims |
+| `local` | fastembed in-process; files fetched once into `AMPUP_MEMORY_MODEL_DIR` (`~/.cache/memstore/models`) | `bge-small-en-v1.5`, 384 dims |
+| `openai` | OpenAI's embeddings API or any server with the same `/embeddings` shape (`AMPUP_MEMORY_EMBED_URL`) | `text-embedding-3-small`, 1,536 dims |
 | `openrouter` | OpenRouter's embeddings API with `OPENROUTER_API_KEY` | `openai/text-embedding-3-small`, 1,536 dims |
 
-Unset: `openai` with `MEMSTORE_EMBED_KEY`/`_KEY_FILE`, else `openrouter` with `OPENROUTER_API_KEY`, else `openai`
+Unset: `openai` with `AMPUP_MEMORY_EMBED_KEY`/`_KEY_FILE`, else `openrouter` with `OPENROUTER_API_KEY`, else `openai`
 with `OPENAI_API_KEY`, else `local`. `cargo run` and `cargo test` pin `local` (`.cargo/config.toml`).
-`MEMSTORE_EMBED_MODEL` and `MEMSTORE_EMBED_DIMS` override the model. `memstore embed <text>` prints which backend
+`AMPUP_MEMORY_EMBED_MODEL` and `AMPUP_MEMORY_EMBED_DIMS` override the model. `ampup-memory embed <text>` prints which backend
 is active.
 
-`MEMSTORE_EMBED_CACHE` (a directory, `gs://`, `s3://`, `file://` or `off`) keeps every vector by the SHA-256 of
+`AMPUP_MEMORY_EMBED_CACHE` (a directory, `gs://`, `s3://`, `file://` or `off`) keeps every vector by the SHA-256 of
 its text, so the same text is embedded once wherever it is indexed. `serve --local` keeps it in
 `<dir>/embeddings`; other processes keep none unless it is set.
 
 ## Loading a corpus
 
-`memstore load <dir>` loads `episodes*.jsonl`, `facts*.jsonl` and `closures*.jsonl` (facts stand in for
+`ampup-memory load <dir>` loads `episodes*.jsonl`, `facts*.jsonl` and `closures*.jsonl` (facts stand in for
 extraction). It is idempotent: an episode or fact already committed is skipped. `--workspace`, `--branch`, `--fresh`
-and `--local` apply. `memstore gen <seed> <episodes> <dir>` writes a synthetic corpus with gold questions, and
-`memstore eval <dir>` answers them.
+and `--local` apply. `ampup-memory gen <seed> <episodes> <dir>` writes a synthetic corpus with gold questions, and
+`ampup-memory eval <dir>` answers them.

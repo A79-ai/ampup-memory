@@ -1,10 +1,10 @@
 # HTTP API
 
-`memstore serve` listens on port 8080 by default (`memstore serve [scope] [port]`). Bodies are JSON. On a server
+`ampup-memory serve` listens on port 8080 by default (`ampup-memory serve [scope] [port]`). Bodies are JSON. On a server
 with sign-in, send `Authorization: Bearer <token or msk_ key>` and select memory with `x-memstore-org` and
 `x-memstore-team` headers (or `?org=&team=`). `serve --local` takes no credentials.
 
-Examples below run against `memstore serve --local` on `localhost:8080`.
+Examples below run against `ampup-memory serve --local` on `localhost:8080`.
 
 ## The learning loop
 
@@ -100,7 +100,7 @@ as if it didn't exist.
   and value (common words aside) must occur in the cited text.
 - `/forget` re-ACLs the episode to an entry nobody holds; the ledger keeps the change.
 - `/retract` hides an episode, and every fact citing it, for every reader on every branch at every time. The bytes
-  stay until a purge (`memstore org purge`).
+  stay until a purge (`ampup-memory org purge`).
 
 ## Admin and operations
 
@@ -110,10 +110,10 @@ as if it didn't exist.
 | `POST /closure` | Push a user's group changes or disable them (admin key) |
 | `POST /team`, `DELETE /team` | Replace or clear a team csv on every server (admin key) |
 | `POST /installations` | Register which org owns a connector installation (admin key) |
-| `GET /metrics` | Prometheus text; the admin key only on the public port, or anyone on `MEMSTORE_METRICS_PORT` |
+| `GET /metrics` | Prometheus text; the admin key only on the public port, or anyone on `AMPUP_MEMORY_METRICS_PORT` |
 | `GET /.well-known/oauth-protected-resource` | The identity provider and CLI client id, for OAuth sign-in (RFC 9728) |
 
-The CLI's people commands (`memstore org`, `team`, `member`, `apikey`, `audit`) call `/admin` when signed in. See
+The CLI's people commands (`ampup-memory org`, `team`, `member`, `apikey`, `audit`) call `/admin` when signed in. See
 [security-model.md](security-model.md).
 
 ## Errors
@@ -123,6 +123,6 @@ The CLI's people commands (`memstore org`, `team`, `member`, `apikey`, `audit`) 
   (`not_member`, `as_denied`, …).
 - 404 for anything the caller may not see.
 - 429 with `Retry-After` past the caller's rate limit (a batch costs a token per item) or past its requests in
-  flight at once (`MEMSTORE_MAX_IN_FLIGHT_PER_CALLER`).
+  flight at once (`AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER`).
 - 503 for advice with no routing model, from `/ready` during warm-up, and with `Retry-After: 1` when the server is
   at its connection or in-flight cap.

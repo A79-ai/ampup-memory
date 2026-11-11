@@ -1,7 +1,7 @@
 # Concepts
 
 AmpUp Memory keeps what agents and people tell it, and learns from how their work went. This page names the
-parts. The command is still `memstore`; it will become `ampup-memory` in a later release.
+parts. The command is `ampup-memory` (`memstore` before the rename, which still works).
 
 ## The learning loop
 
@@ -52,9 +52,9 @@ An episode is one source record: a note, a call transcript, a Slack thread, an e
 | `crm_update` | `hubspot:`, `salesforce:`, `dynamicsCRM:`, `crm:` |
 | `doc` | `mcp:remember_memory:` (notes), `github:`, `linear:`, `sentry:`, `granola:`, `doc:`, `note:` |
 
-A write whose source no type claims is refused. A corpus loaded with `memstore load` may use any source; unclaimed
+A write whose source no type claims is refused. A corpus loaded with `ampup-memory load` may use any source; unclaimed
 ones read as `doc`. Each type says how its body splits into the units facts cite (a call's turn, a message, a
-paragraph, a CRM field) and which predicates a model may extract from it (`memstore episode-type show <type>`).
+paragraph, a CRM field) and which predicates a model may extract from it (`ampup-memory episode-type show <type>`).
 
 ### Documents kept in versions
 
@@ -68,7 +68,7 @@ A fact is `(entity, predicate, value)` with a valid-time window, a verbatim quot
 - Facts come from extraction (a model reads episodes), from `POST /facts`, or from a loaded corpus.
 - A reader sees a fact only if they may read **every** episode it cites.
 - A one-valued attribute's newest visible version wins at read time, so writers need not close old values.
-- A **closure** ends a value with no successor (`memstore close`, `POST /close`, MCP `close_memory`). Its reason is
+- A **closure** ends a value with no successor (`ampup-memory close`, `POST /close`, MCP `close_memory`). Its reason is
   its own episode and its evidence. Nothing is deleted: `as_of` reads still show the old value.
 - Each fact records who wrote it (`written_by`: `extract:<model>` or `posted`).
 
@@ -94,8 +94,8 @@ A fact is `(entity, predicate, value)` with a valid-time window, a verbatim quot
 - `search_memory`'s text answer groups facts by entity, cites each as `[e1 t3]` (episode 1, turn 3) and ends
   with the episode ids `get_episode` reads. It also shows matching source text no fact cites.
 
-The index is derived. It lives at `MEMSTORE_INDEX_URI` and can be rebuilt from the tables at any time
-(`memstore index rebuild`). See [schemas-and-queries.md](schemas-and-queries.md).
+The index is derived. It lives at `AMPUP_MEMORY_INDEX_URI` and can be rebuilt from the tables at any time
+(`ampup-memory index rebuild`). See [schemas-and-queries.md](schemas-and-queries.md).
 
 ## Schemas
 
@@ -129,16 +129,16 @@ entry, so a membership change touches one caller, never the episodes. See [secur
 
 ## What runs in the background
 
-`memstore serve` does, on timers, what the matching commands do once:
+`ampup-memory serve` does, on timers, what the matching commands do once:
 
 | Work | Command | Timer |
 |---|---|---|
-| Extract facts | `memstore extract` | `MEMSTORE_EXTRACT_SECS` (5 s) |
-| Compile skills and AIP graphs | `memstore compile` | `MEMSTORE_COMPILE_SECS` (60 s) |
-| Learn advice | `memstore advice` | `MEMSTORE_ADVICE_SECS` (600 s) |
-| End idle sessions, judge ended ones | | `MEMSTORE_SESSION_SWEEP_SECS` (60 s) |
-| Summarise subjects | `memstore aggregate` | `MEMSTORE_AGGREGATE_SECS` (3600 s) |
-| Dream (reconcile facts) | `memstore dream` | hourly, on scopes `MEMSTORE_DREAM_ON` names |
-| Compact tables, expire snapshots | `memstore compact-ledger`, `memstore maintain` | nightly window `MEMSTORE_MAINTAIN_WINDOW` |
+| Extract facts | `ampup-memory extract` | `AMPUP_MEMORY_EXTRACT_SECS` (5 s) |
+| Compile skills and AIP graphs | `ampup-memory compile` | `AMPUP_MEMORY_COMPILE_SECS` (60 s) |
+| Learn advice | `ampup-memory advice` | `AMPUP_MEMORY_ADVICE_SECS` (600 s) |
+| End idle sessions, judge ended ones | | `AMPUP_MEMORY_SESSION_SWEEP_SECS` (60 s) |
+| Summarise subjects | `ampup-memory aggregate` | `AMPUP_MEMORY_AGGREGATE_SECS` (3600 s) |
+| Dream (reconcile facts) | `ampup-memory dream` | hourly, on scopes `AMPUP_MEMORY_DREAM_ON` names |
+| Compact tables, expire snapshots | `ampup-memory compact-ledger`, `ampup-memory maintain` | nightly window `AMPUP_MEMORY_MAINTAIN_WINDOW` |
 
 With no model configured, none of the model-backed work runs: memory is all there is, and no model is called.

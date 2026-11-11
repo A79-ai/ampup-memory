@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "command": "ampup-memory-client hook session-start --harness cursor", "timeout": 30 }],
+    "stop": [{ "command": "ampup-memory-client hook stop --harness cursor", "timeout": 30 }],
+    "preCompact": [{ "command": "ampup-memory-client hook session-end --harness cursor", "timeout": 30 }],
+    "sessionEnd": [{ "command": "ampup-memory-client hook end --harness cursor", "timeout": 30 }]
+  }
+}

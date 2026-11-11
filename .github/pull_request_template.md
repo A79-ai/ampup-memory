@@ -5,7 +5,7 @@
 ## How I verified it
 
 <!--
-What you ran locally and what you saw: the flow you drove against a real `memstore serve` and store
+What you ran locally and what you saw: the flow you drove against a real `ampup-memory serve` and store
 (`serve --local` is fine), and for a bug, the reproduction before the fix and the same steps after it.
 For a permission or auth change, also show that the caller who must be refused is refused.
 See CONTRIBUTING.md: most changes are verified this way, not with a new test.

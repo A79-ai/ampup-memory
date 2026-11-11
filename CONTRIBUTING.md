@@ -52,7 +52,7 @@ work is yours to license.
 - **Docker** (optional), only for the REST catalog tests below.
 
 `.cargo/config.toml` sets two environment variables for `cargo test` and `cargo run` and nothing else: a larger
-thread stack (`RUST_MIN_STACK`, which debug builds need) and `MEMSTORE_EMBED=local`, so the tests embed with the local
+thread stack (`RUST_MIN_STACK`, which debug builds need) and `AMPUP_MEMORY_EMBED=local`, so the tests embed with the local
 model and never call an embeddings API, whatever keys your shell holds. No compiler wrapper or private registry is
 required; every dependency comes from crates.io.
 
@@ -67,7 +67,7 @@ cargo run --features dylib -- serve --local /tmp/memstore-dev   # a local store,
 ```
 
 Release builds stay static: never ship a binary built with `--features dylib`. A release build is
-`cargo build --release --bin memstore --bin memstore-client`, the command the release workflow runs.
+`cargo build --release --bin ampup-memory --bin ampup-memory-client`, the command the release workflow runs.
 
 ## The code
 
@@ -75,10 +75,10 @@ Two crates and the root:
 
 - `crates/memstore-core` is the store: `Store` (its `lib.rs`), storage, search, query, auth, people, offboarding,
   usage, workspaces, audit, metrics, episode types, platform and retention.
-- The root `memstore` crate is what runs on it: the server, agent, advice, sessions, extraction, hooks, telemetry
-  and the CLI. Core never depends on memstore, and memstore re-exports core (`pub use memstore_core::*`), so
-  `crate::X` and `memstore::X` paths reach core items from either side. An edit in memstore doesn't rebuild core:
-  put new code there unless the store itself needs it. A method on `Store` defined in memstore is an extension
+- The root `memstore` crate (its binary `ampup-memory`) is what runs on it: the server, agent, advice, sessions, extraction, hooks, telemetry
+  and the CLI. Core never depends on `memstore`, and `memstore` re-exports core (`pub use memstore_core::*`), so
+  `crate::X` and `memstore::X` paths reach core items from either side. An edit in `memstore` doesn't rebuild core:
+  put new code there unless the store itself needs it. A method on `Store` defined in `memstore` is an extension
   trait (see `qa_log::StoreQaLog`).
 - `crates/memstore-client` is what runs on a person's machine: the sign-in and contexts, and the coding agents'
   hooks and MCP bridge.
@@ -100,11 +100,11 @@ A change to one of those paths extends the test that already covers it. Nothing 
 integration (no load, latency, CLI, agent or feature tests), unless a maintainer asks for one. Instead:
 
 - **Verify the change locally before you open a pull request.** Run the flow it touches against a real
-  `memstore serve` and store (`serve --local` is fine). For a bug, reproduce it first and watch the fix clear it.
+  `ampup-memory serve` and store (`serve --local` is fine). For a bug, reproduce it first and watch the fix clear it.
 - **Permission and auth changes:** also check that the caller who must be refused is refused.
 - **Say in the pull request what you ran and what you saw.**
 
-Those tests drive a user flow end to end (a real `memstore serve` over HTTP and a real store on a local catalog),
+Those tests drive a user flow end to end (a real `ampup-memory serve` over HTTP and a real store on a local catalog),
 not a function in isolation. There are no in-module unit tests besides the two fail-closed principal checks in
 memstore-core. `tests/it/` is one test binary: a new flow is a file there plus a `mod` line in `tests/it/main.rs`,
 never a file directly in `tests/` (CI checks). A test that sets a process-wide environment variable calls
@@ -174,6 +174,6 @@ is carried over by hand, so it may land as a slightly different change; the main
 
 ## Releases
 
-Maintainers release by pushing a tag: `v*` for the server and CLI, `client-v*` for memstore-client alone. The
+Maintainers release by pushing a tag: `v*` for the server and CLI, `client-v*` for ampup-memory-client alone. The
 release workflow (`.github/workflows/release.yml`) builds Linux x86_64, Linux arm64 and Apple Silicon macOS
 binaries, publishes them to this repository's GitHub Releases, and installs them with `install.sh` to check them.

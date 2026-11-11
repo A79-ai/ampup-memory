@@ -216,7 +216,7 @@ enum Cmd {
     },
     /// A coding agent's hook (`ampup-memory hooks install` registers them; the Claude Code plugin too):
     /// session-start, prompt, stop, session-end or status, reading the hook's JSON on stdin and talking to
-    /// AMPUP_MEMORY_URL; `outcome good|bad [why]` rates the session's run (`/memstore:outcome`). Never fails the
+    /// AMPUP_MEMORY_URL; `outcome good|bad [why]` rates the session's run (`/ampup-memory:outcome`). Never fails the
     /// session: errors go to stderr and it exits 0
     Hook {
         event: String,

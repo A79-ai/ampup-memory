@@ -40,6 +40,6 @@ For example, an org admin assigns `policy:refund-window` to a support owner. A w
 
 ## Verification
 
-The requested integration flows are in `tests/it/governance.rs`, registered in the existing integration-test binary. They use authenticated requests to a real server backed by a local persisted catalog. Run with `--features dylib` as required by `CLAUDE.md`. No model is needed for these explicit-write and approval cases; disable extraction during these tests with `MEMSTORE_EXTRACT=off`.
+The requested integration flows are in `tests/it/governance.rs`, registered in the existing integration-test binary. They use authenticated requests to a real server backed by a local persisted catalog. Run with `--features dylib` as required by `CLAUDE.md`. No model is needed for these explicit-write and approval cases; disable extraction during these tests with `AMPUP_MEMORY_EXTRACT=off`.
 
 The first checkpoint is these flows plus the existing authorization regressions. The integration cases cover server teardown and restart against the persisted catalog, including a proposal with one of two approvals. Automatic ingestion/extraction-to-proposal, deterministic publication-race coverage, complete writer/read-path coverage, and the Studio and planner checkpoints remain required before declaring the full implementation plan complete.

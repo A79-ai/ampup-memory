@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ampup-memory": {
+      "command": "ampup-memory-client",
+      "args": ["mcp"]
+    }
+  }
+}

@@ -1,9 +1,9 @@
 {
-  "name": "memstore",
+  "name": "ampup-memory",
   "plugins": [
     {
-      "name": "memstore",
-      "source": { "source": "local", "path": "./plugins/memstore" },
+      "name": "ampup-memory",
+      "source": { "source": "local", "path": "./plugins/ampup-memory" },
       "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
       "category": "Productivity"
     }

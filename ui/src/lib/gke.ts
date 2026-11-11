@@ -7,9 +7,11 @@ import { promisify } from "node:util";
 // own 127.0.0.1 with no sign-in, so the only way in is a port-forward. This runs `kubectl` with the
 // developer's own credentials: they see the namespaces their cluster access allows, nothing more.
 //
-//   MEMSTORE_KUBE_CONTEXT  the kubectl context to use (default: kubectl's current context)
+//   AMPUP_MEMORY_KUBE_CONTEXT  (or MEMSTORE_KUBE_CONTEXT, its old name) the kubectl context to use (default: kubectl's current context)
 // Inside the cluster (the gateway) kubectl uses the pod's service account instead of a context.
-const CONTEXT = process.env.KUBERNETES_SERVICE_HOST ? null : (process.env.MEMSTORE_KUBE_CONTEXT ?? null);
+const CONTEXT = process.env.KUBERNETES_SERVICE_HOST
+  ? null
+  : (process.env.AMPUP_MEMORY_KUBE_CONTEXT ?? process.env.MEMSTORE_KUBE_CONTEXT ?? null);
 const ctx = (): string[] => (CONTEXT ? ["--context", CONTEXT] : []);
 const PREFIX = "memstore-";
 const run = promisify(execFile);

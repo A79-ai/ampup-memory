@@ -3,7 +3,7 @@ import { gatewayCall, guard, viaGateway } from "@/lib/gateway";
 import { namespaces, type Namespace } from "@/lib/gke";
 import { hostedLabel, mode } from "@/lib/memstore";
 
-// GET: where this UI reads memory. Hosted: MEMSTORE_URL's memstore and, through the gateway, every memstore-
+// GET: where this UI reads memory. Hosted: AMPUP_MEMORY_URL's memstore and, through the gateway, every memstore-
 // namespace on the gateway's Kubernetes cluster (once signed in). Otherwise (a laptop, or the gateway itself) the namespaces,
 // listed with kubectl, and whether each one's memstore is serving.
 export async function GET(req: Request) {

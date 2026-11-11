@@ -23,10 +23,10 @@ A session is one conversation, start to end.
   together. `next` is sent by the Claude Code hooks when a step finishes.
 - Each note is served once per session; asked again, the answer says it was given earlier.
 - `get_advice` with no `session_id`, from a person, opens a session and returns its id.
-- A session nobody ends is ended after `MEMSTORE_SESSION_IDLE_SECS` (1800) without a step, with the last
+- A session nobody ends is ended after `AMPUP_MEMORY_SESSION_IDLE_SECS` (1800) without a step, with the last
   conversation it was sent as its transcript.
 - The opening context, transcript and conversation are the caller's own episodes, readable by them alone, with
-  secret-looking words redacted. At most `MEMSTORE_SESSIONS_PER_DAY` (1000) sessions a person a day.
+  secret-looking words redacted. At most `AMPUP_MEMORY_SESSIONS_PER_DAY` (1000) sessions a person a day.
 
 ### Judging
 
@@ -37,16 +37,16 @@ applied, helped, not helped), counting each person's latest judged session only.
 
 ### Holdout and trial arms
 
-- `MEMSTORE_ADVICE_HOLDOUT` (0 to 1, default 0): that share of new sessions is routed but served nothing.
+- `AMPUP_MEMORY_ADVICE_HOLDOUT` (0 to 1, default 0): that share of new sessions is routed but served nothing.
   Comparing served against withheld outcomes measures lift.
-- `MEMSTORE_ADVICE_TRIAL` (0 to 1, default 0.2): the share of sessions that may be served candidate notes.
+- `AMPUP_MEMORY_ADVICE_TRIAL` (0 to 1, default 0.2): the share of sessions that may be served candidate notes.
 
 ### Evidence gate
 
 A team note is a candidate until it helped more people than it didn't, counted by each person's latest judged
 session, up to the scope's evidence bar: the team's `advice_evidence` setting, else the org's, else
-`MEMSTORE_ADVICE_EVIDENCE` (default 3). Outside the trial arm a candidate isn't served. A bar of 0 serves every
-note. Runs are not evidence; only judged sessions are. `memstore doctor` shows the bar and how many notes passed it.
+`AMPUP_MEMORY_ADVICE_EVIDENCE` (default 3). Outside the trial arm a candidate isn't served. A bar of 0 serves every
+note. Runs are not evidence; only judged sessions are. `ampup-memory doctor` shows the bar and how many notes passed it.
 
 ## Runs and rewards
 
@@ -66,12 +66,12 @@ curl -s localhost:8080/runs/reward -d '{"run_id": "…", "reward": 1, "reason": 
   `reason`. Every run is checked before any is written; one bad run refuses the batch. Batch run ids are derived
   from the runs' content, so loading the same runs into a fresh store gives the same ids.
   `POST /runs/reward {"rewards": [...]}` rewards up to 1,000 runs at once.
-- **From a file.** `memstore runs load <scope> runs.jsonl --as <user>` records one run a line as one batch.
+- **From a file.** `ampup-memory runs load <scope> runs.jsonl --as <user>` records one run a line as one batch.
   With `--local <dir>` (server stopped) it writes a `serve --local` store.
-- Limits: `MEMSTORE_RUNS_PER_DAY` (100) runs and `MEMSTORE_LOG_PER_DAY` (1000) answer-log entries per person a day.
-- Unrewarded runs older than `MEMSTORE_ADVICE_JUDGE_AFTER_SECS` (1800) are judged by a model (1, -1 or "can't
-  tell"); a recorder's own reward later replaces the judgement. `MEMSTORE_ADVICE_JUDGE=off` turns that off.
-  `memstore qa-log <scope>` shows each judgement.
+- Limits: `AMPUP_MEMORY_RUNS_PER_DAY` (100) runs and `AMPUP_MEMORY_LOG_PER_DAY` (1000) answer-log entries per person a day.
+- Unrewarded runs older than `AMPUP_MEMORY_ADVICE_JUDGE_AFTER_SECS` (1800) are judged by a model (1, -1 or "can't
+  tell"); a recorder's own reward later replaces the judgement. `AMPUP_MEMORY_ADVICE_JUDGE=off` turns that off.
+  `ampup-memory qa-log <scope>` shows each judgement.
 
 ## How notes are learned
 
@@ -83,19 +83,19 @@ curl -s localhost:8080/runs/reward -d '{"run_id": "…", "reward": 1, "reason": 
    procedures, and writes one note: *When*, *Steps*, *Pitfalls*, *Evidence*. It is a general procedure and never
    names a record's values.
 4. **Keep.** Notes are versioned documents: `advice/index`, `advice/map`, `advice/<category>/<situation>`. A note
-   is rewritten only after `MEMSTORE_ADVICE_NOTE_MIN_NEW` (5) new runs or 2 new wrong ones.
+   is rewritten only after `AMPUP_MEMORY_ADVICE_NOTE_MIN_NEW` (5) new runs or 2 new wrong ones.
 
 Rules that matter:
 
 - **Team notes need people.** A team note is learned only from situations whose runs come from at least
-  `advice_learn_people` people (`MEMSTORE_ADVICE_LEARN_PEOPLE`, default 3, never below 2). One person's traces
+  `advice_learn_people` people (`AMPUP_MEMORY_ADVICE_LEARN_PEOPLE`, default 3, never below 2). One person's traces
   can't make a team note.
-- **Personal notes.** A person with at least `MEMSTORE_ADVICE_MIN_NEW` (10) rewarded runs or sessions of their own
+- **Personal notes.** A person with at least `AMPUP_MEMORY_ADVICE_MIN_NEW` (10) rewarded runs or sessions of their own
   also gets notes learned from those alone, served to them first, with no evidence bar.
-- **On its own.** Where an org's or team's admins set `advice: true`, `serve` learns every `MEMSTORE_ADVICE_SECS`
-  (600) once `MEMSTORE_ADVICE_MIN_NEW` (10) new rewarded runs are in. `serve --local` learns in its own scope
-  without the setting. `MEMSTORE_ADVICE_LEARN=off` stops the timer; `MEMSTORE_ADVICE=off` stops learning.
-- **By hand.** `memstore advice <scope> [--acl …] [--min-wrong N] [--local DIR]`, or `/admin {"op":
+- **On its own.** Where an org's or team's admins set `advice: true`, `serve` learns every `AMPUP_MEMORY_ADVICE_SECS`
+  (600) once `AMPUP_MEMORY_ADVICE_MIN_NEW` (10) new rewarded runs are in. `serve --local` learns in its own scope
+  without the setting. `AMPUP_MEMORY_ADVICE_LEARN=off` stops the timer; `AMPUP_MEMORY_ADVICE=off` stops learning.
+- **By hand.** `ampup-memory advice <scope> [--acl …] [--min-wrong N] [--local DIR]`, or `/admin {"op":
   "learn_advice", "org", "team"?}` on a server.
 - **Audience.** Learning reads every rewarded run in the scope, so only an org's admins start it or turn it on,
   and the notes are written for the audience they name (`--acl`, default `*`).
@@ -109,11 +109,11 @@ trace's end, not the outcome.
 
 ### Curation (opt-in)
 
-`advice_curation: true` (or `MEMSTORE_ADVICE_CURATION=on`) adds three things to each learn:
+`advice_curation: true` (or `AMPUP_MEMORY_ADVICE_CURATION=on`) adds three things to each learn:
 
 - **Withhold by reward.** A note is withheld when the runs served it score lower than its situation's other runs,
-  with at least `MEMSTORE_ADVICE_RETIRE_MIN` (8) runs a side, a margin of `MEMSTORE_ADVICE_RETIRE_MARGIN` (0.2) and
-  a one-sided z of at least 1.645. Only rewards somebody gave count, unless `MEMSTORE_ADVICE_RETIRE_JUDGED=on`.
+  with at least `AMPUP_MEMORY_ADVICE_RETIRE_MIN` (8) runs a side, a margin of `AMPUP_MEMORY_ADVICE_RETIRE_MARGIN` (0.2) and
+  a one-sided z of at least 1.645. Only rewards somebody gave count, unless `AMPUP_MEMORY_ADVICE_RETIRE_JUDGED=on`.
 - **Edit, don't rewrite.** The model returns item edits (add, modify, remove); an edit that would drop more than
   a quarter of the note's words is refused.
 - **Merge.** Situations that are the same task under two names are merged; the old names stay as aliases.
@@ -130,11 +130,11 @@ The routing model reads one line per kind of task the caller may be advised on a
 The MCP answer starts `Situation: <key>`, then `Skill: <key> (version <n>), learned from <n> runs …`.
 `POST /advice` answers `{situation, advice, skills}`; each skill says `from: "runs"` or `from: "documents"`.
 
-Options on `POST /advice`: `format` (`notes` or `checklist`; also `MEMSTORE_ADVICE_FORMAT`), `max_chars` (at
+Options on `POST /advice`: `format` (`notes` or `checklist`; also `AMPUP_MEMORY_ADVICE_FORMAT`), `max_chars` (at
 least 500), `procedures`, and `"notes": false` to serve compiled procedures only (an ablation a caller runs
 itself).
 
-- **Large libraries.** Above `MEMSTORE_ADVICE_ROUTE_SHORTLIST` (60) lines, lines are first ranked against the
+- **Large libraries.** Above `AMPUP_MEMORY_ADVICE_ROUTE_SHORTLIST` (60) lines, lines are first ranked against the
   question (BM25 and embedding, fused by reciprocal rank) and the router sees the best 60.
 - **Prompt caching.** The index goes in the request's system part, marked cacheable where the provider needs a
   mark, so repeated questions reuse it.
@@ -156,9 +156,9 @@ message, shared frames and files, fused with BM25. No model is called. Answers c
 ### Public capabilities
 
 `get_advice` and `POST /advice` may also suggest a public skill, plugin or MCP server from a small reviewed catalog
-(catalog version `2026-11-08`) when a decisions model (`MEMSTORE_DECIDE`) is configured and is at least 0.9
+(catalog version `2026-11-08`) when a decisions model (`AMPUP_MEMORY_DECIDE`) is configured and is at least 0.9
 confident. Send `available_capabilities` to suppress what the agent already has. `public_capabilities: false` per
-call, or `MEMSTORE_PUBLIC_CAPABILITIES=off`, turns them off. They are suggestions, not installs.
+call, or `AMPUP_MEMORY_PUBLIC_CAPABILITIES=off`, turns them off. They are suggestions, not installs.
 
 ## Procedures: AIP skills and step graphs
 
@@ -175,33 +175,33 @@ ordered kebab-named steps with named inputs and outputs: the portable prose subs
 documents: `skills/<slug>`, `aip/<slug>`, `skills/index`.
 
 ```bash
-memstore org settings acme --compile-sources kb:,github:acme/        # what the org compiles from
-MEMSTORE_COMPILE_SOURCES=kb: memstore serve --local                   # a laptop server's own scope
-memstore compile team:acme/support --sources kb: --branch arm1        # once, on a branch
-memstore compile org --sources kb: --local ./store                    # a laptop store (server stopped)
+ampup-memory org settings acme --compile-sources kb:,github:acme/        # what the org compiles from
+AMPUP_MEMORY_COMPILE_SOURCES=kb: ampup-memory serve --local                   # a laptop server's own scope
+ampup-memory compile team:acme/support --sources kb: --branch arm1        # once, on a branch
+ampup-memory compile org --sources kb: --local ./store                    # a laptop store (server stopped)
 ```
 
 - **Chosen, never on by default.** A scope compiles from its `compile_sources` (source prefixes, or `*`), else
-  `MEMSTORE_COMPILE_SOURCES`. With none, nothing compiles. Versioned documents are never compiled.
+  `AMPUP_MEMORY_COMPILE_SOURCES`. With none, nothing compiles. Versioned documents are never compiled.
 - **Batches.** Sources go to the model 12 at a time (at most 60,000 characters), oldest first; each round sees the
-  library the last one left. Tune with `MEMSTORE_COMPILE_BATCH`, `MEMSTORE_COMPILE_BATCH_CHARS`,
-  `MEMSTORE_COMPILE_MAX_TOKENS` and `MEMSTORE_COMPILE_PARALLEL`.
+  library the last one left. Tune with `AMPUP_MEMORY_COMPILE_BATCH`, `AMPUP_MEMORY_COMPILE_BATCH_CHARS`,
+  `AMPUP_MEMORY_COMPILE_MAX_TOKENS` and `AMPUP_MEMORY_COMPILE_PARALLEL`.
 - **Grounded.** Sources go in under handles (`SRC1`, …); a skill that cites none is dropped, and a graph that
   fails validation isn't written.
 - **Audiences.** Sources with different ACLs never share a batch. A skill is readable by exactly its sources' ACL.
 - `compile_kind: errors` tells the compiler its sources are error reports, so each skill's *When* names the
   exception and message.
-- `MEMSTORE_COMPILE=off` turns compiling off for the server; `set_settings {"compile": false}` for one org or team.
+- `AMPUP_MEMORY_COMPILE=off` turns compiling off for the server; `set_settings {"compile": false}` for one org or team.
 
 ## Models
 
 | Work | Default | Override |
 |---|---|---|
-| Learning advice (sort, link, write) | Claude Opus 5.5 | `MEMSTORE_ADVICE_MODEL` |
-| Compiling skills | Claude Opus 5.5 | `MEMSTORE_COMPILE_MODEL` |
-| AIP graphs | the compile model | `MEMSTORE_AIP_MODEL` |
-| Routing `get_advice` | Claude Haiku 5.5 | `MEMSTORE_ADVICE_ROUTE_MODEL` |
-| Judging sessions and runs | Claude Haiku 5.5 | `MEMSTORE_JUDGE_MODEL` |
+| Learning advice (sort, link, write) | Claude Opus 5.5 | `AMPUP_MEMORY_ADVICE_MODEL` |
+| Compiling skills | Claude Opus 5.5 | `AMPUP_MEMORY_COMPILE_MODEL` |
+| AIP graphs | the compile model | `AMPUP_MEMORY_AIP_MODEL` |
+| Routing `get_advice` | Claude Haiku 5.5 | `AMPUP_MEMORY_ADVICE_ROUTE_MODEL` |
+| Judging sessions and runs | Claude Haiku 5.5 | `AMPUP_MEMORY_JUDGE_MODEL` |
 
 The learning models run rarely; what they write is read on every later task. Per-call work runs on the small model.
 Backends and credentials are in [configuration.md](configuration.md#models).
@@ -211,6 +211,6 @@ Backends and credentials are in [configuration.md](configuration.md#models).
 Every model call can be answered from an earlier identical request (backend, model and request body, keyed by
 SHA-256). Builds (`compile`, `advice`, `extract`, `aggregate`, `serve --local`) keep replies in
 `~/.cache/memstore/model-calls` by default, so rebuilding the same memory pays nothing for calls already made.
-Servers keep none unless `MEMSTORE_MODEL_CACHE` names a location (a directory, `gs://`, `s3://`, `file://`, or
+Servers keep none unless `AMPUP_MEMORY_MODEL_CACHE` names a location (a directory, `gs://`, `s3://`, `file://`, or
 `off`). The cache keeps replies after their data is forgotten: a deployment that must erase data leaves it off or
 clears it too.
