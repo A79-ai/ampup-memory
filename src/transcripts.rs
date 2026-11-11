@@ -8,6 +8,13 @@
 //! repo, session_id, from, text}`, `text` the entries the transcript gained from entry `from` on (prompts, answers,
 //! each tool call with its input and its result; never thinking), secret-looking words redacted on the machine and
 //! again here. `{check: true}` asks whether the scope keeps them and how far the caller's parts of a session go.
+//! Where the scope keeps none, the route says so to any caller ([`kept_in`]); only where it keeps them is a caller
+//! who may not keep one (a key, a reader, a session's branch) refused.
+//!
+//! What memstore itself holds is never copied into one: its tools' answers and the context its hooks added are left
+//! out, each replaced by a reference to the episodes and facts it named (`memstore_client::hook::without_memory`, on
+//! the machine and again here), so nothing outlives the original's forget, retention or offboarding, or its
+//! reader's access to it.
 //!
 //! Each part is an episode of its author's own, readable by them alone: source
 //! `<signature>memstore:transcript:<harness>:<repo>:<session>` (what follows `memstore:transcript:` is the session
@@ -16,11 +23,12 @@
 //! `transcripts/<harness>/<session>/` and a part sent again from the same entry replaces the one before it for
 //! readers. Its body is running text, one turn to a paragraph, so `get_episode` reads it a page of turns at a time.
 //! It is left out of passage search, extraction, a person's profile and the notes a session starts with, and
-//! nothing that reads for the team reads it. Forgetting it (`forget_memory`), a retention policy, offboarding its
-//! author and deleting the org remove it as any of their episodes; forgetting one version of a part forgets every
-//! version of it ([`forgotten`]), and a part its author forgot, or that aged out, is never kept again: sent again
-//! from the same entry it is refused, and a hook that lost its marker sends only what comes after it ([`held`]). An
-//! org whose `pii` setting is on has personal identifiers replaced in it, as in all it stores.
+//! nothing that reads for the team reads it. Forgetting it (`forget_memory`), a retention policy (one of its own,
+//! `memstore:transcript:=30d`, keeps transcripts alone 30 days), offboarding its author and deleting the org remove
+//! it as any of their episodes, and the operator's export leaves out what was forgotten; forgetting one version of a
+//! part forgets every version of it ([`forgotten`]), and a part its author forgot, or that aged out, is never kept
+//! again: sent again from the same entry it is refused, and a hook that lost its marker sends only what comes after
+//! it ([`held`]). An org whose `pii` setting is on has personal identifiers replaced in it, as in all it stores.
 
 use std::collections::HashSet;
 
@@ -30,7 +38,7 @@ use serde_json::{Value, json};
 use crate::{Episode, MAIN, Principal, Scope, Store};
 
 /// What a transcript's source holds after its signature, before the session note's own source.
-pub const SOURCE: &str = "memstore:transcript:";
+pub const SOURCE: &str = crate::TRANSCRIPT_SOURCE;
 /// Where a transcript's parts are kept in versions: `transcripts/<harness>/<session>/<from>`.
 pub const PREFIX: &str = "transcripts/";
 /// The harnesses whose transcripts the hooks read tool calls from.
@@ -58,12 +66,7 @@ fn refuse(m: impl Into<String>) -> anyhow::Error {
 /// The author of a session transcript's part, from its source (`mcp:remember_memory:<author>:memstore:transcript:…`):
 /// a service key's `key:<org>/<name>`, else everything up to the next `:`. None for any other source.
 pub fn author_of(source: &str) -> Option<&str> {
-    let rest = source
-        .strip_prefix(crate::REMEMBER_SOURCE)?
-        .strip_prefix(':')?;
-    let skip = if rest.starts_with("key:") { 4 } else { 0 };
-    let end = skip + rest[skip..].find(':')?;
-    rest[end + 1..].starts_with(SOURCE).then(|| &rest[..end])
+    crate::transcript_source(source).map(|(author, _)| author)
 }
 
 /// Whether `source` is a session transcript's.
@@ -72,31 +75,16 @@ pub fn is_transcript(source: &str) -> bool {
 }
 
 /// Which of the episodes `ids` are parts of `author`'s transcripts, by the sources their rows hold: a forgotten
-/// part's ACL no longer names its author, its source still does.
+/// part's ACL no longer names its author, its source still does. Only the rows of `ids` are read.
 async fn theirs(
     store: &Store,
-    scope: &Scope,
+    session: &crate::Session,
     author: &str,
     ids: &[&str],
 ) -> Result<HashSet<String>> {
-    let mut out = HashSet::new();
-    if ids.is_empty() {
-        return Ok(out);
-    }
-    for b in store
-        .rows(&scope.namespace(), crate::EPISODES)
-        .await?
-        .rows
-        .iter()
-    {
-        let (id, source) = (crate::strings(b, "episode_id"), crate::strings(b, "source"));
-        for i in 0..id.len() {
-            if ids.contains(&id[i].as_str()) && author_of(&source[i]) == Some(author) {
-                out.insert(id[i].clone());
-            }
-        }
-    }
-    Ok(out)
+    session
+        .sourced_by(store, ids, |s| author_of(s) == Some(author))
+        .await
 }
 
 /// Every version of document `key` there is, whoever may read it, newest first.
@@ -185,7 +173,7 @@ async fn held(store: &Store, scope: &Scope, who: &Principal, args: &Value) -> Re
         .filter(|(k, _)| read.last().is_none_or(|last| k > last))
         .flat_map(|(_, vs)| vs.iter().copied())
         .collect();
-    let gone = !theirs(store, scope, who.user(), &after).await?.is_empty();
+    let gone = !theirs(store, &pinned, who.user(), &after).await?.is_empty();
     let (counted, from) = match (gone, read.split_last()) {
         (true, _) => (&read[..], None),
         (false, Some((last, before))) => (
@@ -194,12 +182,12 @@ async fn held(store: &Store, scope: &Scope, who: &Principal, args: &Value) -> Re
         ),
         (false, None) => return Ok(v),
     };
-    let mut bytes = 0;
-    for key in counted {
-        if let Some((_, _, body)) = store.document(scope, who, key, None).await? {
-            bytes += body.len();
-        }
-    }
+    // What the versions they read hold, from the store's sizes of their bodies: none is read.
+    let shown: Vec<&str> = counted
+        .iter()
+        .filter_map(|key| vis.version_at(key, who, None).map(|(_, id)| id))
+        .collect();
+    let bytes: u64 = pinned.body_sizes(store, who, &shown).await?.values().sum();
     match from {
         Some(from) => v["from"] = json!(from),
         None if gone => v["forgotten"] = json!(true),
@@ -207,6 +195,14 @@ async fn held(store: &Store, scope: &Scope, who: &Principal, args: &Value) -> Re
     }
     v["bytes"] = json!(bytes);
     Ok(v)
+}
+
+/// Whether `scope` keeps sessions' transcripts (`Settings::transcripts`). `POST /transcripts` asks it first, so a
+/// scope that keeps none answers `{kept: false, off: true}` to whoever asks, a caller who may keep none there too (a
+/// service key, a reader, a session's branch): their hook stops asking for a while instead of being refused at every
+/// turn for something that was never on.
+pub async fn kept_in(store: &Store, scope: &Scope) -> Result<bool> {
+    Ok(store.directory().await?.dir.keeps_transcripts(scope))
 }
 
 /// `POST /transcripts`: keeps part of the caller's session transcript `args` as their own episode, signed `signed`
@@ -258,34 +254,39 @@ pub async fn keep(
             MAX_TEXT >> 20
         )));
     }
-    let body = crate::hook::redact(part);
+    // What memstore itself holds stays under its own access rules: a hook from before it left that out sends its
+    // tools' answers and its hooks' context whole, and they become references here.
+    let body = crate::hook::redact(&crate::hook::without_memory(part));
     let body = match dir.redacts_pii(scope) {
         true => crate::pii::redact(&body).0,
         false => body,
     };
     let source = format!("{signed}{SOURCE}{harness}:{repo}:{session}");
     let doc = document(harness, session, from);
-    // The same part sent again (its answer lost) is no new version.
-    let current = store.document(scope, who, &doc, None).await?;
-    if let Some((id, _, now)) = &current
-        && now == body.as_bytes()
-    {
-        return Ok(json!({"kept": true, "episode_id": id, "document": doc}));
-    }
-    // A part they forgot (or that aged out) isn't kept again.
-    if current.is_none() {
-        let pinned = store.pin(scope, MAIN).await?;
-        if !theirs(store, scope, who.user(), &versions(pinned.vis(), &doc))
-            .await?
-            .is_empty()
-        {
-            return Ok(json!({"kept": false, "off": false, "forgotten": true, "document": doc}));
-        }
-    }
     let acl: Vec<&str> = acl.iter().map(String::as_str).collect();
     let ep = Episode::sourced(&source, body.as_bytes(), &acl)
         .version_of(&doc)
         .without_text_index();
+    // The same part sent again (its answer lost) is no new version: the same source and body are the same id, so
+    // no body is read to tell.
+    let pinned = store.pin(scope, MAIN).await?;
+    match pinned.vis().version_at(&doc, who, None) {
+        Some((_, id)) if id == ep.episode_id => {
+            return Ok(json!({"kept": true, "episode_id": id, "document": doc}));
+        }
+        Some(_) => {}
+        // A part they forgot (or that aged out) isn't kept again.
+        None => {
+            if !theirs(store, &pinned, who.user(), &versions(pinned.vis(), &doc))
+                .await?
+                .is_empty()
+            {
+                return Ok(
+                    json!({"kept": false, "off": false, "forgotten": true, "document": doc}),
+                );
+            }
+        }
+    }
     crate::episode_types::check(&ep).map_err(|e| refuse(format!("{e:#}")))?;
     store
         .commit(scope, who.user(), std::slice::from_ref(&ep), &[])

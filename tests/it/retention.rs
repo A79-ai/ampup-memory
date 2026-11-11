@@ -652,8 +652,9 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     // A purge stopped right after its last rewrite (the episodes table's) committed, before the files it replaced
     // were deleted (as if the process were killed there): the old note's episode row is out of the table but still
     // in its old data files. The next purge, which finds nothing left to remove, still deletes them. Notes age out
-    // now too, and so do remembered ones: a part of Carol's session transcript, sent 101 days ago and sent again
-    // with more the day after, goes for her in both versions, not only the newest, and leaves every file.
+    // now too, and so do session transcripts, under a rule for them alone: a part of Carol's, sent 101 days ago and
+    // sent again with more the day after, goes for her in both versions, not only the newest, and leaves every file,
+    // while what she remembered 100 days ago stays.
     let script = |said: &str, ago: i64| {
         let mut ep = Episode::sourced(
             "mcp:remember_memory:carol@acme.com:memstore:transcript:claude-code:launch:s-xqaged",
@@ -671,8 +672,15 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     );
     let script_ids = [first.episode_id.clone(), more.episode_id.clone()];
     let script_ids = [script_ids[0].as_str(), script_ids[1].as_str()];
+    let mut remembered = Episode::sourced(
+        "mcp:remember_memory:carol@acme.com:claude-code:launch:s-xqaged",
+        b"xqrememberedold: launch reviews go to the release channel",
+        &["user:carol@acme.com"],
+    );
+    remembered.occurred_at = chrono::Utc::now().timestamp_micros() - 100 * DAY;
+    let remembered_id = remembered.episode_id.clone();
     store
-        .commit(&acme, "carol@acme.com", &[first, more], &[])
+        .commit(&acme, "carol@acme.com", &[first, more, remembered], &[])
         .await
         .unwrap();
     until(
@@ -688,7 +696,7 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
         s,
         &alice,
         json!({"op": "retention", "org": "acme",
-            "rules": ["slack:=30d", "slack:C-legal:=forever", "note:=30d", "mcp:remember_memory:=30d"]}),
+            "rules": ["slack:=30d", "slack:C-legal:=forever", "note:=30d", "memstore:transcript:=30d"]}),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -705,6 +713,11 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
                          "arguments": {"document": "transcripts/claude-code/s-xqaged/00000000"}}});
     let (_, body) = post(&format!("{s}/mcp?org=acme"), &carol, &listing).await;
     assert!(!body.contains("xqscriptfirst"), "{body}");
+    let kept = reads(s, "?org=acme", &carol, &[remembered_id.as_str()]).await;
+    assert!(
+        kept.as_ref().is_some_and(|r| r.contains("xqrememberedold")),
+        "a transcripts rule aged out what she remembered: {kept:?}"
+    );
     unsafe { std::env::set_var("AMPUP_MEMORY_STOP_AFTER_REWRITE", "episodes") };
     let (ok, out, err) = memstore(&home, &["org", "purge", "acme"]);
     unsafe { std::env::remove_var("AMPUP_MEMORY_STOP_AFTER_REWRITE") };
@@ -726,7 +739,12 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     for t in ["xqscriptfirst", "xqscriptmore"] {
         assert_eq!(in_files(t), Vec::<PathBuf>::new(), "{t} still stored");
     }
-    for t in ["xqyoungslack", "xqlegalslack", "xqteamslack"] {
+    for t in [
+        "xqyoungslack",
+        "xqlegalslack",
+        "xqteamslack",
+        "xqrememberedold",
+    ] {
         assert!(!in_files(t).is_empty(), "{t} went with the purge");
     }
 }

@@ -1287,9 +1287,10 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         assert!(!body.contains("xqcarolprefix"), "{body}");
     }
     // Session transcripts ahead of the forget. Off until acme's admins turn them on: Carol's hook is told so and
-    // nothing is kept. On, each part of her session's transcript is her own episode: she reads it, by its id or its
-    // document, and neither Bob nor acme's admin does; a part sent again is no new version. The forget below takes
-    // every part out of every file.
+    // nothing is kept, and so is the hook of acme's reader key, which may keep none, rather than refused at every
+    // turn; on, the key is refused. On, each part of her session's transcript is her own episode: she reads it, by
+    // its id or its document, and neither Bob nor acme's admin does; a part sent again is no new version. The forget
+    // below takes every part out of every file.
     let part = |from: u64, said: &str| {
         json!({"harness": "claude-code", "repo": "launch", "session_id": "s-xqscript", "from": from,
                "text": format!("Claude Code session s-xqscript in launch: its transcript from entry {from}.\n\n\
@@ -1305,6 +1306,13 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""off":true"#), "{body}");
     assert!(in_files("xqcarolran").is_empty());
+    let key_check = json!({"check": true, "harness": "claude-code", "session_id": "s-xqkey"});
+    let (status, body) = post(&format!("{s}/transcripts"), &a_key, &key_check).await;
+    assert_eq!(
+        status, 200,
+        "a key is refused where transcripts are off: {body}"
+    );
+    assert!(body.contains(r#""off":true"#), "{body}");
     let (status, body) = admin_as(
         s,
         &alice,
@@ -1312,6 +1320,8 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     )
     .await;
     assert_eq!(status, 200, "an org admin turns transcripts on: {body}");
+    let (status, body) = post(&format!("{s}/transcripts"), &a_key, &key_check).await;
+    assert_eq!(status, 403, "a reader key keeps transcripts: {body}");
     let mut parts = vec![];
     for (from, said) in [(0, "xqcarolran"), (0, "xqcarolran"), (3, "xqcarolsaw")] {
         let (status, body) = post(
@@ -1363,8 +1373,8 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         );
     }
     // Sent again with more, a part is a new version of it. Carol forgets the newest, and every version goes: neither
-    // is read by its id or its document, listed or matched, and sending it again keeps nothing, from the same entry
-    // or from a hook that lost its marker.
+    // is read by its id or its document, listed or matched, exported by the operator, and sending it again keeps
+    // nothing, from the same entry or from a hook that lost its marker.
     let more = part(3, "xqcarolsaw xqcarolmore");
     let (status, body) = post(&format!("{s}/transcripts?org=acme"), &carol, &more).await;
     assert_eq!(status, 200, "{body}");
@@ -1419,6 +1429,20 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         "a hook that lost its marker would send the part she forgot again: {body}"
     );
     assert!(!episode(&carol, part3).await.contains("xqcarolsaw"));
+    let forgot = dir.path().join("export-forgot");
+    let (ok, out, err) = memstore(
+        &home,
+        &["org", "export", "acme", "--out", forgot.to_str().unwrap()],
+    );
+    assert!(ok, "{out}{err}");
+    let exported = std::fs::read_to_string(forgot.join("org/episodes.jsonl")).unwrap();
+    assert!(exported.contains("xqcarolran"), "{exported}");
+    for t in ["xqcarolsaw", "xqcarolmore"] {
+        assert!(
+            !exported.contains(t),
+            "the operator exported {t}, which she forgot"
+        );
+    }
     // Acme's admin is demoted as she forgets Carol: right after the directory takes Carol out of acme, before
     // anything of hers is deleted. The forget stops there, refused, and says how to finish it: Carol is out of
     // acme, nothing of hers is deleted, and no tombstone is left. Made an admin again, Alice runs it again below,

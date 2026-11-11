@@ -59,6 +59,22 @@ pub const PROFILE_SOURCE_TAIL: &str = "memstore:profile";
 /// quote a session, so a purge of any of them takes it, as it takes a profile version ([`is_profile_source`]).
 pub const NOTES_DREAM_SOURCE_TAIL: &str = "memstore:dream";
 
+/// What follows a person in the source of their session transcripts' parts
+/// (`mcp:remember_memory:<them>:memstore:transcript:<harness>:<repo>:<session>`, `memstore::transcripts`): no note may
+/// take it. A retention rule whose prefix starts with it is for transcripts alone ([`retention::Retention`]).
+pub const TRANSCRIPT_SOURCE: &str = "memstore:transcript:";
+
+/// A session transcript's part's author and what follows them (`memstore:transcript:…`), from its source: the author
+/// a service key's `key:<org>/<name>`, else everything up to the next `:`. None for any other source.
+pub fn transcript_source(source: &str) -> Option<(&str, &str)> {
+    let rest = source.strip_prefix(REMEMBER_SOURCE)?.strip_prefix(':')?;
+    let skip = if rest.starts_with("key:") { 4 } else { 0 };
+    let end = skip + rest[skip..].find(':')?;
+    let own = &rest[end + 1..];
+    own.starts_with(TRANSCRIPT_SOURCE)
+        .then_some((&rest[..end], own))
+}
+
 /// Whether `source` is what the server derives from one person's own notes and sessions and files under their
 /// name: their profile's ([`PROFILE_SOURCE_TAIL`]) or their notes dream's records ([`NOTES_DREAM_SOURCE_TAIL`]).
 pub fn is_profile_source(source: &str) -> bool {
@@ -1617,6 +1633,88 @@ impl Session {
             }
         }
         Ok(found)
+    }
+
+    /// Which of the episodes `ids` this session sees committed with a row whose source passes `wanted`, whoever may
+    /// read them (a forgotten one too: its ACL no longer names its author, its source still does). No body is read,
+    /// and only the rows of these ids are decoded.
+    pub async fn sourced_by(
+        &self,
+        store: &Store,
+        ids: &[&str],
+        wanted: impl Fn(&str) -> bool,
+    ) -> Result<HashSet<String>> {
+        let ids: HashSet<&str> = ids.iter().copied().collect();
+        let mut found = HashSet::new();
+        if ids.is_empty() {
+            return Ok(found);
+        }
+        for b in store
+            .rows(&self.scope.namespace(), EPISODES)
+            .await?
+            .rows
+            .iter()
+        {
+            let column = |name: &str| {
+                b.column_by_name(name)
+                    .unwrap_or_else(|| panic!("{name}"))
+                    .as_string::<i32>()
+            };
+            let id = column("episode_id");
+            let rows: Vec<usize> = (0..id.len())
+                .filter(|&i| ids.contains(id.value(i)) && !found.contains(id.value(i)))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let (commit, source) = (column("commit_id"), column("source"));
+            for i in rows {
+                if self.vis.committed.contains(commit.value(i)) && wanted(source.value(i)) {
+                    found.insert(id.value(i).to_string());
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The size in bytes of each body among the episodes `ids` that the principal may read in this session, from
+    /// the object store's metadata: no body is read. One whose body is gone is left out.
+    pub async fn body_sizes(
+        &self,
+        store: &Store,
+        who: &Principal,
+        ids: &[&str],
+    ) -> Result<HashMap<String, u64>> {
+        let table = store.rows(&self.scope.namespace(), EPISODES).await?.table;
+        let stats: Vec<_> = ids
+            .iter()
+            .filter(|id| self.vis.can_see_episode(id, who))
+            .map(|id| {
+                let (io, path, id) = (
+                    table.file_io().clone(),
+                    body_path(&table, id),
+                    id.to_string(),
+                );
+                async move {
+                    let input = io.new_input(path)?;
+                    let size = match input.metadata().await {
+                        Ok(m) => Some(m.size),
+                        // Deleted since this session's tables were read (a purge, or offboarding, elsewhere).
+                        Err(_) if !input.exists().await? => None,
+                        Err(e) => return Err(anyhow::Error::from(e)),
+                    };
+                    Ok::<_, anyhow::Error>((id, size))
+                }
+            })
+            .collect();
+        let sized: Vec<(String, Option<u64>)> = futures::stream::iter(stats)
+            .buffer_unordered(16)
+            .try_collect()
+            .await?;
+        Ok(sized
+            .into_iter()
+            .filter_map(|(id, size)| Some((id, size?)))
+            .collect())
     }
 
     /// The episodes whose source starts with one of `prefixes` that the principal may read in this session, as

@@ -2,6 +2,8 @@
 //! prefix and a maximum age (or `forever`); an episode follows the rule with the longest prefix its source
 //! starts with, and is kept when no rule matches. Age is counted from when the record happened at its
 //! source (`occurred_at`), not when it was ingested, so re-ingesting an old record doesn't make it young.
+//! Session transcripts' parts, which carry their author's signature first, have rules of their own:
+//! `memstore:transcript:=30d` keeps every transcript 30 days and nothing else ([`Retention::max_age_us`]).
 //!
 //! An episode past its age is gone for every reader at read time, with the facts citing it, as a
 //! retracted one is: no job has to run for it to go, and it goes the moment it ages out, not at the next
@@ -72,12 +74,23 @@ impl Retention {
         Ok(())
     }
 
-    /// How long an episode from `source` is kept, in microseconds; `None` for good.
+    /// How long an episode from `source` is kept, in microseconds; `None` for good. A session transcript's part
+    /// follows the longest rule for transcripts that matches it (a prefix starting [`crate::TRANSCRIPT_SOURCE`],
+    /// matched against its source past its author: `memstore:transcript:<harness>:<repo>:<session>`), else the
+    /// others as any source does.
     pub fn max_age_us(&self, source: &str) -> Option<i64> {
-        self.rules
-            .iter()
-            .filter(|r| source.starts_with(r.source_prefix.as_str()))
-            .max_by_key(|r| r.source_prefix.len())
+        let longest = |s: &str, transcripts: bool| {
+            self.rules
+                .iter()
+                .filter(|r| {
+                    r.source_prefix.starts_with(crate::TRANSCRIPT_SOURCE) == transcripts
+                        && s.starts_with(r.source_prefix.as_str())
+                })
+                .max_by_key(|r| r.source_prefix.len())
+        };
+        crate::transcript_source(source)
+            .and_then(|(_, own)| longest(own, true))
+            .or_else(|| longest(source, false))
             .and_then(|r| r.max_age_secs)
             .map(|s| s.saturating_mul(1_000_000))
     }

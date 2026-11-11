@@ -6,11 +6,18 @@
 //! Before a compaction, at a Stop (at most every [`super::KEEP_EVERY`]) and at the session's end, the hook sends what
 //! the transcript gained since the last part the memory took (a marker keeps how far that was; without one, the
 //! memory says where its last part starts), in parts of at most [`PART_MAX`]: a part the memory didn't take is sent
-//! again, from the same entry, by the next hook, and replaces any earlier send of it. Each part is running text, one turn to a paragraph: each prompt, each answer, each tool
+//! again, from the same entry, by the next hook, and replaces any earlier send of it. Each part is running text, one
+//! turn to a paragraph: each prompt, each answer, each tool
 //! call with its input and each tool result, each input or result whole up to [`BLOCK_MAX`] (past that its first and
-//! last [`BLOCK_END`]), a turn longer than [`UNIT_MAX`] going on in the next paragraph. Never thinking, nor a server
-//! tool's encrypted content; secret-looking words redacted. A session keeps at most [`SESSION_MAX`]; past that
-//! the transcript says it stops there, and the rest isn't sent.
+//! last [`BLOCK_END`]), a turn longer than [`UNIT_MAX`] going on in the next paragraph, an entry longer than a part
+//! cut to fit one ([`fitted`]). Never thinking, nor a server tool's encrypted content; secret-looking words
+//! redacted. Nor what memstore itself holds ([`left_out`]): its tools' answers and what its hooks added are each a
+//! reference to the episodes and facts they named, so no copy of them outlives the original or its access rules. A
+//! session keeps at most [`SESSION_MAX`]; past that the transcript says it stops there, and the rest isn't sent.
+//!
+//! Where the memory keeps none for this caller (the scope's setting off; a key, a reader or a session's branch where
+//! it is on; a server from before transcripts), the hook marks it and doesn't ask again for [`OFF_FOR`], saying so
+//! once. At the session's end, what the memory couldn't take now waits in the outbox, every part of it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,8 +42,261 @@ const WRAP: usize = 4_000;
 const PART_MAX: usize = 2 << 20;
 /// Most bytes of one session's transcript.
 const SESSION_MAX: usize = 32 << 20;
+/// Most bytes of one entry's turns: a part's, less room for its heading and its end.
+const ENTRY_MAX: usize = PART_MAX - (16 << 10);
 /// How long a scope that keeps none is not asked again.
 const OFF_FOR: Duration = Duration::from_secs(6 * 3600);
+/// Most episodes, or facts, a reference to what memstore said names.
+const NAMED_MAX: usize = 40;
+
+/// memstore's own tools, by their own names: an MCP host calls them `mcp__<server>__<tool>` (Claude Code, Codex), or
+/// by the name alone (Gemini CLI).
+const MEMORY_TOOLS: [&str; 20] = [
+    "search_memory",
+    "get_episode",
+    "get_brief",
+    "list_briefs",
+    "start_session",
+    "get_advice",
+    "end_session",
+    "remember_memory",
+    "forget_memory",
+    "query_memory",
+    "ask_memory",
+    "get_entity",
+    "list_facts",
+    "list_advice",
+    "feedback_memory",
+    "close_memory",
+    "log_answer",
+    "record_run",
+    "reward_run",
+    "skills",
+];
+
+/// How each part of what memstore's hooks add to a session begins (recalled facts, advice, the notes a session
+/// starts with, under this name or the one before it), on a line of its own.
+const INJECTED: [&str; 4] = [
+    "From the team memory (",
+    "Advice from the team memory (",
+    "What this user told you before (",
+    "What the team shares (",
+];
+
+/// The heading of the paragraph that stands for what memstore's hooks added: a tool's result, as a later pass reads
+/// a transcript (`notes_dream`), never the person's words.
+const HOOKS_HEAD: &str = "Result of AmpUp Memory's hooks";
+const ANSWER: &str = "AmpUp Memory's answer";
+const ADDED: &str = "what AmpUp Memory's hooks added";
+
+/// Whether `name` is one of memstore's own tools ([`MEMORY_TOOLS`]), under any server's name.
+fn memory_tool(name: &str) -> bool {
+    MEMORY_TOOLS.iter().any(|t| {
+        name == *t
+            || name
+                .strip_suffix(t)
+                .is_some_and(|server| server.ends_with("__"))
+    })
+}
+
+/// Whether a turn's heading (`Result of <tool> (call n)`, `Error from <tool> (call n)`) is a result of one of
+/// memstore's tools.
+fn memory_result(turn: &str) -> bool {
+    turn.strip_prefix("Result of ")
+        .or_else(|| turn.strip_prefix("Error from "))
+        .and_then(|r| r.rsplit_once(" (call "))
+        .is_some_and(|(tool, _)| memory_tool(tool))
+}
+
+/// Where in `text` what memstore's hooks added begins: the start of the first line holding one of [`INJECTED`].
+fn injected_at(text: &str) -> Option<usize> {
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        if INJECTED.iter().any(|l| line.contains(l)) {
+            return Some(at);
+        }
+        at += line.len();
+    }
+    None
+}
+
+/// The episodes (64 hex digits) and facts (UUIDs) some of memstore's text named, each once, in order.
+#[derive(Default)]
+struct Named {
+    episodes: Vec<String>,
+    facts: Vec<String>,
+}
+
+impl Named {
+    fn add(&mut self, text: &str) {
+        let hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
+        for w in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+            let list = if w.len() == 64 && hex(w) {
+                &mut self.episodes
+            } else if w.len() == 36
+                && w.split('-').map(str::len).eq([8, 4, 4, 4, 12])
+                && hex(&w.replace('-', ""))
+            {
+                &mut self.facts
+            } else {
+                continue;
+            };
+            let w = w.to_ascii_lowercase();
+            if !list.contains(&w) {
+                list.push(w);
+            }
+        }
+    }
+
+    /// An indented line standing for `what`, naming what it named.
+    fn reference(&self, what: &str) -> String {
+        let list = |ids: &[String]| {
+            let shown = ids[..ids.len().min(NAMED_MAX)].join(", ");
+            match ids.len() > NAMED_MAX {
+                true => format!("{shown} and {} more", ids.len() - NAMED_MAX),
+                false => shown,
+            }
+        };
+        let mut s =
+            format!("  [left out: {what}, which stays in AmpUp Memory under its own access rules");
+        if !self.episodes.is_empty() {
+            s.push_str(&format!("; episodes {}", list(&self.episodes)));
+        }
+        if !self.facts.is_empty() {
+            s.push_str(&format!("; facts {}", list(&self.facts)));
+        }
+        s.push(']');
+        s
+    }
+}
+
+/// `paragraphs` (an entry's turns, or a whole part's) with what memstore itself holds left out, so no copy of it
+/// outlives the original's forget, retention or offboarding, or its reader's access to it: each result of one of its
+/// tools ([`MEMORY_TOOLS`]; the call and its input stay) becomes a reference to the episodes and facts it named, and
+/// in a turn said to be the person's (`User:`), what its hooks added, from the first line [`INJECTED`] finds to the
+/// turn's end, becomes a paragraph of its own ([`HOOKS_HEAD`]) with the same kind of reference. What the person typed
+/// and what other tools returned stay as they are.
+fn left_out(paragraphs: Vec<String>) -> Vec<String> {
+    // The reference being gathered: its heading, the turn whose `(continued)` paragraphs go into it, what it stands
+    // for and what that named.
+    type Open = Option<(String, String, &'static str, Named)>;
+    fn close(open: &mut Open, out: &mut Vec<String>) {
+        if let Some((head, _, what, named)) = open.take() {
+            out.push(format!("{head}:\n{}", named.reference(what)));
+        }
+    }
+    let mut out = vec![];
+    let mut open: Open = None;
+    for p in paragraphs {
+        let (line, body) = p.split_once('\n').unwrap_or((p.as_str(), ""));
+        let continued = line.ends_with(" (continued):");
+        let turn = line
+            .strip_suffix(':')
+            .map(|h| h.strip_suffix(" (continued)").unwrap_or(h));
+        if let (true, Some(t), Some((_, of, _, named))) = (continued, turn, open.as_mut())
+            && t == of
+        {
+            named.add(body);
+            continue;
+        }
+        close(&mut open, &mut out);
+        let added_at = match turn {
+            Some("User") => injected_at(body),
+            _ => None,
+        };
+        match (turn, added_at) {
+            (Some(t), _) if memory_result(t) => {
+                let mut named = Named::default();
+                named.add(body);
+                open = Some((t.to_string(), t.to_string(), ANSWER, named));
+            }
+            (_, Some(at)) => {
+                let (typed, added) = body.split_at(at);
+                if !typed.trim().is_empty() {
+                    out.push(format!("{line}\n{}", typed.trim_end()));
+                }
+                let mut named = Named::default();
+                named.add(added);
+                open = Some((HOOKS_HEAD.to_string(), "User".into(), ADDED, named));
+            }
+            _ => out.push(p),
+        }
+    }
+    close(&mut open, &mut out);
+    out
+}
+
+/// A part's `text` as a hook from before [`left_out`] sent it, with what memstore holds left out: the server keeps
+/// every part this way, so an older hook's copies are references too.
+pub fn without_memory(text: &str) -> String {
+    left_out(text.split("\n\n").map(str::to_string).collect()).join("\n\n")
+}
+
+/// An entry's paragraphs within `max` bytes (each counted with the blank line after it): whole where they fit, else
+/// those that fit and the next cut where it reaches `max`, with a line saying how much of the entry was left out.
+/// So an entry longer than a part (a prompt pasted whole, a turn of many results) is kept cut, not refused.
+fn fitted(paragraphs: Vec<String>, max: usize) -> Vec<String> {
+    let total: usize = paragraphs.iter().map(|p| p.len() + 2).sum();
+    if total <= max {
+        return paragraphs;
+    }
+    let room = max.saturating_sub(256);
+    let mut out = vec![];
+    let mut used = 0;
+    for p in paragraphs {
+        if used + p.len() + 2 <= room {
+            used += p.len() + 2;
+            out.push(p);
+            continue;
+        }
+        let cut = &p[..p.floor_char_boundary(room.saturating_sub(used + 2))];
+        let (kept, head) = match cut.rfind('\n') {
+            Some(i) => (&cut[..i], true),
+            None => ("", false),
+        };
+        let gone = total - used - kept.len();
+        let said =
+            format!("[… {gone} bytes of this entry left out: it is longer than a part holds …]");
+        out.push(match head {
+            true => format!("{kept}\n  {said}"),
+            false => said,
+        });
+        break;
+    }
+    out
+}
+
+/// Whether the memory answered that it keeps none for this caller here: refused (403: a key, a reader, a session's
+/// branch, where the scope keeps them), or no route for them (404 or 405: a server from before transcripts).
+fn not_here(e: &anyhow::Error) -> bool {
+    let e = format!("{e:#}");
+    [": 403", ": 404", ": 405"].iter().any(|c| e.contains(c))
+}
+
+/// Marks that the memory keeps none for this caller here, so it isn't asked again for [`OFF_FOR`]: `refused`, the
+/// error that said so, else the scope keeps none. A refusal of a caller where the scope keeps them is said once,
+/// when first marked, never at every hook.
+fn mark_off(off: Option<&Path>, refused: Option<&anyhow::Error>) {
+    let Some(m) = off else {
+        return;
+    };
+    let why = refused.map_or(String::new(), |e| {
+        match format!("{e:#}").contains(": 403") {
+            true => "refused".into(),
+            false => "no route".into(),
+        }
+    });
+    if why == "refused"
+        && std::fs::read_to_string(m).ok().as_deref() != Some("refused")
+        && let Some(e) = refused
+    {
+        warn(format!(
+            "transcripts are on here but aren't kept for this sign-in, so none is sent (asked again in {} hours): {e:#}",
+            OFF_FOR.as_secs() / 3600
+        ));
+    }
+    let _ = std::fs::write(m, why);
+}
 
 /// When a hook sends: at once (a compaction, the session's end), or at most every [`KEEP_EVERY`] (a Stop).
 #[derive(Clone, Copy, PartialEq)]
@@ -239,6 +499,31 @@ fn turns(
         );
     };
     if harness == Harness::ClaudeCode {
+        // What a hook added to the session: memstore's hooks', a reference to what it named ([`left_out`]); any other
+        // hook's isn't part of the conversation.
+        if v["type"] == "attachment" {
+            let a = &v["attachment"];
+            let text = match &a["content"] {
+                Value::Array(xs) => xs
+                    .iter()
+                    .map(|x| x.as_str().map_or_else(|| x.to_string(), str::to_string))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                c => c.as_str().map_or_else(|| c.to_string(), str::to_string),
+            };
+            if a["type"] == "hook_additional_context"
+                && let Some(at) = injected_at(&text)
+            {
+                let mut named = Named::default();
+                named.add(&text[at..]);
+                let event = a["hookEvent"].as_str().unwrap_or("a hook");
+                out.push(format!(
+                    "{HOOKS_HEAD} ({event}):\n{}",
+                    named.reference(ADDED)
+                ));
+            }
+            return out;
+        }
         if [&v["isMeta"], &v["isSidechain"], &v["isCompactSummary"]]
             .iter()
             .any(|f| f.as_bool() == Some(true))
@@ -372,16 +657,22 @@ fn turns(
     out
 }
 
-/// Whether the scope keeps them, asked before sending megabytes it would refuse: where it doesn't (a server from before
-/// answers neither), `off` is marked.
+/// Whether the scope keeps them, asked before sending megabytes it would refuse: where it keeps none for this caller
+/// (off, a refusal, or no route: [`not_here`]), `off` is marked ([`mark_off`]) and the answer is `off`.
 async fn check(client: &Client, off: Option<&Path>, ask: &Value) -> Result<Value> {
-    let v = client.post("/transcripts", ask).await?;
-    if v["off"] != false
-        && let Some(m) = off
-    {
-        let _ = std::fs::write(m, "");
+    match client.post("/transcripts", ask).await {
+        Ok(v) => {
+            if v["off"] != false {
+                mark_off(off, None);
+            }
+            Ok(v)
+        }
+        Err(e) if not_here(&e) => {
+            mark_off(off, Some(&e));
+            Ok(json!({"kept": false, "off": true}))
+        }
+        Err(e) => Err(e),
     }
-    Ok(v)
 }
 
 /// Sends what the session's transcript gained since the last part the memory took, in parts.
@@ -475,15 +766,12 @@ pub(super) async fn send(client: &Client, input: &Value, harness: Harness, due: 
     let calls = calls_of(&entries);
     let rendered: Vec<Vec<String>> = entries[from..]
         .iter()
-        .map(|v| turns(v, harness, who, &calls))
+        .map(|v| fitted(left_out(turns(v, harness, who, &calls)), ENTRY_MAX))
         .collect();
     if rendered.iter().all(Vec::is_empty) {
         // Nothing to send (lines that aren't turns): past them.
         sent["entries"] = json!(n);
         let _ = std::fs::write(&sent_marker, sent.to_string());
-        return Ok(());
-    }
-    if !checked && check(client, off.as_deref(), &json!({"check": true})).await?["off"] != false {
         return Ok(());
     }
     let repo: String = repo_name(input)
@@ -494,9 +782,17 @@ pub(super) async fn send(client: &Client, input: &Value, harness: Harness, due: 
             c => c,
         })
         .collect();
+    // The parts, each at most PART_MAX: what the session gained from `from` on, as far as SESSION_MAX lets it.
+    struct Part {
+        start: usize,
+        end: usize,
+        text: String,
+        full: bool,
+    }
+    let mut parts: Vec<Part> = vec![];
+    let mut bytes = sent["bytes"].as_u64().unwrap_or(0) as usize;
     let mut at = 0;
     while at < rendered.len() {
-        let mut bytes = sent["bytes"].as_u64().unwrap_or(0) as usize;
         let start = at;
         let mut units: Vec<&String> = vec![];
         let mut size = 0;
@@ -514,14 +810,14 @@ pub(super) async fn send(client: &Client, input: &Value, harness: Harness, due: 
             size += s;
             at += 1;
         }
-        let stop = format!(
-            "The transcript stops here: it reached {} MB, the most a session keeps.",
-            SESSION_MAX >> 20
-        );
+        if units.is_empty() && !full {
+            continue;
+        }
         let head = format!(
             "{} session {session} in {repo}: its transcript from entry {}. Each tool call's input and result is \
-             whole up to {} KB (past that, its first and last {} KB); thinking is left out and secret-looking \
-             words are redacted.",
+             whole up to {} KB (past that, its first and last {} KB); thinking is left out, and so is what AmpUp \
+             Memory's tools returned and its hooks added (each a reference to what it named); secret-looking words \
+             are redacted.",
             harness.label(),
             from + start,
             BLOCK_MAX >> 10,
@@ -533,57 +829,83 @@ pub(super) async fn send(client: &Client, input: &Value, harness: Harness, due: 
             .collect::<Vec<_>>()
             .join("\n\n");
         if full {
-            text.push_str(&format!("\n\n{stop}"));
+            text.push_str(&format!(
+                "\n\nThe transcript stops here: it reached {} MB, the most a session keeps.",
+                SESSION_MAX >> 20
+            ));
         }
-        if units.is_empty() && !full {
-            continue;
+        bytes += text.len();
+        parts.push(Part {
+            start,
+            end: at,
+            text,
+            full,
+        });
+        if full {
+            break;
         }
-        let body = json!({"harness": harness.name(), "repo": repo, "session_id": session,
-                          "from": from + start, "to": from + at, "text": text});
-        match client.post("/transcripts", &body).await {
+    }
+    let body = |p: &Part| {
+        json!({"harness": harness.name(), "repo": repo, "session_id": session, "from": from + p.start,
+               "to": from + p.end, "text": p.text})
+    };
+    // Unreached at the session's end: every part not yet kept waits in the outbox, each under its own name, for the
+    // next hook that sends what waits there (the next hook sends it again otherwise).
+    let unreached = |e: anyhow::Error, rest: &[Part]| {
+        if due == Due::Ending {
+            for p in rest {
+                let name = format!("{session}-{:08}", from + p.start);
+                client.queue("transcript", &name, "/transcripts", body(p), None);
+            }
+        }
+        e.context("the session's transcript waits to be sent")
+    };
+    if !checked {
+        match check(client, off.as_deref(), &json!({"check": true})).await {
+            Ok(v) if v["off"] != false => return Ok(()),
+            Ok(_) => {}
+            Err(e) if worth_retrying(&e) => return Err(unreached(e, &parts)),
+            Err(e) => return Err(e),
+        }
+    }
+    for (i, p) in parts.iter().enumerate() {
+        match client.post("/transcripts", &body(p)).await {
             Ok(v) if v["kept"] == true => {
-                bytes += text.len();
-                sent["entries"] = json!(from + at);
-                sent["bytes"] = json!(bytes);
+                sent["entries"] = json!(from + p.end);
+                sent["bytes"] = json!(sent["bytes"].as_u64().unwrap_or(0) as usize + p.text.len());
                 sent["parts"] = json!(sent["parts"].as_u64().unwrap_or(0) + 1);
-                if full {
+                if p.full {
                     sent["full"] = json!(true);
                 }
                 let _ = std::fs::write(&sent_marker, sent.to_string());
             }
             // A part the person forgot isn't kept again: past it.
             Ok(v) if v["forgotten"] == true => {
-                sent["entries"] = json!(from + at);
+                sent["entries"] = json!(from + p.end);
                 let _ = std::fs::write(&sent_marker, sent.to_string());
             }
             Ok(v) => {
-                if v["off"] == true
-                    && let Some(m) = &off
-                {
-                    let _ = std::fs::write(m, "");
+                if v["off"] == true {
+                    mark_off(off.as_deref(), None);
                 }
                 return Ok(());
             }
-            // Unreached: the next hook sends it again, or, at the session's end, the outbox does.
-            Err(e) if worth_retrying(&e) => {
-                if due == Due::Ending {
-                    client.queue("transcript", session, "/transcripts", body, None);
-                }
-                return Err(e.context("the session's transcript waits to be sent"));
+            Err(e) if worth_retrying(&e) => return Err(unreached(e, &parts[i..])),
+            // Not kept for this caller here (turned off, or a server from before): sent again once it is.
+            Err(e) if not_here(&e) => {
+                mark_off(off.as_deref(), Some(&e));
+                return Ok(());
             }
             // Refused: it would be refused again, so it isn't sent again.
             Err(e) => {
                 warn(format!(
                     "transcript {session}: entries {} to {} weren't kept: {e:#}",
-                    from + start,
-                    from + at
+                    from + p.start,
+                    from + p.end
                 ));
-                sent["entries"] = json!(from + at);
+                sent["entries"] = json!(from + p.end);
                 let _ = std::fs::write(&sent_marker, sent.to_string());
             }
-        }
-        if full {
-            break;
         }
     }
     Ok(())

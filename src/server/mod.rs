@@ -6346,6 +6346,23 @@ async fn handle(
     }
     if transcripts_route {
         let who = who.expect("public port");
+        let store = state.store.read().unwrap().clone();
+        // Off, it says so to whoever asks, before anything else: a hook that may keep none here (a service key, a
+        // reader, a session's branch) is told they're off and stops asking for a while, not refused at every turn.
+        match crate::transcripts::kept_in(&store, &scope).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(reply(StatusCode::OK, json!({"kept": false, "off": true})));
+            }
+            Err(e) => {
+                eprintln!("transcripts failed: {e:#}");
+                crate::report::failure("transcripts", &e);
+                return Ok(reply(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "transcripts failed"}),
+                ));
+            }
+        }
         let writes = writes_for(
             &state,
             &via,
@@ -6359,7 +6376,6 @@ async fn handle(
                 json!({"error": format!("transcripts on {scope} aren't kept here: keep them where its memory is written, on main")}),
             ));
         }
-        let store = state.store.read().unwrap().clone();
         let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         let done = match own_acl(&state, &who, &via, "transcript") {
             Ok(acl) => {

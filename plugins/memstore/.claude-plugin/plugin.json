@@ -1,6 +1,6 @@
 {
   "name": "memstore",
-  "version": "0.4.12",
+  "version": "0.4.13",
   "description": "Team memory for Claude Code: advice from the org's memory at a session's first prompt, each session recorded as a run to learn from (rate it with /memstore:outcome), what the memory knows recalled into context, and skills to search it, see where things stand and remember what lasts.",
   "author": { "name": "AmpUp" },
   "repository": "https://github.com/A79-ai/ampup-memory"

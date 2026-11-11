@@ -3088,7 +3088,8 @@ pub type ExportFile = (String, Vec<Value>);
 
 /// `memstore org export`: the org's memory as committed facts, the entities they describe, and the
 /// episodes with their text. The operator (`reader` unused) takes all of it: the org's scope and every
-/// team's, whatever the episodes' ACLs. An org admin (`reader`: who they are signed in as, holding what
+/// team's, whatever the episodes' ACLs, but what was retracted or forgotten (and the facts citing it), which
+/// no one reads until a purge deletes it. An org admin (`reader`: who they are signed in as, holding what
 /// the org shares with all its members, `group:<org>.all`, as a read the directory resolves gives them) takes
 /// what they may read: the org's scope and the teams they are members of (a team is isolated from the rest of
 /// its org, admins included), and only the episodes their ACLs let them see and the facts all of whose
@@ -3171,7 +3172,10 @@ async fn export_facts(
                 None => {
                     vis.committed.contains(&commit)
                         && !vis.retracted_facts.contains(&f.fact_id)
-                        && !f.source_episodes.iter().any(|e| vis.is_retracted(e))
+                        && !f
+                            .source_episodes
+                            .iter()
+                            .any(|e| vis.is_retracted(e) || forgotten(vis, e))
                 }
                 Some(who) => vis.allows(&commit, &f, who, None),
             };
@@ -3200,6 +3204,15 @@ async fn export_facts(
     Ok((facts, entities))
 }
 
+/// Whether episode `id` was forgotten (`Store::forget`): its newest ACL names no one but [`crate::FORGOTTEN`]. No
+/// reader reads it, nor a fact citing it, until a purge deletes it; the operator's export leaves them out too, so
+/// what a person forgot (a part of their session's transcript, a note) isn't handed on in the meantime.
+fn forgotten(vis: &crate::Vis, id: &str) -> bool {
+    vis.acls
+        .get(id)
+        .is_some_and(|a| !a.is_empty() && a.iter().all(|e| e == crate::FORGOTTEN))
+}
+
 async fn export_episodes(
     store: &Store,
     ns: &str,
@@ -3221,6 +3234,7 @@ async fn export_episodes(
         for i in 0..b.num_rows() {
             if !vis.committed.contains(&commit[i])
                 || vis.is_retracted(&id[i])
+                || forgotten(vis, &id[i])
                 || reader.is_some_and(|who| !vis.can_see_episode(&id[i], who))
             {
                 continue;

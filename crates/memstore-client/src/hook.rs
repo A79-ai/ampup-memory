@@ -26,8 +26,9 @@
 //!   1.5 s together, so `end` hands its work to a copy of itself that runs on.
 //! - `session-end`, `stop` (at most every [`KEEP_EVERY`]) and `end`, where the scope keeps them: what the session's
 //!   transcript gained since the last part the memory took, whole (each tool call with its input and its result;
-//!   never thinking), secrets redacted, is kept as the caller's own episode for later passes to check notes against
-//!   (`transcripts`, `POST /transcripts`). The note and the trace above stay as they were.
+//!   never thinking, nor what memstore's own tools returned or its hooks added, which are references), secrets
+//!   redacted, is kept as the caller's own episode for later passes to check notes against (`transcripts`,
+//!   `POST /transcripts`). The note and the trace above stay as they were.
 //! - `outcome` (`/memstore:outcome good|bad [why]`, no stdin): rewards this session, which advice learns from.
 //! - `status`: where the memory is and whether it answers.
 //!
@@ -93,6 +94,7 @@ const DETACHED: &str = "AMPUP_MEMORY_HOOK_DETACHED";
 mod advice_traces;
 #[path = "transcripts.rs"]
 mod transcripts;
+pub use transcripts::without_memory;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
