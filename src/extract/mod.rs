@@ -2403,8 +2403,6 @@ async fn run_with(
     Ok(done)
 }
 
-/// An OpenAI reasoning model (`gpt-5…`, `o1…`, `o3…`, `o4…`, also behind a router's `openai/` prefix): it takes
-/// no `temperature`.
 /// Whether the model may think before it answers (`AMPUP_MEMORY_EXTRACT_THINKING`, default on).
 fn thinks() -> bool {
     std::env::var("AMPUP_MEMORY_EXTRACT_THINKING").map_or(true, |v| v != "off")
@@ -2413,10 +2411,42 @@ fn thinks() -> bool {
 /// Models that refused a temperature since the server started.
 static NO_TEMPERATURE: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
-/// Whether to ask `model` for temperature 0. OpenAI's reasoning models (the default, gpt-5-mini, among
-/// them) refuse any temperature but their own, as do models that have refused one this run.
+/// Whether to ask `model` for temperature 0. OpenAI's reasoning models (the default, gpt-5-mini, among them)
+/// refuse any temperature but their own, and Anthropic's newer models any at all ([`claude_without_sampling`]):
+/// neither is ever sent one, so no call to them is refused and asked again. Nor is a model on neither list once
+/// it has refused one this run; only the calls already in flight when it first did are each refused once.
 fn takes_temperature(model: &str) -> bool {
-    !reasoning(model) && !NO_TEMPERATURE.lock().unwrap().contains(model)
+    !reasoning(model)
+        && !claude_without_sampling(model)
+        && !NO_TEMPERATURE.lock().unwrap().contains(model)
+}
+
+/// A Claude model that takes no sampling parameters, which refuses a request with a temperature in it (a 400:
+/// "`temperature` is deprecated for this model"): Claude Opus 4.7 and later, every Claude 5 model or later
+/// (Haiku, Sonnet, Opus), Fable and Mythos. However a backend names it: `claude-haiku-5-5` (Anthropic),
+/// `anthropic/claude-haiku-5.5` (a router), `us.anthropic.claude-opus-4-7-v1:0` (Bedrock),
+/// `claude-opus-4-7@20260416` (Vertex).
+fn claude_without_sampling(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    let Some(at) = model.find("claude-") else {
+        return false;
+    };
+    let name = model[at..]
+        .split(['@', ':'])
+        .next()
+        .unwrap_or_default()
+        .replace('.', "-");
+    let mut parts = name.split('-').skip(1);
+    let family = parts.next().unwrap_or_default();
+    // The version's numbers, up to a date (`-20251001`) or a Bedrock suffix (`-v1`).
+    let mut version = parts.map_while(|p| (p.len() <= 2).then(|| p.parse::<u32>().ok()).flatten());
+    let (major, minor) = (version.next(), version.next().unwrap_or(0));
+    match (family, major) {
+        ("fable" | "mythos", _) => true,
+        ("opus", Some(4)) => minor >= 7,
+        ("opus" | "sonnet" | "haiku", Some(m)) => m >= 5,
+        _ => false,
+    }
 }
 
 /// A 400 that names the temperature.
@@ -2425,6 +2455,8 @@ fn refuses_temperature(e: &anyhow::Error) -> bool {
         .is_some_and(|r| r.0.contains(": 400 ") && r.0.contains("temperature"))
 }
 
+/// An OpenAI reasoning model (`gpt-5…`, `o1…`, `o3…`, `o4…`, also behind a router's `openai/` prefix): it takes
+/// no `temperature`.
 fn reasoning(model: &str) -> bool {
     let m = model.strip_prefix("openai/").unwrap_or(model);
     m.starts_with("gpt-5")
