@@ -69,6 +69,21 @@ A new memory has no advice to give until it has rewarded runs to learn from or d
 HTTP routes: `/remember`, `/search`, `/query`, `/advice`, `/sessions`, `/sessions/end`, `/runs`, `/runs/reward`,
 and `/mcp` ([all routes](docs/guide/http-api.md)).
 
+From code, the Python and TypeScript clients wrap the same routes:
+
+```bash
+pip install ampup-memory        # Python 3.10+, sdk/python
+npm install @ampup/memory       # Node 20+, sdk/typescript
+```
+
+```python
+from ampup_memory import AmpUpMemory
+
+mem = AmpUpMemory("http://127.0.0.1:8080", None)  # a local server; from_profile() uses `ampup-memory-client join`'s sign-in
+mem.remember("note:deploy", "Deploy billing with ./deploy.sh billing.")
+print(mem.query({"find": "passages", "text": "deploy billing"})["results"])
+```
+
 ## Docs
 
 - [Quickstart](docs/guide/quickstart.md) and [concepts](docs/guide/concepts.md): episodes, facts, sessions,
