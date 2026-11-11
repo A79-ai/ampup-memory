@@ -758,12 +758,17 @@ pub fn flush_interval() -> Duration {
     )
 }
 
-/// What one flush commits: per namespace and actor, the store, scope, rows, and their keys and versions.
-type Groups = BTreeMap<(String, String), (Store, Scope, Vec<Logged>, Vec<((String, String), u64)>)>;
+/// What one flush commits: per catalog (its index among the flush's), namespace and actor, the store, scope, rows,
+/// and their keys and versions.
+type Groups =
+    BTreeMap<(usize, String, String), (Store, Scope, Vec<Logged>, Vec<((String, String), u64)>)>;
 
-/// Commits the held session rows, one commit per scope and actor; returns how many. A row whose asker was removed
-/// from its org (forgotten, offboarded) or disabled since, or whose org was deleted, is dropped, never written: it
-/// would bring back what the forget deleted. Rows that fail stay for the next flush.
+/// Commits the held session rows, one commit per catalog, scope and actor; returns how many. Each row goes to the
+/// catalog it was held for, checked against that catalog's directory: a process serving several (as the tests run
+/// their servers) never commits one's session to another's. A row whose asker was removed from its org
+/// (forgotten, offboarded) or disabled since, or whose org was deleted, is dropped, never written: it would bring
+/// back what the forget deleted. Rows that fail, or whose catalog's directory can't be read, stay for the next
+/// flush.
 pub async fn flush() -> Result<usize> {
     let _one = FLUSHING.lock().await;
     recheck().await;
@@ -773,19 +778,45 @@ pub async fn flush() -> Result<usize> {
         .iter()
         .map(|(k, h)| (k.clone(), h.clone()))
         .collect();
-    let Some(any) = held.first().map(|(_, h)| h.store.clone()) else {
+    if held.is_empty() {
         return Ok(0);
-    };
-    let dir = Directory::fresh(&any).await?;
+    }
+    // The catalogs the rows were held for, each with its directory as it is now (none: it can't be read).
+    let mut catalogs: Vec<(std::sync::Arc<dyn iceberg::Catalog>, Option<Directory>)> = vec![];
     let mut groups = Groups::new();
     let mut dropped = vec![];
+    let mut failed = None;
     for (key, h) in held {
-        if !still_theirs(&dir, &h.scope, &h.l) {
+        let catalog = h.store.catalog();
+        let at = match catalogs
+            .iter()
+            .position(|(c, _)| std::sync::Arc::ptr_eq(c, &catalog))
+        {
+            Some(at) => at,
+            None => {
+                let dir = match Directory::fresh(&h.store).await {
+                    Ok(dir) => Some(dir),
+                    Err(e) => {
+                        eprintln!(
+                            "memstore: session rows not written yet (kept): their directory can't be read: {e:#}"
+                        );
+                        failed.get_or_insert(e);
+                        None
+                    }
+                };
+                catalogs.push((catalog, dir));
+                catalogs.len() - 1
+            }
+        };
+        let Some(dir) = &catalogs[at].1 else {
+            continue;
+        };
+        if !still_theirs(dir, &h.scope, &h.l) {
             dropped.push((key, h.version));
             continue;
         }
         let g = groups
-            .entry((key.0.clone(), h.actor))
+            .entry((at, key.0.clone(), h.actor))
             .or_insert_with(|| (h.store, h.scope, vec![], vec![]));
         g.2.push(h.l);
         g.3.push((key, h.version));
@@ -797,8 +828,8 @@ pub async fn flush() -> Result<usize> {
         );
         settle(&dropped).await;
     }
-    let (mut written, mut failed) = (0, None);
-    for ((ns, actor), (store, scope, rows, keys)) in groups {
+    let mut written = 0;
+    for ((_, ns, actor), (store, scope, rows, keys)) in groups {
         match store.write_qa_rows(&scope, &actor, &rows).await {
             Ok(()) => {
                 written += rows.len();

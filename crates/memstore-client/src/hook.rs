@@ -2079,7 +2079,8 @@ async fn open_session(
     {
         let _ = write_whole(&r, &remembered);
     }
-    std::fs::write(m, id)?;
+    // Whole, as a hook reads it the moment it is there: one that read it half-written would find no session.
+    write_whole(&m, id)?;
     // The agent asks for advice again, when it needs help or finishes a step, in this session (the `memstore-advice` skill).
     let mut context = format!(
         "AmpUp Memory session: {id} (pass it as session_id to get_advice when you need help and when a step is finished and you move to the next (moment next); the hooks end it)"
