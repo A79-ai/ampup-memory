@@ -1676,7 +1676,7 @@ impl Extractor {
             Disputes(&'a Fact),
             New,
         }
-        for (i, (f, k)) in ask.into_iter().enumerate() {
+        for (i, (mut f, k)) in ask.into_iter().enumerate() {
             let label = format!("N{}", i + 1);
             let pick = |id: &str| -> Option<&Fact> {
                 let n: usize = id.trim().strip_prefix('E')?.parse().ok()?;
@@ -1727,6 +1727,16 @@ impl Extractor {
                             episode_id: ep.episode_id.clone(),
                         });
                         out.ended.push(old.clone());
+                    }
+                    // What ends a fact begins after it. Dated before it (a day the text gave, the old one told
+                    // later that day or the day before), the ended fact would read as the newest version, and
+                    // nothing as current: an older version stays replaced. So it begins when it was told.
+                    if f.valid_from <= old.valid_from
+                        && out.closures.iter().any(|c| c.fact_id == old.fact_id)
+                    {
+                        f.valid_from = ep.occurred_at;
+                        f.valid_to = f.valid_to.filter(|t| *t > f.valid_from);
+                        f.time_basis = Some("as_of_source".into());
                     }
                     out.facts.push(f);
                 }

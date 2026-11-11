@@ -2276,7 +2276,8 @@ impl Store {
     /// later, the new branch also ends what main holds for the key; where main's is, `held`'s facts for the key are
     /// left out. Its closures of facts main no longer holds are left out too. The new branch is proposed as
     /// superseding `held`, which retires it; when nothing is left, nothing is proposed and `held` stays as it is.
-    /// Returns the new branch.
+    /// The records of conflicts `held` holds ([`crate::conflicts`]) go with it, each whose two facts the new branch
+    /// still reads (one it stages, the other on main or staged too). Returns the new branch.
     async fn restage_held(&self, scope: &Scope, held: &str) -> Result<Option<String>> {
         let ledger = self.governance_ledger(scope).await?;
         let main = ledger.visible(MAIN);
@@ -2394,6 +2395,7 @@ impl Store {
         if facts.is_empty() && ends.is_empty() {
             return Ok(None);
         }
+        let records = self.held_records(scope, &own, &kept, &current_ids).await?;
         let mut what: Vec<String> = facts
             .iter()
             .map(|f| format!("{}|{}|{}|{}", f.entity, f.predicate, f.value, f.valid_from))
@@ -2435,7 +2437,7 @@ impl Store {
         let wanted: BTreeSet<&str> = facts.iter().map(|f| f.fact_id.as_str()).collect();
         let wrote = !on_branch.is_empty() || closure_commits.iter().any(|c| written.contains(c));
         if !wrote {
-            self.commit_full(scope, &branch, &actor, &[], &facts, &[], &ends, None)
+            self.commit_full(scope, &branch, &actor, &records, &facts, &[], &ends, None)
                 .await?;
         } else {
             anyhow::ensure!(
@@ -2444,8 +2446,77 @@ impl Store {
             );
         }
         self.propose_held(scope, &branch, Some(held)).await?;
-        eprintln!("governance: {held} staged again on main as {branch} in {scope}");
+        eprintln!(
+            "governance: {held} staged again on main as {branch} in {scope}, with {} conflict records",
+            records.len()
+        );
         Ok(Some(branch))
+    }
+
+    /// The records of conflicts committed in `own` (a held branch's own commits) whose two facts are both still
+    /// read: one of `kept` (staged again) and the other kept too or `current` on main. Whole, bodies included, to
+    /// be committed again with what they name.
+    async fn held_records(
+        &self,
+        scope: &Scope,
+        own: &HashSet<String>,
+        kept: &HashSet<String>,
+        current: &HashSet<&str>,
+    ) -> Result<Vec<Episode>> {
+        let read = |f: &str| kept.contains(f) || current.contains(f);
+        let mut found: HashMap<String, Episode> = HashMap::new();
+        for b in self.governance_rows(scope, EPISODES).await?.iter() {
+            let (commit, id, source, acl) = (
+                strings(b, "commit_id"),
+                strings(b, "episode_id"),
+                strings(b, "source"),
+                strings(b, "acl"),
+            );
+            let (occurred, document) = (
+                timestamps(b, "occurred_at"),
+                optional_strings(b, "document"),
+            );
+            for i in 0..b.num_rows() {
+                let Some((x, y)) = document[i]
+                    .as_deref()
+                    .filter(|_| {
+                        own.contains(&commit[i]) && source[i].starts_with(crate::conflicts::SOURCE)
+                    })
+                    .and_then(crate::conflicts::named)
+                else {
+                    continue;
+                };
+                if !(kept.contains(x) || kept.contains(y)) || !read(x) || !read(y) {
+                    continue;
+                }
+                found.entry(id[i].clone()).or_insert_with(|| Episode {
+                    episode_id: id[i].clone(),
+                    source: source[i].clone(),
+                    occurred_at: occurred[i].unwrap_or_default(),
+                    acl: split_list(&acl[i]),
+                    about: vec![],
+                    index_text: false,
+                    body: vec![],
+                    recorded_at: None,
+                    document: document[i].clone(),
+                });
+            }
+        }
+        if found.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut bodies = self
+            .episode_bodies(scope, found.keys().cloned().collect())
+            .await?;
+        let mut out: Vec<Episode> = found
+            .into_values()
+            .filter_map(|mut e| {
+                e.body = bodies.remove(&e.episode_id)?;
+                Some(e)
+            })
+            .collect();
+        out.sort_by(|a, b| a.episode_id.cmp(&b.episode_id));
+        Ok(out)
     }
 
     /// When each of `ids` (committed on main) was said: its `occurred_at`, but never later than the commit that

@@ -453,9 +453,9 @@ impl Reads {
 
     /// What has gone stale or overdue among `facts` (`crate::freshness`), by fact id: a read's current facts as of
     /// `valid_at` (`i64::MAX`: now). A read over history (None) marks nothing, and nor does a scope whose own
-    /// setting (or the server's) leaves marks off. The schemas of every scope read say what to mark. `whole`: the
-    /// facts hold their entities' plans and statuses; else those are read beside them, so a status can read
-    /// overdue.
+    /// setting (or the server's) leaves marks off: each fact is marked as the scope read that holds it says, not
+    /// the caller's scope. The schemas of every scope read say what to mark. `whole`: the facts hold their
+    /// entities' plans and statuses; else those are read beside them, so a status can read overdue.
     pub async fn marks(
         &self,
         store: &Store,
@@ -472,10 +472,14 @@ impl Reads {
             .filter_map(|s| s.vis().schema.clone())
             .collect();
         let schemas: Vec<&Schema> = held.iter().map(|s| s.as_ref()).collect();
-        if facts.is_empty()
-            || !freshness::any(&schemas)
-            || !freshness::on(store, self.own.scope()).await
-        {
+        if facts.is_empty() || !freshness::any(&schemas) {
+            return Ok(HashMap::new());
+        }
+        let mut on = vec![];
+        for s in self.sessions() {
+            on.push(freshness::on(store, s.scope()).await);
+        }
+        if !on.contains(&true) {
             return Ok(HashMap::new());
         }
         let mut beside = vec![];
@@ -496,7 +500,25 @@ impl Reads {
             .copied()
             .chain(beside.iter().filter(|f| !have.contains(f.fact_id.as_str())))
             .collect();
-        Ok(freshness::marks(&schemas, &all, at))
+        let mut marks = freshness::marks(&schemas, &all, at);
+        // Only the facts of a scope that marks: a fact is its scope's, as the episodes it cites are.
+        if on.contains(&false) {
+            let marking: Vec<&Session> = self
+                .sessions()
+                .zip(&on)
+                .filter_map(|(s, on)| on.then_some(s))
+                .collect();
+            let by_id: HashMap<&str, &Fact> =
+                all.iter().map(|f| (f.fact_id.as_str(), *f)).collect();
+            marks.retain(|id, _| {
+                by_id.get(id.as_str()).is_some_and(|f| {
+                    f.source_episodes
+                        .iter()
+                        .any(|e| marking.iter().any(|s| s.vis().acls.contains_key(e)))
+                })
+            });
+        }
+        Ok(marks)
     }
 
     /// What another fact says against each of `facts` (`crate::conflicts`), by fact id, read at `valid_at` as these

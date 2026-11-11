@@ -18,7 +18,9 @@
 //!   contact is expected is that person's id;
 //! - finds the unit the quote comes from and stores it as the fact's citation; a quote in no unit drops it;
 //! - dates the fact: `valid_from` / `valid_to` as the model resolved them (`stated` or `inferred`), else as of
-//!   the episode (`as_of_source`);
+//!   the episode (`as_of_source`). A day resolves to its start, but a `valid_from` on the episode's own day (in
+//!   its zone) is the episode's time: a change told today began no earlier than it was told, and taken at
+//!   midnight it would sort before what was said earlier that day, which it corrects;
 //! - caps the facts at `extract.facts_per_episode`, and adds the engine's facts (who was invited, who spoke);
 //! - drops a row that says nothing: no predicate, or a value that is empty or a placeholder (`null`, `n/a`, `tbd`,
 //!   only punctuation) ([`says_nothing`]);
@@ -1405,6 +1407,13 @@ fn settle(
                 .flatten()
         };
         let (from, to) = (when("valid_from"), when("valid_to"));
+        // A start on the episode's own day is when it was told: at the day's start it would sort before what was
+        // said earlier that day, and a correction would lose to what it corrects.
+        let today = day_micros_of(&zone, ep.occurred_at);
+        let from = from.map(|t| match t == today {
+            true => ep.occurred_at,
+            false => t,
+        });
         f.valid_from = from.unwrap_or(ep.occurred_at);
         f.valid_to = to.filter(|t| *t > f.valid_from);
         let basis = str_of("time_basis");
@@ -1871,6 +1880,12 @@ async fn disputes(store: &Store, scope: &Scope, ex: &Extractor, got: Got) -> (Go
         }
         Err(e) => ((ep, o, Err(e)), vec![]),
     }
+}
+
+/// The start of the day `at` falls on in `zone`, as a day the model resolved reads ([`schema::day_micros`]: that
+/// date's start, UTC).
+fn day_micros_of(zone: &Zone, at: i64) -> i64 {
+    schema::day_micros(zone.at(at).date_naive())
 }
 
 /// The types of the people an episode is about. Sharing one of them is not sharing a thread: the same rep is on
