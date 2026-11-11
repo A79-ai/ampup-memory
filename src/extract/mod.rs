@@ -47,9 +47,10 @@
 //!   None is sent when there is none (a local server).
 //! - `AMPUP_MEMORY_EXTRACT_THINKING=off`: Claude models answer without thinking first. Thinking is billed as
 //!   output: on 50 trial notes, Haiku 5.5 wrote 1.7k tokens a note with it and 0.7k without, and found 12%
-//!   fewer facts without. It holds for every call made through the Anthropic API (compiling, learning advice,
-//!   judging and dreaming too). Claude Opus 5.5 and later, Fable and Mythos always think: they are asked for low
-//!   effort instead, and Claude Sonnet 5.5 for its own `between_tools` ([`ThinkingOff`]).
+//!   fewer facts without. It holds for every call (compiling, learning advice, judging and dreaming too) to a Claude
+//!   model through the Anthropic API, OpenRouter (its `reasoning`) or Bedrock. Claude Opus 5.5 and later, Fable
+//!   and Mythos always think: they are asked for low effort instead, and Claude Sonnet 5.5 for its own
+//!   `between_tools` (low effort through OpenRouter, which has no such form) ([`ThinkingOff`]).
 //! - `AMPUP_MEMORY_EXTRACT_PARALLEL`: requests in flight at once (default 8).
 //! - `AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1` (or `on`, `true`): also extract the episodes the schema's `extract` section
 //!   doesn't name, with the prompt below. Unset, only what it names (and starter documents) is extracted.
@@ -962,7 +963,7 @@ impl Extractor {
         // asked, is asked again without it, and isn't sent it again. Every call that sent it retries: calls in
         // flight together are all refused, not only the first. Each retry learns one thing, so at most two.
         loop {
-            let off = (self.api == Api::Anthropic && !thinks()).then(|| thinking_off(&self.model));
+            let off = self.thinking_off();
             match self
                 .complete_once(system, prompt, max_tokens, temperature, off, usable)
                 .await
@@ -992,6 +993,23 @@ impl Extractor {
         }
     }
 
+    /// How this extractor's requests turn thinking off, where `AMPUP_MEMORY_EXTRACT_THINKING=off` asks them to
+    /// and they can say so: every model through the Anthropic API; a Claude model through OpenRouter (its
+    /// `reasoning`, which other providers' models are never sent); and through Bedrock's Converse only a Claude
+    /// model that thinks unless told not to (Claude 5 and later): the older ones there think only when asked, so
+    /// they are already off and sent nothing they might not know.
+    fn thinking_off(&self) -> Option<ThinkingOff> {
+        if thinks() {
+            return None;
+        }
+        let sends = match self.api {
+            Api::Anthropic => true,
+            Api::OpenAi => self.backend == "openrouter" && claude_version(&self.model).is_some(),
+            Api::Bedrock => thinks_unasked(&self.model),
+        };
+        sends.then(|| thinking_off(&self.model))
+    }
+
     async fn complete_once(
         &self,
         system: Option<&str>,
@@ -1011,6 +1029,15 @@ impl Extractor {
                 let mut body = json!({"model": self.model, "messages": messages});
                 if temperature {
                     body["temperature"] = json!(0);
+                }
+                // OpenRouter's own field (`reasoning`), which it turns into each provider's: off where the model
+                // can be told not to think, else low effort (it has no `between_tools`).
+                match off {
+                    None => {}
+                    Some(ThinkingOff::Disabled) => body["reasoning"] = json!({"enabled": false}),
+                    Some(ThinkingOff::BetweenTools | ThinkingOff::LowEffort) => {
+                        body["reasoning"] = json!({"effort": "low"})
+                    }
                 }
                 (format!("{}/chat/completions", self.url), body)
             }
@@ -1042,6 +1069,22 @@ impl Extractor {
                                       "inferenceConfig": {"maxTokens": max_tokens}});
                 if temperature {
                     body["inferenceConfig"]["temperature"] = json!(0);
+                }
+                // Converse hands a model's own fields through as they are.
+                match off {
+                    None => {}
+                    Some(ThinkingOff::Disabled) => {
+                        body["additionalModelRequestFields"] =
+                            json!({"thinking": {"type": "disabled"}})
+                    }
+                    Some(ThinkingOff::BetweenTools) => {
+                        body["additionalModelRequestFields"] =
+                            json!({"thinking": {"type": "between_tools"}})
+                    }
+                    Some(ThinkingOff::LowEffort) => {
+                        body["additionalModelRequestFields"] =
+                            json!({"output_config": {"effort": "low"}})
+                    }
                 }
                 if let Some(s) = system {
                     let mut parts = vec![json!({"text": s})];
@@ -2646,13 +2689,28 @@ fn thinking_off(model: &str) -> ThinkingOff {
 }
 
 /// A 400 that refuses thinking turned off as it was asked: `disabled` where the model always thinks, or
-/// `between_tools` where it isn't the model's own.
+/// `between_tools` where it isn't the model's own (the Anthropic API's words, which Bedrock passes on), or
+/// OpenRouter's "Reasoning is mandatory for this endpoint and cannot be disabled".
 fn refuses_thinking_off(e: &anyhow::Error) -> bool {
     e.downcast_ref::<Refused>().is_some_and(|r| {
-        r.0.contains(": 400 ")
-            && r.0.contains("thinking")
-            && (r.0.contains("disabled") || r.0.contains("between_tools"))
+        let m = r.0.to_ascii_lowercase();
+        m.contains(": 400 ")
+            && ((m.contains("thinking") && (m.contains("disabled") || m.contains("between_tools")))
+                || (m.contains("reasoning")
+                    && (m.contains("mandatory") || m.contains("cannot be disabled"))))
     })
+}
+
+/// A Claude model that thinks unless told not to: Claude 5 and later (Haiku, Sonnet, Opus), Fable and Mythos.
+/// Earlier ones think only when asked.
+fn thinks_unasked(model: &str) -> bool {
+    match claude_version(model) {
+        Some((family, _)) if family == "fable" || family == "mythos" => true,
+        Some((family, (major, _))) if ["opus", "sonnet", "haiku"].contains(&family.as_str()) => {
+            major >= 5
+        }
+        _ => false,
+    }
 }
 
 /// A Claude model's family (`opus`, `sonnet`, `haiku`, `fable`, `mythos`) and version from its name, however a
