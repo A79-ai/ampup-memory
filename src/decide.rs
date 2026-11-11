@@ -8,7 +8,9 @@
 //! `AMPUP_MEMORY_DECIDE` (`openai`, `openrouter` or `off`), `AMPUP_MEMORY_DECIDE_MODEL` (default `gpt-6-luna`, or
 //! `typesafe/jev-1.13` on OpenRouter), `AMPUP_MEMORY_DECIDE_URL` (default the backend's decisions endpoint) and
 //! `AMPUP_MEMORY_DECIDE_KEY` (else `OPENAI_API_KEY` or `OPENROUTER_API_KEY`). Unset, it is OpenAI's where there is an
-//! OpenAI key, else OpenRouter's where there is an OpenRouter key, else off. A person's own notes go only to the one on
+//! OpenAI key, else OpenRouter's where there is an OpenRouter key, else off; off too where `AMPUP_MEMORY_LLM` (or a
+//! choice `serve --local` saved) runs every model, as a decisions model is OpenAI's or OpenRouter's alone: callers
+//! match by word overlap instead. A person's own notes go only to the one on
 //! the route extraction takes ([`Decider::on_extraction_route`]).
 
 use std::collections::HashMap;
@@ -78,6 +80,10 @@ impl Decider {
             Some(c) if c.eq_ignore_ascii_case("openai") => Api::OpenAi,
             Some(c) if c.eq_ignore_ascii_case("openrouter") => Api::OpenRouter,
             Some(c) => anyhow::bail!("AMPUP_MEMORY_DECIDE is openai, openrouter or off, not {c:?}"),
+            // Every model on the one switch (`AMPUP_MEMORY_LLM`: a local model, say): no decisions model unless
+            // `AMPUP_MEMORY_DECIDE` names one, whatever keys the environment holds, so nothing goes where the
+            // switch doesn't send it. Callers fall back to word overlap.
+            None if crate::extract::llm::configured().is_some() => return Ok(None),
             None if var("OPENAI_API_KEY").is_some() => Api::OpenAi,
             None if var("OPENROUTER_API_KEY").is_some() => Api::OpenRouter,
             None if var("AMPUP_MEMORY_DECIDE_KEY").is_some()
@@ -128,6 +134,8 @@ impl Decider {
         };
         let route = match var("AMPUP_MEMORY_EXTRACT") {
             Some(c) => c.to_ascii_lowercase(),
+            // Extraction on the one switch (`AMPUP_MEMORY_LLM`, or what `serve --local` saved): see `from_env`.
+            None if crate::extract::llm::configured().is_some() => return Ok(None),
             None if extraction_key().is_some() || var("OPENROUTER_API_KEY").is_some() => {
                 "openrouter".into()
             }

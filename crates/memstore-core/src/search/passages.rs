@@ -925,7 +925,7 @@ pub async fn warm(
     store: &Store,
     scope: &Scope,
     text: &str,
-    q: &arrow_array::Float32Array,
+    q: Option<&arrow_array::Float32Array>,
 ) -> Result<()> {
     let index = open_cached(store, scope).await?;
     let Some(ds) = &index.passages else {
@@ -934,6 +934,9 @@ pub async fn warm(
     let mut scan = ds.scan();
     scan.full_text_search(FullTextSearchQuery::new(text.to_string()).limit(Some(1)))?;
     search::rows::ids(scan).await?;
+    let Some(q) = q else {
+        return Ok(());
+    };
     if search::rows::nearest_flat(ds, "vec", q, 1, None)
         .await?
         .is_none()
@@ -1181,7 +1184,8 @@ pub async fn search(
     let searched = keep.as_ref().map_or(fts.len(), HashSet::len);
     fts.retain(|t| keep.as_ref().is_none_or(|k| k.contains(t)));
     let fts = fts.join(" ");
-    let q_vec = Float32Array::from(search::embed_text(text).await?);
+    // None without an embedder (the local model not fetched, and offline): the keyword list alone.
+    let q_vec = search::embed_query(text).await.map(Float32Array::from);
     mark!("embed");
     // (bm25, distance) per (episode, chunk), and the passage.
     let mut hits: HashMap<(String, i32), Ranked> = HashMap::new();
@@ -1196,31 +1200,30 @@ pub async fn search(
             // The keyword and the vector query run at once; their rows are taken in this order after.
             let mut queries = vec![];
             for by_vector in [false, true] {
-                if !by_vector && fts.is_empty() {
+                if (!by_vector && fts.is_empty()) || (by_vector && q_vec.is_none()) {
                     continue;
                 }
                 let mut scan = ds.scan();
                 if let Some(f) = &sql {
                     scan.filter(f)?.prefilter(true);
                 }
-                if by_vector {
-                    search::probe(scan.nearest("vec", &q_vec, fetch)?);
+                if let Some(q) = q_vec.as_ref().filter(|_| by_vector) {
+                    search::probe(scan.nearest("vec", q, fetch)?);
                 } else {
                     scan.full_text_search(
                         FullTextSearchQuery::new(fts.clone()).limit(Some(fetch as i64)),
                     )?;
                 }
                 // Row ids only: the rows come from the row cache (see `search::rows`).
-                let (q_vec, sql) = (&q_vec, &sql);
+                let (q_vec, sql) = (q_vec.as_ref(), &sql);
                 queries.push(async move {
                     let q_t = std::time::Instant::now();
                     // Without a vector index, the embeddings held in memory are searched.
-                    let flat = match by_vector {
-                        true => {
-                            search::rows::nearest_flat(ds, "vec", q_vec, fetch, sql.as_deref())
-                                .await?
+                    let flat = match q_vec.filter(|_| by_vector) {
+                        Some(q) => {
+                            search::rows::nearest_flat(ds, "vec", q, fetch, sql.as_deref()).await?
                         }
-                        false => None,
+                        None => None,
                     };
                     let ids = match flat {
                         Some(ids) => ids,
@@ -1284,11 +1287,12 @@ pub async fn search(
 
     // The unindexed tail: matched by its share of the query's terms, and by meaning when small.
     let tail: Vec<Passage> = tail.into_iter().filter(|p| visible(p)).collect();
-    let tail_vecs = if !tail.is_empty() && tail.len() <= search::TAIL_EMBED_MAX {
-        let texts: Vec<String> = tail.iter().map(|p| p.text.clone()).collect();
-        Some(search::embed_tail(&texts).await?)
-    } else {
-        None
+    let tail_vecs = match &q_vec {
+        Some(q) if !tail.is_empty() && tail.len() <= search::TAIL_EMBED_MAX => {
+            let texts: Vec<String> = tail.iter().map(|p| p.text.clone()).collect();
+            search::embed_tail_or_none(&texts).await.map(|v| (v, q))
+        }
+        _ => None,
     };
     // Matched as the index would match it: stemmed, stop words out.
     let q_stems = search::stems(&q_terms.iter().cloned().collect::<Vec<_>>().join(" "));
@@ -1297,9 +1301,9 @@ pub async fn search(
     let n_terms = q_stems.len().max(1) as f32;
     for (i, p) in tail.into_iter().enumerate() {
         let m = matched(&p.text);
-        let d = tail_vecs.as_ref().map(|v| {
+        let d = tail_vecs.as_ref().map(|(v, q)| {
             v[i].iter()
-                .zip(q_vec.values().iter())
+                .zip(q.values().iter())
                 .map(|(a, b)| (a - b) * (a - b))
                 .sum::<f32>()
         });

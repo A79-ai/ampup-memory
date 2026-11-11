@@ -36,10 +36,11 @@
 //!
 //! Configured from the environment:
 //! - `AMPUP_MEMORY_EXTRACT`: `openrouter`, `openrouter-batch` (OpenRouter's Batch API, for experiments: half the
-//!   price, answers in minutes; [`batch`]), `openai` (any OpenAI-compatible chat API: OpenAI, vLLM, Ollama),
-//!   `anthropic`, `bedrock`, `vertex` or `cortex`, or `off`. Unset: OpenRouter, with `OPENROUTER_API_KEY`; with
-//!   no key, no extraction. OpenRouter runs any model, through the organization's own provider keys where its
-//!   account holds them (BYOK). An OpenRouter model named with its `:batch` suffix goes through the Batch API too.
+//!   price, answers in minutes; [`batch`]), `openai` (any OpenAI-compatible chat API: OpenAI, vLLM, LM Studio),
+//!   `ollama` (a local Ollama through its own API, [`llm`]), `anthropic`, `bedrock`, `vertex` or `cortex`, or
+//!   `off`. Unset: what `AMPUP_MEMORY_LLM` names for every role ([`llm`]), else OpenRouter, with
+//!   `OPENROUTER_API_KEY`; with no key, no extraction. OpenRouter runs any model, through the organization's own
+//!   provider keys where its account holds them (BYOK). An OpenRouter model named with its `:batch` suffix goes through the Batch API too.
 //! - `AMPUP_MEMORY_EXTRACT_MODEL`: the model (defaults: `anthropic/claude-haiku-5.5` on OpenRouter, `gpt-5-mini`,
 //!   `claude-haiku-5-5`, and the rest below).
 //! - `AMPUP_MEMORY_EXTRACT_URL`: the API's base URL (defaults to the vendor's).
@@ -70,6 +71,7 @@ use sha2::{Digest, Sha256};
 mod batch;
 pub mod cache;
 pub mod goals;
+pub mod llm;
 mod statements;
 pub mod train_log;
 
@@ -355,6 +357,8 @@ enum Api {
     Anthropic,
     /// Amazon Bedrock's Converse API.
     Bedrock,
+    /// Ollama's own chat API (`/api/chat`), which takes the context size a request needs ([`llm`]).
+    Ollama,
 }
 
 /// How a request proves who sends it.
@@ -676,12 +680,20 @@ impl Extractor {
     ) -> Result<Option<Self>> {
         let own_key =
             var(&format!("{prefix}_KEY")).is_some() || var(&format!("{prefix}_KEY_FILE")).is_some();
-        let choice = match var(prefix) {
-            Some(c) if c.eq_ignore_ascii_case("off") => return Ok(None),
-            Some(c) => c,
-            None if own_key || var("OPENROUTER_API_KEY").is_some() => "openrouter".into(),
-            None => return Ok(None),
+        // A role that names no backend of its own takes the one switch's, where it is set ([`llm`]).
+        let llm = match var(prefix) {
+            Some(_) => None,
+            None => llm::configured(),
         };
+        let choice = match (var(prefix), &llm) {
+            (Some(c), _) if c.eq_ignore_ascii_case("off") => return Ok(None),
+            (Some(c), _) => c,
+            (None, Some(l)) if l.provider == "off" => return Ok(None),
+            (None, Some(l)) => l.provider.clone(),
+            (None, None) if own_key || var("OPENROUTER_API_KEY").is_some() => "openrouter".into(),
+            (None, None) => return Ok(None),
+        };
+        let llm = llm.unwrap_or_default();
         let region = var(&format!("{prefix}_REGION"));
         let (api, url, model, auth) = match choice.to_ascii_lowercase().as_str() {
             "openai" => (
@@ -689,6 +701,13 @@ impl Extractor {
                 "https://api.openai.com/v1".to_string(),
                 "gpt-5-mini",
                 Auth::Key(var("OPENAI_API_KEY")),
+            ),
+            // One model for every role unless `_MODEL` names another: the strong ones run on it too.
+            "ollama" => (
+                Api::Ollama,
+                llm::OLLAMA_URL.to_string(),
+                llm::OLLAMA_MODEL,
+                Auth::Key(None),
             ),
             "openrouter" | "openrouter-batch" => (
                 Api::OpenAi,
@@ -754,7 +773,12 @@ impl Extractor {
                 )
             }
             other => bail!(
-                "{prefix} is openrouter, openrouter-batch, openai, anthropic, bedrock, vertex, cortex or off, not {other}"
+                "{} is openrouter, openrouter-batch, openai, ollama, anthropic, bedrock, vertex, cortex or off, not {other}",
+                if llm.provider.is_empty() {
+                    prefix
+                } else {
+                    "AMPUP_MEMORY_LLM"
+                }
             ),
         };
         // `<prefix>_KEY`, else a file `<prefix>_KEY_FILE` names (a mounted secret), else the vendor's.
@@ -764,11 +788,15 @@ impl Extractor {
                 .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty())
         });
-        let auth = match key {
+        let auth = match key.or(llm.key) {
             Some(k) => Auth::Key(Some(k)),
+            // A server the switch names by its URL (a local one) isn't sent a vendor's key from the environment.
+            None if llm.url.is_some() => Auth::Key(None),
             None => auth,
         };
-        let model = var(&format!("{prefix}_MODEL")).unwrap_or_else(|| model.into());
+        let model = var(&format!("{prefix}_MODEL"))
+            .or(llm.model)
+            .unwrap_or_else(|| model.into());
         // OpenRouter names a model's batch endpoint `<model>:batch`; a batch is submitted under the model's own name.
         let openrouter = choice.to_ascii_lowercase().starts_with("openrouter");
         let (model, batch) = match model.strip_suffix(":batch") {
@@ -779,12 +807,17 @@ impl Extractor {
             c if c.starts_with("openrouter") => "openrouter".to_string(),
             c => c,
         };
+        let url = var(&format!("{prefix}_URL"))
+            .or(llm.url)
+            .unwrap_or(url)
+            .trim_end_matches('/')
+            .to_string();
         Ok(Some(Self {
             api,
-            url: var(&format!("{prefix}_URL"))
-                .unwrap_or(url)
-                .trim_end_matches('/')
-                .to_string(),
+            url: match api {
+                Api::Ollama => llm::ollama_base(&url),
+                _ => url,
+            },
             auth,
             model,
             batch,
@@ -866,24 +899,25 @@ impl Extractor {
     /// chat completions API takes it, sent with this model, and the reply's JSON. Never from the model-call
     /// cache: a turn depends on what the tools answered.
     pub(crate) async fn chat(&self, mut body: Value) -> Result<Value> {
-        if self.api != Api::OpenAi || self.batch {
+        if !matches!(self.api, Api::OpenAi | Api::Ollama) || self.batch {
             return Err(Refused(format!(
                 "{} takes no tool calls here: an agent runs on an OpenAI-compatible backend (openrouter)",
                 self.backend
             ))
             .into());
         }
+        // Ollama takes tool calls on its OpenAI-compatible API.
+        let base = match self.api {
+            Api::Ollama => format!("{}/v1", self.url),
+            _ => self.url.clone(),
+        };
         body["model"] = json!(self.model);
         let key = match &self.auth {
             Auth::Key(k) => k.clone(),
             Auth::Google => Some(google_token().await?),
         };
         let (v, _) = self
-            .send(
-                &format!("{}/chat/completions", self.url),
-                &body,
-                key.as_deref(),
-            )
+            .send(&format!("{base}/chat/completions"), &body, key.as_deref())
             .await?;
         self.count(&v, false);
         Ok(v)
@@ -1006,6 +1040,7 @@ impl Extractor {
             Api::Anthropic => true,
             Api::OpenAi => self.backend == "openrouter" && claude_version(&self.model).is_some(),
             Api::Bedrock => thinks_unasked(&self.model),
+            Api::Ollama => false,
         };
         sends.then(|| thinking_off(&self.model))
     }
@@ -1096,6 +1131,23 @@ impl Extractor {
                 }
                 (format!("{}/model/{}/converse", self.url, self.model), body)
             }
+            // The context size goes with every request, the same each time so the model is loaded once; and a
+            // cap on the reply, so a small model that repeats itself stops.
+            Api::Ollama => {
+                let mut messages = vec![];
+                if let Some(s) = system {
+                    messages.push(json!({"role": "system", "content": s}));
+                }
+                messages.push(json!({"role": "user", "content": prompt}));
+                let mut options =
+                    json!({"num_ctx": llm::ollama_context(), "num_predict": max_tokens});
+                if temperature {
+                    options["temperature"] = json!(0);
+                }
+                let body = json!({"model": self.model, "messages": messages, "stream": false,
+                                  "options": options});
+                (format!("{}/api/chat", self.url), body)
+            }
         };
         let mut body = body;
         if self.batch {
@@ -1174,6 +1226,7 @@ impl Extractor {
             Api::OpenAi => &v["choices"][0]["finish_reason"],
             Api::Anthropic => &v["stop_reason"],
             Api::Bedrock => &v["stopReason"],
+            Api::Ollama => &v["done_reason"],
         };
         train_log::record(train_log::Call {
             backend: &self.backend,
@@ -1216,6 +1269,19 @@ impl Extractor {
                     n("inputTokens") + n("cacheReadInputTokens") + n("cacheWriteInputTokens");
                 return (read, n("outputTokens"));
             }
+            // Its own API's counts, or (a tool turn, on its OpenAI-compatible API) OpenAI's.
+            Api::Ollama => {
+                let n = |own: &str, openai: &str| {
+                    v[own]
+                        .as_u64()
+                        .or_else(|| v["usage"][openai].as_u64())
+                        .unwrap_or(0)
+                };
+                return (
+                    n("prompt_eval_count", "prompt_tokens"),
+                    n("eval_count", "completion_tokens"),
+                );
+            }
         };
         (read.as_u64().unwrap_or(0), wrote.as_u64().unwrap_or(0))
     }
@@ -1226,6 +1292,7 @@ impl Extractor {
             Api::OpenAi => &v["usage"]["prompt_tokens_details"]["cached_tokens"],
             Api::Anthropic => &v["usage"]["cache_read_input_tokens"],
             Api::Bedrock => &v["usage"]["cacheReadInputTokens"],
+            Api::Ollama => &v["prompt_eval_cached_count"],
         };
         n.as_u64().unwrap_or(0)
     }
@@ -1251,6 +1318,7 @@ impl Extractor {
             Api::OpenAi => &v["choices"][0]["finish_reason"],
             Api::Anthropic => &v["stop_reason"],
             Api::Bedrock => &v["stopReason"],
+            Api::Ollama => &v["done_reason"],
         };
         matches!(stop.as_str(), Some("stop" | "end_turn" | "stop_sequence"))
     }
@@ -1269,7 +1337,7 @@ impl Extractor {
         }
         if let Some(k) = key {
             req = match self.api {
-                Api::OpenAi | Api::Bedrock => req.bearer_auth(k),
+                Api::OpenAi | Api::Bedrock | Api::Ollama => req.bearer_auth(k),
                 Api::Anthropic => req
                     .header("x-api-key", k)
                     .header("anthropic-version", "2023-06-01"),
@@ -1354,6 +1422,13 @@ impl Extractor {
             Api::OpenAi => {
                 return v["choices"][0]["message"]["content"]
                     .as_str()
+                    .map(String::from)
+                    .ok_or_else(|| Refused(format!("{url}: no text in the model's reply")).into());
+            }
+            Api::Ollama => {
+                return v["message"]["content"]
+                    .as_str()
+                    .filter(|t| !t.is_empty())
                     .map(String::from)
                     .ok_or_else(|| Refused(format!("{url}: no text in the model's reply")).into());
             }

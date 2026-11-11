@@ -32,8 +32,25 @@ claude mcp add --transport http ampup-memory http://localhost:8080/mcp
 ```
 
 `--local` needs no Docker, catalog service or sign-in, and binds to 127.0.0.1. Without a model key it stores and
-searches but learns nothing; any OpenAI-compatible, Anthropic, Bedrock or Vertex AI endpoint works instead of
-OpenRouter ([configuration](docs/guide/configuration.md#models)).
+searches but learns nothing; any OpenAI-compatible, Anthropic, Bedrock or Vertex AI endpoint, or a local Ollama,
+works instead of OpenRouter ([configuration](docs/guide/configuration.md#models)).
+
+### Offline, on your laptop
+
+No key and no network: local embeddings (the default) and a local model through [Ollama](https://ollama.com) for
+everything the memory learns.
+
+```bash
+ollama pull qwen2.5:3b                 # the default local model
+ampup-memory embed warmup              # fetch the embedding model (~130 MB) while you're online
+AMPUP_MEMORY_LLM=ollama AMPUP_MEMORY_CLIENT_UPDATE=off ampup-memory serve --local
+```
+
+`AMPUP_MEMORY_LLM_MODEL` picks another model, `AMPUP_MEMORY_LLM_URL` another server (any OpenAI-compatible one:
+LM Studio, llama.cpp, vLLM). Started in a terminal with nothing configured, `serve --local` asks once whether to
+use a key, the local Ollama, or no model, and keeps the answer in `~/.ampup-memory/llm.json`. Without the embedding
+model (`HF_HUB_OFFLINE=1`, nothing fetched yet), search ranks by keyword alone. More in the
+[quickstart](docs/guide/quickstart.md#offline-on-your-laptop).
 
 ## First memory, search and advice
 

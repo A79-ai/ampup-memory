@@ -830,7 +830,7 @@ pub async fn serve_with(
             if off {
                 "extraction is off (AMPUP_MEMORY_EXTRACT=off)"
             } else {
-                "no extraction model (OPENROUTER_API_KEY, or AMPUP_MEMORY_EXTRACT)"
+                "no extraction model (OPENROUTER_API_KEY, AMPUP_MEMORY_LLM, or AMPUP_MEMORY_EXTRACT)"
             }
         );
     }

@@ -242,6 +242,29 @@ pub async fn embed_text(text: &str) -> Result<Vec<f32>> {
     v
 }
 
+/// When a search last ranked by keyword alone for want of vectors, to say so once a [`embed::LOAD_REST`].
+static KEYWORD_ONLY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// A search's embedder failed (the local model not fetched yet, and no network to fetch it): it ranks by keyword
+/// alone instead of failing, and the first in a while says why.
+pub fn keyword_only(e: &anyhow::Error) {
+    let mut at = KEYWORD_ONLY.lock().unwrap();
+    if at.is_none_or(|t| t.elapsed() >= embed::LOAD_REST) {
+        *at = Some(std::time::Instant::now());
+        eprintln!("search: ranking by keyword alone: no embeddings ({e:#})");
+    }
+}
+
+/// [`embed_text`], or None where the embedder fails ([`keyword_only`]).
+pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
+    embed_text(text).await.map_err(|e| keyword_only(&e)).ok()
+}
+
+/// [`embed_tail`], or None where the embedder fails ([`keyword_only`]): the tail is matched by its words.
+pub async fn embed_tail_or_none(texts: &[String]) -> Option<Vec<Vec<f32>>> {
+    embed_tail(texts).await.map_err(|e| keyword_only(&e)).ok()
+}
+
 /// Unit-length embeddings of `texts`, from the process's provider (`crate::search::embed`).
 pub async fn embed(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
     crate::search::embed::embed(texts).await
@@ -2622,7 +2645,8 @@ impl PreparedCandidates {
         let matched = cached.matched?;
         let distance = if keyword {
             *cached.keyword_distance.get_or_insert_with(|| {
-                row.vec.as_ref().map(|e| {
+                // No query vector (empty: the embedder failed), no distance.
+                row.vec.as_ref().filter(|_| !query.is_empty()).map(|e| {
                     e.iter()
                         .zip(query.iter())
                         .map(|(a, b)| (a - b) * (a - b))
@@ -3215,7 +3239,8 @@ pub async fn search(
 pub async fn warm(store: &Store, scope: &Scope) -> Result<()> {
     store.pin(scope, crate::MAIN).await?;
     let query = "warm up";
-    let q = Float32Array::from(embed_text(query).await?);
+    // Without the embedding model (not fetched, and offline), the rest still warms: searches rank by keyword.
+    let q = embed_query(query).await.map(Float32Array::from);
     let index = open_cached(store, scope).await?;
     store.fact_files(scope, &index.held).await?;
     let keyword = keyword_queries(&fact_terms(query), false, None)?;
@@ -3225,13 +3250,15 @@ pub async fn warm(store: &Store, scope: &Scope) -> Result<()> {
             scan.full_text_search(FullTextSearchQuery::new_query(k.clone()).limit(Some(1)))?;
             rows::ids(scan).await?;
         }
-        if rows::nearest_flat(ds, "vec", &q, 1, None).await?.is_none() {
+        if let Some(q) = &q
+            && rows::nearest_flat(ds, "vec", q, 1, None).await?.is_none()
+        {
             let mut scan = ds.scan();
-            probe(scan.nearest("vec", &q, 1)?);
+            probe(scan.nearest("vec", q, 1)?);
             rows::ids(scan).await?;
         }
     }
-    passages::warm(store, scope, query, &q).await
+    passages::warm(store, scope, query, q.as_ref()).await
 }
 
 /// Index rows fetched per search part start at this multiple of `k`, and grow by 4x while too
@@ -3484,9 +3511,10 @@ async fn ranked(
     // trusted only for files that are still current with the same deletes.
     let (q_vec, found) = tokio::join!(
         async {
-            let v = embed_text(query).await?;
+            // None without an embedder (the local model not fetched, and offline): keyword lists alone.
+            let v = embed_query(query).await;
             slow.mark("embed");
-            Ok::<_, anyhow::Error>(Float32Array::from(v))
+            Ok::<_, anyhow::Error>(v.map(Float32Array::from))
         },
         async {
             let index = index_for(store, scope, pin).await?;
@@ -3582,7 +3610,7 @@ async fn ranked(
     // or its distance (`_distance`). Keyword hits are scored by vector too, from their stored embedding, so
     // every candidate has both signals: otherwise a fact that only keywords find (outside the nearest pool,
     // say behind hundreds of near-duplicates of one entity) is outvoted by any fact both lists happen to hold.
-    let q = q_vec.values();
+    let q: &[f32] = q_vec.as_ref().map_or(&[], |v| v.values().as_ref());
     // Never share preparation across requests: visibility and matches depend on the principal and query.
     let prepared: std::sync::Mutex<PreparedCandidates> = Default::default();
     // `signal`: which keyword ranking the rows are (see `keyword_queries`), none for the vector one; each row
@@ -3624,9 +3652,10 @@ async fn ranked(
         // truncate an unranked match stream instead.
         // Each keyword ranking and the vector one; with a time named, also the best keyword and nearest
         // matches stated in it, so the facts of that time are candidates however many others match better.
+        let vector = q_vec.as_ref().map(|_| None);
         let mut lists: Vec<(Option<usize>, Option<String>)> = (0..keyword.len())
             .map(Some)
-            .chain([None])
+            .chain(vector)
             .map(|s| (s, filter.clone()))
             .collect();
         if let Some(w) = &window {
@@ -3639,7 +3668,7 @@ async fn ranked(
             lists.extend(
                 first
                     .into_iter()
-                    .chain([None])
+                    .chain(vector)
                     .map(|s| (s, Some(only.clone()))),
             );
         }
@@ -3648,22 +3677,26 @@ async fn ranked(
             if let Some(f) = &filter {
                 scan.filter(f)?.prefilter(true);
             }
-            match signal {
-                None => {
-                    probe(scan.nearest("vec", &q_vec, fetch)?);
+            // A vector list is listed only with a query vector.
+            let q_vec = q_vec.as_ref();
+            match (signal, q_vec) {
+                (None, Some(q)) => {
+                    probe(scan.nearest("vec", q, fetch)?);
                 }
-                Some(s) => {
+                (None, None) => continue,
+                (Some(s), _) => {
                     scan.full_text_search(fts(&keyword[s].0).limit(Some(fetch as i64)))?;
                 }
             }
-            let q_vec = &q_vec;
             let log = &slow.lists;
             queries.push(async move {
                 let t = std::time::Instant::now();
                 // A part with no vector index is searched by its embeddings held in memory.
-                let flat = match signal {
-                    None => rows::nearest_flat(ds, "vec", q_vec, fetch, filter.as_deref()).await?,
-                    Some(_) => None,
+                let flat = match (signal, q_vec) {
+                    (None, Some(q)) => {
+                        rows::nearest_flat(ds, "vec", q, fetch, filter.as_deref()).await?
+                    }
+                    _ => None,
                 };
                 let how = match (signal, flat.is_some()) {
                     (Some(s), _) => format!("keyword {s}"),
@@ -3758,20 +3791,21 @@ async fn ranked(
         .flat_map(|(_, rows)| rows.iter())
         .flat_map(|b| crate::decode_facts(b, "source_episodes"))
         .collect();
-    let tail_vecs = if tail_facts.len() <= TAIL_EMBED_MAX && !tail_facts.is_empty() {
-        let texts: Vec<String> = tail_facts
-            .iter()
-            .map(|(_, f)| fact_text(&f.entity, &f.predicate, &f.value))
-            .collect();
-        Some(embed_tail(&texts).await?)
-    } else {
-        None
+    let tail_vecs = match &q_vec {
+        Some(q) if tail_facts.len() <= TAIL_EMBED_MAX && !tail_facts.is_empty() => {
+            let texts: Vec<String> = tail_facts
+                .iter()
+                .map(|(_, f)| fact_text(&f.entity, &f.predicate, &f.value))
+                .collect();
+            embed_tail_or_none(&texts).await.map(|v| (v, q))
+        }
+        _ => None,
     };
     for (i, (commit, fact)) in tail_facts.into_iter().enumerate() {
         // Squared L2, as Lance reports `_distance`, so tail and index rows rank on one scale.
-        let d = tail_vecs.as_ref().map(|v| {
+        let d = tail_vecs.as_ref().map(|(v, q)| {
             v[i].iter()
-                .zip(q_vec.values().iter())
+                .zip(q.values().iter())
                 .map(|(a, b)| (a - b) * (a - b))
                 .sum::<f32>()
         });

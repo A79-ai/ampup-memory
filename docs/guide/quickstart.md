@@ -41,6 +41,42 @@ OPENROUTER_API_KEY=... AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1 ampup-memory serve --lo
 `AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1` reads every episode into facts. Other providers (Anthropic, OpenAI-compatible,
 Bedrock, Vertex AI, a local Ollama) are in [configuration.md](configuration.md#models).
 
+### Offline, on your laptop
+
+Everything can run with no network and no key: embeddings with a small local model (bge-small, about 130 MB, the
+default when no embeddings key is set), and every model call (extracting, compiling, learning advice, judging,
+routing) through [Ollama](https://ollama.com) or any OpenAI-compatible server on your machine.
+
+```bash
+ollama pull qwen2.5:3b              # the default local model, a 1.9 GB download
+ampup-memory embed warmup           # fetches the embedding model now, while you have a network
+AMPUP_MEMORY_LLM=ollama AMPUP_MEMORY_CLIENT_UPDATE=off ampup-memory serve --local
+# ampup-memory: every model call goes to Ollama at http://localhost:11434 (qwen2.5:3b, context 32768 tokens)
+# ampup-memory: embeddings: local Xenova/bge-small-en-v1.5 (384 dims), loaded from ~/.cache/memstore/models
+```
+
+- `AMPUP_MEMORY_LLM=ollama` sends every role to Ollama, on one model: `AMPUP_MEMORY_LLM_MODEL` names another
+  (`qwen2.5:7b` or larger learns better advice, where the machine has the memory), `AMPUP_MEMORY_LLM_URL` another
+  address. A role's own variables (`AMPUP_MEMORY_EXTRACT`, `AMPUP_MEMORY_ADVICE_MODEL`, ...) still win.
+- Ollama is called through its own API with a 32,768-token context (`AMPUP_MEMORY_LLM_CONTEXT`), so the longest
+  prompts (60,000 characters) aren't cut off: its OpenAI-compatible endpoint ignores a request's context size, and
+  its default is as low as 4,096 tokens on a machine with little memory.
+- Another local server (LM Studio, llama.cpp's server, vLLM): `AMPUP_MEMORY_LLM_URL=http://localhost:1234/v1` and
+  `AMPUP_MEMORY_LLM_MODEL=<its model>`. Set the server's own context to 32k tokens or more.
+- With a local model, no decisions model is asked (they are OpenAI's and OpenRouter's alone, and
+  `AMPUP_MEMORY_DECIDE` still names one): kept notes are matched to a task by shared words, and the learning model
+  sorts and merges advice alone.
+- `HF_HUB_OFFLINE=1` never fetches the embedding model; `AMPUP_MEMORY_MODEL_DIR` (or `HF_HOME`) says where it is
+  kept, and `HF_ENDPOINT` names a mirror to fetch it from. Until the model loads, searches rank by keyword alone
+  rather than failing.
+- `AMPUP_MEMORY_CLIENT_UPDATE=off` keeps the hooks' client from checking for a new release.
+
+Run `ampup-memory serve --local` in a terminal with nothing configured and it asks once: paste an OpenRouter,
+OpenAI or Anthropic key, use the local Ollama (listing its models), or continue without learning. The answer is
+kept in `~/.ampup-memory/llm.json` (delete it to be asked again); environment variables override it. A key typed
+there is not shown and only goes to that provider: embeddings stay local. Without a terminal nothing is asked, and
+the server says how to turn learning on.
+
 ## 3. A first memory
 
 ```bash

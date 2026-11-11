@@ -4,8 +4,12 @@
 //!
 //! Backends:
 //! - `local`: a fastembed model run in-process (default `Xenova/bge-small-en-v1.5`, 384 dims).
-//!   Any model fastembed ships can be named; its files are fetched on first use into
-//!   `AMPUP_MEMORY_MODEL_DIR` (default `~/.cache/memstore/models`).
+//!   Any model fastembed ships can be named; its files (about 130 MB for the default) are fetched
+//!   from Hugging Face (`HF_ENDPOINT`, default huggingface.co) on first use into [`model_dir`]
+//!   (`AMPUP_MEMORY_MODEL_DIR`, default `~/.cache/memstore/models`), and load from there with no
+//!   network after. `ampup-memory embed warmup` fetches them ahead of time. With `HF_HUB_OFFLINE=1`
+//!   nothing is fetched. A model that can't load (not fetched yet, and no network) isn't tried
+//!   again for [`LOAD_REST`]: until it loads, searches rank by keyword alone.
 //! - `openai`: OpenAI's embeddings API (default `text-embedding-3-small`, 1,536 dims), or any
 //!   server with its `/embeddings` shape.
 //! - `openrouter`: OpenRouter's embeddings API, where one key reaches every vendor's embedding
@@ -352,17 +356,7 @@ async fn embed_local(provider: &Provider, texts: Vec<String>) -> Result<Vec<Vec<
             }
             let mut m = which.lock();
             if m.is_none() {
-                let dir = std::env::var("AMPUP_MEMORY_MODEL_DIR").unwrap_or_else(|_| {
-                    format!(
-                        "{}/.cache/memstore/models",
-                        std::env::var("HOME").unwrap_or_else(|_| ".".into())
-                    )
-                });
-                *m = Some(fastembed::TextEmbedding::try_new(
-                    fastembed::TextInitOptions::new(model.clone())
-                        .with_cache_dir(dir.into())
-                        .with_show_download_progress(false),
-                )?);
+                *m = Some(load_local(&model)?);
             }
             v.extend(m.as_mut().unwrap().embed(slice, Some(EMBED_SLICE))?);
             // To whoever is waiting (a search's query, say), not back to this batch's next slice.
@@ -372,6 +366,124 @@ async fn embed_local(provider: &Provider, texts: Vec<String>) -> Result<Vec<Vec<
         Ok(v)
     })
     .await?
+}
+
+/// Where the local model's files are kept: `HF_HOME` where it is set (fastembed reads it first), else
+/// `AMPUP_MEMORY_MODEL_DIR`, else `~/.cache/memstore/models`.
+pub fn model_dir() -> std::path::PathBuf {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    var("HF_HOME")
+        .or_else(|| var("AMPUP_MEMORY_MODEL_DIR"))
+        .unwrap_or_else(|| {
+            format!(
+                "{}/.cache/memstore/models",
+                var("HOME").unwrap_or_else(|| ".".into())
+            )
+        })
+        .into()
+}
+
+/// Whether every file the process's local model loads from is in [`model_dir`], so it loads with no network.
+/// None where embeddings come from an API.
+pub fn model_cached() -> Option<bool> {
+    let Provider::Local { code, .. } = provider() else {
+        return None;
+    };
+    let info = local_model(code).ok()?;
+    // Hugging Face's cache: `models--<org>--<name>/refs/main` names the snapshot that holds the files.
+    let repo = model_dir().join(format!("models--{}", info.model_code.replace('/', "--")));
+    let Ok(rev) = std::fs::read_to_string(repo.join("refs/main")) else {
+        return Some(false);
+    };
+    let snapshot = repo.join("snapshots").join(rev.trim());
+    let tokenizer = [
+        "tokenizer.json",
+        "config.json",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+    ];
+    Some(
+        std::iter::once(info.model_file.as_str())
+            .chain(info.additional_files.iter().map(String::as_str))
+            .chain(tokenizer)
+            .all(|f| snapshot.join(f).is_file()),
+    )
+}
+
+/// What the local model's files are, where they are, and whether they're there yet, for a server's first lines.
+/// None where embeddings come from an API.
+pub fn model_status() -> Option<String> {
+    let dir = model_dir();
+    Some(match model_cached()? {
+        true => format!("{}, loaded from {}", provider().describe(), dir.display()),
+        false if offline() => format!(
+            "{}, not in {} and HF_HUB_OFFLINE is set: searches rank by keyword alone until its files are \
+             there (`ampup-memory embed warmup` with a network fetches them)",
+            provider().describe(),
+            dir.display()
+        ),
+        false => format!(
+            "{}, not in {} yet: fetched from {} on first use (about 130 MB for the default; \
+             `ampup-memory embed warmup` fetches it now). Until it loads, searches rank by keyword alone",
+            provider().describe(),
+            dir.display(),
+            std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "huggingface.co".into())
+        ),
+    })
+}
+
+/// `HF_HUB_OFFLINE` (`1`, `true`, `yes` or `on`): never fetch a model, as Hugging Face's own tools read it.
+fn offline() -> bool {
+    std::env::var("HF_HUB_OFFLINE").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// How long a local model that failed to load (not fetched, and no network to fetch it) isn't tried again:
+/// every search would otherwise wait on a fetch that fails, and say so.
+pub const LOAD_REST: std::time::Duration = std::time::Duration::from_secs(60);
+/// When loading the local model last failed, and why.
+static LOAD_FAILED: LazyLock<parking_lot::Mutex<Option<(std::time::Instant, String)>>> =
+    LazyLock::new(Default::default);
+
+/// The local model, from [`model_dir`], fetched there first if it isn't (unless `HF_HUB_OFFLINE` says not to).
+fn load_local(model: &fastembed::EmbeddingModel) -> Result<fastembed::TextEmbedding> {
+    if let Some((at, why)) = &*LOAD_FAILED.lock()
+        && at.elapsed() < LOAD_REST
+    {
+        anyhow::bail!(
+            "{why} ({} s ago; tried again after {} s)",
+            at.elapsed().as_secs(),
+            LOAD_REST.as_secs()
+        );
+    }
+    let failed = |why: String| {
+        *LOAD_FAILED.lock() = Some((std::time::Instant::now(), why.clone()));
+        anyhow::anyhow!(why)
+    };
+    if offline() && model_cached() == Some(false) {
+        return Err(failed(format!(
+            "the local embedding model isn't in {} and HF_HUB_OFFLINE is set",
+            model_dir().display()
+        )));
+    }
+    match fastembed::TextEmbedding::try_new(
+        fastembed::TextInitOptions::new(model.clone())
+            .with_cache_dir(model_dir())
+            .with_show_download_progress(false),
+    ) {
+        Ok(m) => {
+            *LOAD_FAILED.lock() = None;
+            Ok(m)
+        }
+        Err(e) => Err(failed(format!(
+            "loading the local embedding model into {} failed: {e:#}",
+            model_dir().display()
+        ))),
+    }
 }
 
 /// Clears its flag when dropped: the future that waits for a blocking batch holds one.

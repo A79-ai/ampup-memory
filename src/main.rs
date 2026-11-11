@@ -458,7 +458,8 @@ enum Cmd {
         #[arg(long, env = "AMPUP_MEMORY_BACKFILL_REDO")]
         redo: bool,
     },
-    /// Load the embedding model and embed some text (checks an image's baked-in model)
+    /// Load the embedding model and embed some text: checks an image's baked-in model, and fetches the local
+    /// model ahead of going offline (`ampup-memory embed warmup`)
     Embed {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
@@ -1085,7 +1086,8 @@ fn main() -> Result<()> {
 
 /// What to say when no model is configured for extraction (and, through it, aggregation and compiling).
 const NO_MODEL: &str = "set OPENROUTER_API_KEY for the default, OpenRouter with Claude Haiku 5.5 (or the model \
-AMPUP_MEMORY_EXTRACT_MODEL names), or set AMPUP_MEMORY_EXTRACT (openrouter, openrouter-batch, openai, anthropic, bedrock, vertex or cortex)";
+AMPUP_MEMORY_EXTRACT_MODEL names), AMPUP_MEMORY_LLM=ollama for a local Ollama, or AMPUP_MEMORY_EXTRACT (openrouter, \
+openrouter-batch, openai, ollama, anthropic, bedrock, vertex or cortex)";
 
 /// `memstore qa-log`: the answer log, as JSON lines.
 /// `memstore advice`.
@@ -2108,15 +2110,22 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&m)?);
             return Ok(());
         }
-        // Fetches the model into AMPUP_MEMORY_MODEL_DIR when building an image.
+        // Fetches the model into AMPUP_MEMORY_MODEL_DIR when building an image, or ahead of going offline.
         Cmd::Embed { text } => {
             let v = memstore::search::embed_text(&text.join(" ")).await?;
             println!(
-                "{}: {} dims, first {:?}; embedding cache: {}",
+                "{}: {} dims, first {:?}; embedding cache: {}{}",
                 memstore::search::embed::provider().describe(),
                 v.len(),
                 &v[..3.min(v.len())],
-                memstore::search::embed_cache::describe()
+                memstore::search::embed_cache::describe(),
+                match memstore::search::embed::model_cached() {
+                    Some(_) => format!(
+                        "; model files in {}",
+                        memstore::search::embed::model_dir().display()
+                    ),
+                    None => String::new(),
+                }
             );
             return Ok(());
         }
@@ -3230,6 +3239,12 @@ async fn serve_local(dir: &str, port: u16, scope: Scope, groups: Vec<String>) ->
         );
     }
     let catalog = memstore::platform::local_dir(&dir).await?;
+    // The model it learns with: what the environment names, else what its first run chose (asked at a terminal,
+    // kept in DIR/llm.json).
+    memstore::extract::llm::first_run(&dir).await?;
+    if let Some(s) = memstore::search::embed::model_status() {
+        eprintln!("ampup-memory: embeddings: {s}");
+    }
     // Unless AMPUP_MEMORY_EMBED_CACHE says otherwise, index updates keep the vectors they compute beside the index, so
     // the same text in another scope, workspace or branch of this store, or a rebuilt index, isn't embedded again.
     memstore::search::embed_cache::default_to(dir.join("embeddings").display().to_string());

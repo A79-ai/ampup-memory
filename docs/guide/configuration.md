@@ -34,6 +34,9 @@ over the server's variables where both exist; a team's setting wins over its org
 | Variable | What it does |
 |---|---|
 | `OPENROUTER_API_KEY` | The default backend's key. With no model key at all, nothing is extracted, compiled or learned. |
+| `AMPUP_MEMORY_LLM` | One backend for every role below whose own variable names none: `ollama`, any `AMPUP_MEMORY_EXTRACT` value, or `off`. `serve --local` keeps a choice made at its first run in `llm.json` in its directory, under the variables. |
+| `AMPUP_MEMORY_LLM_MODEL`, `AMPUP_MEMORY_LLM_URL`, `AMPUP_MEMORY_LLM_KEY` | One model (the strong roles' too), base URL and key for it. `AMPUP_MEMORY_LLM_URL` alone means `openai` at that URL. |
+| `AMPUP_MEMORY_LLM_CONTEXT` (32768) | The context, in tokens, Ollama loads the model with. |
 | `AMPUP_MEMORY_EXTRACT` | The backend: `openrouter` (default with a key), `openrouter-batch`, `openai`, `anthropic`, `bedrock`, `vertex`, `cortex`, or `off`. |
 | `AMPUP_MEMORY_EXTRACT_MODEL`, `AMPUP_MEMORY_EXTRACT_URL`, `AMPUP_MEMORY_EXTRACT_KEY` (or `_KEY_FILE`), `AMPUP_MEMORY_EXTRACT_REGION` | The extraction model, endpoint, key and region. |
 | `AMPUP_MEMORY_COMPILE`, `AMPUP_MEMORY_COMPILE_MODEL`, `AMPUP_MEMORY_AIP_MODEL` | Compiling skills and AIP graphs (falls back to extraction's backend). `AMPUP_MEMORY_COMPILE=off` stops compiling. |
@@ -50,7 +53,8 @@ Backends and their defaults:
 |---|---|---|---|
 | `openrouter` | OpenRouter; your own provider keys pass through where the account holds them | `anthropic/claude-haiku-5.5` (learning and compiling: `anthropic/claude-opus-5.5`) | `OPENROUTER_API_KEY` |
 | `openrouter-batch` | OpenRouter's Batch API: half the price, answers in minutes | as above | `OPENROUTER_API_KEY` |
-| `openai` | OpenAI-compatible chat (OpenAI, vLLM, Ollama) | `gpt-5-mini` | `OPENAI_API_KEY` |
+| `openai` | OpenAI-compatible chat (OpenAI, vLLM, LM Studio) | `gpt-5-mini` | `OPENAI_API_KEY` |
+| `ollama` | Ollama's own chat API at `http://localhost:11434`, with the context size each request needs | `qwen2.5:3b` (every role) | none |
 | `anthropic` | Anthropic Messages | `claude-haiku-5-5` (learning and compiling: `claude-opus-5-5`) | `ANTHROPIC_API_KEY` |
 | `bedrock` | Amazon Bedrock Converse, in `AMPUP_MEMORY_EXTRACT_REGION` or `AWS_REGION` (`us-east-1`) | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | `AWS_BEARER_TOKEN_BEDROCK` |
 | `vertex` | Vertex AI's OpenAI-compatible endpoint in `GCP_PROJECT` | `google/gemini-2.5-flash` | Google application default credentials |
@@ -76,7 +80,8 @@ Requests carry `X-Title: ampup-memory`, so their spend shows apart on a shared k
 |---|---|
 | `AMPUP_MEMORY_EMBED` | `local`, `openai` or `openrouter` (chosen from the keys present when unset). |
 | `AMPUP_MEMORY_EMBED_MODEL`, `AMPUP_MEMORY_EMBED_DIMS`, `AMPUP_MEMORY_EMBED_URL`, `AMPUP_MEMORY_EMBED_KEY` (or `_KEY_FILE`) | The embedding model and API. |
-| `AMPUP_MEMORY_MODEL_DIR` | Where local embedding models are kept (`~/.cache/memstore/models`). |
+| `AMPUP_MEMORY_MODEL_DIR` | Where local embedding models are kept (`~/.cache/memstore/models`). `ampup-memory embed warmup` fetches the model there ahead of time. |
+| `HF_ENDPOINT`, `HF_HOME`, `HF_HUB_OFFLINE=1` | Where the local model is fetched from (a mirror), kept instead (over the above), or never fetched. Without it, search ranks by keyword alone. |
 | `AMPUP_MEMORY_EMBED_CACHE` | Where computed vectors are cached, or `off`. |
 | `AMPUP_MEMORY_CHUNK_BYTES` (1500), `AMPUP_MEMORY_CHUNK_OVERLAP` (150) | Passage chunking. |
 | `AMPUP_MEMORY_VIEW_FACTS` (200000) | Values and entities typed queries keep in memory; 0 keeps none. |
