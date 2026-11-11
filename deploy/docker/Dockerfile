@@ -31,6 +31,8 @@ RUN AMPUP_MEMORY_MODEL_DIR=/fetch target/release/ampup-memory embed warmup >/dev
 FROM cgr.dev/chainguard/glibc-dynamic:latest-dev
 COPY --from=build /src/target/release/ampup-memory /usr/local/bin/ampup-memory
 # The command's name before the rename, kept: a Deployment's `command` (or a script) that names memstore still runs it.
+# The -dev base runs as nonroot, which can't write /usr/local/bin; the image still runs as nonroot (below).
+USER root
 RUN ln -s ampup-memory /usr/local/bin/memstore
 COPY --from=build /models /models
 # The licenses of what the image holds: AmpUp Memory's, the crates and ONNX Runtime it links, and the model.
