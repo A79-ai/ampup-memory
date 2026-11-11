@@ -3060,8 +3060,9 @@ pub type ExportFile = (String, Vec<Value>);
 
 /// `memstore org export`: the org's memory as committed facts, the entities they describe, and the
 /// episodes with their text. The operator (`reader` unused) takes all of it: the org's scope and every
-/// team's, whatever the episodes' ACLs. An org admin (`reader`: who they are signed in as) takes what
-/// they may read: the org's scope and the teams they are members of (a team is isolated from the rest of
+/// team's, whatever the episodes' ACLs. An org admin (`reader`: who they are signed in as, holding what
+/// the org shares with all its members, `group:<org>.all`, as a read the directory resolves gives them) takes
+/// what they may read: the org's scope and the teams they are members of (a team is isolated from the rest of
 /// its org, admins included), and only the episodes their ACLs let them see and the facts all of whose
 /// sources they can see, as every read path gives it to them. Never a secret, a key or a key's hash:
 /// those live in the directory, which isn't exported.
@@ -3081,12 +3082,22 @@ pub async fn export_org(
     let Some(o) = dir.orgs.get(org) else {
         return Err(refused(format!("no org {org}")));
     };
-    // Fail closed: only the operator exports without a reader.
+    // Fail closed: only the operator exports without a reader. An admin reads the org as its members do, holding
+    // what it shares with all of them: the directory found them its admin, and a read it resolves adds that, but
+    // a person signed in holds nothing of it until then.
     let reader = match (actor.superuser, reader) {
         (true, _) => None,
-        (false, Some(r)) => Some(r),
+        (false, Some(r)) => {
+            let mut r = r.clone();
+            let all = crate::auth::acl::org_wide(org);
+            if !r.groups().contains(&all) {
+                r.add_groups([all]);
+            }
+            Some(r)
+        }
         (false, None) => return Err(refused(format!("{} may not export org {org}", actor.user))),
     };
+    let reader = reader.as_ref();
     let teams: Vec<String> = match reader {
         None => o.teams.keys().cloned().collect(),
         Some(_) => dir

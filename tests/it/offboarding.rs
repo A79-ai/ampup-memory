@@ -2,9 +2,10 @@
 //! (team `a1`) and `globex`, filled with memories that each carry a tag no other memory has. Then:
 //!
 //! - `memstore org export acme` (the operator, through the CLI) and the `/admin` export as acme's admin:
-//!   acme's facts, entities and episodes, nothing of globex's, no key or key hash;
+//!   acme's facts, entities and episodes, nothing of globex's, no key or key hash; the admin's holds what acme
+//!   shares with all its members, as their reads do, and not what is a single other member's;
 //! - callers who must be refused are: globex's admin forgetting an acme member, a plain member forgetting
-//!   anyone, acme's admin deleting acme, acme's admin exporting globex, a service key exporting;
+//!   anyone or exporting, acme's admin deleting acme, acme's admin exporting globex, a service key exporting;
 //! - acme's admin demoted in the middle of forgetting carol (after carol is out of acme) deletes nothing of hers
 //!   and leaves no tombstone; made an admin again, she runs the forget again and it finishes:
 //! - acme's admin forgets carol: her episodes are gone from search, queries and episode reads, through pins taken
@@ -534,6 +535,19 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         .commit(&acme, "test", &[secret], &[secret_fact])
         .await
         .unwrap();
+    // An acme episode shared with the whole org (`group:acme.all`, which its members and keys hold through the
+    // directory), and a fact from it.
+    let org_wide = Episode::new(
+        "note:handbook",
+        b"xqorgwide owner note",
+        &["group:acme.all"],
+    );
+    let org_wide_fact =
+        Fact::new("deal:xqorgwide", "owner", "xqorgwide").from_episodes(&[&org_wide]);
+    store
+        .commit(&acme, "test", &[org_wide], &[org_wide_fact])
+        .await
+        .unwrap();
     // An acme message, and a fact from it, that its source then deleted: in no export.
     let deleted = Episode::new("slack:C9:1.0", b"xqdeleted owner note", &["group:acme"]);
     let deleted_fact = Fact::new("deal:xqdeleted", "owner", "xqdeleted").from_episodes(&[&deleted]);
@@ -562,6 +576,7 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     let carol_tags = ["xqcarolteam", "xqcarolorg", "xqcarolfact", "xqmixedfact"];
     let acme_tags = [
         "xqorgalpha",
+        "xqorgwide",
         "xqteamalpha",
         "xqbobkeeps",
         "xqbobfact",
@@ -579,6 +594,7 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         r.as_ref().is_some_and(|r| {
             [
                 "xqorgalpha",
+                "xqorgwide",
                 "xqbobkeeps",
                 "xqcarolorg",
                 "xqbobfact",
@@ -632,10 +648,16 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         read("team-a1/episodes.jsonl"),
         read("org/entities.jsonl"),
     );
-    for t in ["xqorgalpha", "xqbobfact", "xqmixedfact"] {
+    for t in ["xqorgalpha", "xqorgwide", "xqbobfact", "xqmixedfact"] {
         assert!(org_facts.contains(t), "{t} in {org_facts}");
     }
-    for t in ["xqorgalpha", "xqbobkeeps", "xqcarolorg", "xqbobsecret"] {
+    for t in [
+        "xqorgalpha",
+        "xqorgwide",
+        "xqbobkeeps",
+        "xqcarolorg",
+        "xqbobsecret",
+    ] {
         assert!(org_eps.contains(t), "{t} in {org_eps}");
     }
     assert!(org_facts.contains("xqbobsecret"), "{org_facts}");
@@ -658,12 +680,19 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         !everything.contains(&a_key_sha) && !everything.contains("msk_"),
         "a key in the export"
     );
-    // Acme's admin exports what she may read, as every read path gives it to her: the org's scope, not
-    // team a1 (she isn't in it: a team is isolated from its org's admins), not the episode only Bob may
-    // read nor the fact drawn from it.
+    // Acme's admin exports what she may read, as every read path gives it to her: the org's scope, with what
+    // acme shares with all its members (she holds it as they do, though `/admin` resolves no read), not team a1
+    // (she isn't in it: a team is isolated from its org's admins), not the episode only Bob may read nor the
+    // fact drawn from it.
     let (status, body) = admin_as(s, &alice, json!({"op": "export_org", "org": "acme"})).await;
     assert_eq!(status, 200, "{body}");
-    for t in ["xqorgalpha", "xqbobkeeps", "xqcarolorg", "xqbobfact"] {
+    for t in [
+        "xqorgalpha",
+        "xqorgwide",
+        "xqbobkeeps",
+        "xqcarolorg",
+        "xqbobfact",
+    ] {
         assert!(body.contains(t), "{t} not in acme's admin's export: {body}");
     }
     for t in [
@@ -677,11 +706,12 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         assert!(!body.contains(t), "{t} in acme's admin's export: {body}");
     }
 
-    // Refused: acme's admin exporting globex, a service key exporting its own org, globex's admin
-    // forgetting an acme member (naming acme, or naming no org), a plain member forgetting anyone,
-    // acme's admin deleting acme.
+    // Refused: acme's admin exporting globex, a plain member exporting acme, a service key exporting its own
+    // org, globex's admin forgetting an acme member (naming acme, or naming no org), a plain member forgetting
+    // anyone, acme's admin deleting acme.
     let refusals = [
         (&alice, json!({"op": "export_org", "org": "globex"})),
+        (&bob, json!({"op": "export_org", "org": "acme"})),
         (&a_key, json!({"op": "export_org", "org": "acme"})),
         (
             &a_key,
@@ -764,6 +794,10 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     assert_eq!(status, 200, "{body}");
     let (status, body) = admin_as(s, &gary, json!({"op": "export_org", "org": "globex"})).await;
     assert!(status == 200 && body.contains("xqorgbeta"), "{body}");
+    assert!(
+        !body.contains("xqorgwide"),
+        "acme's in globex's export: {body}"
+    );
     // Nothing was refused into happening.
     until(
         s,
