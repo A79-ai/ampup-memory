@@ -101,7 +101,7 @@ pub enum PeopleCmd {
     /// Which caller-identity source this environment configures, and whether each part works
     #[command(subcommand)]
     Identity(IdentityCmd),
-    /// Deprecated (admin keys aside): API keys in a keys file, read at server start. Use `apikey`
+    /// API keys in a keys file: admin keys, and the keys of a server that serves its own scope (an org's: `apikey`)
     #[command(subcommand)]
     Keys(KeysCmd),
     /// Disable or re-enable a user on a running server; forget a user (delete what they wrote)
@@ -755,27 +755,20 @@ pub enum ApikeyCmd {
         org: Option<String>,
     },
     /// Move file keys (`AMPUP_MEMORY_API_KEYS`, `ampup-memory keys new`) into the directory as the org's (or
-    /// --team's) keys: same key, same holder, no more rights. The operator imports from the keys file
-    /// (--from, through a server that has it, or --direct); a key's holder imports their own (--self,
-    /// signed in with it). Admin keys and keys holding groups are refused; only sha256s are read
+    /// --team's) keys: same key, same holder, no more rights. The operator's, from the keys file: through a
+    /// server, the rows of its own keys file with the ids --from lists; with --direct, the rows of --from.
+    /// Admin keys and keys holding groups are refused; only sha256s are read
     Import {
         #[arg(long)]
         org: Option<String>,
         /// Each key reads (and writes) only this team's memory; its user must be in the team
         #[arg(long)]
         team: Option<String>,
-        /// The keys file: JSON rows of {id, sha256, user, groups, admin} (the operator)
-        #[arg(
-            long,
-            required_unless_present = "self_import",
-            conflicts_with = "self_import"
-        )]
-        from: Option<PathBuf>,
-        /// The file key you are signed in with (its holder)
-        #[arg(long = "self")]
-        self_import: bool,
+        /// The keys file: JSON rows of {id, sha256, user, groups, admin}
+        #[arg(long)]
+        from: PathBuf,
         /// Only these rows (comma-separated ids)
-        #[arg(long, requires = "from")]
+        #[arg(long)]
         only: Option<String>,
         /// writer (what a file key could do), or narrower: reader, ingest
         #[arg(long, default_value = "writer")]
@@ -1462,40 +1455,31 @@ async fn apikey(to: &Target<'_>, cmd: &ApikeyCmd) -> Result<()> {
             org,
             team,
             from,
-            self_import,
             only,
             role,
             dry_run,
         } => {
-            let mut keys = vec![];
-            if let Some(from) = from {
-                let text = std::fs::read_to_string(from)
-                    .with_context(|| format!("--from {}", from.display()))?;
-                keys = directory::parse_file_keys(&text)
-                    .with_context(|| format!("{}: not a keys file", from.display()))?;
-                if let Some(only) = only {
-                    let ids = crate::split_list(only);
-                    if let Some(missing) = ids.iter().find(|i| !keys.iter().any(|k| &k.id == *i)) {
-                        anyhow::bail!("no key with id {missing} in {}", from.display());
-                    }
-                    keys.retain(|k| ids.contains(&k.id));
+            let text = std::fs::read_to_string(from)
+                .with_context(|| format!("--from {}", from.display()))?;
+            let mut keys = directory::parse_file_keys(&text)
+                .with_context(|| format!("{}: not a keys file", from.display()))?;
+            if let Some(only) = only {
+                let ids = crate::split_list(only);
+                if let Some(missing) = ids.iter().find(|i| !keys.iter().any(|k| &k.id == *i)) {
+                    anyhow::bail!("no key with id {missing} in {}", from.display());
                 }
+                keys.retain(|k| ids.contains(&k.id));
             }
-            anyhow::ensure!(
-                !(*self_import && to.store.is_some()),
-                "--self goes to the server that has your key, signed in with it: ampup-memory auth login --server <url> --api-key <key>"
-            );
             let change = Change::ImportKeys {
                 org: org_of(org)?,
                 team: team.clone(),
                 role: directory::KeyRole::parse(role)?,
                 keys,
-                self_import: *self_import,
             };
             let done = to.change(change, *dry_run).await?;
             if !dry_run && !done.is_empty() {
                 println!(
-                    "\nThe same keys work as before, now as the directory's: revoke them with `ampup-memory apikey revoke`. Remove them from the keys file when the server next restarts."
+                    "\nThe same keys work as before, now as the directory's: revoke them with `ampup-memory apikey revoke`, and take them out of the keys file."
                 );
             }
         }
@@ -1661,12 +1645,11 @@ fn write_keys(path: &PathBuf, rows: &[Value]) -> Result<()> {
     Ok(())
 }
 
-/// `memstore keys` writes a keys file, which servers read only when they start: deprecated for
-/// everything but admin keys, which no directory key can stand for.
-const KEYS_DEPRECATED: &str = "deprecated: keys files are read only when the server starts; use `ampup-memory apikey create|revoke` (an org's or team's key, working from its next request), and `ampup-memory apikey import` to move existing file keys. Only admin keys still belong here.";
+/// `ampup-memory keys` writes a keys file: what it is for, said each time.
+const KEYS_NOTE: &str = "a keys file holds admin keys, and the keys of a server that serves its own scope only: a non-admin file key reads that scope, never an org's. An org's or team's keys are `ampup-memory apikey create|revoke`, and `ampup-memory apikey import` moves a file key there.";
 
 fn keys(cmd: &KeysCmd) -> Result<()> {
-    eprintln!("{KEYS_DEPRECATED}");
+    eprintln!("{KEYS_NOTE}");
     match cmd {
         KeysCmd::New {
             keys_file,

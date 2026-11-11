@@ -137,7 +137,7 @@ Requests carry `X-Title: ampup-memory`, so their spend shows apart on a shared k
 
 | Variable | What it does |
 |---|---|
-| `AMPUP_MEMORY_API_KEYS` | A keys file (deprecated for everything but admin keys; use `ampup-memory apikey`). Read again within 2 seconds when it changes; keep it the same on every server. |
+| `AMPUP_MEMORY_API_KEYS` | A keys file: admin keys, and the keys of a server that serves its own scope only (a non-admin file key reads that scope, never an org's; orgs use `ampup-memory apikey`). Read again within 2 seconds when it changes; keep it the same on every server. |
 | `AMPUP_MEMORY_JWT_JWKS_URL`, `AMPUP_MEMORY_JWT_PUBLIC_KEY`, `AMPUP_MEMORY_JWT_SECRET`, `AMPUP_MEMORY_JWT_ISSUER`, `AMPUP_MEMORY_JWT_AUDIENCE`, `AMPUP_MEMORY_JWT_ORG_CLAIM`, `AMPUP_MEMORY_JWT_GROUPS_CLAIM`, `AMPUP_MEMORY_JWT_USER_CLAIMS` | JWT callers. |
 | `AMPUP_MEMORY_OIDC_ISSUER`, `AMPUP_MEMORY_OIDC_AUDIENCE`, `AMPUP_MEMORY_OIDC_CLI_CLIENT_ID`, `AMPUP_MEMORY_OIDC_CLI_CLIENT_SECRET`, `AMPUP_MEMORY_OIDC_CLI_CALLBACK_PORT` | People's sign-in through the server's identity provider. Serve a client secret only for a public client. |
 | `AMPUP_MEMORY_IAP_AUDIENCE` | People through Google's Identity-Aware Proxy. |

@@ -155,7 +155,7 @@ struct State {
     ready: std::sync::atomic::AtomicBool,
     /// Whether this server does the background writing (`writer`): one server per catalog at a time.
     writer: Arc<writer::Lease>,
-    /// What this server says of its non-admin file keys, being retired (`file_keys`).
+    /// What this server says of its non-admin file keys (`file_keys`).
     file_keys: file_keys::Report,
     /// What this server does (`AMPUP_MEMORY_ROLE`), read once as it starts.
     role: Role,
@@ -307,8 +307,6 @@ impl State {
 struct DirectoryAuth {
     providers: Vec<auth::OrgProvider>,
     keys: Vec<auth::OrgKey>,
-    /// sha256 of keys revoked from the directory: a file key among them stays refused.
-    retired: std::collections::BTreeSet<String>,
     /// Orgs bound to an Auth0 Organization, each with its id.
     auth0_orgs: Vec<(String, String)>,
 }
@@ -621,8 +619,8 @@ pub async fn serve_with(
         options.audit_flush.unwrap_or_else(audit::flush_interval),
         move || writer.store.read().unwrap().clone(),
     ));
-    // Non-admin file keys, being retired: each is named in the log (`ALERT` while it is read from the file) and
-    // in `memstore_file_keys` once the directory is read, and the writer imports those it can (`file_keys`).
+    // Non-admin file keys: each is named in the log (`ALERT` where this server ignores it) and in
+    // `memstore_file_keys` once the directory is read, and the writer imports those it can (`file_keys`).
     state
         .metrics
         .register(Box::new(state.file_keys.gauge.clone()));
@@ -2220,52 +2218,30 @@ async fn request_principal(
         Identity::Token(auth) => {
             // Orgs' own providers and keys live in the directory: read it only for a token that may be
             // theirs. A key the deployment's own keys don't know may be an org's.
-            // The directory is where keys live. A file key it imported, checked against the file key
-            // itself, is the directory's key from then on, even where a keys file still lists it, and
-            // once revoked there stays revoked. No other directory key ever takes a file key's place,
-            // whatever hash it was given; an admin file key is the file's alone.
+            // A bearer that is one of the directory's keys is that key, on every server, whatever a keys file
+            // says; an admin file key is the keys file's alone. A non-admin file key the directory doesn't
+            // have reads this server's own scope, never an org's (it is bound to none), and a server that
+            // reads every request through the directory takes none (`file_keys` names each in an ALERT).
             let file_key = match token.starts_with(auth::KEY_PREFIX) {
                 true => Some(auth.key_caller(token)),
                 false => None,
             };
-            // Set when the request runs as a (non-admin) file key: the sha256 it proves holding.
-            let mut as_file_key = None;
+            let mut bound_to_none = false;
             let c = if let Some(file_key) = file_key
                 && file_key.as_ref().is_none_or(|k| !k.admin)
             {
                 let d = directory_auth(state).await?;
                 match file_key {
-                    Some(f) => {
-                        let mine: Vec<auth::OrgKey> = d
-                            .keys
-                            .iter()
-                            .filter(|k| k.replaces_file_key && k.sha256 == f.sha256)
-                            .cloned()
-                            .collect();
-                        if mine.is_empty() {
-                            anyhow::ensure!(
-                                !d.retired.contains(&f.sha256),
-                                "api key {} was revoked from the directory",
-                                f.id
-                            );
-                            // A directory key made with this bearer (on a server whose keys file
-                            // doesn't hold it, or with --direct) is another caller: the bearer names
-                            // two, so it names neither, here or there (where it is that key alone,
-                            // and is refused here: never one caller on one server and another
-                            // elsewhere).
-                            anyhow::ensure!(
-                                !d.keys.iter().any(|k| k.sha256 == f.sha256),
-                                "api key {} is also a directory key: it names two callers, so neither",
-                                f.id
-                            );
-                            as_file_key = Some(f.sha256.clone());
-                            auth.authenticate(token).await?
-                        } else {
-                            // Expired or not, the imported key decides: never its file twin.
-                            auth::org_key_caller(token, &mine)?
-                        }
+                    Some(f) if !d.keys.iter().any(|k| k.sha256 == f.sha256) => {
+                        anyhow::ensure!(
+                            !state.directory_only,
+                            "api key {} is a keys-file key, which this server doesn't take (it reads every request through the directory): an org's memory takes one of the org's keys",
+                            f.id
+                        );
+                        bound_to_none = true;
+                        auth.authenticate(token).await?
                     }
-                    None => auth::org_key_caller(token, &d.keys)?,
+                    _ => auth::org_key_caller(token, &d.keys)?,
                 }
             } else {
                 let d = if auth.wants_org_providers(token) {
@@ -2282,11 +2258,13 @@ async fn request_principal(
             }
             let via = SignIn {
                 person: c.person,
-                orgs: c.orgs,
+                orgs: match bound_to_none {
+                    true => Some(Default::default()),
+                    false => c.orgs,
+                },
                 groups: c.idp_groups,
                 verified_email: c.email_verified,
                 key: c.key,
-                file_key: as_file_key,
                 auth0: c.auth0,
                 auth0_org: c.auth0_org,
                 operator: c.operator,
@@ -2343,7 +2321,7 @@ async fn keys_file_watch(state: Arc<State>) {
     };
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut failed = Default::default();
+    let mut passes = file_keys::Passes::default();
     loop {
         tick.tick().await;
         let Some(auth) = state.token_auth() else {
@@ -2357,7 +2335,7 @@ async fn keys_file_watch(state: Arc<State>) {
             Err(e) => eprintln!("ALERT keys file {path}: {e:#}"),
         }
         // Its non-admin keys against the directory as it is now: said when that changes, imported where they can be.
-        file_keys::pass(&state, &mut failed).await;
+        file_keys::pass(&state, &mut passes).await;
     }
 }
 
@@ -2387,7 +2365,6 @@ async fn directory_auth(state: &State) -> Result<DirectoryAuth> {
                 expires_at: k.expires_at,
                 sources: k.sources.clone(),
                 sha256: k.sha256.clone(),
-                replaces_file_key: k.verified_import,
             })
         })
         .collect();
@@ -2411,7 +2388,6 @@ async fn directory_auth(state: &State) -> Result<DirectoryAuth> {
     let d = DirectoryAuth {
         providers,
         keys,
-        retired: dir.retired_keys.clone(),
         auth0_orgs,
     };
     *state.providers.lock().unwrap() = Some((std::time::Instant::now(), d.clone()));
@@ -2597,7 +2573,7 @@ fn iap_set() -> bool {
 
 pub async fn identity_check() -> Vec<Check> {
     let mut out = Vec::new();
-    // Non-admin keys in a keys file: being retired, each is judged against the directory below.
+    // Non-admin keys in a keys file: each is judged against the directory below.
     let mut file_keys: Option<String> = None;
     let mut file_rows: Vec<auth::KeyCaller> = vec![];
     let mut check = |what: &str, r: Result<String>| {
@@ -2701,7 +2677,7 @@ pub async fn identity_check() -> Vec<Check> {
                     let (keys, admins) = auth.key_counts();
                     if let Some(p) = var("AMPUP_MEMORY_API_KEYS").filter(|_| keys > admins) {
                         file_keys = Some(format!(
-                            "{p} holds {} non-admin keys, which are being retired: move them into the directory with `ampup-memory apikey import --org <org> --from {p}` (a server reading through the directory, AMPUP_MEMORY_DIRECTORY=required, imports those it can itself)",
+                            "{p} holds {} non-admin keys: they read this server's own scope only, and a server reading every request through the directory (AMPUP_MEMORY_DIRECTORY=required) takes none; an org's keys are directory keys (`ampup-memory apikey import --org <org> --from {p}` moves them)",
                             keys - admins
                         ));
                         file_rows = auth.file_key_callers();
@@ -2776,20 +2752,31 @@ pub async fn identity_check() -> Vec<Check> {
     if let Some(detail) = file_keys {
         // Each key against the directory, as a server here would judge it, less the groups a server gives callers
         // (its `serve` groups, closures pushed while it runs), which only it knows.
-        let dir = match std::env::var("AMPUP_MEMORY_PLATFORM") {
-            Ok(_) => match platform::catalog_from_env().await {
-                Ok(c) => crate::people::directory::Directory::load(&Store::new(c))
-                    .await
-                    .ok(),
-                Err(_) => None,
-            },
+        let store = match std::env::var("AMPUP_MEMORY_PLATFORM") {
+            Ok(_) => platform::catalog_from_env().await.ok().map(Store::new),
             Err(_) => None,
         };
+        let dir = match &store {
+            Some(s) => crate::people::directory::Directory::load(s)
+                .await
+                .ok()
+                .map(|d| (s, d)),
+            None => None,
+        };
         match dir {
-            Some(dir) => {
+            Some((store, dir)) => {
                 let through =
                     std::env::var("AMPUP_MEMORY_DIRECTORY").is_ok_and(|v| v == "required");
-                for (k, f) in file_keys::fates(&dir, file_rows, through, |_| vec![]) {
+                let ever = file_keys::ever_directory_keys(store)
+                    .await
+                    .unwrap_or_default();
+                for (k, f) in file_keys::fates(
+                    &dir,
+                    file_rows,
+                    through,
+                    |_| vec![],
+                    |sha| ever.contains(sha),
+                ) {
                     out.push(Check {
                         what: format!("file key {}", k.id),
                         ok: true,
@@ -2841,7 +2828,7 @@ async fn secrets_check() -> Vec<Check> {
                 what: "directory".into(),
                 ok: true,
                 warn: true,
-                detail: "none yet: no orgs, so no org keys, retired keys or identity providers \
+                detail: "none yet: no orgs, so no org keys or identity providers \
                          (keys files' keys serve as they are)"
                     .into(),
             },
@@ -3293,25 +3280,14 @@ async fn installations_caller(
     if let Ok(a) = admin {
         return Ok((a, None));
     }
-    let Some(auth) = state.token_auth() else {
-        anyhow::bail!("this needs AMPUP_MEMORY_CALLER_IDENTITY=token");
-    };
+    anyhow::ensure!(
+        state.token_auth().is_some(),
+        "this needs AMPUP_MEMORY_CALLER_IDENTITY=token"
+    );
     let d = directory_auth(state).await?;
-    // As `request_principal` resolves it: a file key's bearer is the directory key that replaced it,
-    // and a bearer that is both a file key and another directory key names neither.
-    let c = match auth.key_caller(token) {
-        Some(f) => {
-            let mine: Vec<auth::OrgKey> = d
-                .keys
-                .iter()
-                .filter(|k| k.replaces_file_key && k.sha256 == f.sha256)
-                .cloned()
-                .collect();
-            anyhow::ensure!(!mine.is_empty(), "a file key that isn't an admin key");
-            auth::org_key_caller(token, &mine)?
-        }
-        None => auth::org_key_caller(token, &d.keys)?,
-    };
+    // As `request_principal` resolves it: a bearer the directory holds is that org key, whatever a keys file
+    // says; a non-admin file key the directory doesn't hold is bound to no org, so it manages none.
+    let c = auth::org_key_caller(token, &d.keys)?;
     let k = c.key.as_ref().context("not an org key")?;
     anyhow::ensure!(
         k.role == crate::people::directory::KeyRole::Ingest
@@ -5456,7 +5432,7 @@ async fn handle(
                     eprintln!("directory change by {} refused: {e:#}", who.user());
                     match e.downcast_ref::<crate::people::directory::Refused>() {
                         Some(r) => {
-                            let why = if via.key.is_some() || via.file_key.is_some() {
+                            let why = if via.key.is_some() {
                                 audit::Reason::ServiceKeyAdmin
                             } else if (req["op"] == "audit" && req["operator"] == true)
                                 || req["op"] == "support_event"
@@ -5821,7 +5797,6 @@ async fn handle(
                 && !matches!(scope, Scope::Org | Scope::User(_)));
         let org_admin = !ingest_key
             && via.key.is_none()
-            && via.file_key.is_none()
             && named_scope(&req_query).is_none()
             && match scope.org_name() {
                 Some(org) => {
@@ -5847,7 +5822,7 @@ async fn handle(
                 json!({"error": "a retract is on main as it is now: drop the branch and snapshot (at)"}),
             ));
         }
-        if let Some(((org, i), key)) = key_caller(&state, &via, &scope).await {
+        if let Some(((org, i), key)) = key_caller(&state, &via).await {
             state
                 .audit
                 .key_use((&org, i), &key, &scope.to_string(), "/retract", true);
@@ -5905,7 +5880,7 @@ async fn handle(
                 json!({"error": "ingest writes to main as it is now: drop the branch and snapshot (at)"}),
             ));
         }
-        if let Some(((org, i), key)) = key_caller(&state, &via, &scope).await {
+        if let Some(((org, i), key)) = key_caller(&state, &via).await {
             state
                 .audit
                 .key_use((&org, i), &key, &scope.to_string(), "/ingest", true);
@@ -5944,7 +5919,7 @@ async fn handle(
             eprintln!("refused {path} for {}: {why} (app {app})", who.user());
             return Ok(reply(StatusCode::FORBIDDEN, json!({"error": why})));
         }
-        if let Some(((org, i), key)) = key_caller(&state, &via, &scope).await {
+        if let Some(((org, i), key)) = key_caller(&state, &via).await {
             state.audit.key_use(
                 (&org, i),
                 &key,
@@ -6135,7 +6110,7 @@ async fn handle(
         // A key's use is recorded only for a call `mcp` will run, never one it refuses: an ingest key writes
         // only through remember_memory, and forget_memory and close_memory read the memory they change, in
         // the scope itself rather than an inbox.
-        if let Some(((org, i), key)) = key_caller(&state, &via, &scope).await
+        if let Some(((org, i), key)) = key_caller(&state, &via).await
             && let Some((path, write)) = tool_call(&body)
             && match (path, write) {
                 (_, false) => via.may_read(),
@@ -6199,7 +6174,7 @@ async fn handle(
             json!({"error": format!("{who} is an ingest key: it writes memory, it doesn't read it")}),
         ));
     }
-    if let Some(((org, i), key)) = key_caller(&state, &via, &scope).await {
+    if let Some(((org, i), key)) = key_caller(&state, &via).await {
         state
             .audit
             .key_use((&org, i), &key, &scope.to_string(), route, false);
@@ -6811,7 +6786,6 @@ async fn handle(
         // An org's admin also lists the team's candidate advice: a person, not a key, who administers the org.
         let admin = list_op == Some("advice")
             && via.key.is_none()
-            && via.file_key.is_none()
             && match scope.org_name() {
                 Some(org) => crate::people::directory::Directory::load(&store)
                     .await
@@ -6973,7 +6947,7 @@ fn named_scope(query: &str) -> Option<String> {
 async fn mine_scope(state: &State, who: &Principal, via: &SignIn) -> Result<Scope> {
     if !state.fixed() {
         anyhow::ensure!(
-            via.person && via.key.is_none() && via.file_key.is_none(),
+            via.person && via.key.is_none(),
             "scope=mine is a person's own memory: {} is a key and has none",
             who.user()
         );
@@ -7237,19 +7211,10 @@ async fn member_org(
 }
 
 /// A service key's org (and incarnation, see [`member_org`]) and audit id: a directory key (imported
-/// file keys included) is `key:<org>/<name>` in its org; a file key not in the directory is
-/// `file:<id>`, in the org of the memory it read.
-async fn key_caller(state: &State, via: &SignIn, scope: &Scope) -> Option<((String, i64), String)> {
-    if let Some(k) = &via.key {
-        return Some((member_org(state, None, via, None).await?, k.user()));
-    }
-    let sha = via.file_key.as_deref()?;
-    let id = state.token_auth()?.file_key(sha)?.id;
-    let org = scope.org_name()?;
-    let store = state.store.read().unwrap().clone();
-    let f = store.directory().await.ok()?;
-    let i = f.dir.orgs.get(org)?.created_at;
-    Some(((org.to_string(), i), format!("file:{id}")))
+/// file keys included) is `key:<org>/<name>` in its org. A keys-file key reads no org's memory.
+async fn key_caller(state: &State, via: &SignIn) -> Option<((String, i64), String)> {
+    let k = via.key.as_ref()?;
+    Some((member_org(state, None, via, None).await?, k.user()))
 }
 
 /// The MCP tool call a request makes: the path it is recorded under (a tool the server doesn't offer is
@@ -7728,28 +7693,6 @@ async fn directory_change(
             return Err(Refused(msg).into());
         }
     }
-    // A file key is a service key too, whatever user the keys file names: it manages nothing. Its holder
-    // may import it (`apikey import --self`) and see the view; the ops below with refusals of their own keep them.
-    if via.file_key.is_some()
-        && !matches!(
-            req["op"].as_str(),
-            Some(
-                "show"
-                    | "import_keys"
-                    | "audit"
-                    | "forget_user"
-                    | "export_org"
-                    | "snapshot"
-                    | "check_directory"
-            )
-        )
-    {
-        let msg = format!(
-            "{} signed in with a file key, a service key: it doesn't manage the org (sign in as a person)",
-            who.user()
-        );
-        return Err(Refused(msg).into());
-    }
     let store = state.store.read().unwrap().clone();
     if matches!(
         req["op"].as_str(),
@@ -7851,9 +7794,7 @@ async fn directory_change(
             superuser
                 || via.operator
                 || access.get(o).is_some_and(|a| {
-                    via.directory_key().is_some()
-                        || (via.file_key.is_none()
-                            && a.role == crate::people::directory::Role::Admin)
+                    via.directory_key().is_some() || a.role == crate::people::directory::Role::Admin
                 })
         };
         return Ok(match req["org"].as_str() {
@@ -7895,7 +7836,7 @@ async fn directory_change(
     if req["op"] == "audit" && req["operator"] == true {
         // The rows of no org (anonymous callers, outsiders): the operator's admin key alone. Not an org
         // admin (these are other orgs' outsiders, and anyone's probes), not a key of any kind.
-        if !superuser || via.key.is_some() || via.file_key.is_some() || via.person {
+        if !superuser || via.key.is_some() || via.person {
             return Err(Refused(format!(
                 "{} may not read the operator's audit (only the operator's admin key may)",
                 who.user()
@@ -7921,7 +7862,7 @@ async fn directory_change(
         // The deployment agent's record of a support session (`crate::agent::support`): appended to the
         // audit, never changed or read back through this op. The operator's admin key alone (the agent
         // holds it, `AMPUP_MEMORY_AGENT_ADMIN_KEY_FILE`): not a person, not a key of any kind.
-        if !superuser || via.key.is_some() || via.file_key.is_some() || via.person {
+        if !superuser || via.key.is_some() || via.person {
             return Err(Refused(format!(
                 "{} may not write support events (only the operator's admin key may)",
                 who.user()
@@ -7943,13 +7884,6 @@ async fn directory_change(
     if req["op"] == "audit" {
         // An org's audit: its admins (signed in so they count there) and the operator, no one else. A file
         // key is a service key too, whoever it acts as.
-        if via.file_key.is_some() {
-            return Err(Refused(format!(
-                "{} is a service key: it doesn't read the org's audit",
-                who.user()
-            ))
-            .into());
-        }
         let org = req["org"].as_str().unwrap_or_default();
         crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
@@ -7980,13 +7914,6 @@ async fn directory_change(
         // The conversations people asked for advice in, every word and tool result of them, to train an advice
         // model on: the org's admins (and the operator), never a service key. What was kept stays theirs to read
         // after the org stops keeping more, until forgotten.
-        if via.file_key.is_some() {
-            return Err(Refused(format!(
-                "{} is a service key: it doesn't read people's advice traces",
-                who.user()
-            ))
-            .into());
-        }
         let org = req["org"].as_str().unwrap_or_default();
         crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
@@ -8017,13 +7944,6 @@ async fn directory_change(
         // (`conversation`, by `id`), and the facts from what one person wrote or said (`user_facts`, those the
         // admin may read): its admins (and the operator), unless the org turned it off. Never a service key: what
         // people asked is theirs and their admins' alone.
-        if via.file_key.is_some() {
-            return Err(Refused(format!(
-                "{} is a service key: it doesn't read people's activity",
-                who.user()
-            ))
-            .into());
-        }
         let org = req["org"].as_str().unwrap_or_default();
         crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
@@ -8104,13 +8024,6 @@ async fn directory_change(
         // A reviewer's +1 or -1 on one run or ended session (`id`), whoever recorded it, a -1 with what went wrong
         // (`crate::qa_log::review`): those who may read it as `conversation` does (the org's admins, or the
         // operator, where the org shows people's activity), never a service key.
-        if via.file_key.is_some() {
-            return Err(Refused(format!(
-                "{} is a service key: it doesn't review people's sessions",
-                who.user()
-            ))
-            .into());
-        }
         let org = req["org"].as_str().unwrap_or_default();
         crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
@@ -8165,13 +8078,6 @@ async fn directory_change(
     if req["op"] == "advice_trail" {
         // Where each of the team's notes was proposed, used and validated: who ran what, so the org's admins
         // alone (and the operator), and only where the org shows people's activity.
-        if via.file_key.is_some() {
-            return Err(Refused(format!(
-                "{} is a service key: it doesn't read advice's trail",
-                who.user()
-            ))
-            .into());
-        }
         let org = req["org"].as_str().unwrap_or_default();
         crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
@@ -8205,13 +8111,6 @@ async fn directory_change(
         // A branch of the org's memory (or a team's) against main: what each changed since the branch was made and
         // the keys both changed differently, and merging it into main once none are left. Its admins (and the
         // operator), and a team's only for its readers.
-        if via.file_key.is_some() {
-            return Err(Refused(format!(
-                "{} is a service key: it doesn't read or merge branches",
-                who.user()
-            ))
-            .into());
-        }
         let org = req["org"].as_str().unwrap_or_default();
         crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
@@ -8546,7 +8445,6 @@ async fn directory_change(
             superuser,
             via: via.clone(),
             owner: false,
-            vouched_keys: Default::default(),
             file_keys: Default::default(),
         };
         let org = req["org"].as_str();
@@ -8618,28 +8516,30 @@ async fn directory_change(
             return Err(Refused(why).into());
         }
     };
-    // `apikey import --self`: the file key this request is made with, as this server holds it.
-    if let Change::ImportKeys {
-        keys,
-        self_import: true,
-        ..
-    } = &mut change
-    {
-        let held = via
-            .file_key
-            .as_deref()
-            .and_then(|sha| state.token_auth()?.file_key(sha));
-        let Some(h) = held else {
-            let msg = "--self imports the file key the request is made with: sign in with it (ampup-memory auth login --api-key …)";
-            return Err(Refused(msg.into()).into());
-        };
-        *keys = vec![crate::people::directory::FileKey {
-            id: h.id,
-            sha256: h.sha256,
-            user: h.user,
-            groups: h.groups,
-            admin: h.admin,
-        }];
+    // `apikey import`: the rows are this server's own keys file's, by the ids asked for, never what the request
+    // says they are: a keys file's hashes can be read without holding its keys, so a row naming a hash is no
+    // proof of holding the key, and an import of one could capture that key's requests.
+    if let Change::ImportKeys { keys, .. } = &mut change {
+        let held = state
+            .token_auth()
+            .map(|a| a.file_key_callers())
+            .unwrap_or_default();
+        for k in keys.iter_mut() {
+            let Some(h) = held.iter().find(|h| h.id == k.id) else {
+                let msg = format!(
+                    "this server's keys file holds no key {}: import it through a server that has it (or with --direct, as the catalog's owner)",
+                    k.id
+                );
+                return Err(Refused(msg).into());
+            };
+            *k = crate::people::directory::FileKey {
+                id: h.id.clone(),
+                sha256: h.sha256.clone(),
+                user: h.user.clone(),
+                groups: h.groups.clone(),
+                admin: h.admin,
+            };
+        }
     }
     // A provider's client secret is sealed here, before anything is planned or stored: the directory
     // never holds it in plain text.
@@ -8652,35 +8552,12 @@ async fn directory_change(
         let msg = format!("the client secret is env:{n}, but {n} is not set on this server");
         return Err(Refused(msg).into());
     }
-    // An imported row must be the key this server holds under that sha256, if it holds one: nobody can
-    // pass off an operator's file key (an admin key above all) as a lesser one and so take it over.
-    let mut vouched = std::collections::BTreeSet::new();
-    if let (Change::ImportKeys { keys, .. }, Some(auth)) = (&change, state.token_auth()) {
-        use crate::people::directory::user_id;
-        for k in keys {
-            if let Some(held) = auth.file_key(&k.sha256) {
-                let same = held.id == k.id
-                    && user_id(&held.user) == user_id(&k.user)
-                    && held.groups == k.groups
-                    && held.admin == k.admin;
-                if !same {
-                    let msg = format!(
-                        "file key {} is not the key this server holds with that sha256 (that is {}, acting as {})",
-                        k.id, held.id, held.user
-                    );
-                    return Err(Refused(msg).into());
-                }
-                vouched.insert(k.sha256.to_ascii_lowercase());
-            }
-        }
-    }
     // One key, one caller: a new key may not be one of this server's file keys (`plan`, `CreateKey`).
     let actor = Actor {
         user: who.user().to_string(),
         superuser,
         via: via.clone(),
         owner: false,
-        vouched_keys: vouched,
         file_keys: state
             .token_auth()
             .map(|a| a.file_key_hashes())
@@ -9293,8 +9170,8 @@ async fn telemetry_advice(state: &State) -> Result<crate::telemetry::Envelope> {
     })
 }
 
-/// Whose bucket a request comes out of, and which limit holds it: a service key's own (by its hash), a
-/// file key's (by its hash), or a person's (by the identity verified). None: the operator's admin key
+/// Whose bucket a request comes out of, and which limit holds it: a service key's own (by its hash), or a
+/// person's (by the identity verified; a keys-file key's user, apart from that person's sign-ins). None: the operator's admin key
 /// (the deployment's own, which can change anything anyway), or a server that doesn't identify callers.
 fn limit_key(
     state: &State,
@@ -9313,17 +9190,15 @@ fn limit_key(
         };
         return Some((class, format!("key:{}", k.sha256)));
     }
-    if let Some(sha) = &via.file_key {
-        return Some((ratelimit::Class::Default, format!("file:{sha}")));
-    }
     // A person an org's own provider signed in is that provider's word only: its bucket is apart from
     // the same name signed in elsewhere, so an org's provider can't drain someone else's bucket by
-    // minting tokens in their name. (Org names come from the directory.)
-    let via_org = via
-        .orgs
-        .as_ref()
-        .map(|o| format!(" via {}", o.iter().cloned().collect::<Vec<_>>().join(",")))
-        .unwrap_or_default();
+    // minting tokens in their name. (Org names come from the directory.) A keys-file key, bound to no org, is
+    // apart from its user's own sign-ins in the same way.
+    let via_org = match &via.orgs {
+        Some(o) if o.is_empty() && !via.person => " via the keys file".to_string(),
+        Some(o) => format!(" via {}", o.iter().cloned().collect::<Vec<_>>().join(",")),
+        None => String::new(),
+    };
     Some((
         ratelimit::Class::Default,
         format!(
@@ -9343,7 +9218,7 @@ async fn audit_read(
     route: &'static str,
     reads: &Reads,
 ) {
-    let (org, actor) = match key_caller(state, via, scope).await {
+    let (org, actor) = match key_caller(state, via).await {
         Some((org, key)) => (Some(org), key),
         None => match who {
             Some(w) => (
@@ -10560,7 +10435,6 @@ async fn mcp(
                     .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default()),
                 "list_advice" => {
                     let admin = via.key.is_none()
-                        && via.file_key.is_none()
                         && match scope.org_name() {
                             Some(org) => crate::people::directory::Directory::load(&store)
                                 .await

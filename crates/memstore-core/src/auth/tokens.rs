@@ -27,6 +27,7 @@ struct ApiKeyRow {
 }
 
 /// A verified API key's caller.
+#[derive(Clone, Debug)]
 pub struct KeyCaller {
     pub id: String,
     pub user: String,
@@ -360,9 +361,6 @@ pub struct OrgKey {
     pub sources: Vec<String>,
     #[serde(skip)]
     pub sha256: String,
-    /// A verified import of a file key: it, and only it, takes that file key's place.
-    #[serde(skip)]
-    pub replaces_file_key: bool,
 }
 
 impl OrgKey {

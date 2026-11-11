@@ -443,7 +443,6 @@ pub(super) async fn approve(state: &State, token: Option<&str>) -> Shown {
             ..Default::default()
         },
         owner: false,
-        vouched_keys: Default::default(),
         file_keys: Default::default(),
     };
     let change = Change::Invite {

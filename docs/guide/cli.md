@@ -109,7 +109,7 @@ ampup-memory workspace gc                                   # delete those past 
 | `ampup-memory users disable\|enable\|forget` | Disable or forget a person. |
 | `ampup-memory acl set <url> <acl> --source-prefix p \| --source s \| --episode id --key k` | Change episodes' ACLs. |
 | `ampup-memory audit [--org o] [--since 7d] [--kind k] [--json]` | The audit log. |
-| `ampup-memory keys new\|revoke` | Admin keys in a keys file (other keys: `apikey`). |
+| `ampup-memory keys new\|revoke` | Keys in a keys file: admin keys, and a single-scope server's (an org's keys: `apikey`). |
 
 ## Maintenance and checks
 

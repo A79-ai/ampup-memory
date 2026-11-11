@@ -334,13 +334,13 @@ fn refused(msg: String) -> anyhow::Error {
 }
 
 /// Whether `actor` may delete, forget or export in `org`: the operator anywhere; an org's admins in their
-/// own org, signed in as a person (never a service or file key).
+/// own org, signed in as a person (never a key: a keys-file key is bound to no org).
 fn may_manage(dir: &Directory, actor: &Actor, org: &str, what: &str) -> Result<()> {
     if actor.superuser {
         return Ok(());
     }
     let me = &actor.user;
-    if actor.via.key.is_some() || actor.via.file_key.is_some() {
+    if actor.via.key.is_some() {
         return Err(refused(format!("{me} is a service key: it may not {what}")));
     }
     if !dir.is_admin(me, &actor.via, org) {

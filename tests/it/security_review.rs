@@ -1,8 +1,8 @@
 //! Holes found in hardening the server, each driven end to end on a real
 //! `memstore serve` over HTTP and a local catalog, with the caller who must be refused refused:
 //!
-//! - a file key the keys file gives an org admin's name manages nothing: no keys, no members, no
-//!   identity provider, no schema (it is a service key, as the audit and offboarding already say);
+//! - a file key the keys file gives an org admin's name reads and manages nothing of the org: it reads the
+//!   server's own scope, and changes no keys, members, identity provider or schema;
 //! - a member who writes the same text as someone else's `remember_memory` episode writes an episode of
 //!   their own: they can't re-ACL (hide or widen) the other author's episode;
 //! - an org's admin can't name another org's `env:AMPUP_MEMORY_IDP_SECRET_…` variable as their client
@@ -15,11 +15,14 @@
 //! - the keys file is read again when it changes: a key taken out stops working within seconds, a new one
 //!   works, and a file that doesn't parse keeps the keys last read and says so;
 //! - one bearer is one caller on every server: a directory key made with a file key's plaintext (through a
-//!   server whose keys file doesn't hold it) leaves the bearer refused where the file does hold it;
+//!   server whose keys file doesn't hold it) is that directory key where the file does hold it too;
 //! - removing a person (from the org or a team, or forgetting them) revokes the keys imported in their name,
-//!   and a key whose person a planner from before left behind reads nothing;
-//! - an org that requires its own provider takes no other sign-in: not the server's provider, an app's
-//!   JWT or a file key, only its provider and its own keys; and file keys aren't imported into it;
+//!   and a key whose person a planner from before left behind reads nothing; only the operator imports, and
+//!   only the rows its server's keys file holds;
+//! - an org that requires its own provider takes no other sign-in: not the server's provider or an app's
+//!   JWT, only its provider and its own keys; and file keys aren't imported into it;
+//! - a server that reads every request through the directory takes no non-admin file key: it imports those
+//!   a directory key reads just as much as, and refuses and names the rest;
 //! - a member's view of their org is themselves, the whole view is its admins';
 //! - closure groups pushed for an email don't reach a sign-in through an org's own provider, which
 //!   says what the email is;
@@ -343,18 +346,33 @@ async fn post(server: &str, path: &str, bearer: &str, body: &Value) -> (u16, Val
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_file_key_in_an_org_admin_s_name_manages_nothing() {
+async fn a_file_key_in_an_org_admin_s_name_reads_and_manages_nothing_of_the_org() {
     let (s, issuer, _dir) = start().await;
     let alice = id_token(&issuer, "alice@acme.com");
 
-    // The file key acts as alice where it reads (her org's memory), so it is no stranger to acme.
+    // The file key acts as alice in this server's own scope, and is bound to no org: alice's org is not its.
     let (status, me) = post(&s, "/me", ALICE_FILE_KEY, &json!({})).await;
     assert_eq!(status, 200, "{me}");
-    assert_eq!(me["memberships"]["acme"]["role"], "admin", "{me}");
+    assert_eq!(me["user"], "alice@acme.com", "{me}");
+    assert_eq!(me["scope"], "org", "{me}");
+    assert!(
+        me["memberships"].as_object().is_none_or(|m| m.is_empty()),
+        "a keys-file key is a member of its user's orgs: {me}"
+    );
+    let (status, me) = me_in(&s, ALICE_FILE_KEY, "acme").await;
+    assert_eq!(status, 200, "{me}");
+    assert!(
+        me["scope"].is_null(),
+        "a keys-file key reads its user's org: {me}"
+    );
+    assert!(
+        me["refused"].as_str().unwrap().contains("keys-file key"),
+        "{me}"
+    );
 
-    // But it is a service key: every change to the org is refused, whatever name the keys file gives it.
-    // Each of these would hand its holder the org for good (a directory key that outlives the file key,
-    // a new admin, the org's sign-in redirected to a provider of their own, the memory's schema).
+    // Every change to the org is refused, whatever name the keys file gives it. Each of these would hand its
+    // holder the org for good (a directory key that outlives the file key, a new admin, the org's sign-in
+    // redirected to a provider of their own, the memory's schema).
     let key = format!("msk_{}backdoor", uuid::Uuid::new_v4().simple());
     let changes = [
         json!({"op": "create_key", "org": "acme", "name": "backdoor", "role": "writer", "key": key}),
@@ -368,11 +386,19 @@ async fn a_file_key_in_an_org_admin_s_name_manages_nothing() {
     for change in &changes {
         let (status, body) = post(&s, "/admin", ALICE_FILE_KEY, change).await;
         assert_eq!(status, 403, "{change}: {body}");
-        assert!(
-            body["error"].as_str().unwrap().contains("a service key"),
-            "{change}: {body}"
-        );
     }
+    // Nor does it read the org's view.
+    let (status, body) = post(
+        &s,
+        "/admin",
+        ALICE_FILE_KEY,
+        &json!({"op": "show", "org": "acme"}),
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "a keys-file key read its user's org's view: {body}"
+    );
     let (_, view) = post(
         &s,
         "/admin",
@@ -480,12 +506,12 @@ async fn an_org_s_schema_is_read_by_its_members_and_set_by_its_admins() {
     );
     let get = json!({"op": "get_schema", "org": "acme", "history": true});
 
-    // Nobody but acme's admin sets its schema: not a member, not another org's admin, not a service key
-    // in the admin's name.
+    // Nobody but acme's admin sets its schema: not a member, not another org's admin, not a file key in the
+    // admin's name.
     for (who, bearer) in [
         ("a member", &bob),
         ("another org's admin", &gary),
-        ("a service key", &ALICE_FILE_KEY.to_string()),
+        ("a file key", &ALICE_FILE_KEY.to_string()),
     ] {
         let (status, body) = post(&s, "/admin", bearer, &set(&v1, false)).await;
         assert_eq!(status, 403, "{who} set acme's schema: {body}");
@@ -562,7 +588,7 @@ async fn an_org_s_schema_is_read_by_its_members_and_set_by_its_admins() {
     assert!(got.get("schema").is_none(), "{got}");
 
     // The CLI, signed in with a key (a person's browser sign-in can't be scripted): the operator's reads and
-    // sets; a file key in the org admin's name is a service key, refused.
+    // sets; a file key in the org admin's name is refused.
     let file = dir.path().join("schema.json");
     let v3 = schema(&["doc:alpha:", "doc:beta:", "doc:gamma:"]);
     std::fs::write(&file, v3.to_string()).unwrap();
@@ -586,7 +612,7 @@ async fn an_org_s_schema_is_read_by_its_members_and_set_by_its_admins() {
         assert!(ok, "{home} login: {err}");
     }
     let (ok, _, _) = cli("file-key", &["org", "set-schema", "acme", path]);
-    assert!(!ok, "a service key set the schema");
+    assert!(!ok, "a file key set the schema");
     let (_, got) = post(&s, "/admin", &alice, &get).await;
     assert_eq!(got["history"].as_array().unwrap().len(), 2, "{got}");
     let (ok, out, err) = cli("operator", &["org", "schema", "acme", "--history"]);
@@ -946,8 +972,12 @@ async fn one_bearer_is_one_caller_on_every_server() {
             "{body}"
         );
     }
-    let (_, me) = me_in(&s, CAROL_FILE_KEY, "acme").await;
+    // Carol's file key acts as carol in this server's own scope, and reads none of her org.
+    let (_, me) = post(&s, "/me", CAROL_FILE_KEY, &json!({})).await;
     assert_eq!(me["user"], "carol@acme.com", "{me}");
+    assert_eq!(me["scope"], "org", "{me}");
+    let (_, me) = me_in(&s, CAROL_FILE_KEY, "acme").await;
+    assert!(me["scope"].is_null(), "{me}");
 
     // A second server on the same catalog, whose keys file holds the admin key only: there, carol's file key
     // is nobody's, and alice makes a directory key of it.
@@ -967,16 +997,19 @@ async fn one_bearer_is_one_caller_on_every_server() {
     let (_, me) = me_in(&other, CAROL_FILE_KEY, "acme").await;
     assert_eq!(me["user"], "key:acme/twin", "{me}");
 
-    // Where the keys file holds it, the bearer is now two callers: neither (once the first server sees the
-    // key, within its 5 s cache), never carol there and the key here.
+    // Where the keys file holds it too, the bearer is now the directory's key (once the first server sees it,
+    // within its 5 s cache): one caller on both servers, never carol there and the key here.
     assert!(
-        within(|| async { post(&s, "/me", CAROL_FILE_KEY, &json!({})).await.0 == 401 }).await,
-        "a bearer that is a file key here and a directory key there is served as the file key here"
+        within(|| async {
+            post(&s, "/me", CAROL_FILE_KEY, &json!({})).await.1["user"] == "key:acme/twin"
+        })
+        .await,
+        "a bearer that is a directory key there is a file key here"
     );
-    let (status, me) = me_in(&s, CAROL_FILE_KEY, "acme").await;
-    assert_eq!(status, 401, "{me}");
+    let (_, me) = post(&s, "/me", CAROL_FILE_KEY, &json!({})).await;
+    assert_eq!(me["scope"], "org:acme", "{me}");
 
-    // Revoked, the file key is the file's again.
+    // Revoked, the file key is the file's again: carol, in this server's own scope.
     let (status, body) = post(
         &other,
         "/admin",
@@ -986,15 +1019,21 @@ async fn one_bearer_is_one_caller_on_every_server() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert!(
-        within(|| async { me_in(&s, CAROL_FILE_KEY, "acme").await.1["user"] == "carol@acme.com" })
-            .await,
-        "the file key stayed refused after the directory key was revoked"
+        within(|| async {
+            post(&s, "/me", CAROL_FILE_KEY, &json!({})).await.1["user"] == "carol@acme.com"
+        })
+        .await,
+        "the file key stayed the directory's after the directory key was revoked"
     );
+    let (_, me) = post(&s, "/me", CAROL_FILE_KEY, &json!({})).await;
+    assert_eq!(me["scope"], "org", "{me}");
+    assert_eq!(post(&other, "/me", CAROL_FILE_KEY, &json!({})).await.0, 401);
 }
 
 /// A file key imported into the directory reads no more than its person does. Removing them from the org, or
-/// from the team the key reads, or forgetting them, revokes it in the same commit (and its file twin with it);
-/// and a key whose person a planner from before this left behind (a removal with no revoke) reads nothing.
+/// from the team the key reads, or forgetting them, revokes it in the same commit (its file twin is back to
+/// this server's own scope, never the org's); and a key whose person a planner from before this left behind (a
+/// removal with no revoke) reads nothing. Only the operator imports, and only rows this server's file holds.
 #[tokio::test(flavor = "multi_thread")]
 async fn removing_a_person_revokes_the_keys_imported_in_their_name() {
     let (s, issuer, _dir, catalog) = start_on(true).await;
@@ -1006,22 +1045,58 @@ async fn removing_a_person_revokes_the_keys_imported_in_their_name() {
         let (status, body) = post(&s, "/admin", &alice, &change).await;
         assert_eq!(status, 200, "{change}: {body}");
     }
-    // Each person's file key imports itself: carol's into her team, the others' into the org.
-    for (key, team) in [
-        (BOB_FILE_KEY, None),
-        (CAROL_FILE_KEY, Some("deals")),
-        (DAN_FILE_KEY, None),
-        (ERIN_FILE_KEY, None),
+    let rows = keys_file_rows();
+    let row = |id: &str| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    let import = |team: Option<&str>, keys: Value| json!({"op": "import_keys", "org": "acme", "team": team, "role": "reader", "keys": keys});
+    // A file key doesn't import itself, nor does the org's admin: the operator does.
+    for bearer in [BOB_FILE_KEY, alice.as_str()] {
+        let (status, body) =
+            post(&s, "/admin", bearer, &import(None, json!([row("bobfile")]))).await;
+        assert_eq!(status, 403, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("only the operator"),
+            "{body}"
+        );
+    }
+    // Only a row this server's keys file holds, as the file holds it: a row the request makes up is refused,
+    // and a hash the request swaps in is the file's again.
+    let made_up = json!([{"id": "nobody", "sha256": sha("msk_a_key_no_keys_file_holds_here"), "user": "bob@acme.com"}]);
+    let (status, body) = post(&s, "/admin", ADMIN_KEY, &import(None, made_up)).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("holds no key nobody"),
+        "{body}"
+    );
+    let mut swapped = row("bobfile");
+    swapped["sha256"] = json!(sha("msk_a_key_no_keys_file_holds_here"));
+    // The operator imports each person's file key: carol's into her team, the others' into the org.
+    for (team, keys) in [
+        (None, json!([swapped, row("danfile"), row("erinfile")])),
+        (Some("deals"), json!([row("carolfile")])),
     ] {
-        let (status, body) = post(
-            &s,
-            "/admin",
-            key,
-            &json!({"op": "import_keys", "org": "acme", "team": team, "role": "reader", "self": true}),
-        )
-        .await;
+        let (status, body) = post(&s, "/admin", ADMIN_KEY, &import(team, keys)).await;
         assert_eq!(status, 200, "{body}");
     }
+    assert_eq!(
+        post(&s, "/me", "msk_a_key_no_keys_file_holds_here", &json!({}))
+            .await
+            .0,
+        401,
+        "an import took the request's hash, not the keys file's"
+    );
     // A key selecting nothing gets its own scope.
     let scope_of = |key: &'static str| {
         let s = s.clone();
@@ -1077,22 +1152,17 @@ async fn removing_a_person_revokes_the_keys_imported_in_their_name() {
         );
         assert!(!keys().await.contains(&gone.to_string()), "{change}");
     }
-    // Refused (within the 5 s key cache), the file twin too: the revoke retired its hash, so it is not read
-    // as the person any more either.
+    // Within the 5 s key cache, the file twin reads this server's own scope again, and nothing of the org.
     for key in [BOB_FILE_KEY, CAROL_FILE_KEY, DAN_FILE_KEY] {
         assert!(
-            within(|| async { post(&s, "/me", key, &json!({})).await.0 == 401 }).await,
-            "a key imported in a removed person's name still signs in"
+            within(|| async { scope_of(key).await == "org" }).await,
+            "a key imported in a removed person's name still reads the org"
         );
+        let (_, me) = me_in(&s, key, "acme").await;
+        assert!(me["scope"].is_null(), "{me}");
+        let (_, me) = post(&s, "/me", key, &json!({})).await;
+        assert!(me["memberships"].as_object().unwrap().is_empty(), "{me}");
     }
-    let (status, body) = post(
-        &s,
-        "/admin",
-        BOB_FILE_KEY,
-        &json!({"op": "import_keys", "org": "acme", "role": "reader", "self": true}),
-    )
-    .await;
-    assert_eq!(status, 401, "a revoked key imported itself again: {body}");
 
     // Erin removed by a planner from before this (a removal, and no revoke): her key reads nothing.
     Store::new(catalog)
@@ -1113,8 +1183,8 @@ async fn removing_a_person_revokes_the_keys_imported_in_their_name() {
 }
 
 /// An org that requires its own identity provider takes no other way in, a person's or a service's: not the
-/// server's provider, not an app's JWT, not a file key in a member's name. Its provider and its own keys get
-/// in; a file key isn't imported into it. Its members see themselves in its view, its admins the whole of it.
+/// server's provider, not an app's JWT (a file key in a member's name reads no org at all). Its provider and
+/// its own keys get in; a file key isn't imported into it. Its members see themselves in its view, its admins the whole of it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_org_that_requires_its_provider_takes_no_other_sign_in() {
     let (s, issuer, _dir) = start().await;
@@ -1139,22 +1209,26 @@ async fn an_org_that_requires_its_provider_takes_no_other_sign_in() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    let ways: [(&str, &str); 5] = [
+    let ways: [(&str, &str); 4] = [
         ("the server's provider", &carol),
         ("an app's JWT", &carol_app),
-        ("a file key", CAROL_FILE_KEY),
         ("acme's provider", &carol_own),
         (
             "acme's own key",
             "msk_acmes_own_reader_key_for_the_review_x",
         ),
     ];
-    // Not required: every way in reads acme.
+    // Not required: every way in reads acme, but a file key in a member's name.
     for (way, bearer) in ways {
         let (status, me) = me_in(&s, bearer, "acme").await;
         assert_eq!(status, 200, "{way}: {me}");
         assert!(me["scope"].is_string(), "{way}: {me}");
     }
+    let (_, me) = me_in(&s, CAROL_FILE_KEY, "acme").await;
+    assert!(
+        me["scope"].is_null(),
+        "a file key reads its user's org: {me}"
+    );
 
     // Required: its provider and its keys only.
     let (status, body) = post(&s, "/admin", &alice, &provider(true)).await;
@@ -1174,12 +1248,14 @@ async fn an_org_that_requires_its_provider_takes_no_other_sign_in() {
             );
         }
     }
-    // A file key isn't imported into it: the import would read more than the key does.
+    // A file key isn't imported into it, even by the operator: the import would read more than its user does.
+    let carolfile = keys_file_rows()[3].clone();
+    assert_eq!(carolfile["id"], "carolfile");
     let (status, body) = post(
         &s,
         "/admin",
-        CAROL_FILE_KEY,
-        &json!({"op": "import_keys", "org": "acme", "role": "reader", "self": true}),
+        ADMIN_KEY,
+        &json!({"op": "import_keys", "org": "acme", "role": "reader", "keys": [carolfile]}),
     )
     .await;
     assert_eq!(status, 403, "{body}");
@@ -1259,13 +1335,14 @@ async fn closure_groups_don_t_reach_a_sign_in_through_an_org_s_own_provider() {
     );
 }
 
-/// Non-admin file keys are being retired. A server that reads every request through the directory imports each
-/// one a directory key reads exactly as much as (its user in one org and in none of its teams, no groups): the
-/// same bearer, now the directory's key. Revoked there, it is refused with no restart and never imported again.
-/// A key no directory key would read just as much as stays the file's, named by the server, never its key.
+/// A server that reads every request through the directory takes no non-admin file key. It imports each one a
+/// directory key reads exactly as much as (its user in one org and in none of its teams, no groups): the same
+/// bearer, now the directory's key. Revoked there, it is refused with no restart and never imported again. The
+/// rest are refused, and named by the server (id and user, never the key). A server that serves its own scope
+/// takes them, for that scope alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_file_key_becomes_the_directory_s_only_as_what_it_reads() {
-    let (s, issuer, dir) = start_tuned(true, |o| Options {
+    let (s, issuer, dir, catalog) = start_on_tuned(true, |o| Options {
         directory_only: true,
         ..o
     })
@@ -1322,11 +1399,39 @@ async fn a_file_key_becomes_the_directory_s_only_as_what_it_reads() {
         json!({"id": "lenfile", "sha256": sha(LEN), "user": "len@acme.com"}),
     ]);
     std::fs::write(dir.path().join("keys.json"), json!(rows).to_string()).unwrap();
+    let metrics = |s: String| async move {
+        let r = CLIENT
+            .get(format!("{s}/metrics"))
+            .bearer_auth(ADMIN_KEY)
+            .send()
+            .await
+            .unwrap();
+        r.text().await.unwrap()
+    };
+    let line = |id: &str, user: &str, state: &str| {
+        format!("memstore_file_keys{{id=\"{id}\",state=\"{state}\",user=\"{user}\"}} 1")
+    };
+    // The server reads the new rows, and names each key it takes no more.
     assert!(
-        within(|| async { user_of(LEN).await == (200, "len@acme.com".into()) }).await,
-        "a key put in the keys file doesn't work"
+        within(|| async {
+            let m = metrics(s.clone()).await;
+            ["halfile", "ivyfile", "jayfile", "lenfile"]
+                .iter()
+                .all(|id| m.contains(&format!("id=\"{id}\",state=\"ignored\"")))
+                && m.contains(&line("bobfile", "bob@acme.com", "imported"))
+        })
+        .await,
+        "the file keys aren't reported: {}",
+        metrics(s.clone()).await
     );
-    // Len joins acme: the same bearer, working as his file key a moment ago, is acme's key now.
+    for key in [HAL, IVY, JAY, LEN] {
+        assert_eq!(
+            user_of(key).await.0,
+            401,
+            "a server that reads every request through the directory took a file key"
+        );
+    }
+    // Len joins acme: the same bearer, refused a moment ago, is acme's key now.
     let (status, body) = post(
         &s,
         "/admin",
@@ -1339,46 +1444,15 @@ async fn a_file_key_becomes_the_directory_s_only_as_what_it_reads() {
         within(|| async { user_of(LEN).await == (200, "key:acme/lenfile".into()) }).await,
         "a file key whose user joined one org wasn't imported"
     );
-    // The others stay the file's, and the server says so for each, by id and user only.
-    let metrics = || {
-        let s = s.clone();
-        async move {
-            let r = CLIENT
-                .get(format!("{s}/metrics"))
-                .bearer_auth(ADMIN_KEY)
-                .send()
-                .await
-                .unwrap();
-            r.text().await.unwrap()
-        }
-    };
-    let line = |id: &str, user: &str, state: &str| {
-        format!("memstore_file_keys{{id=\"{id}\",state=\"{state}\",user=\"{user}\"}} 1")
-    };
-    assert!(
-        within(|| async {
-            let m = metrics().await;
-            m.contains(&line("halfile", "hal@acme.com", "file"))
-                && m.contains(&line("ivyfile", "ivy@acme.com", "file"))
-                && m.contains(&line("jayfile", "jay@acme.com", "file"))
-                && m.contains(&line("bobfile", "bob@acme.com", "imported"))
-        })
-        .await,
-        "the file keys aren't reported: {}",
-        metrics().await
-    );
-    for (key, user) in [
-        (HAL, "hal@acme.com"),
-        (IVY, "ivy@acme.com"),
-        (JAY, "jay@acme.com"),
-    ] {
+    // The others stay refused.
+    for key in [HAL, IVY, JAY] {
         assert_eq!(
-            user_of(key).await,
-            (200, user.to_string()),
-            "a file key no directory key reads just as much as was imported"
+            user_of(key).await.0,
+            401,
+            "a file key was imported that reads more than it may"
         );
     }
-    let m = metrics().await;
+    let m = metrics(s.clone()).await;
     for key in [BOB_FILE_KEY, HAL, IVY, JAY, LEN, ADMIN_KEY] {
         assert!(
             !m.contains(key) && !m.contains(&sha(key)),
@@ -1401,12 +1475,12 @@ async fn a_file_key_becomes_the_directory_s_only_as_what_it_reads() {
     );
     assert!(
         within(|| async {
-            metrics()
+            metrics(s.clone())
                 .await
-                .contains(&line("bobfile", "bob@acme.com", "refused"))
+                .contains(&line("bobfile", "bob@acme.com", "ignored"))
         })
         .await,
-        "a revoked file key isn't reported refused"
+        "a revoked file key isn't reported ignored"
     );
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
@@ -1422,6 +1496,38 @@ async fn a_file_key_becomes_the_directory_s_only_as_what_it_reads() {
     )
     .await;
     assert!(v["view"]["keys"].get("bobfile").is_none(), "{v}");
+
+    // A server on the same catalog that serves its own scope takes hal's key, for that scope: no org's memory,
+    // and no ALERT for it.
+    let single = serve_on(
+        &catalog,
+        dir.path(),
+        "single-keys.json",
+        &json!([
+            {"id": "platform", "sha256": sha(ADMIN_KEY), "user": "svc:platform", "admin": true},
+            {"id": "halfile", "sha256": sha(HAL), "user": "hal@acme.com"},
+        ]),
+        &issuer,
+        true,
+        |o| o,
+    )
+    .await;
+    let (status, me) = post(&single, "/me", HAL, &json!({})).await;
+    assert_eq!((status, me["scope"].clone()), (200, json!("org")), "{me}");
+    let (_, me) = me_in(&single, HAL, "acme").await;
+    assert!(me["scope"].is_null(), "{me}");
+    let (_, me) = me_in(&single, HAL, "acme").await;
+    assert!(me["memberships"].as_object().unwrap().is_empty(), "{me}");
+    assert!(
+        within(|| async {
+            metrics(single.clone())
+                .await
+                .contains(&line("halfile", "hal@acme.com", "scope"))
+        })
+        .await,
+        "a file key on a server that serves its own scope isn't reported: {}",
+        metrics(single.clone()).await
+    );
 }
 
 /// User ids fold ASCII letters only: an email that only Unicode case rules fold into a member's (a Kelvin sign

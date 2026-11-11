@@ -349,10 +349,9 @@ impl Event {
                 Some(k) => {
                     format!(
                         "{} {} key {} for {}{}",
-                        match (&k.imported_from, k.verified) {
-                            (Some(f), true) => format!("import file key {f} as"),
-                            (Some(f), false) => format!("import file key {f} (unverified) as"),
-                            (None, _) => "create".into(),
+                        match k.imported_user() {
+                            Some(u) => format!("import a file key acting as {u} as"),
+                            None => "create".into(),
                         },
                         k.role.as_str(),
                         k.name,
@@ -586,10 +585,6 @@ pub struct ServiceKey {
     /// the servers' usage records ([`Directory::with_usage`]) for views. None: never (or not looked up).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<i64>,
-    /// A verified import of a file key: it stands for that file key wherever a server still lists it.
-    /// No other directory key ever does, whatever its hash.
-    #[serde(skip)]
-    pub verified_import: bool,
     /// The user an imported file key acted as ([`user_id`]): it reads its scope only while they are a
     /// member there, and removing them revokes it.
     #[serde(skip)]
@@ -608,13 +603,10 @@ pub struct KeyDetail {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<String>,
     pub created_by: String,
-    /// Imported from a keys file: the row's id and the user it acted as (`ci (svc:ci)`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// On imports from before `imported_user` was written: the row's id and the user it acted as
+    /// (`ci (svc:ci)`). Read for [`KeyDetail::imported_user`] only, and never written.
+    #[serde(default, skip_serializing)]
     pub imported_from: Option<String>,
-    /// The import was checked against the file key itself: by a server holding a key with this sha256
-    /// (the row matched it), or by the catalog's owner. Only such a key takes the file key's place.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub verified: bool,
     /// The user the imported file key acted as ([`user_id`]); on imports before it was written, read from
     /// `imported_from` ([`KeyDetail::imported_user`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -779,7 +771,8 @@ const PUBLIC_MAIL: [&str; 12] = [
 pub struct SignIn {
     /// Signed in through an identity provider (a person), not with an API key or an app's token.
     pub person: bool,
-    /// Signed in through these orgs' own provider: they may act in these orgs only.
+    /// Signed in through these orgs' own provider: they may act in these orgs only. Bound to none
+    /// (`Some` of nothing): they act in no org, as a keys-file key, which reads its server's own scope only.
     pub orgs: Option<BTreeSet<String>>,
     /// The groups that provider says they are in.
     pub groups: Vec<String>,
@@ -787,8 +780,6 @@ pub struct SignIn {
     pub verified_email: bool,
     /// Signed in with an org's service key: it holds its own scope and nothing else.
     pub key: Option<crate::auth::OrgKey>,
-    /// Signed in with a (non-admin) file key: its sha256. Making a request with it proves holding it.
-    pub file_key: Option<String>,
     /// Signed in through the platform's Auth0 tenant: only the org bound to the Auth0 Organization the
     /// token was issued for counts it ([`Directory::vouched`]); none, if it names none.
     pub auth0: bool,
@@ -1317,7 +1308,6 @@ struct SnapKey {
     created_by: String,
     created_at: i64,
     sha256: String,
-    verified_import: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     imported_user: Option<String>,
 }
@@ -1391,7 +1381,7 @@ fn chain(prev: &str, e: &Event) -> String {
 
 /// What a snapshot's state means changes when the fold does: a snapshot of another format is never
 /// loaded (the log is replayed instead). Bump it with any change to what [`Directory::apply_events`] does.
-pub const SNAPSHOT_FORMAT: i64 = 10;
+pub const SNAPSHOT_FORMAT: i64 = 11;
 
 /// A folded snapshot of the directory log (`memory_system.directory_snapshot`): the state after the log's
 /// first `events` changes, the last of them at `at`.
@@ -1545,10 +1535,6 @@ pub fn snapshot_problems(events: &[Event], snap: &Snapshot) -> Vec<String> {
 #[derive(Clone, Debug, Serialize)]
 pub struct Directory {
     pub orgs: BTreeMap<String, Org>,
-    /// sha256 of every verified file-key import revoked (or gone with its team or org) and not imported
-    /// again: that file key stays refused, though a keys file may still list it.
-    #[serde(skip)]
-    pub retired_keys: BTreeSet<String>,
     /// Orgs deleted whose memory isn't known to be purged yet (`org.delete` with no `org.purged` after
     /// it): nobody can create one of these names again until `memstore org delete` has finished it.
     #[serde(skip)]
@@ -1601,7 +1587,6 @@ impl Directory {
     pub fn empty() -> Self {
         Directory {
             orgs: BTreeMap::from([(DEFAULT_ORG.into(), Org::default())]),
-            retired_keys: BTreeSet::new(),
             purging: BTreeSet::new(),
             purged: BTreeSet::new(),
             disabled: BTreeMap::new(),
@@ -1613,7 +1598,6 @@ impl Directory {
     /// Apply `events`, which come after every change already folded in, in order.
     pub fn apply_events(&mut self, events: &[Event]) {
         let orgs = &mut self.orgs;
-        let retired = &mut self.retired_keys;
         let purging = &mut self.purging;
         let purged = &mut self.purged;
         for e in events {
@@ -1668,14 +1652,7 @@ impl Directory {
             }
             if e.op == "org.delete" {
                 purging.insert(e.org.clone());
-                if let Some(o) = orgs.remove(&e.org) {
-                    retired.extend(
-                        o.keys
-                            .into_values()
-                            .filter(|k| k.verified_import)
-                            .map(|k| k.sha256),
-                    );
-                }
+                orgs.remove(&e.org);
                 continue;
             }
             let Some(org) = orgs.get_mut(&e.org) else {
@@ -1689,13 +1666,7 @@ impl Directory {
                     org.teams.remove(t);
                     org.team_settings.remove(t);
                     // A team made again later is a new team: its old keys don't come back with it.
-                    org.keys.retain(|_, k| {
-                        let gone = k.team.as_deref() == Some(t);
-                        if gone && k.verified_import {
-                            retired.insert(k.sha256.clone());
-                        }
-                        !gone
-                    });
+                    org.keys.retain(|_, k| k.team.as_deref() != Some(t));
                 }
                 ("member.add", _, Some(u)) => {
                     let role = e.role.as_deref().and_then(|r| Role::parse(r).ok());
@@ -1795,10 +1766,6 @@ impl Directory {
                         .as_deref()
                         .and_then(|d| serde_json::from_str::<KeyDetail>(d).ok())
                     {
-                        let verified_import = k.imported_from.is_some() && k.verified;
-                        if verified_import {
-                            retired.remove(&k.sha256);
-                        }
                         let imported_user = k.imported_user();
                         org.keys.insert(
                             k.name,
@@ -1811,7 +1778,6 @@ impl Directory {
                                 created_at: e.at,
                                 sha256: k.sha256,
                                 last_used_at: None,
-                                verified_import,
                                 imported_user,
                             },
                         );
@@ -1828,10 +1794,8 @@ impl Directory {
                     }
                 }
                 ("key.revoke", _, _) => {
-                    if let Some(k) = e.detail.as_ref().and_then(|name| org.keys.remove(name))
-                        && k.verified_import
-                    {
-                        retired.insert(k.sha256);
+                    if let Some(name) = &e.detail {
+                        org.keys.remove(name);
                     }
                 }
                 // A known op missing what it acts on (no user, no team), or `member.forget` (a record only).
@@ -1875,7 +1839,6 @@ impl Directory {
                             created_by: k.created_by.clone(),
                             created_at: k.created_at,
                             sha256: k.sha256.clone(),
-                            verified_import: k.verified_import,
                             imported_user: k.imported_user.clone(),
                         };
                         (n.clone(), key)
@@ -1901,7 +1864,7 @@ impl Directory {
                 (name, org)
             })
             .collect();
-        json!({"orgs": orgs, "retired_keys": self.retired_keys, "purging": self.purging,
+        json!({"orgs": orgs, "purging": self.purging,
                "purged": self.purged, "disabled": self.disabled,
                "closure_edits": self.closure_edits, "team_csv": self.team_csv})
         .to_string()
@@ -1912,7 +1875,6 @@ impl Directory {
         #[derive(Deserialize)]
         struct Snap {
             orgs: BTreeMap<String, SnapOrg>,
-            retired_keys: BTreeSet<String>,
             #[serde(default)]
             purging: BTreeSet<String>,
             #[serde(default)]
@@ -1942,7 +1904,6 @@ impl Directory {
                             created_at: k.created_at,
                             sha256: k.sha256,
                             last_used_at: None,
-                            verified_import: k.verified_import,
                             imported_user: k.imported_user,
                         };
                         (n, key)
@@ -1970,7 +1931,6 @@ impl Directory {
             .collect();
         Ok(Directory {
             orgs,
-            retired_keys: snap.retired_keys,
             purging: snap.purging,
             purged: snap.purged,
             disabled: snap.disabled,
@@ -2087,9 +2047,9 @@ impl Directory {
                     .get(org)
                     .is_some_and(|o| o.provider.as_ref().is_none_or(|p| !p.required));
         }
-        // Bound to orgs (their own provider): those orgs alone. Bound to none: any org that doesn't require its
-        // own provider. That is every other way in, a person's or not: the server's provider, a gateway (IAP,
-        // a Google ID token, Snowflake), an app's JWT, a file key (whatever user the keys file names). An
+        // Bound to orgs (their own provider): those orgs alone; a keys-file key is bound to none of them. Not
+        // bound: any org that doesn't require its own provider. That is every other way in, a person's or not:
+        // the server's provider, a gateway (IAP, a Google ID token, Snowflake), an app's JWT. An
         // org's own keys never get here ([`Self::access`] holds a key to its scope first): the org's admins
         // make them, so they are how a service reaches an org that requires its provider.
         match &via.orgs {
@@ -2570,6 +2530,16 @@ impl Directory {
                 k.org
             );
         }
+        // A keys-file key (bound to no org) reads its server's own scope: the directory gives it nothing.
+        if !via.person
+            && !via.auth0
+            && via.key.is_none()
+            && via.orgs.as_ref().is_some_and(|o| o.is_empty())
+        {
+            anyhow::bail!(
+                "{user} signed in with a keys-file key, which reads this server's own scope only: an org's memory takes one of the org's keys (ampup-memory apikey create)"
+            );
+        }
         let (org, team) = match &via.key {
             Some(k) if org.is_none() && team.is_none() => (Some(k.org.as_str()), k.team.as_deref()),
             _ => (org, team),
@@ -2633,11 +2603,8 @@ pub struct Actor {
     pub superuser: bool,
     /// How they signed in (an org admin signed in through another org's provider is no admin here).
     pub via: SignIn,
-    /// The catalog's owner, reaching it directly: their imports count as verified (they hold the keys
-    /// files as much as the catalog).
+    /// The catalog's owner, reaching it directly.
     pub owner: bool,
-    /// sha256 of the file keys the server checked an import's rows against, and found them to be.
-    pub vouched_keys: BTreeSet<String>,
     /// sha256 (hex, lower-case) of every file key the actor's process holds: the server's keys file, or the
     /// catalog owner's (`AMPUP_MEMORY_API_KEYS`, with --direct). None of them may become a directory key.
     pub file_keys: BTreeSet<String>,
@@ -2817,12 +2784,10 @@ pub enum Change {
         team: Option<String>,
         #[serde(default = "writer")]
         role: KeyRole,
+        /// The rows, as the keys file holds them: through a server, the rows of its own file with these ids
+        /// (it replaces them with its own); with --direct, the catalog owner's.
         #[serde(default)]
         keys: Vec<FileKey>,
-        /// The caller's own file key, the one the request is made with (`apikey import --self`): the
-        /// server fills `keys` with it.
-        #[serde(default, rename = "self")]
-        self_import: bool,
     },
 }
 
@@ -3145,7 +3110,7 @@ pub fn plan(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Event
 /// The `key.revoke`s that go with `events`: a file key imported in someone's name reads no more than they do,
 /// so taking them out of an org (`member.remove`) revokes every key imported in their name there, and out of a
 /// team (`team.remove`), those of that team. In the same commit as the removal, so no server ever sees them
-/// gone and the key still there; the revoke retires a verified import's hash, so its file twin is refused too.
+/// gone and the key still there.
 pub fn import_revokes(dir: &Directory, me: &str, events: &[Event]) -> Vec<Event> {
     let mut gone: BTreeSet<(&str, &str)> = BTreeSet::new();
     let mut out = vec![];
@@ -3189,18 +3154,12 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
     // An operator makes the changes that are theirs as an admin key would, and no other.
     let superuser = actor.superuser || (actor.via.operator && change.operators(dir));
     // Creating and deleting orgs is the catalog owner's; the rest is the org's admins'.
-    // A file key is the operator's or its holder's to import, never an org admin's: an import makes the
-    // directory answer for the key, and revoking it then stops the key.
-    if let Change::ImportKeys { keys, .. } = change {
-        let holder = !keys.is_empty()
-            && keys.iter().all(|k| {
-                actor.via.file_key.as_deref() == Some(k.sha256.to_ascii_lowercase().as_str())
-            });
-        if !superuser && !holder {
-            refuse!(
-                "{me} may not import file keys: only the operator (an admin key, or the catalog's owner with --direct) or the key's own holder (`ampup-memory apikey import --self`, signed in with that key) may"
-            );
-        }
+    // A file key is the operator's to import, never an org admin's: the rows are the keys file's own, as the
+    // server holding it reads them (`directory_change` takes them from its file by id), or the catalog owner's.
+    if matches!(change, Change::ImportKeys { .. }) && !actor.superuser {
+        refuse!(
+            "{me} may not import file keys: only the operator (an admin key, or the catalog's owner with --direct) may"
+        );
     }
     // Binding an org to Auth0 decides who signs in to it: never its own admins' to choose.
     let owner_only = matches!(
@@ -3382,7 +3341,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         Change::RequestJoin { .. } => {
             // A person an identity provider knows, by a verified email: what an invite then names. A key or
             // an app's token asks for nobody, and the operator joins as an admin would add them.
-            if !actor.via.person || actor.via.key.is_some() || actor.via.file_key.is_some() {
+            if !actor.via.person || actor.via.key.is_some() {
                 refuse!(
                     "{me} is not a person signed in through an identity provider: only a person asks to join an org"
                 );
@@ -3797,10 +3756,6 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             {
                 refuse!("that key is already in use");
             }
-            // A revoked file key's hash stays revoked: making it again would bring the file key back.
-            if dir.retired_keys.contains(&sha256) {
-                refuse!("that key was revoked; make a new one");
-            }
             // A file key (an admin key above all) is the keys file's: as a directory key too, one bearer
             // would be two callers. Every server refuses a bearer that is both (it names neither), and
             // this refuses making one wherever the keys file is known.
@@ -3816,7 +3771,6 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 sources,
                 created_by: user_id(me),
                 imported_from: None,
-                verified: false,
                 imported_user: None,
             };
             let mut e = ev("key.create").detail(&serde_json::to_string(&detail)?);
@@ -3891,7 +3845,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                         k.groups.join(", ")
                     );
                 }
-                // It may read only what its user could select with it already: no more.
+                // It may read only what its user could select through the server's sign-in: no more.
                 let user = user_id(&k.user);
                 let held = dir.access(&user, &SignIn::default());
                 let reaches = held
@@ -3900,11 +3854,11 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 if !reaches {
                     if org.provider.as_ref().is_some_and(|p| p.required) {
                         refuse!(
-                            "file key {id}: org {org_name} takes sign-ins through its own identity provider only, so file keys don't reach it, and an import would read more than the key does; an admin of {org_name} makes the service a key instead (ampup-memory apikey create)"
+                            "file key {id}: org {org_name} takes sign-ins through its own identity provider only, so its user doesn't reach it this way, and an import would read more than they do; an admin of {org_name} makes the service a key instead (ampup-memory apikey create)"
                         );
                     }
                     refuse!(
-                        "file key {id} acts as {user}, who is not a member of {scope}: as a key of {scope} it would read more than it does"
+                        "file key {id} acts as {user}, who is not a member of {scope}: as a key of {scope} it would read more than they do"
                     );
                 }
                 let Some(name) = key_name_of(id) else {
@@ -3915,31 +3869,21 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 if !names.insert(name.clone()) {
                     invalid!("two file keys would both be named {name}");
                 }
-                let verified = actor.owner || actor.vouched_keys.contains(&sha256);
-                // Imported already (the same key under the same name): nothing to do, unless this
-                // import is verified and that one wasn't.
-                let again = org.keys.get(&name).filter(|s| s.sha256 == sha256);
-                if again.is_some_and(|s| s.verified_import || !verified) {
+                // Imported already (the same key under the same name): nothing to do.
+                if org.keys.get(&name).is_some_and(|s| s.sha256 == sha256) {
                     continue;
                 }
-                if again.is_none() && org.keys.contains_key(&name) {
+                if org.keys.contains_key(&name) {
                     refuse!("org {org_name} already has a key {name} (revoke it first)");
                 }
-                if again.is_none()
-                    && dir
-                        .orgs
-                        .values()
-                        .flat_map(|o| o.keys.values())
-                        .any(|s| s.sha256 == sha256)
+                // One key, one service account: a bearer names one key.
+                if dir
+                    .orgs
+                    .values()
+                    .flat_map(|o| o.keys.values())
+                    .any(|s| s.sha256 == sha256)
                 {
                     refuse!("file key {id} is already in the directory under another name");
-                }
-                // Only an import checked against the file key itself goes in: one that isn't could name
-                // any hash, a key it doesn't hold, and so capture that key's requests.
-                if !verified {
-                    refuse!(
-                        "file key {id} can't be checked against the key itself here: run the import against a server that has the keys file (or with --direct, as the catalog's owner)"
-                    );
                 }
                 let detail = KeyDetail {
                     name,
@@ -3949,8 +3893,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                     expires_at: None,
                     sources: vec![],
                     created_by: user_id(me),
-                    imported_from: Some(format!("{id} ({user})")),
-                    verified,
+                    imported_from: None,
                     imported_user: Some(user.clone()),
                 };
                 let mut e = ev("key.create").detail(&serde_json::to_string(&detail)?);
