@@ -66,7 +66,7 @@ Requests carry `X-Title: memstore`, so their spend shows apart on a shared key.
 | `MEMSTORE_EXTRACT_SECS` (5) | How soon after landing an episode is read. |
 | `MEMSTORE_EXTRACT_SCOPES` (4) | Scopes extracted at once. |
 | `MEMSTORE_EXTRACT_PARALLEL` (8) | Requests in flight. |
-| `MEMSTORE_EXTRACT_THINKING=off` | Claude models answer without thinking first. |
+| `MEMSTORE_EXTRACT_THINKING=off` | Claude models answer without thinking first, on every call through the Anthropic API; those that always think (Opus 5.5 and later, Fable, Mythos) are asked for low effort, and Sonnet 5.5 for `between_tools`. |
 | `MEMSTORE_EXTRACT_PRICE` | `<$/M in>,<$/M out>`, for `backfill --max-usd` and estimates. |
 | `MEMSTORE_BATCH_GATHER_SECS` (5), `MEMSTORE_BATCH_MAX_REQUESTS` (5000), `MEMSTORE_BATCH_MAX_MB` (100) | Batch API gathering. |
 

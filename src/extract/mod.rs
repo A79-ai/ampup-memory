@@ -47,7 +47,9 @@
 //!   None is sent when there is none (a local server).
 //! - `AMPUP_MEMORY_EXTRACT_THINKING=off`: Claude models answer without thinking first. Thinking is billed as
 //!   output: on 50 trial notes, Haiku 5.5 wrote 1.7k tokens a note with it and 0.7k without, and found 12%
-//!   fewer facts without.
+//!   fewer facts without. It holds for every call made through the Anthropic API (compiling, learning advice,
+//!   judging and dreaming too). Claude Opus 5.5 and later, Fable and Mythos always think: they are asked for low
+//!   effort instead, and Claude Sonnet 5.5 for its own `between_tools` ([`ThinkingOff`]).
 //! - `AMPUP_MEMORY_EXTRACT_PARALLEL`: requests in flight at once (default 8).
 //! - `AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1` (or `on`, `true`): also extract the episodes the schema's `extract` section
 //!   doesn't name, with the prompt below. Unset, only what it names (and starter documents) is extracted.
@@ -946,25 +948,38 @@ impl Extractor {
         max_tokens: u32,
         usable: fn(&str) -> bool,
     ) -> Result<(String, bool)> {
-        let temperature = takes_temperature(&self.model);
-        match self
-            .complete_once(system, prompt, max_tokens, temperature, usable)
-            .await
-        {
-            // A model that refuses a temperature (newer Claude models deprecate it) is asked again without
-            // one, and isn't sent one again. Every call that sent one retries: calls in flight together are
-            // all refused, not only the first.
-            Err(e) if temperature && refuses_temperature(&e) => {
-                if NO_TEMPERATURE.lock().unwrap().insert(self.model.clone()) {
-                    eprintln!(
-                        "extract: {} takes no temperature; asking without one",
-                        self.model
-                    );
+        let mut temperature = takes_temperature(&self.model);
+        // A model that refuses a temperature (newer Claude models deprecate it), or thinking turned off as it was
+        // asked, is asked again without it, and isn't sent it again. Every call that sent it retries: calls in
+        // flight together are all refused, not only the first. Each retry learns one thing, so at most two.
+        loop {
+            let off = (self.api == Api::Anthropic && !thinks()).then(|| thinking_off(&self.model));
+            match self
+                .complete_once(system, prompt, max_tokens, temperature, off, usable)
+                .await
+            {
+                Err(e) if temperature && refuses_temperature(&e) => {
+                    if NO_TEMPERATURE.lock().unwrap().insert(self.model.clone()) {
+                        eprintln!(
+                            "extract: {} takes no temperature; asking without one",
+                            self.model
+                        );
+                    }
+                    temperature = false;
                 }
-                self.complete_once(system, prompt, max_tokens, false, usable)
-                    .await
+                Err(e)
+                    if off.is_some_and(|o| o != ThinkingOff::LowEffort)
+                        && refuses_thinking_off(&e) =>
+                {
+                    if ALWAYS_THINKS.lock().unwrap().insert(self.model.clone()) {
+                        eprintln!(
+                            "extract: {} can't be asked not to think; asking it for low effort",
+                            self.model
+                        );
+                    }
+                }
+                r => return r,
             }
-            r => r,
         }
     }
 
@@ -974,6 +989,7 @@ impl Extractor {
         prompt: &str,
         max_tokens: u32,
         temperature: bool,
+        off: Option<ThinkingOff>,
         usable: fn(&str) -> bool,
     ) -> Result<(String, bool)> {
         let (url, body) = match self.api {
@@ -996,9 +1012,16 @@ impl Extractor {
                     body["temperature"] = json!(0);
                 }
                 // Claude 5 models think before answering unless told not to, and the thinking is billed as
-                // output: `AMPUP_MEMORY_EXTRACT_THINKING=off` turns it off.
-                if !thinks() {
-                    body["thinking"] = json!({"type": "disabled"});
+                // output: `AMPUP_MEMORY_EXTRACT_THINKING=off` turns it off, or down where the model always thinks.
+                match off {
+                    None => {}
+                    Some(ThinkingOff::Disabled) => body["thinking"] = json!({"type": "disabled"}),
+                    Some(ThinkingOff::BetweenTools) => {
+                        body["thinking"] = json!({"type": "between_tools"})
+                    }
+                    Some(ThinkingOff::LowEffort) => {
+                        body["output_config"] = json!({"effort": "low"})
+                    }
                 }
                 if let Some(s) = system {
                     body["system"] = json!([{"type": "text", "text": s, "cache_control": {"type": "ephemeral"}}]);
@@ -2542,28 +2565,12 @@ fn takes_temperature(model: &str) -> bool {
 
 /// A Claude model that takes no sampling parameters, which refuses a request with a temperature in it (a 400:
 /// "`temperature` is deprecated for this model"): Claude Opus 4.7 and later, every Claude 5 model or later
-/// (Haiku, Sonnet, Opus), Fable and Mythos. However a backend names it: `claude-haiku-5-5` (Anthropic),
-/// `anthropic/claude-haiku-5.5` (a router), `us.anthropic.claude-opus-4-7-v1:0` (Bedrock),
-/// `claude-opus-4-7@20260416` (Vertex).
+/// (Haiku, Sonnet, Opus), Fable and Mythos, however a backend names it ([`claude_version`]).
 fn claude_without_sampling(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    let Some(at) = model.find("claude-") else {
-        return false;
-    };
-    let name = model[at..]
-        .split(['@', ':'])
-        .next()
-        .unwrap_or_default()
-        .replace('.', "-");
-    let mut parts = name.split('-').skip(1);
-    let family = parts.next().unwrap_or_default();
-    // The version's numbers, up to a date (`-20251001`) or a Bedrock suffix (`-v1`).
-    let mut version = parts.map_while(|p| (p.len() <= 2).then(|| p.parse::<u32>().ok()).flatten());
-    let (major, minor) = (version.next(), version.next().unwrap_or(0));
-    match (family, major) {
-        ("fable" | "mythos", _) => true,
-        ("opus", Some(4)) => minor >= 7,
-        ("opus" | "sonnet" | "haiku", Some(m)) => m >= 5,
+    match claude_version(model) {
+        Some((family, _)) if family == "fable" || family == "mythos" => true,
+        Some((family, version)) if family == "opus" => version >= (4, 7),
+        Some((family, (major, _))) if family == "sonnet" || family == "haiku" => major >= 5,
         _ => false,
     }
 }
@@ -2582,4 +2589,69 @@ fn reasoning(model: &str) -> bool {
         || ["o1", "o3", "o4"]
             .iter()
             .any(|p| m == *p || m.starts_with(&format!("{p}-")))
+}
+
+/// How a request turns `model`'s thinking off (`AMPUP_MEMORY_EXTRACT_THINKING=off`), as far as the model lets it.
+/// Most Claude models take `{"type": "disabled"}`. Claude Opus 5.5 and later, Fable and Mythos always think and
+/// refuse it with a 400 ("`thinking.type.disabled` is not supported for this model"), so they are asked to think
+/// as little as they will, at low effort. Claude Sonnet 5.5 refuses it too but takes its own `between_tools`; a
+/// later Sonnet, which may not, is asked at low effort. A model on no list that refuses `disabled` is learned from
+/// its first refusal, as a temperature is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ThinkingOff {
+    /// `"thinking": {"type": "disabled"}`: no thinking.
+    Disabled,
+    /// `"thinking": {"type": "between_tools"}` (Claude Sonnet 5.5 alone takes it): no thinking before it answers.
+    BetweenTools,
+    /// No `thinking` (the model thinks as it decides) and `"output_config": {"effort": "low"}`: as little as it does.
+    LowEffort,
+}
+
+/// Models that refused thinking turned off since the server started.
+static ALWAYS_THINKS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+fn thinking_off(model: &str) -> ThinkingOff {
+    if ALWAYS_THINKS.lock().unwrap().contains(model) {
+        return ThinkingOff::LowEffort;
+    }
+    match claude_version(model) {
+        Some((family, _)) if family == "fable" || family == "mythos" => ThinkingOff::LowEffort,
+        Some((family, (5, 5))) if family == "sonnet" => ThinkingOff::BetweenTools,
+        Some((family, version))
+            if (family == "opus" || family == "sonnet") && version >= (5, 5) =>
+        {
+            ThinkingOff::LowEffort
+        }
+        _ => ThinkingOff::Disabled,
+    }
+}
+
+/// A 400 that refuses thinking turned off as it was asked: `disabled` where the model always thinks, or
+/// `between_tools` where it isn't the model's own.
+fn refuses_thinking_off(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Refused>().is_some_and(|r| {
+        r.0.contains(": 400 ")
+            && r.0.contains("thinking")
+            && (r.0.contains("disabled") || r.0.contains("between_tools"))
+    })
+}
+
+/// A Claude model's family (`opus`, `sonnet`, `haiku`, `fable`, `mythos`) and version from its name, however a
+/// backend spells it: `claude-opus-5-5` (Anthropic), `anthropic/claude-opus-5.5` (a router),
+/// `us.anthropic.claude-opus-4-7-v1:0` (Bedrock), `claude-opus-4-7@20260416` (Vertex),
+/// `claude-haiku-4-5-20251001` (dated). A version without its minor number is `.0`; none at all, `0.0`.
+fn claude_version(model: &str) -> Option<(String, (u32, u32))> {
+    let model = model.to_ascii_lowercase();
+    let at = model.find("claude-")?;
+    let name = model[at..]
+        .split(['@', ':'])
+        .next()
+        .unwrap_or_default()
+        .replace('.', "-");
+    let mut parts = name.split('-').skip(1);
+    let family = parts.next().unwrap_or_default().to_string();
+    // The version's numbers, up to a date (`-20251001`) or a Bedrock suffix (`-v1`).
+    let mut version = parts.map_while(|p| (p.len() <= 2).then(|| p.parse::<u32>().ok()).flatten());
+    let (major, minor) = (version.next().unwrap_or(0), version.next().unwrap_or(0));
+    Some((family, (major, minor)))
 }
