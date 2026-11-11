@@ -133,9 +133,16 @@ pub(super) async fn answer(
                             ),
                             false,
                         )),
-                        // A refusal says why; anything else (the store failing) says only that it failed.
-                        Err(e) => match e.downcast_ref::<crate::people::directory::Refused>() {
-                            Some(r) => ok(text(format!("not asked: {}", r.0), true)),
+                        // A refusal, or a request no one could make (an org name that can't be one), says why;
+                        // anything else (the store failing) says only that it failed.
+                        Err(e) => match e
+                            .downcast_ref::<crate::people::directory::Refused>()
+                            .map(|r| &r.0)
+                            .or_else(|| {
+                                e.downcast_ref::<crate::people::directory::Invalid>()
+                                    .map(|i| &i.0)
+                            }) {
+                            Some(why) => ok(text(format!("not asked: {why}"), true)),
                             None => {
                                 eprintln!(
                                     "lobby: request_join by {} to {org} failed: {e:#}",

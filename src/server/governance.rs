@@ -9,10 +9,10 @@ pub(super) async fn handle(
     via: &SignIn,
     req: &Value,
 ) -> Result<Value> {
-    use crate::people::directory::{Directory, Refused};
+    use crate::people::directory::{Directory, Invalid};
     let field = |k: &str| req[k].as_str().unwrap_or_default();
     let org = field("org");
-    crate::check_name("org", org).map_err(|e| Refused(e.to_string()))?;
+    crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
     let dir = Directory::load(store).await?;
     let scope = dir.resolve(
         who.user(),
@@ -65,7 +65,7 @@ pub(super) async fn handle(
             let approve = match field("decision") {
                 "approve" => true,
                 "reject" => false,
-                _ => return Err(Refused("decision is approve or reject".into()).into()),
+                _ => return Err(Invalid("decision is approve or reject".into()).into()),
             };
             serde_json::to_value(
                 store

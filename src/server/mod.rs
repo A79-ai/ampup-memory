@@ -5364,10 +5364,15 @@ async fn handle(
                             StatusCode::MISDIRECTED_REQUEST,
                             json!({"error": format!("{e:#}")}),
                         ),
-                        None => reply(
-                            StatusCode::BAD_REQUEST,
-                            json!({"error": "bad request or change failed"}),
-                        ),
+                        // A request no one could make as it is (a value out of range, a name that can't be
+                        // one): the caller fixes the request, so it says what is wrong, and refuses no one.
+                        None => match e.downcast_ref::<crate::people::directory::Invalid>() {
+                            Some(bad) => reply(StatusCode::BAD_REQUEST, json!({"error": bad.0})),
+                            None => reply(
+                                StatusCode::BAD_REQUEST,
+                                json!({"error": "bad request or change failed"}),
+                            ),
+                        },
                     }
                 }
             },
@@ -7557,12 +7562,12 @@ async fn directory_change(
     superuser: bool,
     body: &[u8],
 ) -> Result<Value> {
-    use crate::people::directory::{Actor, Change, Directory, Refused, apply, plan};
+    use crate::people::directory::{Actor, Change, Directory, Invalid, Refused, apply, plan};
     if state.fixed() {
         return Err(Refused("this server doesn't identify callers".into()).into());
     }
     let req: Value =
-        serde_json::from_slice(body).map_err(|_| Refused("body is not JSON".into()))?;
+        serde_json::from_slice(body).map_err(|_| Invalid("body is not JSON".into()))?;
     if let Some(k) = &via.key {
         // A directory key (a SCIM bridge's) manages its org's members and teams, and sees the org: `plan`
         // holds it to its own org and to members who aren't admins. Every other key manages nothing.
@@ -7624,9 +7629,13 @@ async fn directory_change(
                 | "entity_graph"
         )
     ) {
+        // A malformed request stays one (400); anything else is refused (403) with its reason.
         return governance::handle(&store, who, via, &req)
             .await
-            .map_err(|e| Refused(format!("{e:#}")).into());
+            .map_err(|e| match e.is::<Invalid>() {
+                true => e,
+                false => Refused(format!("{e:#}")).into(),
+            });
     }
     if req["op"] == "set_schema" {
         // Type an org's memory with a built-in schema or one given inline; never a path on this server.
@@ -7641,15 +7650,15 @@ async fn directory_change(
         }
         let schema = match &req["schema"] {
             Value::String(name) => crate::query::schema::builtin(name)
-                .ok_or_else(|| Refused(format!("no built-in schema {name}")))
+                .ok_or_else(|| Invalid(format!("no built-in schema {name}")))
                 .and_then(|j| {
-                    crate::query::schema::Schema::parse(j).map_err(|e| Refused(e.to_string()))
+                    crate::query::schema::Schema::parse(j).map_err(|e| Invalid(e.to_string()))
                 })?,
             v @ Value::Object(_) => crate::query::schema::Schema::parse(&v.to_string())
-                .map_err(|e| Refused(format!("schema: {e}")))?,
-            _ => return Err(Refused("schema is a built-in name or a schema object".into()).into()),
+                .map_err(|e| Invalid(format!("schema: {e}")))?,
+            _ => return Err(Invalid("schema is a built-in name or a schema object".into()).into()),
         };
-        let scope = Scope::org(org).map_err(|e| Refused(e.to_string()))?;
+        let scope = Scope::org(org).map_err(|e| Invalid(e.to_string()))?;
         // A dry run makes every check the set would (the schema, its version, a breaking change against
         // the org's schema now) and commits nothing.
         let dry_run = req["dry_run"] == true;
@@ -7729,7 +7738,7 @@ async fn directory_change(
         if !superuser && !via.operator && !dir.access(who.user(), via).contains_key(org) {
             return Err(Refused(format!("{} is not a member of org {org}", who.user())).into());
         }
-        let scope = Scope::org(org).map_err(|e| Refused(e.to_string()))?;
+        let scope = Scope::org(org).map_err(|e| Invalid(e.to_string()))?;
         let branch = req["branch"].as_str().unwrap_or(MAIN);
         let schema = store.schema(&scope, branch).await?;
         let mut out = json!({"schema": schema.as_deref()});
@@ -7803,7 +7812,7 @@ async fn directory_change(
             .into());
         }
         let org = req["org"].as_str().unwrap_or_default();
-        crate::check_name("org", org).map_err(|e| Refused(e.to_string()))?;
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
         if !superuser && !dir.is_admin(who.user(), via, org) {
             return Err(Refused(format!(
@@ -7840,7 +7849,7 @@ async fn directory_change(
             .into());
         }
         let org = req["org"].as_str().unwrap_or_default();
-        crate::check_name("org", org).map_err(|e| Refused(e.to_string()))?;
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
         if !superuser && !dir.is_admin(who.user(), via, org) {
             return Err(Refused(format!(
@@ -7850,11 +7859,11 @@ async fn directory_change(
             .into());
         }
         let scope = match req["team"].as_str().filter(|t| !t.is_empty()) {
-            Some(t) if superuser => Scope::team(org, t).map_err(|e| Refused(e.to_string()))?,
+            Some(t) if superuser => Scope::team(org, t).map_err(|e| Invalid(e.to_string()))?,
             Some(t) => dir
                 .resolve(who.user(), via, Some(org), Some(t))
                 .map_err(|e| Refused(format!("{e:#}")))?,
-            None => Scope::org(org).map_err(|e| Refused(e.to_string()))?,
+            None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
         };
         let offset = req["offset"].as_u64().unwrap_or(0) as usize;
         let limit = req["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
@@ -7877,7 +7886,7 @@ async fn directory_change(
             .into());
         }
         let org = req["org"].as_str().unwrap_or_default();
-        crate::check_name("org", org).map_err(|e| Refused(e.to_string()))?;
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
         if !superuser && !dir.is_admin(who.user(), via, org) {
             return Err(Refused(format!(
@@ -7894,11 +7903,11 @@ async fn directory_change(
         }
         // A team is isolated from the rest of its org, its admins included: only its own readers.
         let scope = match req["team"].as_str().filter(|t| !t.is_empty()) {
-            Some(t) if superuser => Scope::team(org, t).map_err(|e| Refused(e.to_string()))?,
+            Some(t) if superuser => Scope::team(org, t).map_err(|e| Invalid(e.to_string()))?,
             Some(t) => dir
                 .resolve(who.user(), via, Some(org), Some(t))
                 .map_err(|e| Refused(format!("{e:#}")))?,
-            None => Scope::org(org).map_err(|e| Refused(e.to_string()))?,
+            None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
         };
         let log = crate::qa_log::list(&store, &scope, None).await?;
         let mut v = if req["op"] == "conversation" {
@@ -7964,7 +7973,7 @@ async fn directory_change(
             .into());
         }
         let org = req["org"].as_str().unwrap_or_default();
-        crate::check_name("org", org).map_err(|e| Refused(e.to_string()))?;
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
         if !superuser && !dir.is_admin(who.user(), via, org) {
             return Err(Refused(format!(
@@ -7981,11 +7990,11 @@ async fn directory_change(
         }
         // A team is isolated from the rest of its org, its admins included: only its own readers.
         let scope = match req["team"].as_str().filter(|t| !t.is_empty()) {
-            Some(t) if superuser => Scope::team(org, t).map_err(|e| Refused(e.to_string()))?,
+            Some(t) if superuser => Scope::team(org, t).map_err(|e| Invalid(e.to_string()))?,
             Some(t) => dir
                 .resolve(who.user(), via, Some(org), Some(t))
                 .map_err(|e| Refused(format!("{e:#}")))?,
-            None => Scope::org(org).map_err(|e| Refused(e.to_string()))?,
+            None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
         };
         if !cell::mine(&scope) {
             return Err(Refused(format!(
@@ -7995,7 +8004,7 @@ async fn directory_change(
         }
         let id = req["id"].as_str().unwrap_or_default();
         let Some(reward) = req["reward"].as_f64() else {
-            return Err(Refused("reward is 1 or -1".into()).into());
+            return Err(Invalid("reward is 1 or -1".into()).into());
         };
         let l = crate::qa_log::review(
             &store,
@@ -8025,7 +8034,7 @@ async fn directory_change(
             .into());
         }
         let org = req["org"].as_str().unwrap_or_default();
-        crate::check_name("org", org).map_err(|e| Refused(e.to_string()))?;
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
         if !superuser && !dir.is_admin(who.user(), via, org) {
             return Err(Refused(format!(
@@ -8042,11 +8051,11 @@ async fn directory_change(
         }
         // A team is isolated from the rest of its org, its admins included: only its own readers.
         let scope = match req["team"].as_str().filter(|t| !t.is_empty()) {
-            Some(t) if superuser => Scope::team(org, t).map_err(|e| Refused(e.to_string()))?,
+            Some(t) if superuser => Scope::team(org, t).map_err(|e| Invalid(e.to_string()))?,
             Some(t) => dir
                 .resolve(who.user(), via, Some(org), Some(t))
                 .map_err(|e| Refused(format!("{e:#}")))?,
-            None => Scope::org(org).map_err(|e| Refused(e.to_string()))?,
+            None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
         };
         let mut v = crate::advice::trail(&store, &scope, who, req["key"].as_str()).await?;
         v["org"] = json!(org);
@@ -8065,7 +8074,7 @@ async fn directory_change(
             .into());
         }
         let org = req["org"].as_str().unwrap_or_default();
-        crate::check_name("org", org).map_err(|e| Refused(e.to_string()))?;
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
         if !superuser && !dir.is_admin(who.user(), via, org) {
             return Err(Refused(format!(
@@ -8075,15 +8084,15 @@ async fn directory_change(
             .into());
         }
         let scope = match req["team"].as_str().filter(|t| !t.is_empty()) {
-            Some(t) if superuser => Scope::team(org, t).map_err(|e| Refused(e.to_string()))?,
+            Some(t) if superuser => Scope::team(org, t).map_err(|e| Invalid(e.to_string()))?,
             Some(t) => dir
                 .resolve(who.user(), via, Some(org), Some(t))
                 .map_err(|e| Refused(format!("{e:#}")))?,
-            None => Scope::org(org).map_err(|e| Refused(e.to_string()))?,
+            None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
         };
         let branch = req["branch"].as_str().unwrap_or_default();
         if branch.is_empty() || branch == crate::MAIN {
-            return Err(Refused("branch must name a branch other than main".into()).into());
+            return Err(Invalid("branch must name a branch other than main".into()).into());
         }
         if req["op"] == "branch_diff" {
             let d = store
@@ -8144,7 +8153,7 @@ async fn directory_change(
         // (`crate::sessions::mark_automated`), or taskless ones named by their transcript's first ask, into advice
         // (`crate::sessions::name_tasks`): the org's admins (or the operator). A dry run (the default) counts them.
         let org = req["org"].as_str().unwrap_or_default();
-        crate::check_name("org", org).map_err(|e| Refused(e.to_string()))?;
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
         if !superuser && !dir.is_admin(who.user(), via, org) {
             return Err(Refused(format!(
@@ -8162,11 +8171,11 @@ async fn directory_change(
         }
         // A team is isolated from the rest of its org, its admins included: only its own readers.
         let scope = match req["team"].as_str().filter(|t| !t.is_empty()) {
-            Some(t) if superuser => Scope::team(org, t).map_err(|e| Refused(e.to_string()))?,
+            Some(t) if superuser => Scope::team(org, t).map_err(|e| Invalid(e.to_string()))?,
             Some(t) => dir
                 .resolve(who.user(), via, Some(org), Some(t))
                 .map_err(|e| Refused(format!("{e:#}")))?,
-            None => Scope::org(org).map_err(|e| Refused(e.to_string()))?,
+            None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
         };
         if !cell::mine(&scope) {
             return Err(Refused(format!(
@@ -8182,7 +8191,7 @@ async fn directory_change(
         } else {
             let ids: std::collections::BTreeSet<String> =
                 serde_json::from_value(req["ids"].clone())
-                    .map_err(|_| Refused("ids is a list of session ids".into()))?;
+                    .map_err(|_| Invalid("ids is a list of session ids".into()))?;
             crate::sessions::mark_automated(&store, &scope, who.user(), &ids, dry_run).await?
         };
         let total: usize = counts.values().sum();
@@ -8202,7 +8211,7 @@ async fn directory_change(
         // the org's admins (or the operator). It writes the advice map, as a learn does: the writer lease's holder,
         // while no learn runs in the scope.
         let org = req["org"].as_str().unwrap_or_default();
-        crate::check_name("org", org).map_err(|e| Refused(e.to_string()))?;
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
         if !superuser && !dir.is_admin(who.user(), via, org) {
             return Err(Refused(format!(
@@ -8212,20 +8221,20 @@ async fn directory_change(
             .into());
         }
         let scope = match req["team"].as_str().filter(|t| !t.is_empty()) {
-            Some(t) if superuser => Scope::team(org, t).map_err(|e| Refused(e.to_string()))?,
+            Some(t) if superuser => Scope::team(org, t).map_err(|e| Invalid(e.to_string()))?,
             Some(t) => dir
                 .resolve(who.user(), via, Some(org), Some(t))
                 .map_err(|e| Refused(format!("{e:#}")))?,
-            None => Scope::org(org).map_err(|e| Refused(e.to_string()))?,
+            None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
         };
         let keys: std::collections::BTreeSet<String> = serde_json::from_value(req["keys"].clone())
             .ok()
             .filter(|k: &std::collections::BTreeSet<String>| !k.is_empty())
-            .ok_or_else(|| Refused("keys is a list of note keys (category/situation)".into()))?;
+            .ok_or_else(|| Invalid("keys is a list of note keys (category/situation)".into()))?;
         let acl: Vec<String> = match &req["acl"] {
             Value::Null => vec!["*".into()],
             v => serde_json::from_value(v.clone())
-                .map_err(|_| Refused("acl is a list of ACL entries, such as group:sales".into()))?,
+                .map_err(|_| Invalid("acl is a list of ACL entries, such as group:sales".into()))?,
         };
         let hold = req["hold"].as_bool() != Some(false);
         if !cell::mine(&scope) {
@@ -8308,7 +8317,7 @@ async fn directory_change(
         let acl: Vec<String> = match &req["acl"] {
             Value::Null => vec!["*".into()],
             v => serde_json::from_value(v.clone())
-                .map_err(|_| Refused("acl is a list of ACL entries, such as group:sales".into()))?,
+                .map_err(|_| Invalid("acl is a list of ACL entries, such as group:sales".into()))?,
         };
         let min_wrong = req["min_wrong"].as_u64().unwrap_or(2) as usize;
         // `resort`: from a new map, every run sorted and every note written again (`crate::advice::relearn`).
@@ -8318,7 +8327,7 @@ async fn directory_change(
         let rewrite: std::collections::BTreeSet<String> = match &req["rewrite"] {
             Value::Null => Default::default(),
             v => serde_json::from_value(v.clone()).map_err(|_| {
-                Refused("rewrite is a list of note keys (category/situation)".into())
+                Invalid("rewrite is a list of note keys (category/situation)".into())
             })?,
         };
         let force = req["force"].as_bool() == Some(true);
@@ -8403,7 +8412,7 @@ async fn directory_change(
         };
         let org = req["org"].as_str();
         if req["op"] == "export_org" {
-            let org = org.ok_or_else(|| Refused("which org?".into()))?;
+            let org = org.ok_or_else(|| Invalid("which org?".into()))?;
             let files = crate::offboard::export_org(&store, &actor, Some(who), org).await?;
             let files: serde_json::Map<String, Value> = files
                 .into_iter()
@@ -8412,12 +8421,12 @@ async fn directory_change(
             return Ok(json!({"org": org, "files": files}));
         }
         if req["op"] == "retention" {
-            let org = org.ok_or_else(|| Refused("which org?".into()))?;
+            let org = org.ok_or_else(|| Invalid("which org?".into()))?;
             let rules: Option<Vec<String>> = match &req["rules"] {
                 Value::Null => None,
                 v => Some(
                     serde_json::from_value(v.clone())
-                        .map_err(|_| Refused("rules are a list of <source prefix>=<age>".into()))?,
+                        .map_err(|_| Invalid("rules are a list of <source prefix>=<age>".into()))?,
                 ),
             };
             let done = crate::offboard::retention(
@@ -8432,7 +8441,7 @@ async fn directory_change(
             return Ok(done);
         }
         let done = if req["op"] == "purge_retracted" {
-            let org = org.ok_or_else(|| Refused("which org?".into()))?;
+            let org = org.ok_or_else(|| Invalid("which org?".into()))?;
             crate::offboard::purge_retracted(&store, &actor, org).await?
         } else {
             let user = req["user"].as_str().unwrap_or_default();
@@ -8453,8 +8462,23 @@ async fn directory_change(
             eprintln!("audit: events not written before an org delete: {e:#}");
         }
     }
-    let mut change: Change = serde_json::from_value(req.clone())
-        .map_err(|e| Refused(format!("not a directory change: {e}")))?;
+    let mut change: Change = match serde_json::from_value(req.clone()) {
+        Ok(change) => change,
+        // The operator and the named org's admins hear what is wrong with it; anyone else is refused, as
+        // they would be for the change made right.
+        Err(e) => {
+            let why = format!("not a directory change: {e}");
+            let org = req["org"].as_str().unwrap_or_default();
+            if superuser
+                || Directory::load(&store)
+                    .await?
+                    .is_admin(who.user(), via, org)
+            {
+                return Err(Invalid(why).into());
+            }
+            return Err(Refused(why).into());
+        }
+    };
     // `apikey import --self`: the file key this request is made with, as this server holds it.
     if let Change::ImportKeys {
         keys,
@@ -8666,17 +8690,17 @@ fn renew_store(state: &State) {
 /// An audit read's window: since when (µs since the epoch; `since_secs` ago, a day by default) and
 /// which kind of event.
 fn audit_window(req: &Value) -> Result<(i64, Option<audit::Kind>)> {
-    use crate::people::directory::Refused;
+    use crate::people::directory::Invalid;
     let since_secs = match &req["since_secs"] {
         Value::Null => 86_400,
         v => v
             .as_i64()
             .filter(|s| *s >= 0)
-            .ok_or_else(|| Refused("since_secs is a number of seconds".into()))?,
+            .ok_or_else(|| Invalid("since_secs is a number of seconds".into()))?,
     };
     let kind = match req["kind"].as_str() {
         None => None,
-        Some(k) => Some(audit::Kind::parse(k).map_err(|e| Refused(e.to_string()))?),
+        Some(k) => Some(audit::Kind::parse(k).map_err(|e| Invalid(e.to_string()))?),
     };
     let since = chrono::Utc::now().timestamp_micros() - since_secs.saturating_mul(1_000_000);
     Ok((since, kind))

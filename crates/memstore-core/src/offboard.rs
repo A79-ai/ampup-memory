@@ -29,7 +29,7 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{NamespaceIdent, TableIdent};
 use serde_json::{Value, json};
 
-use crate::people::directory::{Actor, Directory, Event, Forgotten, Refused, user_id};
+use crate::people::directory::{Actor, Directory, Event, Forgotten, Invalid, Refused, user_id};
 use crate::{
     AGG_REQUESTS, AGGREGATES, CLOSURES, DEFAULT_ORG, DIRECTORY, DIRECTORY_SNAPSHOT, EPISODES,
     EXTRACTIONS, FACTS, FEEDBACK, INSTALLATIONS, KEY_USAGE, LEDGER, Ledger, MAIN, QA_LOG, QUOTES,
@@ -2880,7 +2880,7 @@ pub async fn forget_user(
     };
     for o in &orgs {
         if crate::check_name("org", o).is_err() {
-            return Err(refused(format!("invalid org name {o:?}")));
+            return Err(Invalid(format!("invalid org name {o:?}")).into());
         }
         may_manage(&dir, actor, o, &format!("forget {user}"))?;
         // Another cell's org: refused before anything changes in any org, never forgotten halfway.
@@ -2966,7 +2966,7 @@ pub async fn forget_user(
 pub async fn purge_retracted(store: &Store, actor: &Actor, org: &str) -> Result<Value> {
     crate::cell::check_org(org)?;
     if crate::check_name("org", org).is_err() {
-        return Err(refused(format!("invalid org name {org:?}")));
+        return Err(Invalid(format!("invalid org name {org:?}")).into());
     }
     let dir = Directory::load(store).await?;
     may_manage(&dir, actor, org, "purge memory")?;
@@ -3010,7 +3010,7 @@ pub async fn retention(
 ) -> Result<Value> {
     crate::cell::check_org(org)?;
     if crate::check_name("org", org).is_err() {
-        return Err(refused(format!("invalid org name {org:?}")));
+        return Err(Invalid(format!("invalid org name {org:?}")).into());
     }
     let dir = Directory::load(store).await?;
     let what = match rules {
@@ -3032,7 +3032,8 @@ pub async fn retention(
         }
     };
     if let Some(rules) = rules {
-        let policy = crate::retention::Retention::parse(rules)?;
+        let policy =
+            crate::retention::Retention::parse(rules).map_err(|e| Invalid(format!("{e:#}")))?;
         store.set_retention(&scope, &actor.user, &policy).await?;
         store
             .append_audit(&[crate::audit::Entry {
@@ -3074,7 +3075,7 @@ pub async fn export_org(
 ) -> Result<Vec<ExportFile>> {
     crate::cell::check_org(org)?;
     if crate::check_name("org", org).is_err() {
-        return Err(refused(format!("invalid org name {org:?}")));
+        return Err(Invalid(format!("invalid org name {org:?}")).into());
     }
     let dir = Directory::load(store).await?;
     // Rights first: whether an org exists is no business of someone who may not manage it.

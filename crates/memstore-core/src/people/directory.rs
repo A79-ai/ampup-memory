@@ -2883,7 +2883,8 @@ impl NewKey {
     }
 }
 
-/// A change the caller can fix; its message is shown to them.
+/// A change refused to its caller: they may not make it, or the directory as it stands won't take it (an org
+/// that exists already, a team that doesn't). Its message is shown to them; a server answers it 403.
 #[derive(Debug)]
 pub struct Refused(pub String);
 
@@ -2899,6 +2900,24 @@ macro_rules! refuse {
     ($($t:tt)*) => { return Err(Refused(format!($($t)*)).into()) };
 }
 
+/// A request no one could make as it is: a value out of range, a name that can't be one, a field missing or of
+/// the wrong type. Its message is shown to the caller, who fixes the request, not their rights; a server answers
+/// it 400. Checked after who may ask, so a caller who may not still hears only that ([`Refused`]).
+#[derive(Debug)]
+pub struct Invalid(pub String);
+
+impl std::fmt::Display for Invalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Invalid {}
+
+macro_rules! invalid {
+    ($($t:tt)*) => { return Err(Invalid(format!($($t)*)).into()) };
+}
+
 /// A key's source prefixes as given, checked: an ingest key's only (they bound `/ingest` and `/retract`,
 /// which no other key reaches), each non-empty and outside the server's own families, sorted, once each.
 fn key_sources(role: KeyRole, sources: &[String]) -> Result<Vec<String>> {
@@ -2907,13 +2926,13 @@ fn key_sources(role: KeyRole, sources: &[String]) -> Result<Vec<String>> {
         return Ok(out);
     }
     if role != KeyRole::Ingest {
-        refuse!(
+        invalid!(
             "source prefixes hold an ingest key to what it writes: a {} key writes no sources",
             role.as_str()
         );
     }
     if out.iter().any(|s| s.is_empty()) {
-        refuse!("a source prefix is not empty (it would match every source)");
+        invalid!("a source prefix is not empty (it would match every source)");
     }
     out.sort();
     out.dedup();
@@ -3088,7 +3107,7 @@ pub fn import_revokes(dir: &Directory, me: &str, events: &[Event]) -> Vec<Event>
 fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Event>> {
     let org_name = change.org();
     if check_name("org", org_name).is_err() {
-        refuse!(
+        invalid!(
             "invalid org name {org_name:?}: use lower-case letters, digits and single underscores"
         );
     }
@@ -3155,7 +3174,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
     // One Auth0 Organization is one org's: its sign-ins must name one org.
     let auth0_free = |id: &str| -> Result<()> {
         if !valid_auth0_org(id) {
-            refuse!("{id:?} is not an Auth0 organization id (org_ and letters and digits)");
+            invalid!("{id:?} is not an Auth0 organization id (org_ and letters and digits)");
         }
         if let Some((other, _)) = dir
             .orgs
@@ -3194,7 +3213,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             refuse!("the default org can't be deleted");
         }
         if confirm.as_deref() != Some(org_name) {
-            refuse!(
+            invalid!(
                 "deleting org {org_name} deletes its memory for good: repeat its name to confirm (--confirm {org_name})"
             );
         }
@@ -3215,7 +3234,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
     };
     let team_ok = |t: &str| -> Result<()> {
         if check_name("team", t).is_err() {
-            refuse!(
+            invalid!(
                 "invalid team name {t:?}: use lower-case letters, digits and single underscores"
             );
         }
@@ -3309,7 +3328,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             let u = user_id(me);
             // A plain address: it is quoted to admins as a command to run, and shown on the approval page.
             if !plain_email(&u) {
-                refuse!("{u:?} is not a plain email address (letters, digits, . _ + - @)");
+                invalid!("{u:?} is not a plain email address (letters, digits, . _ + - @)");
             }
             if org.members.contains_key(&u) {
                 refuse!("{u} is a member of {org_name} already");
@@ -3351,7 +3370,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             for m in members {
                 let u = user_id(&m.user);
                 if !u.contains('@') || u.starts_with('@') || u.ends_with('@') {
-                    refuse!("{u:?} is not an email address");
+                    invalid!("{u:?} is not an email address");
                 }
                 for t in &m.teams {
                     has_team(t)?;
@@ -3379,28 +3398,28 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         }
         Change::SetSettings { team, settings, .. } => {
             if team.is_some() && settings.activity.is_some() {
-                refuse!("activity is the org's setting, not a team's: set it without a team");
+                invalid!("activity is the org's setting, not a team's: set it without a team");
             }
             if team.is_some() && settings.session_branches.is_some() {
-                refuse!(
+                invalid!(
                     "session_branches is the org's setting, not a team's: set it without a team"
                 );
             }
             if team.is_some() && settings.auto_review.is_some() {
-                refuse!("auto_review is the org's setting, not a team's: set it without a team");
+                invalid!("auto_review is the org's setting, not a team's: set it without a team");
             }
             if settings.is_empty() {
-                refuse!(
+                invalid!(
                     "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>, \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             if let Some(sources) = &settings.compile_sources {
                 if sources.len() > 50 {
-                    refuse!("compile_sources names at most 50 source prefixes");
+                    invalid!("compile_sources names at most 50 source prefixes");
                 }
                 for p in sources {
                     if p.trim().is_empty() || p.trim() != p || p.len() > 200 {
-                        refuse!(
+                        invalid!(
                             "invalid compile source {p:?}: a source prefix (kb:, github:acme/) or * for every source"
                         );
                     }
@@ -3408,11 +3427,11 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             if let Some(users) = &settings.advice_learn_exclude {
                 if users.len() > 50 {
-                    refuse!("advice_learn_exclude names at most 50 accounts");
+                    invalid!("advice_learn_exclude names at most 50 accounts");
                 }
                 for u in users {
                     if u.trim().is_empty() || u.trim() != u || u.len() > 254 {
-                        refuse!(
+                        invalid!(
                             "invalid account {u:?} in advice_learn_exclude: a user id as its sign-in gives it (dev@example.com)"
                         );
                     }
@@ -3422,7 +3441,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 .compile_batch
                 .is_some_and(|n| n > MAX_COMPILE_BATCH)
             {
-                refuse!(
+                invalid!(
                     "compile_batch is at most {MAX_COMPILE_BATCH} sources a round (0 unsets it)"
                 );
             }
@@ -3430,28 +3449,28 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 .advice_personal_runs
                 .is_some_and(|n| n > MAX_PERSONAL_RUNS)
             {
-                refuse!(
+                invalid!(
                     "advice_personal_runs is at most {MAX_PERSONAL_RUNS} rewarded runs (0 unsets it): it only lowers the bars a person's own advice waits for"
                 );
             }
             if let Some(k) = &settings.advice_skills
                 && !ADVICE_SKILLS.contains(&k.as_str())
             {
-                refuse!(
+                invalid!(
                     "invalid advice_skills {k:?}: \"fallback\" (compiled skills only where no kind of task learned from runs fits), \"together\" (both on one list), \"off\" (never a compiled skill), or \"\" to unset it"
                 );
             }
             if let Some(k) = &settings.instructions
                 && !INSTRUCTIONS.contains(&k.as_str())
             {
-                refuse!(
+                invalid!(
                     "invalid instructions {k:?}: \"default\" (the session's call order), \"purpose\" (what memory is for, no fixed procedure), or \"\" to unset it"
                 );
             }
             if let Some(k) = &settings.compile_kind
                 && !COMPILE_KINDS.contains(&k.as_str())
             {
-                refuse!(
+                invalid!(
                     "invalid compile_kind {k:?}: \"errors\" (the sources are error reports), or \"\" to unset it"
                 );
             }
@@ -3482,7 +3501,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                     );
                 }
                 if reads.len() > MAX_READS {
-                    refuse!("reads names at most {MAX_READS} scopes");
+                    invalid!("reads names at most {MAX_READS} scopes");
                 }
                 let own = match team {
                     Some(t) => crate::Scope::team(org_name, t),
@@ -3491,17 +3510,17 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 for r in reads {
                     let scope = match crate::Scope::parse(r.trim()) {
                         Ok(s @ (crate::Scope::Team(_) | crate::Scope::NamedOrg(_))) => s,
-                        _ => refuse!(
+                        _ => invalid!(
                             "reads names scopes of org {org_name}: team:{org_name}/<team> (or org:{org_name} for a team), not {r:?}"
                         ),
                     };
                     if scope.org_name() != Some(org_name) {
-                        refuse!(
+                        invalid!(
                             "reads names scopes of org {org_name} only, not {r:?}: another org's memory is never read here"
                         );
                     }
                     if scope == own {
-                        refuse!("{r} is the scope itself: reads names other scopes");
+                        invalid!("{r} is the scope itself: reads names other scopes");
                     }
                     if let crate::Scope::Team(id) = &scope {
                         has_team(id.split_once('/').map_or(id.as_str(), |(_, t)| t))?;
@@ -3517,7 +3536,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             .flatten()
             {
                 if !valid_model(m) {
-                    refuse!(
+                    invalid!(
                         "invalid model {m:?}: a backend's model id, such as anthropic/claude-haiku-5.5"
                     );
                 }
@@ -3531,7 +3550,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         }
         Change::SetProvider { provider: p, .. } => {
             if !PROVIDER_KINDS.contains(&p.kind.as_str()) {
-                refuse!(
+                invalid!(
                     "provider is one of {}, got {:?}",
                     PROVIDER_KINDS.join(", "),
                     p.kind
@@ -3539,23 +3558,23 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             let issuer = p.issuer.trim_end_matches('/');
             if !secure_issuer(issuer) {
-                refuse!("the issuer must be an https:// URL, got {issuer:?}");
+                invalid!("the issuer must be an https:// URL, got {issuer:?}");
             }
             if p.client_ids.is_empty() || p.client_ids.iter().any(|c| c.trim().is_empty()) {
-                refuse!("the provider needs its client id (--client-id)");
+                invalid!("the provider needs its client id (--client-id)");
             }
             if p.groups_claim.trim().is_empty() {
-                refuse!("the groups claim can't be empty");
+                invalid!("the groups claim can't be empty");
             }
             if let Some(why) = client_type_problem(p) {
-                refuse!("{why}");
+                invalid!("{why}");
             }
             // Anyone who can read the bucket reads the directory: a secret goes in sealed with the
             // server's key, or as the name of the server's environment variable that holds it.
             if let Some(s) = &p.client_secret
                 && crate::auth::secret::stored(s) == crate::auth::secret::Stored::Plain
             {
-                refuse!(
+                invalid!(
                     "the client secret goes into the directory sealed or as env:AMPUP_MEMORY_IDP_SECRET_<NAME>, never in plain text"
                 );
             }
@@ -3595,10 +3614,10 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 && d.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
             if !valid {
-                refuse!("{domain:?} is not a domain name");
+                invalid!("{domain:?} is not a domain name");
             }
             if PUBLIC_MAIL.contains(&d.as_str()) {
-                refuse!("{d} is a public mail service: anyone can have an address there");
+                invalid!("{d} is a public mail service: anyone can have an address there");
             }
             // An admin can claim their own domain only, proven by the server's provider (an org's own
             // provider is run by its admins, so it proves nothing here); the catalog owner or an admin key
@@ -3642,7 +3661,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 );
             }
             if group.trim().is_empty() {
-                refuse!("which group?");
+                invalid!("which group?");
             }
             has_team(team)?;
             vec![ev("group.map").team(team).detail(group.trim())]
@@ -3668,7 +3687,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         } => {
             let sources = key_sources(*role, sources)?;
             if check_name("key", name).is_err() {
-                refuse!(
+                invalid!(
                     "invalid key name {name:?}: use lower-case letters, digits and single underscores"
                 );
             }
@@ -3676,7 +3695,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 refuse!("org {org_name} already has a key {name} (revoke it first)");
             }
             if *role == KeyRole::Directory && team.is_some() {
-                refuse!(
+                invalid!(
                     "a directory key manages the whole org's members and teams: leave out the team"
                 );
             }
@@ -3685,7 +3704,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             let prefix = crate::auth::KEY_PREFIX;
             if !key.0.starts_with(prefix) || key.0.len() < prefix.len() + 32 {
-                refuse!(
+                invalid!(
                     "a key is {prefix} and 32 or more characters after it, as `ampup-memory apikey create` makes it"
                 );
             }
@@ -3694,7 +3713,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64;
             if expires_at.is_some_and(|t| t <= now) {
-                refuse!("the key would already have expired");
+                invalid!("the key would already have expired");
             }
             // One key, one service account: a bearer must name exactly one.
             if dir
@@ -3762,7 +3781,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             team, role, keys, ..
         } => {
             if matches!(role, KeyRole::Directory | KeyRole::Recorder) {
-                refuse!(
+                invalid!(
                     "a file key is imported as a reader, writer or ingest key, never a {} key (make one with `ampup-memory apikey create --role {}`)",
                     role.as_str(),
                     role.as_str()
@@ -3772,7 +3791,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 has_team(t)?;
             }
             if keys.is_empty() {
-                refuse!("no keys to import");
+                invalid!("no keys to import");
             }
             let scope = match team {
                 Some(t) => format!("{org_name}/{t}"),
@@ -3784,7 +3803,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 let id = &k.id;
                 let sha256 = k.sha256.to_ascii_lowercase();
                 if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    refuse!("file key {id}: its sha256 is not 64 hex characters");
+                    invalid!("file key {id}: its sha256 is not 64 hex characters");
                 }
                 // A directory key can't administer anything: an admin key would lose what it holds.
                 if k.admin {
@@ -3816,12 +3835,12 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                     );
                 }
                 let Some(name) = key_name_of(id) else {
-                    refuse!(
+                    invalid!(
                         "file key {id}: its id makes no key name (lower-case letters, digits, single underscores)"
                     );
                 };
                 if !names.insert(name.clone()) {
-                    refuse!("two file keys would both be named {name}");
+                    invalid!("two file keys would both be named {name}");
                 }
                 let verified = actor.owner || actor.vouched_keys.contains(&sha256);
                 // Imported already (the same key under the same name): nothing to do, unless this
@@ -3878,10 +3897,10 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             for m in members {
                 let u = user_id(&m.user);
                 if u.is_empty() {
-                    refuse!("a member without a user");
+                    invalid!("a member without a user");
                 }
                 if listed.insert(u.clone(), m).is_some() {
-                    refuse!("{u} is listed twice");
+                    invalid!("{u} is listed twice");
                 }
             }
             let wanted_teams: BTreeSet<&str> = members

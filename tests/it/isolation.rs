@@ -1245,40 +1245,48 @@ async fn cross_scope_reads(
     let mut checked = 0;
     let set = |settings: Value| json!({"op": "set_settings", "org": "acme", "settings": settings});
     let alice = person("alice@acme.com");
-    for (bearer, settings, why) in [
+    // Refused: a caller who may not set it (403), the operator naming scopes no one may (another org's, the scope
+    // itself, not a scope: 400), and a team the org doesn't have (403).
+    for (bearer, settings, why, want) in [
         (
             alice.as_str(),
             json!({"reads": ["team:acme/a1"]}),
             "only the operator",
+            403,
         ),
         (
             ADMIN_KEY,
             json!({"reads": ["team:globex/b1"]}),
             "scopes of org acme only",
+            400,
         ),
         (
             ADMIN_KEY,
             json!({"reads": ["org:globex"]}),
             "scopes of org acme only",
+            400,
         ),
         (
             ADMIN_KEY,
             json!({"reads": ["org:acme"]}),
             "the scope itself",
+            400,
         ),
         (
             ADMIN_KEY,
             json!({"reads": ["team:acme/nope"]}),
             "no team acme/nope",
+            403,
         ),
         (
             ADMIN_KEY,
             json!({"reads": ["user:u1"]}),
             "reads names scopes",
+            400,
         ),
     ] {
         let (status, body) = post(&format!("{s}/admin"), bearer, &set(settings.clone())).await;
-        assert_eq!(status, 403, "{settings}: {body}");
+        assert_eq!(status, want, "{settings}: {body}");
         assert!(body.contains(why), "{settings}: {body}");
         checked += 1;
     }
