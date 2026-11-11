@@ -1721,7 +1721,7 @@ struct Asked {
     /// recorded in the session, so the steps of a skill are ranked from here.
     procedures: Vec<(String, String)>,
     /// Whether its start handed none of the notes its user and their team asked to be remembered (it was opened
-    /// with no context), so its first ask for advice hands the ones that bear on its task ([`owe_notes`]).
+    /// with no context), so its first ask for advice hands the ones that bear on its task ([`notes_at_start`]).
     notes_owed: bool,
 }
 static ASKED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Asked>>> =
@@ -1792,15 +1792,34 @@ pub fn under_cap(scope: &Scope, who: &Principal, id: &str) -> bool {
     asked_in(scope, who, id, |a| a.count < MAX_HOOK_ADVICE)
 }
 
-/// Notes that session `id` started with no context, so none of its user's notes were handed: its first ask for
-/// advice hands the ones that bear on the task ([`take_notes_owed`]).
+/// Notes that session `id` started, and whether its user's notes are owed: it started with no context, so none
+/// were handed, and its first ask for advice hands the ones that bear on the task ([`take_notes_owed`]).
+pub fn notes_at_start(scope: &Scope, who: &Principal, id: &str, owed: bool) {
+    asked_in(scope, who, id, |a| a.notes_owed = owed);
+}
+
+/// Notes that session `id`'s notes are owed again: the ask that took them ([`take_notes_owed`]) failed before it
+/// handed them, so the next one does.
 pub fn owe_notes(scope: &Scope, who: &Principal, id: &str) {
     asked_in(scope, who, id, |a| a.notes_owed = true);
 }
 
-/// Whether session `id`'s notes are still owed (see [`owe_notes`]), and none from here: they are handed once.
-pub fn take_notes_owed(scope: &Scope, who: &Principal, id: &str) -> bool {
-    asked_in(scope, who, id, |a| std::mem::take(&mut a.notes_owed))
+/// Whether session `id`'s notes are still owed ([`notes_at_start`]), and none from here: they are handed once, and
+/// an ask that fails before handing them owes them again ([`owe_notes`]). What this process noted is held in memory
+/// alone, so for a session it doesn't know (it restarted since the session started, or another served the start) the
+/// session's row says: one opened with no task, that no ask has named since ([`name_task`]), is owed them.
+pub async fn take_notes_owed(store: &Store, scope: &Scope, who: &Principal, id: &str) -> bool {
+    let key = format!("{scope}\0{}\0{id}", who.user());
+    if let Some(a) = ASKED.lock().unwrap().get_mut(&key) {
+        a.used = std::time::Instant::now();
+        return std::mem::take(&mut a.notes_owed);
+    }
+    let owed = Box::pin(find(store, scope, who, id)).await.is_ok_and(|l| {
+        !an_ask(&l.question) && l.session.as_ref().is_some_and(|s| s.ended_at.is_none())
+    });
+    // Known from here: a later ask reads no row.
+    asked_in(scope, who, id, |a| a.notes_owed = false);
+    owed
 }
 
 /// Notes that `advice` was handed to session `id`'s agent: each of its lines is not handed again.

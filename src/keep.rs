@@ -222,19 +222,68 @@ fn names(text: &str) -> HashSet<String> {
     out
 }
 
+/// Words that turn an instruction round: "run clippy" and "don't run clippy" share every other word.
+fn negated(text: &str) -> bool {
+    const NOT: [&str; 22] = [
+        "not", "no", "never", "nor", "none", "without", "cannot", "dont", "doesnt", "didnt",
+        "isnt", "arent", "wasnt", "werent", "wont", "cant", "shouldnt", "wouldnt", "couldnt",
+        "mustnt", "neednt", "havent",
+    ];
+    text.split_whitespace().any(|raw| {
+        let w: String = raw
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        NOT.contains(&w.as_str())
+    })
+}
+
+/// The commonest words of three letters or fewer: what is left of a short word, a tool's or product's name (`npm`,
+/// `uv`, `gh`, `pip`), is a content word ([`short_names`]).
+const SHORT_COMMON: [&str; 117] = [
+    "a", "ad", "ago", "aim", "all", "am", "an", "and", "any", "are", "as", "ask", "at", "bad",
+    "be", "big", "bit", "but", "buy", "by", "can", "cut", "day", "did", "do", "due", "eg", "end",
+    "etc", "far", "few", "fit", "fix", "for", "get", "go", "got", "had", "has", "her", "him",
+    "his", "how", "i", "ie", "if", "in", "is", "it", "its", "job", "key", "let", "lot", "low",
+    "may", "me", "men", "met", "mix", "my", "new", "no", "nor", "not", "now", "odd", "of", "off",
+    "oh", "ok", "old", "on", "one", "or", "our", "out", "own", "pay", "per", "put", "ran", "raw",
+    "red", "run", "saw", "say", "see", "set", "she", "so", "ten", "the", "to", "too", "top", "try",
+    "two", "up", "us", "use", "via", "was", "way", "we", "who", "why", "won", "yes", "yet", "you",
+    "add", "bug", "fun", "hot", "lie", "six",
+];
+
+/// The short words of a text that name a tool or product: two or three letters, not a number, and not one of the
+/// [`SHORT_COMMON`] or [`GENERIC`] ones. "Use pnpm, not npm" holds two instructions, not one.
+fn short_names(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|w| {
+            (2..=3).contains(&w.chars().count())
+                && !w.chars().all(|c| c.is_ascii_digit())
+                && !SHORT_COMMON.contains(&w.as_str())
+                && !GENERIC.contains(&w.as_str())
+        })
+        .collect()
+}
+
 /// What a text says, as [`Said::says`] compares it, read once: its words and numbers ([`words`]), its names
-/// ([`names`]), each word it is written with, lowercased, and its topic ([`topic`]).
+/// ([`names`]), each word it is written with, lowercased, its topic ([`topic`]) with its short names
+/// ([`short_names`]), and whether it is said the other way round ([`negated`]).
 pub(crate) struct Said {
     words: HashSet<String>,
     numbers: HashSet<String>,
     names: HashSet<String>,
     written: HashSet<String>,
     topic: HashSet<String>,
+    negated: bool,
 }
 
 impl Said {
     pub(crate) fn of(text: &str) -> Self {
         let (words, numbers) = words(text);
+        let mut topic = topic(text);
+        topic.extend(short_names(text));
         Said {
             words,
             numbers,
@@ -246,29 +295,31 @@ impl Said {
                         .to_lowercase()
                 })
                 .collect(),
-            topic: topic(text),
+            topic,
+            negated: negated(text),
         }
     }
 
-    /// Whether this text, the newer, says what `older` does, so that handing both hands one thing twice. Every
-    /// number of the older is in it, and either most of the older's words are ([`repeats`]), or every name of the
-    /// older is and so is its topic, all of it, or all but one word of five or more. Cheap and the same every time
-    /// (no model, no embedding): it folds a note said again with its words reordered or inflected, or with
-    /// how-words (always, never, every, use, run) added or dropped, and lets through one that swaps a word for a
-    /// synonym. "Use pnpm in the billing repo" and "... in the website repo" differ by one word too, and are two
-    /// notes.
+    /// Whether this text, the newer, says what `older` does, so that handing both hands one thing twice: every
+    /// number of the older is in it, every word of the older's topic (so the older carries no instruction this one
+    /// lacks: "run fmt and clippy" isn't folded into "run fmt"), it is said the same way round (not "never retry"
+    /// for "retry"), and either most of the older's words are in it ([`repeats`]), or every name of the older is
+    /// and its topic is two words or more. Cheap and the same every time (no model, no embedding): it folds a note
+    /// said again with its words reordered or inflected, or with how-words (always, every, use, run) added or
+    /// dropped, and lets through one that swaps a word for a synonym, or for another tool. "Use pnpm in the billing
+    /// repo" and "... in the website repo" differ by one word too, and are two notes. Where the newer only adds to
+    /// the older, it stands for both.
     pub(crate) fn says(&self, older: &Said) -> bool {
-        if !older.numbers.is_subset(&self.numbers) {
+        if !older.numbers.is_subset(&self.numbers)
+            || !older.topic.is_subset(&self.topic)
+            || older.negated != self.negated
+        {
             return false;
         }
         if older.words.intersection(&self.words).count() * 10 >= older.words.len().max(1) * 9 {
             return true;
         }
-        if !older.names.is_subset(&self.written) {
-            return false;
-        }
-        let missing = older.topic.difference(&self.topic).count();
-        older.topic.len() >= 2 && (missing == 0 || (missing == 1 && older.topic.len() >= 5))
+        older.names.is_subset(&self.written) && older.topic.len() >= 2
     }
 }
 
@@ -277,12 +328,21 @@ pub(crate) fn says_same(newer: &str, older: &str) -> bool {
     Said::of(newer).says(&Said::of(older))
 }
 
-/// Whether a team-shared sentence says something: at least two words that aren't [`GENERIC`] and that the share's
-/// check counts (four letters or more, not the commonest, or a number: [`stems`]). What three people's notes have in
-/// common can be only short and common words, and a sentence of those ("Do a bit, not a lot.") passes the check and
-/// says nothing.
+/// Whether a team-shared sentence says something: a word that isn't [`GENERIC`] and that the share's check counts
+/// (four letters or more, not the commonest, or a number: [`stems`]), or a short name ([`short_names`]: `npm`,
+/// `uv`). What three people's notes have in common can be only short and common words, and a sentence of those
+/// ("Do a bit, not a lot.") passes the check and says nothing; one content word is an instruction ("Prefer Rust.",
+/// "Use uv for Python.").
 pub(crate) fn says_something(sentence: &str) -> bool {
-    stems(&specific(sentence)).len() >= 2
+    !stems(&specific(sentence)).is_empty() || !short_names(sentence).is_empty()
+}
+
+/// The words of a text the share's check finds in the notes of [`SHARED_AT`] people: its [`stems`] and its short
+/// names ([`short_names`]), so a tool's name one person wrote (`npm`) doesn't reach the team either.
+fn checked(text: &str) -> HashSet<String> {
+    let mut words = stems(text);
+    words.extend(short_names(text));
+    words
 }
 
 /// A handed note's text without the day it leads with (`(2026-10-25) `).
@@ -491,7 +551,7 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
         let person = *people.entry(author).or_insert(n);
         let t: String = t.chars().take(SHARE_NOTE_CHARS).collect();
         lines.push(format!("[{}] (person {person}) {t}", lines.len() + 1));
-        by_line.push((author.as_str(), stems(&t)));
+        by_line.push((author.as_str(), checked(&t)));
     }
     let joined = lines.join("\n");
     let fence = crate::extract::fence(&[&joined]);
@@ -547,7 +607,7 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
             })
             .cloned()
             .collect();
-        let backed = |t: &str| !t.is_empty() && stems(t).is_subset(&words);
+        let backed = |t: &str| !t.is_empty() && checked(t).is_subset(&words);
         let text = match backed(&text) {
             true => text,
             false => {
@@ -936,31 +996,76 @@ pub(crate) fn session_note(source: &str) -> bool {
 /// The most of each kind of note [`bearing_on`] hands.
 const BEARING: usize = 8;
 
+/// Words too broad to tie a note to a task on their own: any coding task has a repo and code, and "use tabs in the
+/// website repo" doesn't bear on a test in the billing one ([`shares_words`]).
+const BROAD: [&str; 8] = [
+    "repo",
+    "repos",
+    "repository",
+    "repositories",
+    "code",
+    "project",
+    "task",
+    "work",
+];
+
+/// Whether `note` shares a word of its topic with `task`'s ([`topic`] and [`short_names`]): not a how-word
+/// ([`GENERIC`]: "each", "make"), a number (a note's day, a "top 10"), or a word too broad to tie the two
+/// ([`BROAD`]).
+fn shares_words(task: &HashSet<String>, note: &str) -> bool {
+    let mut words = topic(undated(note));
+    words.extend(short_names(undated(note)));
+    words.iter().any(|w| task.contains(w))
+}
+
+/// A task's words as [`shares_words`] matches them.
+fn task_words(task: &str) -> HashSet<String> {
+    let broad = topic(&BROAD.join(" "));
+    let mut words = topic(task);
+    words.extend(short_names(task));
+    words.retain(|w| !broad.contains(w));
+    words
+}
+
+/// Whether the notes `scope`'s sessions are handed may be judged by a decisions model: its team's or org's
+/// `notes_decide` setting, on unless set false. A directory that can't be read keeps them off the model.
+pub async fn judges(store: &crate::Store, scope: &crate::Scope) -> bool {
+    match store.directory().await {
+        Ok(d) => d.dir.decides_notes(scope),
+        Err(e) => {
+            eprintln!(
+                "remembered notes: the directory wasn't read, notes kept by shared words: {e:#}"
+            );
+            false
+        }
+    }
+}
+
 /// Of `notes` (what [`for_session`] read: the user's own and the team's, newest first, each `(day) text`), the
-/// ones that bear on `task`, newest first, at most [`BEARING`] of each: the ones a decisions model finds the agent
-/// should know or honour doing it (one request for all of them), or, with no decisions model or when it fails, the
-/// ones that share a word with the task. Handed whole, the newest twenty were mostly about other work: replaying 8
-/// real Claude Code sessions on the ampup org, each began with the same 13, from competitor positioning to a blog's
-/// tone, whatever the task was.
+/// ones that bear on `task`, newest first, at most [`BEARING`] of each: the ones a decisions model finds would
+/// change how the task is done (one request for all of them, [`judged`]; only where `judge`, the scope's
+/// `notes_decide`), or, with no decisions model or when it fails, the ones that share a word of their topic with the
+/// task ([`shares_words`]). Handed whole, the newest twenty were mostly about other work: replaying 8 real Claude Code
+/// sessions on a production deployment, each began with the same 13, from competitor positioning to a blog's tone,
+/// whatever the task was.
 pub async fn bearing_on(
     task: &str,
     (mine, team): (Vec<String>, Vec<String>),
+    judge: bool,
 ) -> (Vec<String>, Vec<String>) {
     let all: Vec<&String> = mine.iter().chain(&team).collect();
     if all.is_empty() || task.trim().is_empty() {
         return (mine, team);
     }
-    let keep: Vec<bool> = match judged(task, &all).await {
+    let judgement = match judge {
+        true => judged(task, &all).await,
+        false => None,
+    };
+    let keep: Vec<bool> = match judgement {
         Some(k) => k,
         None => {
-            let informative: Vec<String> = crate::search::terms(task)
-                .into_iter()
-                .filter(|t| crate::search::informative(t))
-                .collect();
-            let words = crate::search::stems(&informative.join(" "));
-            all.iter()
-                .map(|n| crate::search::stems(n).iter().any(|w| words.contains(w)))
-                .collect()
+            let words = task_words(task);
+            all.iter().map(|n| shares_words(&words, n)).collect()
         }
     };
     let (kept_mine, kept_team) = keep.split_at(mine.len());
@@ -976,36 +1081,54 @@ pub async fn bearing_on(
     (pick(mine, kept_mine), pick(team, kept_team))
 }
 
-/// Whether each of `notes` bears on `task`, as a decisions model judges it; none with no model or when it fails.
+/// What the decisions model is asked of each note ([`judged`]), the note after it. Asked whether the agent "should
+/// know or honour" a note, OpenAI's said yes to notes about nothing the task does: on a churn report, a lunch order
+/// (1.00) and a benchmark VM's port (0.71); on a flaky test, one nonsense word added to the task moved the lunch order
+/// from 0.38 to 0.97. Asked whether the note would change how the task is done, it handed the flaky test's 7 notes
+/// (0.98 to 1.00) with and without the word, and on the churn report none (0.02 at most, 0.18 with the word).
+const BEARS_ON: &str = "Doing the task in the state, an agent would act differently because of this note: it is a \
+    preference, decision or fact about this task's own project, code, data or deliverable, or about a step this task \
+    takes. A note about unrelated work, another project, an event or an errand changes nothing in this task. The \
+    note:";
+
+/// How likely the decisions model must find a note to bear on the task ([`BEARS_ON`]) for it to be handed. Its
+/// answers to that question sit near 0 or near 1; the one between them (0.55, a person's own preference for PR
+/// descriptions, on a task that opens one) bore on its task.
+const BEARS_AT: f64 = 0.5;
+
+/// The longest a session's start or first ask waits for the decisions model ([`judged`]) before it hands the notes
+/// that share a word with the task instead. It answered a dozen notes in 0.2 to 0.7 s.
+const JUDGE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether each of `notes` bears on `task`, as a decisions model judges it ([`BEARS_ON`]); none with no model, or when
+/// it fails or is slow. Only the decisions model on the route extraction takes reads them
+/// ([`crate::decide::Decider::on_extraction_route`]): a person's own notes go where the organization's other data
+/// goes, never to another provider because its key is set.
 async fn judged(task: &str, notes: &[&String]) -> Option<Vec<bool>> {
-    let d = crate::decide::Decider::from_env().ok().flatten()?;
+    let d = match crate::decide::Decider::on_extraction_route() {
+        Ok(d) => d?,
+        Err(e) => {
+            eprintln!("remembered notes: no decisions model ({e:#}), kept by shared words");
+            return None;
+        }
+    };
     let questions = notes
         .iter()
         .enumerate()
         .map(|(i, n)| {
             (
                 format!("note{i}"),
-                crate::decide::Question::Likely(format!(
-                    "The state is a task a user gave an AI agent. Should the agent know or honour this note, which \
-                     the user or their team asked to be remembered, while doing that task? Answer low for a note \
-                     about other work, another project or another topic: {}",
-                    n.replace('\n', " ")
-                )),
+                crate::decide::Question::Likely(format!("{BEARS_ON} {}", n.replace('\n', " "))),
             )
         })
         .collect();
     let state = serde_json::json!(task.chars().take(3_000).collect::<String>());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        d.decide(&state, questions),
-    )
-    .await
-    {
+    match tokio::time::timeout(JUDGE_WAIT, d.decide(&state, questions)).await {
         Ok(Ok(a)) => Some(
             (0..notes.len())
                 .map(|i| {
                     a.get(&format!("note{i}"))
-                        .is_some_and(|a| a.likely() >= 0.5)
+                        .is_some_and(|a| a.likely() >= BEARS_AT)
                 })
                 .collect(),
         ),
@@ -1014,10 +1137,23 @@ async fn judged(task: &str, notes: &[&String]) -> Option<Vec<bool>> {
             None
         }
         Err(_) => {
-            eprintln!("remembered notes: no decisions within 5s, kept by shared words");
+            eprintln!(
+                "remembered notes: no decisions within {}s, kept by shared words",
+                JUDGE_WAIT.as_secs()
+            );
             None
         }
     }
+}
+
+/// Of `notes` (the user's own and the team's, newest first), the newest [`BEARING`] of each: what a session's start
+/// hands where its scope's agents are told what memory is for rather than when to ask (`purpose` instructions) and
+/// it names no task, since nothing tells such an agent to ask for advice, where it would get them.
+pub fn newest((mine, team): (Vec<String>, Vec<String>)) -> (Vec<String>, Vec<String>) {
+    (
+        mine.into_iter().take(BEARING).collect(),
+        team.into_iter().take(BEARING).collect(),
+    )
 }
 
 /// What the notes that bear on the task, handed with a session's start or its first ask for advice, take at most, in

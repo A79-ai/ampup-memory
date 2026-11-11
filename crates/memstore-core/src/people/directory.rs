@@ -1034,6 +1034,12 @@ pub struct Settings {
     /// `AMPUP_MEMORY_NOTES_DREAM_ON` decides (off by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_dream: Option<bool>,
+    /// Whether the notes a session is handed (a person's own and what their team shares) are picked by a decisions
+    /// model judging which bear on the task (`memstore::keep::bearing_on`), on the route the server's extraction
+    /// takes. Set false, a person's notes never go to that model: the ones that share a word with the task are
+    /// handed instead. On unless set false (where the server has a decisions model on that route).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_decide: Option<bool>,
     /// Other scopes of the same org whose memory this scope's readers also search (`team:<org>/<team>`, or
     /// `org:<org>` for a team): the read routes they search through (`/search`, `/episode`, `search_memory`,
     /// `get_episode`) read this scope and these, each hit naming its scope. Writes, extraction, the schema and
@@ -1102,6 +1108,7 @@ impl Settings {
             && self.transcripts.is_none()
             && self.instructions.is_none()
             && self.notes_dream.is_none()
+            && self.notes_decide.is_none()
             && self.reads.is_none()
             && self.purge.is_none()
             && self.activity.is_none()
@@ -1196,6 +1203,9 @@ impl Settings {
         }
         if other.notes_dream.is_some() {
             self.notes_dream = other.notes_dream;
+        }
+        if other.notes_decide.is_some() {
+            self.notes_decide = other.notes_decide;
         }
         if other.instructions.is_some() {
             self.instructions = other.instructions;
@@ -2405,6 +2415,13 @@ impl Directory {
         self.setting(scope, |s| s.notes_dream, default)
     }
 
+    /// Whether the notes a session in `scope` is handed may be judged by a decisions model
+    /// (`Settings::notes_decide`): its team's setting, else its org's; on where neither sets it, and in a scope the
+    /// directory doesn't hold.
+    pub fn decides_notes(&self, scope: &crate::Scope) -> bool {
+        self.setting(scope, |s| s.notes_decide, true)
+    }
+
     /// The other scopes `scope`'s readers also search (`Settings::reads`), in the order the setting names them:
     /// only the scope's own setting (a team's never comes from its org), only scopes of its own org, never itself,
     /// and only teams the org still has. None in a scope the directory doesn't hold.
@@ -2874,6 +2891,7 @@ impl Change {
                     && settings.transcripts.is_none()
                     && settings.instructions.is_none()
                     && settings.notes_dream.is_none()
+                    && settings.notes_decide.is_none()
                     && settings.activity.is_none()
                     && settings.session_branches.is_none()
                     && settings.auto_review.is_none()
@@ -3466,7 +3484,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             if settings.is_empty() {
                 invalid!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             if let Some(sources) = &settings.compile_sources {

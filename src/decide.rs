@@ -8,7 +8,8 @@
 //! `AMPUP_MEMORY_DECIDE` (`openai`, `openrouter` or `off`), `AMPUP_MEMORY_DECIDE_MODEL` (default `gpt-6-luna`, or
 //! `typesafe/jev-1.13` on OpenRouter), `AMPUP_MEMORY_DECIDE_URL` (default the backend's decisions endpoint) and
 //! `AMPUP_MEMORY_DECIDE_KEY` (else `OPENAI_API_KEY` or `OPENROUTER_API_KEY`). Unset, it is OpenAI's where there is an
-//! OpenAI key, else OpenRouter's where there is an OpenRouter key, else off.
+//! OpenAI key, else OpenRouter's where there is an OpenRouter key, else off. A person's own notes go only to the one on
+//! the route extraction takes ([`Decider::on_extraction_route`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -103,6 +104,79 @@ impl Decider {
             url: var("AMPUP_MEMORY_DECIDE_URL").unwrap_or_else(|| url.into()),
             key: var("AMPUP_MEMORY_DECIDE_KEY").or(key),
             model: var("AMPUP_MEMORY_DECIDE_MODEL").unwrap_or_else(|| model.into()),
+            spent: Arc::default(),
+        }))
+    }
+
+    /// The decisions model on the route the server's extraction takes (`AMPUP_MEMORY_EXTRACT`, else OpenRouter where
+    /// there is its key), for what only that route may read: a person's own notes, which they keep for themselves.
+    /// OpenRouter's decisions model where extraction runs on OpenRouter (with the extraction's key, so its account's
+    /// data and provider settings apply), OpenAI's where it runs on OpenAI's own API. None where extraction runs
+    /// elsewhere (Anthropic, Bedrock, Vertex, Cortex, a server of its own at `AMPUP_MEMORY_EXTRACT_URL`) or is off,
+    /// and none where `AMPUP_MEMORY_DECIDE` is off or names another route. Where it names this one, its `_URL`,
+    /// `_MODEL` and `_KEY` apply ([`Decider::from_env`]). So an OpenAI key in the environment never takes notes to
+    /// OpenAI when extraction goes through OpenRouter.
+    pub fn on_extraction_route() -> Result<Option<Self>> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let extraction_key = || {
+            var("AMPUP_MEMORY_EXTRACT_KEY").or_else(|| {
+                var("AMPUP_MEMORY_EXTRACT_KEY_FILE")
+                    .and_then(|f| std::fs::read_to_string(f).ok())
+                    .map(|k| k.trim().to_string())
+                    .filter(|k| !k.is_empty())
+            })
+        };
+        let route = match var("AMPUP_MEMORY_EXTRACT") {
+            Some(c) => c.to_ascii_lowercase(),
+            None if extraction_key().is_some() || var("OPENROUTER_API_KEY").is_some() => {
+                "openrouter".into()
+            }
+            None => return Ok(None),
+        };
+        let (api, host) = match route.as_str() {
+            "openrouter" | "openrouter-batch" => (Api::OpenRouter, "openrouter.ai"),
+            "openai" => (Api::OpenAi, "api.openai.com"),
+            _ => return Ok(None),
+        };
+        match var("AMPUP_MEMORY_DECIDE").map(|c| c.to_ascii_lowercase()) {
+            Some(c) if c == "off" => return Ok(None),
+            Some(c) if c == "openai" || c == "openrouter" => {
+                let named = if c == "openai" {
+                    Api::OpenAi
+                } else {
+                    Api::OpenRouter
+                };
+                return match named == api {
+                    true => Self::from_env(),
+                    false => Ok(None),
+                };
+            }
+            Some(c) => anyhow::bail!("AMPUP_MEMORY_DECIDE is openai, openrouter or off, not {c:?}"),
+            None => {}
+        }
+        // Extraction sent to a server of its own (a gateway, a local model): not the vendor's decisions endpoint.
+        if var("AMPUP_MEMORY_EXTRACT_URL").is_some_and(|u| {
+            u.split("://").nth(1).unwrap_or(&u).split(['/', ':']).next() != Some(host)
+        }) {
+            return Ok(None);
+        }
+        let (url, model, key) = match api {
+            Api::OpenAi => (
+                "https://api.openai.com/v1/decisions",
+                "gpt-6-luna",
+                var("OPENAI_API_KEY"),
+            ),
+            Api::OpenRouter => (
+                "https://openrouter.ai/api/alpha/decisions",
+                "typesafe/jev-1.13",
+                var("OPENROUTER_API_KEY"),
+            ),
+        };
+        Ok(Some(Decider {
+            api,
+            url: url.into(),
+            key: extraction_key().or(key),
+            model: model.into(),
             spent: Arc::default(),
         }))
     }

@@ -10659,32 +10659,51 @@ async fn mcp(
                         })
                 }
                 "start_session" if writes == Writes::Scope => {
-                    // What the user and their team asked to be remembered is handed back with it.
-                    let (started, remembered) = tokio::join!(
-                        Box::pin(start_session(state, session, &store, who, via, args, args["max_chars"].is_null())),
-                        Box::pin(crate::keep::for_session(session, &store, who, state.fixed())),
+                    // What the user and their team asked to be remembered is handed back with it, picked while the
+                    // session opens (its advice routes meanwhile), so the start waits for the slower of the two.
+                    let context = args["context"].as_str().map(str::trim).filter(|c| !c.is_empty());
+                    let agent = args["max_chars"].is_null();
+                    let (started, (remembered, later)) = tokio::join!(
+                        Box::pin(start_session(state, session, &store, who, via, args, agent)),
+                        Box::pin(async {
+                            let remembered = crate::keep::for_session(session, &store, who, state.fixed())
+                                .await
+                                .unwrap_or_else(|e| {
+                                    eprintln!(
+                                        "start_session: reading what {} asked to be remembered failed: {e:#}",
+                                        who.user()
+                                    );
+                                    Default::default()
+                                });
+                            // With what the user asked, only the notes that bear on it. With nothing asked yet (the
+                            // hooks open a session before its first prompt), none: they would be the newest,
+                            // whatever the task. The answer says how many there are, and the session's first
+                            // get_advice hands the ones that bear on its task. Where the scope's agents are told
+                            // what memory is for, and not to ask for advice when a task starts (`purpose`), an
+                            // agent's start hands the newest that fit instead: it may never ask.
+                            match context {
+                                Some(c) => {
+                                    let judge = crate::keep::judges(&store, scope).await;
+                                    (crate::keep::bearing_on(c, remembered, judge).await, None)
+                                }
+                                None if agent && purpose::asks(&store, scope).await => {
+                                    (crate::keep::newest(remembered), None)
+                                }
+                                None => (Default::default(), Some((remembered.0.len(), remembered.1.len()))),
+                            }
+                        }),
                     );
-                    let remembered = remembered.unwrap_or_else(|e| {
-                        eprintln!("start_session: reading what {} asked to be remembered failed: {e:#}", who.user());
-                        Default::default()
-                    });
-                    // With what the user asked, only the notes that bear on it. With nothing asked yet (the hooks
-                    // open a session before its first prompt), none: they would be the newest, whatever the task.
-                    // The answer says how many there are, and the session's first get_advice hands the ones that
-                    // bear on its task.
-                    let (remembered, later) =
-                        match args["context"].as_str().map(str::trim).filter(|c| !c.is_empty()) {
-                            Some(c) => (crate::keep::bearing_on(c, remembered).await, None),
-                            None => (Default::default(), Some((remembered.0.len(), remembered.1.len()))),
-                        };
                     started
                         .map(|(l, served)| {
                             // What the user opened with is checked for what to keep once the session answered.
                             let said = args["context"].as_str().unwrap_or_default();
                             keep_later(state, &store, scope, who, via, args, said, &l.answer_id);
-                            if later.is_some_and(|(m, t)| m + t > 0) {
-                                crate::sessions::owe_notes(scope, who, &l.answer_id);
-                            }
+                            crate::sessions::notes_at_start(
+                                scope,
+                                who,
+                                &l.answer_id,
+                                later.is_some_and(|(m, t)| m + t > 0),
+                            );
                             let out =
                                 session_started(&l, &served, session.vis().episode_type_counts(who));
                             crate::keep::with_remembered(out, remembered, later)
@@ -12489,6 +12508,22 @@ fn lookup_moment(args: &Value) -> &'static str {
     }
 }
 
+/// A session's notes an ask took ([`crate::sessions::take_notes_owed`]): owed again when it is dropped still holding
+/// them (`id`), as an ask that failed or was cancelled before it handed them is.
+struct OwedNotes<'a> {
+    scope: &'a Scope,
+    who: &'a Principal,
+    id: Option<&'a str>,
+}
+
+impl Drop for OwedNotes<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            crate::sessions::owe_notes(self.scope, self.who, id);
+        }
+    }
+}
+
 /// [`get_advice_tool`]'s work, its lookup traced.
 #[allow(clippy::too_many_arguments)]
 async fn advise_tool(
@@ -12503,20 +12538,31 @@ async fn advise_tool(
 ) -> Result<String> {
     // A hook's first ask of a session (`remembered`) is answered with the notes that bear on its task, alongside the
     // advice: the session's start came before the task was known, and handed none. So is an agent's first ask in a
-    // session it opened with no context (`crate::sessions::owe_notes`), its notes after the advice's text.
+    // session it opened with no context (`crate::sessions::notes_at_start`), its notes after the advice's text.
     let asks = args["decide"].as_bool() != Some(true) && args["event"].is_null();
     let hook_first = asks && args["remembered"].as_bool() == Some(true) && writes == Writes::Scope;
     let id = args["session_id"]
         .as_str()
         .map(str::trim)
         .filter(|i| !i.is_empty());
-    let owed = asks
-        && !args["question"]
-            .as_str()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-        && id.is_some_and(|i| crate::sessions::take_notes_owed(scope, who, i));
+    let asked_task = !args["question"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .is_empty();
+    let owed = match id {
+        Some(i) if asks && asked_task => {
+            crate::sessions::take_notes_owed(store, scope, who, i).await
+        }
+        _ => false,
+    };
+    // Owed again unless they go out with this answer: an ask that fails (its advice's routing timed out, say) or is
+    // dropped leaves them to the next.
+    let mut still_owed = OwedNotes {
+        scope,
+        who,
+        id: id.filter(|_| owed),
+    };
     let remembered = hook_first || owed;
     let question = args["question"].as_str().unwrap_or_default();
     // The notes that bear on the task, within what they may take.
@@ -12530,9 +12576,10 @@ async fn advise_tool(
                 );
                 Default::default()
             });
+        let judge = crate::keep::judges(store, scope).await;
         crate::keep::within(
             crate::keep::NOTES,
-            crate::keep::bearing_on(question, notes).await,
+            crate::keep::bearing_on(question, notes, judge).await,
         )
     };
     // The advice keeps the caller's `max_chars`: a hook's first ask has the notes in their own fields, beside it.
@@ -12599,7 +12646,14 @@ async fn advise_tool(
     )
     .await;
     let text = crate::public_capabilities::append_text(text, &suggestions, args);
+    // A session this call opened (the agent skipped start_session) named its task: none are owed in it.
+    if id.is_none()
+        && let Some(r) = resolved.as_deref()
+    {
+        crate::sessions::notes_at_start(scope, who, r, false);
+    }
     if let Some((mine, team)) = notes {
+        still_owed.id = None;
         if !hook_first {
             return Ok(crate::keep::text_with_notes(text, (mine, team)));
         }

@@ -352,6 +352,10 @@ pub enum OrgCmd {
         /// (default: the server's AMPUP_MEMORY_NOTES_DREAM_ON, off)
         #[arg(long)]
         notes_dream: Option<bool>,
+        /// Pick the notes a session is handed with the decisions model on the extraction's route; false keeps
+        /// people's notes off it and hands the ones that share a word with the task (default true)
+        #[arg(long)]
+        notes_decide: Option<bool>,
         /// Other scopes of the org its readers also search, comma-separated (team:<org>/<team>; "" unsets them;
         /// the operator only)
         #[arg(long)]
@@ -1166,6 +1170,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             transcripts,
             instructions,
             notes_dream,
+            notes_decide,
             reads,
             purge,
             activity,
@@ -1209,6 +1214,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 transcripts: *transcripts,
                 instructions: instructions.clone(),
                 notes_dream: *notes_dream,
+                notes_decide: *notes_decide,
                 reads: reads.as_deref().map(|r| {
                     r.split(',')
                         .map(str::trim)
