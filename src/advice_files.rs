@@ -62,16 +62,19 @@ const REPLY_TOKENS: u32 = 3_000;
 /// Condensing replies a process keeps ([`condense`]); at about 2 KB each, a few MB.
 const KEPT: usize = 1_024;
 
-/// What a caller asks: the change's files, its title, its pull request (left out of the sources), its repository
-/// (`owner/repo`: only its pull requests count; none, every repository's), the issue keys it links, and how many
-/// skills to condense.
+/// What a caller asks: the change's files, its title and description, its pull request (left out of the sources),
+/// its repository (`owner/repo`: only its pull requests count; none, every repository's), the issue keys it links,
+/// how many skills to condense (or, for [`crate::advice_regressions`], checks to serve), and the time it is asked as
+/// of (µs: only pull requests merged before it count; none, now).
 pub struct Asked<'a> {
     pub files: &'a [String],
     pub title: &'a str,
+    pub description: &'a str,
     pub pr: Option<u64>,
     pub repo: Option<&'a str>,
     pub issues: &'a [String],
     pub top: usize,
+    pub as_of: Option<i64>,
 }
 
 /// The checks for one change.
@@ -132,7 +135,7 @@ static REPLIES: LazyLock<Mutex<Replies>> = LazyLock::new(Default::default);
 /// `cx`'s condensing reply to `prompt`: the one this process kept for the same request (backend, model, token cap
 /// and prompt), else the model's, kept when whole. Two asks at once both call the model; the first reply kept is
 /// the one every later ask gets.
-async fn condense(cx: &Extractor, prompt: &str) -> Result<String> {
+pub(crate) async fn condense(cx: &Extractor, prompt: &str) -> Result<String> {
     let key: [u8; 32] = Sha256::new()
         .chain_update(cx.backend())
         .chain_update([0])
@@ -204,7 +207,7 @@ fn parse_pr(body: &str) -> Pr {
 
 /// Whether a pull request's title says it fixed something: `fix`, `bug`, `hotfix` or `revert` first, after an
 /// optional `[TICKET]`.
-fn fixes(title: &str) -> bool {
+pub(crate) fn fixes(title: &str) -> bool {
     let t = title.trim_start();
     let t = match t.strip_prefix('[').and_then(|r| r.split_once(']')) {
         Some((_, rest)) => rest.trim_start(),
@@ -217,7 +220,7 @@ fn fixes(title: &str) -> bool {
 }
 
 /// The first `n` characters.
-fn chars(text: &str, n: usize) -> &str {
+pub(crate) fn chars(text: &str, n: usize) -> &str {
     text.char_indices().nth(n).map_or(text, |(i, _)| &text[..i])
 }
 
@@ -361,11 +364,14 @@ async fn condensed(
 ) -> Result<(Vec<String>, Vec<Found>)> {
     let in_repo = |r: &str| asked.repo.is_none_or(|want| want.eq_ignore_ascii_case(r));
 
-    // Every pull request the caller may read, in the repository, with its files.
-    let prs = newest_by_source(session, store, who, |s| {
+    // Every pull request the caller may read, in the repository, merged before `as_of`, with its files.
+    let mut prs = newest_by_source(session, store, who, |s| {
         pr_of(s).is_some_and(|(r, _, thread)| !thread && in_repo(r))
     })
     .await?;
+    if let Some(t) = asked.as_of {
+        prs.retain(|_, (_, at)| *at < t);
+    }
     fill(
         session,
         store,
@@ -552,7 +558,7 @@ async fn condensed(
 
 /// The newest version of each issue `keys` names (`linear:<workspace>/<KEY>`) that `who` may read, in the order
 /// asked, each once.
-async fn issues(
+pub(crate) async fn issues(
     session: &Session,
     store: &Store,
     who: &Principal,

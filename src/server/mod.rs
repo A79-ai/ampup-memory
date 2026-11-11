@@ -6540,8 +6540,14 @@ async fn handle(
         if !args["files"].is_null() {
             return Ok(match advice_files(&session, &store, &who, &args).await {
                 Ok(v) => reply(StatusCode::OK, v),
-                Err(e) => match e.downcast_ref::<ToolError>() {
-                    Some(m) => reply(StatusCode::SERVICE_UNAVAILABLE, json!({"error": m.0})),
+                Err(e) => match e
+                    .downcast_ref::<ToolError>()
+                    .map(|m| m.0.clone())
+                    .or_else(|| {
+                        e.downcast_ref::<crate::advice_regressions::NotReady>()
+                            .map(|m| m.0.clone())
+                    }) {
+                    Some(m) => reply(StatusCode::SERVICE_UNAVAILABLE, json!({"error": m})),
                     None => match e.downcast_ref::<FilesAsked>() {
                         Some(m) => reply(StatusCode::BAD_REQUEST, json!({"error": m.0})),
                         None => {
@@ -11626,9 +11632,11 @@ impl std::error::Error for FilesAsked {}
 const ADVICE_FILES: usize = 1_000;
 const ADVICE_ISSUES: usize = 10;
 
-/// `POST /advice {files, title?, pr?, repo?, issues?, top?}`: review checks for a change, from the skills whose
-/// sources changed its files, with its linked issues (`crate::advice_files`). Outside sessions only: no arm decides
-/// these.
+/// `POST /advice {files, title?, description?, pr?, repo?, issues?, top?, as_of?, from?}`: review checks for a
+/// change, with its linked issues. `from` says where they come from: `skills` (the default), the skills whose
+/// sources changed its files (`crate::advice_files`), or `regressions`, the fixes its files and words are like
+/// (`crate::advice_regressions`). `as_of` (µs) reads only the pull requests merged before it. Outside sessions only:
+/// no arm decides these.
 async fn advice_files(
     session: &Session,
     store: &Store,
@@ -11669,6 +11677,25 @@ async fn advice_files(
         Value::String(t) => t.trim(),
         _ => return Err(asked("title is a string")),
     };
+    let description = match &args["description"] {
+        Value::Null => "",
+        Value::String(t) => t.trim(),
+        _ => return Err(asked("description is a string")),
+    };
+    let as_of = match &args["as_of"] {
+        Value::Null => None,
+        v => Some(
+            v.as_i64()
+                .filter(|t| *t > 0)
+                .ok_or_else(|| asked("as_of is a time in microseconds since the epoch"))?,
+        ),
+    };
+    let regressions = match args["from"].as_str() {
+        None if args["from"].is_null() => false,
+        Some("skills") => false,
+        Some("regressions") => true,
+        _ => return Err(asked("from is skills or regressions")),
+    };
     let pr = match &args["pr"] {
         Value::Null => None,
         v => Some(
@@ -11682,6 +11709,7 @@ async fn advice_files(
         _ => return Err(asked("repo is owner/repo")),
     };
     let top = match &args["top"] {
+        Value::Null if regressions => crate::advice_regressions::TOP,
         Value::Null => crate::advice_files::TOP,
         v => match v.as_u64() {
             Some(n @ 1..=10) => n as usize,
@@ -11693,21 +11721,21 @@ async fn advice_files(
             ToolError("advice is condensed by a model: this server has none".into()).into(),
         );
     };
-    let found = crate::advice_files::checks(
-        session,
-        store,
-        who,
-        &cx,
-        crate::advice_files::Asked {
-            files: &files,
-            title,
-            pr,
-            repo,
-            issues: &issues,
-            top,
-        },
-    )
-    .await?;
+    let asked = crate::advice_files::Asked {
+        files: &files,
+        title,
+        description,
+        pr,
+        repo,
+        issues: &issues,
+        top,
+        as_of,
+    };
+    if regressions {
+        let found = crate::advice_regressions::checks(session, store, who, &cx, asked).await?;
+        return Ok(serde_json::to_value(found)?);
+    }
+    let found = crate::advice_files::checks(session, store, who, &cx, asked).await?;
     Ok(serde_json::to_value(found)?)
 }
 

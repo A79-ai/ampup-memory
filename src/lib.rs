@@ -37,6 +37,7 @@ pub mod advice_curate;
 pub mod advice_files;
 pub mod advice_lookups;
 pub mod advice_loop;
+pub mod advice_regressions;
 pub mod advice_requests;
 pub mod advice_route;
 pub mod advice_traces;

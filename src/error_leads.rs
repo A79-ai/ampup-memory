@@ -319,7 +319,7 @@ pub fn render(leads: &[Lead]) -> String {
 
 /// Whether a `github:` source is a merged PR's own episode: `github:https://github.com/<repo>/pull/<n>` (the eng
 /// corpus) or `github:<repo>#<n>` (the PR ingest), not a review thread's or a review's.
-fn pr_source(source: &str) -> bool {
+pub(crate) fn pr_source(source: &str) -> bool {
     let Some(rest) = source.strip_prefix("github:") else {
         return false;
     };
@@ -437,7 +437,7 @@ fn parse(source: &str, body: &str, occurred_at: i64) -> Parsed {
 /// The text as written before the corpus format split it: the title line, a blank line, then the body's chunks
 /// joined by newlines, each repeating the last one's final [`OVERLAP`] characters. Each seam is checked; text that
 /// doesn't read so is kept as it is.
-fn unchunk(text: &str) -> String {
+pub(crate) fn unchunk(text: &str) -> String {
     let Some((title, body)) = text.split_once("\n\n") else {
         return text.to_string();
     };
