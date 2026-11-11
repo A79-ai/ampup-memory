@@ -47,7 +47,7 @@ it back where the CLI reads it.
 Every failure raises `AmpUpMemoryError` with `status`, `message` and, on a 429, `retry_after`. An error the
 server reports inside a row (a bad query, say) raises it too, with status 200.
 
-The TypeScript client with the same methods is [`@ampup/memory`](https://github.com/A79-ai/ampup-memory/tree/main/sdk/typescript).
+The TypeScript client with the same methods is [`ampup-memory`](https://github.com/A79-ai/ampup-memory/tree/main/sdk/typescript).
 
 ## License
 

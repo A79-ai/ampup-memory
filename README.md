@@ -73,7 +73,7 @@ From code, the Python and TypeScript clients wrap the same routes:
 
 ```bash
 pip install ampup-memory        # Python 3.10+, sdk/python
-npm install @ampup/memory       # Node 20+, sdk/typescript
+npm install ampup-memory       # Node 20+, sdk/typescript
 ```
 
 ```python

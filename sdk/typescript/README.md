@@ -1,17 +1,17 @@
-# @ampup/memory
+# ampup-memory
 
 A thin TypeScript client for an [AmpUp Memory](https://github.com/A79-ai/ampup-memory) server: write what your
 team knows, search it, and read it back. One class, no codegen, and no runtime dependencies (global `fetch`,
 Node 20+).
 
 ```sh
-npm install @ampup/memory
+npm install ampup-memory
 ```
 
 ## Quickstart
 
 ```ts
-import { AmpUpMemory, micros } from "@ampup/memory";
+import { AmpUpMemory, micros } from "ampup-memory";
 
 const mem = await AmpUpMemory.fromProfile(); // the CLI's current context; or AmpUpMemory.fromProfile("work")
 // const mem = new AmpUpMemory("https://memory.example.com", "msk_...", { org: "acme" }); // an explicit API key
