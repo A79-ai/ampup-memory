@@ -148,19 +148,24 @@ tokio::task_local! {
 pub async fn traced<F: std::future::Future>(moment: &str, f: F) -> F::Output {
     TRACE
         .scope(
-            RefCell::new(Trace {
-                moment: moment.to_string(),
-                started: Instant::now(),
-                at: crate::now_micros(),
-                steps: vec![],
-                score: None,
-                fit: None,
-                when: None,
-                trouble: None,
-            }),
+            fresh(moment.to_string(), Instant::now(), crate::now_micros()),
             f,
         )
         .await
+}
+
+/// A lookup's trace with no step noted yet.
+fn fresh(moment: String, started: Instant, at: i64) -> RefCell<Trace> {
+    RefCell::new(Trace {
+        moment,
+        started,
+        at,
+        steps: vec![],
+        score: None,
+        fit: None,
+        when: None,
+        trouble: None,
+    })
 }
 
 /// `f`, to run on a task of its own (a routing job the caller won't wait for), as part of the lookup it was started
@@ -175,25 +180,39 @@ pub fn carry<F: std::future::Future>(f: F) -> impl std::future::Future<Output = 
     async move {
         match from {
             None => f.await,
-            Some((moment, started, at)) => {
-                TRACE
-                    .scope(
-                        RefCell::new(Trace {
-                            moment,
-                            started,
-                            at,
-                            steps: vec![],
-                            score: None,
-                            fit: None,
-                            when: None,
-                            trouble: None,
-                        }),
-                        f,
-                    )
-                    .await
-            }
+            Some((moment, started, at)) => TRACE.scope(fresh(moment, started, at), f).await,
         }
     }
+}
+
+/// `f`, a routing run at once beside another of the same lookup (a person's own advice beside the team's): its
+/// steps are noted apart, so neither's scores land on the other's step, and then put before the lookup's others,
+/// where the person's own come when routed first.
+pub async fn apart<F: std::future::Future>(f: F) -> F::Output {
+    let Ok((moment, started, at)) = TRACE.try_with(|t| {
+        let t = t.borrow();
+        (t.moment.clone(), t.started, t.at)
+    }) else {
+        return f.await;
+    };
+    let (out, (steps, trouble)) = TRACE
+        .scope(fresh(moment, started, at), async move {
+            let out = f.await;
+            let noted = TRACE.with(|t| {
+                let mut t = t.borrow_mut();
+                (std::mem::take(&mut t.steps), t.trouble.take())
+            });
+            (out, noted)
+        })
+        .await;
+    let _ = TRACE.try_with(|t| {
+        let mut t = t.borrow_mut();
+        t.steps.splice(0..0, steps);
+        if t.trouble.is_none() {
+            t.trouble = trouble;
+        }
+    });
+    out
 }
 
 /// The decisions model's best score for the routing under way.

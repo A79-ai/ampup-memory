@@ -728,8 +728,8 @@ pub async fn serve_with(
             eprintln!("sessions aren't judged: {e:#}");
             None
         });
-        // Where a scope asks for people's own advice sooner (`advice_personal_runs`), it is learned right after
-        // their sessions end rewarded (`crate::advice_loop::personal_soon`), on the learning model.
+        // Where a scope asks for people's own advice sooner (`advice_personal_runs`), it is learned once their
+        // sessions are rewarded or judged (`crate::advice_loop::personal_soon`), on the learning model.
         let learn = match crate::advice_loop::enabled() {
             true => crate::extract::Extractor::advice_from_env().unwrap_or_else(|e| {
                 eprintln!("people's own advice isn't learned after their sessions: {e:#}");
@@ -794,7 +794,8 @@ pub async fn serve_with(
                             match crate::advice_loop::personal_soon(&store, &scope, &cx).await {
                                 Ok(0) => {}
                                 Ok(n) => eprintln!(
-                                    "advice {scope}: learned {n} people's own advice after their sessions"
+                                    "advice {scope}: learned {n} people's own advice after their sessions (a note of \
+                                     theirs written)"
                                 ),
                                 Err(e) => eprintln!("advice {scope}: own advice after sessions: {e:#}"),
                             }
@@ -11417,6 +11418,8 @@ fn advice_procedures(args: &Value) -> Result<Option<bool>, ()> {
 /// learned. A note comes alone unless the call or the scope's admins (`set_settings {advice_procedures: true}`)
 /// ask for its procedures too. `also` are the other scopes the caller's scope reads ([`advice_reads`]): their
 /// lines are routed over too, each with the notes it serves a caller there outside a session (whatever `arm`).
+/// The caller's own advice for the question, when they have some, comes before the team's, beside it and never
+/// instead of it (`crate::advice::beside`).
 #[allow(clippy::too_many_arguments)]
 async fn advice(
     session: &Session,
@@ -11473,17 +11476,6 @@ async fn advice(
         procedures,
         skills,
     };
-    // The caller's own learned advice first, with no evidence bar: it was learned from their own sessions and
-    // is readable by them alone. Only when `notes` is on, and only where they have a map of their own.
-    if own_notes {
-        let mine = crate::advice::Space::mine(who.user());
-        if let Some(a) =
-            crate::advice::get_in(session, store, who, &router, question, serving, None, &mine)
-                .await?
-        {
-            return Ok(Some(a));
-        }
-    }
     // Another scope's notes as its own readers outside a session are served them: past its evidence bar only. One
     // that can't be read now serves its procedures alone.
     let mut others = vec![];
@@ -11504,7 +11496,34 @@ async fn advice(
         };
         others.push(crate::advice::Also { session: o, notes });
     }
-    crate::advice::get_across(
+    // The caller's own learned advice too, with no evidence bar: it was learned from their own sessions and is
+    // readable by them alone. Only when `notes` is on, and only where they have a map of their own. It is served
+    // before the team's advice or procedure for the same task, beside it and never instead of it, in a third of a
+    // capped answer at most (`crate::advice::own_share`), so the team's always has the rest. The two are routed at
+    // once: the caller waits for one routing, not two.
+    let own = async {
+        if !own_notes {
+            return None;
+        }
+        let mine = crate::advice::Space::mine(who.user());
+        let theirs = crate::advice::Serving {
+            max_chars: max_chars.map(crate::advice::own_share),
+            ..serving
+        };
+        // Theirs failing to route leaves the team's to answer alone.
+        crate::advice_lookups::apart(crate::advice::get_in(
+            session, store, who, &router, question, theirs, None, &mine,
+        ))
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "advice: the caller's own advice in {} failed: {e:#}",
+                session.scope()
+            );
+            None
+        })
+    };
+    let team = crate::advice::get_across(
         session,
         store,
         who,
@@ -11513,8 +11532,31 @@ async fn advice(
         serving,
         notes.as_ref(),
         &others,
-    )
-    .await
+    );
+    let (own, team) = tokio::join!(own, team);
+    let mut team = team?;
+    // The two past the cap together: the team's routed again, fitted to what the caller's own leaves of it.
+    if let (Some(o), Some(t), Some(max)) = (&own, &team, max_chars) {
+        let left = max.saturating_sub(o.text.chars().count() + 2);
+        if t.text.chars().count() > left {
+            let fitted = crate::advice::Serving {
+                max_chars: Some(left),
+                ..serving
+            };
+            team = crate::advice::get_across(
+                session,
+                store,
+                who,
+                &router,
+                question,
+                fitted,
+                notes.as_ref(),
+                &others,
+            )
+            .await?;
+        }
+    }
+    Ok(crate::advice::beside(own, team))
 }
 
 /// The other scopes `session`'s scope reads (`Settings::reads`, [`Reads::of`]), which its advice routes over too:
@@ -12109,7 +12151,7 @@ async fn session_advice(
                     let withheld = if !crate::sessions::under_cap(session.scope(), who, id) {
                         Some(outcome::STEP_NOTHING)
                     } else {
-                        let text = format!("Situation: `{}`\n{}", a.key, a.text);
+                        let text = format!("{}\n{}", a.situation_line(), a.whole_text());
                         let seen = seen.unwrap_or_default();
                         match crate::sessions::useful(question, seen, &text, None, Some(&said))
                             .await?
@@ -12739,10 +12781,14 @@ async fn get_advice_step(
             crate::advice_lookups::outside(found.as_ref());
             let text = match found {
                 Some(a) => format!(
-                    "Situation: `{}`\n{}\n\n{}",
-                    a.key,
-                    crate::advice::named(&a.skills),
-                    a.text
+                    "{}\n{}\n\n{}{}",
+                    a.situation_line(),
+                    crate::advice::named(&a.all_skills()),
+                    a.whole_text(),
+                    match a.key.starts_with(crate::advice::MINE_KEY) {
+                        true => format!("\n\n{OWN_ADVICE}"),
+                        false => String::new(),
+                    }
                 ),
                 None => "No advice for this kind of question.".into(),
             };
@@ -12873,13 +12919,15 @@ fn served_text(served: &crate::sessions::Served) -> String {
             evidence,
             bar,
             skills,
+            own,
         } => format!(
-            "Situation: `{situation}`\n{}\n\n{note}\n\n{}",
-            crate::advice::named(skills),
+            "{}\n{}\n\n{}\n\n{}",
+            crate::advice::situation_line(situation, own.as_ref().map(|o| o.situation.as_str())),
+            crate::advice::named(&with_own_skills(own.as_ref(), skills)),
+            with_own_text(own.as_ref(), note),
             // A person's own note has no tally to show (it is theirs, learned from their past sessions).
             if situation.starts_with(crate::advice::MINE_KEY) {
-                "This is your own advice, learned from your past sessions; only you see it."
-                    .to_string()
+                OWN_ADVICE.to_string()
             } else {
                 evidence.line(*bar)
             }
@@ -12888,13 +12936,38 @@ fn served_text(served: &crate::sessions::Served) -> String {
             situation,
             text,
             skills,
+            own,
         } => format!(
-            "Situation: `{situation}`\n{}\n\n{text}",
-            crate::advice::named(skills)
+            "{}\n{}\n\n{}",
+            crate::advice::situation_line(situation, own.as_ref().map(|o| o.situation.as_str())),
+            crate::advice::named(&with_own_skills(own.as_ref(), skills)),
+            with_own_text(own.as_ref(), text)
         ),
         Served::Again { .. } | Served::Withheld | Served::None => NO_NEW_ADVICE.into(),
         Served::Pending => ADVICE_PENDING.into(),
     }
+}
+
+/// What closes a person's own note served alone, where a team note's evidence would be.
+const OWN_ADVICE: &str =
+    "This is your own advice, learned from your past sessions; only you see it.";
+
+/// A step's text: the person's own note first, when one is served beside the team's (`crate::sessions::Own`).
+fn with_own_text(own: Option<&crate::sessions::Own>, text: &str) -> String {
+    match own {
+        Some(o) => crate::advice::with_own(&o.note, text),
+        None => text.to_string(),
+    }
+}
+
+/// A step's skills: the person's own note's first, when one is served beside the team's.
+fn with_own_skills(
+    own: Option<&crate::sessions::Own>,
+    skills: &[crate::advice::Skill],
+) -> Vec<crate::advice::Skill> {
+    let mut out: Vec<crate::advice::Skill> = own.iter().flat_map(|o| o.skills.clone()).collect();
+    out.extend(skills.iter().cloned());
+    out
 }
 
 /// An advice step still routing when its caller stopped waiting (`routing`).
@@ -12916,20 +12989,34 @@ fn served_json(served: &crate::sessions::Served) -> Value {
             note,
             evidence,
             skills,
+            own,
             ..
         } => {
             // A person's own note has no tally (it is theirs: `served_text` says so).
-            if situation.starts_with(crate::advice::MINE_KEY) {
+            let mut v = if situation.starts_with(crate::advice::MINE_KEY) {
                 json!({"situation": situation, "advice": note, "own": true, "skills": skills})
             } else {
-                json!({"situation": situation, "advice": note, "evidence": evidence, "skills": skills})
+                json!({"situation": situation, "advice": with_own_text(own.as_ref(), note), "evidence": evidence,
+                       "skills": with_own_skills(own.as_ref(), skills)})
+            };
+            if let Some(o) = own {
+                v["own_situation"] = json!(o.situation);
             }
+            v
         }
         Served::Procedures {
             situation,
             text,
             skills,
-        } => json!({"situation": situation, "advice": text, "skills": skills}),
+            own,
+        } => {
+            let mut v = json!({"situation": situation, "advice": with_own_text(own.as_ref(), text),
+                               "skills": with_own_skills(own.as_ref(), skills)});
+            if let Some(o) = own {
+                v["own_situation"] = json!(o.situation);
+            }
+            v
+        }
         Served::Again { .. } | Served::Withheld | Served::None => {
             json!({"situation": null, "advice": null})
         }

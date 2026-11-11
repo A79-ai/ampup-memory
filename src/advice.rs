@@ -947,6 +947,8 @@ struct Run {
     advice: Option<String>,
     /// When it was first logged (µs).
     at: i64,
+    /// Whether someone gave it its reward ([`given`]), not only a model's reading of it.
+    given: bool,
 }
 
 /// A rewarded run's reward and the advice it was served, for what later came of a note
@@ -1344,6 +1346,7 @@ async fn runs_and_overrides(
         .flat_map(|l| {
             // What became of the PRs a session opened, the surest reward it can have: it teaches as a whole.
             let pr = pr_outcome(&l);
+            let given = given(&l);
             // A person who read the whole trace graded it (`crate::qa_log::review`): it teaches as a whole too.
             let reviewed = crate::qa_log::reviewed(&l);
             // A session graded request by request teaches by each request the person's next move graded, in
@@ -1426,6 +1429,7 @@ async fn runs_and_overrides(
                 whole,
                 advice,
                 at: l.asked_at,
+                given,
             }]
         })
         .collect();
@@ -1442,6 +1446,22 @@ pub(crate) fn sorts(l: &crate::qa_log::Logged) -> bool {
             || ((crate::sessions::an_ask(&l.question) || graded(l).is_some())
                 && !l.episodes.is_empty()
                 && !crate::sessions::automated(l)))
+}
+
+/// Whether the reward `l` teaches by was given by someone, not only read by the engine's judge (a reason starting
+/// `judged: `): a caller's reward (`reward_run`, `end_session`'s, the hooks' `outcome`), a person's rating, review or
+/// next message, or what became of its PRs. Where a scope asks for a person's own advice at one run
+/// ([`personal_runs`]), only such a run brings it forward: one model's reading of one run backs no note.
+pub(crate) fn given(l: &crate::qa_log::Logged) -> bool {
+    pr_outcome(l).is_some()
+        || crate::qa_log::reviewed(l)
+        || l.rating.is_some()
+        || graded(l).is_some()
+        || (l.reward.is_some()
+            && !l
+                .reward_reason
+                .as_deref()
+                .is_some_and(|w| w.starts_with(crate::qa_log::JUDGED)))
 }
 
 /// What became of the PRs session `l` opened or pushed to, as its reward and why ([`crate::session_prs::outcome`]).
@@ -1541,6 +1561,8 @@ fn task_runs(l: &crate::qa_log::Logged, body: &str, graded: &[(usize, usize, boo
                     .map(|s| s.served.join("; "))
                     .filter(|s| !s.is_empty()),
                 at: l.asked_at,
+                // The person's own next message graded it.
+                given: true,
             })
         })
         .collect()
@@ -3736,13 +3758,16 @@ async fn learn_space(
     // The notes served or routed to lately ([`used_since`]), read only once a note is found to need an update.
     let mut used: Option<BTreeSet<String>> = None;
     // A person's own notes, where the scope asks for them sooner ([`personal_runs`]): a note at that many of their
-    // runs, whichever way they went (so one may rest on a single run), written again after that many new ones.
+    // runs, whichever way they went, written again after that many new ones. At one, a note rests on a single run:
+    // only where someone gave a run of the situation its reward ([`given`]); a situation whose runs only the judge
+    // read waits for the server's bars, as one model's reading of one run backs nothing.
     let sooner = match space.owner {
         Some(_) => personal_runs(store, scope).await,
         None => None,
     };
-    let bar = |b: usize| sooner.map_or(b, |n| b.min(n));
     for ((c, s), rs) in &groups {
+        let sooner = sooner.filter(|n| *n > 1 || rs.iter().any(|r| r.given));
+        let bar = |b: usize| sooner.map_or(b, |n| b.min(n));
         let wrong = rs.iter().filter(|r| !r.right).count();
         if wrong < bar(min_wrong.max(1)) && rs.len() - wrong < bar(min_right()) {
             done.too_few += 1;
@@ -4592,6 +4617,64 @@ pub struct Advised {
     /// The version of the note the text holds: its document's episode id, so a session's judge reads what was
     /// served ([`crate::qa_log::SessionPart::served_versions`]).
     pub version: Option<String>,
+    /// The caller's own advice for the same question (a `mine:` note), served before this, the team's, and labelled
+    /// as theirs ([`beside`]): never instead of it.
+    pub own: Option<Box<Advised>>,
+}
+
+impl Advised {
+    /// The situation line an answer starts with: its key, and the caller's own note's beside it.
+    pub fn situation_line(&self) -> String {
+        situation_line(&self.key, self.own.as_ref().map(|o| o.key.as_str()))
+    }
+
+    /// The skills the answer serves: the caller's own note's first, then the team's.
+    pub fn all_skills(&self) -> Vec<Skill> {
+        let mut out: Vec<Skill> = self.own.iter().flat_map(|o| o.skills.clone()).collect();
+        out.extend(self.skills.iter().cloned());
+        out
+    }
+
+    /// The text served: the caller's own advice first, when there is some, then this.
+    pub fn whole_text(&self) -> String {
+        match &self.own {
+            Some(o) => with_own(&o.text, &self.text),
+            None => self.text.clone(),
+        }
+    }
+}
+
+/// How an answer names what it serves: `Situation: `<key>``, and the caller's own note's key after it when it serves
+/// one beside the team's.
+pub fn situation_line(key: &str, own: Option<&str>) -> String {
+    match own {
+        Some(o) => format!("Situation: `{key}` (with your own advice, `{o}`)"),
+        None => format!("Situation: `{key}`"),
+    }
+}
+
+/// A person's own advice, `own`, before the team's, `team`, in one text: each begins with the line that says whose
+/// it is.
+pub fn with_own(own: &str, team: &str) -> String {
+    format!("{}\n\n{}", own.trim_end(), team)
+}
+
+/// The share of a caller's `max_chars` a person's own advice may take when the team's is served beside it: a third,
+/// so their own note never starves the team's procedure ([`beside`]).
+pub fn own_share(max_chars: usize) -> usize {
+    max_chars / 3
+}
+
+/// What a caller is served of a person's own advice, `own`, and the team's, `team`, for one question: the team's
+/// with theirs before it ([`Advised::own`]), theirs alone, or the team's alone.
+pub fn beside(own: Option<Advised>, team: Option<Advised>) -> Option<Advised> {
+    match (own, team) {
+        (Some(o), Some(mut t)) => {
+            t.own = Some(Box::new(o));
+            Some(t)
+        }
+        (o, t) => t.or(o),
+    }
 }
 
 /// The advice for `question`, if one kind of task the caller may be advised on fits; the routing model `router`
@@ -5071,7 +5154,7 @@ async fn route(
     let noted = note.is_some();
     // What the note says of when it applies, read from the note whole: the text served may leave its Withhold when out.
     let when = note.as_deref().and_then(crate::advice_route::When::of);
-    let (text, dropped) = fit(note, procedures, more, format, max_chars);
+    let (text, dropped) = fit(note, procedures, more, format, max_chars, mine);
     let fit = match check_fit {
         Some(d) => crate::advice_route::fits(d, question, when.as_ref(), &text).await,
         None => crate::advice_route::fits_chat(router, question, when.as_ref(), &text).await,
@@ -5093,6 +5176,7 @@ async fn route(
         shortlist,
         scope: (from > 0).then(|| session.scope().to_string()),
         version: version.filter(|_| noted),
+        own: None,
     }))
 }
 
@@ -5235,8 +5319,9 @@ fn fit(
     mut more: Vec<String>,
     format: Format,
     max_chars: Option<usize>,
+    mine: bool,
 ) -> (String, usize) {
-    let text = compose(note.clone(), &procedures, &more, format);
+    let text = compose(note.clone(), &procedures, &more, format, mine);
     let Some(max) = max_chars else {
         return (text, 0);
     };
@@ -5259,7 +5344,7 @@ fn fit(
             .to_string()
     };
     loop {
-        let text = compose(note.clone(), &procedures, &more, format);
+        let text = compose(note.clone(), &procedures, &more, format, mine);
         if fits(&text) || procedures.is_empty() {
             let dropped = given - procedures.len();
             if fits(&text) {
@@ -5401,9 +5486,19 @@ fn without_empty_sections(md: &str) -> String {
     out.join("\n")
 }
 
-/// The answer's text: a line on what follows, the note, then the procedures.
-fn compose(note: Option<String>, procedures: &[String], more: &[String], format: Format) -> String {
+/// The answer's text: a line on what follows, the note, then the procedures. `mine`: the note is the caller's own,
+/// learned from their sessions alone, and its line says so (a personal space serves no procedures).
+fn compose(
+    note: Option<String>,
+    procedures: &[String],
+    more: &[String],
+    format: Format,
+    mine: bool,
+) -> String {
     let mut out = match (&note, procedures.is_empty()) {
+        (Some(_), _) if mine => "Below is your own advice for this kind of task, learned from your past sessions; \
+                                 only you see it. Follow it unless the data contradicts it."
+            .to_string(),
         (Some(_), false) => "Below are the lessons learned from this organization's past runs of this kind of task, \
                              then the procedure compiled from its documents. Follow them unless the data \
                              contradicts them."
@@ -5580,12 +5675,17 @@ async fn procedure(
     Ok(Some(out))
 }
 
-/// [`get`]'s answer as JSON: the key routed to, the text, and the skills it serves; and how the routing call was
-/// shortlisted, when it was.
+/// [`get`]'s answer as JSON: the key routed to, the text (the caller's own advice first, when theirs is served beside
+/// it: `own_situation` names it), and the skills it serves; and how the routing call was shortlisted, when it was.
 pub fn served(found: Option<Advised>) -> Value {
     match found {
         Some(a) => {
-            let mut v = json!({"situation": a.key, "advice": a.text, "skills": a.skills});
+            let mut v =
+                json!({"situation": a.key, "advice": a.whole_text(), "skills": a.all_skills()});
+            // The caller's own note, served before the team's answer ([`Advised::own`]).
+            if let Some(o) = &a.own {
+                v["own_situation"] = json!(o.key);
+            }
             if let Some(s) = a.shortlist {
                 v["shortlist"] = json!(s);
             }

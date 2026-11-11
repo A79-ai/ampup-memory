@@ -275,11 +275,13 @@ pub enum OrgCmd {
         #[arg(long)]
         advice_learn_people: Option<usize>,
         /// The rewarded runs or sessions each person's own advice waits for, where fewer than the server's bars:
-        /// their map after this many new ones, a note at this many runs, rewritten after this many new ones, and
-        /// learned right after their session ends rewarded (1 to 10; 0 unsets it; default: the server's
-        /// AMPUP_MEMORY_ADVICE_PERSONAL_RUNS, unset)
+        /// their map after this many new ones, a note at this many runs, rewritten after this many new ones, learned
+        /// by the next session sweep once a run is rewarded (a session only the judge rewards, as the hooks' are,
+        /// waits for its judging, AMPUP_MEMORY_SESSION_JUDGE_WAIT_SECS, 600 s, after its last step), and at 1 only
+        /// from runs someone gave a reward. 1 to 10; 0 unsets it; off turns it off here, over the org's and the
+        /// server's AMPUP_MEMORY_ADVICE_PERSONAL_RUNS (default: that, unset)
         #[arg(long)]
-        advice_personal_runs: Option<usize>,
+        advice_personal_runs: Option<directory::PersonalRuns>,
         /// How advice routes over the skills compiled from documents: fallback (default: only where no kind of
         /// task learned from runs fits), together (both on one list) or off ("" unsets it)
         #[arg(long)]

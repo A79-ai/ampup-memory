@@ -821,6 +821,15 @@ impl Extractor {
         self.batch
     }
 
+    /// This model through its synchronous API, for work that waits on its answers: the Batch API's take minutes to
+    /// hours.
+    pub fn unbatched(&self) -> Self {
+        Self {
+            batch: false,
+            ..self.clone()
+        }
+    }
+
     /// How many requests to have in flight: `n` one call at a time; on the Batch API all of them, so that a run's
     /// requests go out in as few batches as its limits allow.
     pub(crate) fn parallel(&self, n: usize) -> usize {

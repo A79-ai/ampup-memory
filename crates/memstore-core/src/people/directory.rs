@@ -82,6 +82,52 @@ const MAX_COMPILE_BATCH: usize = 100;
 /// The most rewarded runs `advice_personal_runs` may name: the server's own bar for a person's first map
 /// (`AMPUP_MEMORY_ADVICE_MIN_NEW`) is 10 by default, and the setting only ever lowers bars.
 const MAX_PERSONAL_RUNS: usize = 10;
+
+/// What a scope's `advice_personal_runs` says ([`Settings::advice_personal_runs`]): a number of rewarded runs (`0`
+/// unsets it), or `"off"`, which turns it off there whatever its org or the server says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersonalRuns {
+    Runs(usize),
+    Off,
+}
+
+impl Serialize for PersonalRuns {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            PersonalRuns::Runs(n) => s.serialize_u64(*n as u64),
+            PersonalRuns::Off => s.serialize_str("off"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PersonalRuns {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        match Value::deserialize(d)? {
+            Value::Number(n) if n.as_u64().is_some() => {
+                Ok(PersonalRuns::Runs(n.as_u64().unwrap_or_default() as usize))
+            }
+            Value::String(s) => s.parse().map_err(serde::de::Error::custom),
+            other => Err(serde::de::Error::custom(format!(
+                "advice_personal_runs is a number of rewarded runs (0 unsets it) or \"off\", not {other}"
+            ))),
+        }
+    }
+}
+
+impl std::str::FromStr for PersonalRuns {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.trim() {
+            "off" => Ok(PersonalRuns::Off),
+            n => n.parse().map(PersonalRuns::Runs).map_err(|_| {
+                format!(
+                    "advice_personal_runs is a number of rewarded runs (0 unsets it) or \"off\", not {s:?}"
+                )
+            }),
+        }
+    }
+}
 /// What a scope's compile sources may be said to be (`Settings::compile_kind`); `""` unsets it.
 pub const COMPILE_KINDS: &[&str] = &["", "errors"];
 /// How advice routes over a scope's compiled skills (`Settings::advice_skills`); `""` unsets it.
@@ -869,11 +915,13 @@ pub struct Settings {
     /// that is fewer than the server's bars: a person's map is learned once they have this many new ones (instead
     /// of `AMPUP_MEMORY_ADVICE_MIN_NEW`, 10), a situation of theirs gets a note at this many runs (instead of 2 that
     /// went wrong or 4 that went right), and their note is written again after this many new runs (instead of
-    /// `AMPUP_MEMORY_ADVICE_NOTE_MIN_NEW`, 5, or 2 wrong); and it is learned right after a session of theirs ends
-    /// rewarded, instead of at the advice timer's next round. A bar already lower stays. The team's notes are
-    /// untouched. 1 to 10; 0 unsets it, back to the org's (or the server's `AMPUP_MEMORY_ADVICE_PERSONAL_RUNS`).
+    /// `AMPUP_MEMORY_ADVICE_NOTE_MIN_NEW`, 5, or 2 wrong); and it is learned by the server's session sweep once such
+    /// a run is rewarded, instead of at the advice timer's next round. At 1, only a run someone gave its reward
+    /// counts, not one the judge alone read. A bar already lower stays. The team's notes are untouched. 1 to 10; 0
+    /// unsets it, back to the org's (or the server's `AMPUP_MEMORY_ADVICE_PERSONAL_RUNS`); `off` turns it off here,
+    /// over the org's value (for a team) and the server's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub advice_personal_runs: Option<usize>,
+    pub advice_personal_runs: Option<PersonalRuns>,
     /// How advice routes over the skills compiled from the scope's documents (`crate::advice`): `fallback` (the
     /// default) weighs the kinds of task learned from runs first, every one of them, and the compiled skills only
     /// when none fits; `together` weighs both on one list, as advice did before; `off` never serves a compiled
@@ -2206,14 +2254,22 @@ impl Directory {
 
     /// The rewarded runs each person's own advice waits for in `scope` (`Settings::advice_personal_runs`): its
     /// team's setting, else its org's (0 is unset), else `default` (the server's `AMPUP_MEMORY_ADVICE_PERSONAL_RUNS`),
-    /// which a scope the directory doesn't hold also gets. None: the server's own bars.
+    /// which a scope the directory doesn't hold also gets. None: the server's own bars, as where the team's setting,
+    /// or else the org's, is `off`.
     pub fn advice_personal_runs(
         &self,
         scope: &crate::Scope,
         default: Option<usize>,
     ) -> Option<usize> {
-        self.team_or_org(scope, |s| s.advice_personal_runs.filter(|n| *n > 0))
-            .or(default)
+        let set = |s: &Settings| {
+            s.advice_personal_runs
+                .filter(|r| *r != PersonalRuns::Runs(0))
+        };
+        match self.team_or_org(scope, set) {
+            Some(PersonalRuns::Runs(n)) => Some(n),
+            Some(PersonalRuns::Off) => None,
+            None => default,
+        }
     }
 
     /// The accounts whose runs teach `scope`'s team notes nothing (`Settings::advice_learn_exclude`), as ACL ids:
@@ -3410,7 +3466,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             if settings.is_empty() {
                 invalid!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>, \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             if let Some(sources) = &settings.compile_sources {
@@ -3445,12 +3501,11 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                     "compile_batch is at most {MAX_COMPILE_BATCH} sources a round (0 unsets it)"
                 );
             }
-            if settings
-                .advice_personal_runs
-                .is_some_and(|n| n > MAX_PERSONAL_RUNS)
+            if let Some(PersonalRuns::Runs(n)) = settings.advice_personal_runs
+                && n > MAX_PERSONAL_RUNS
             {
                 invalid!(
-                    "advice_personal_runs is at most {MAX_PERSONAL_RUNS} rewarded runs (0 unsets it): it only lowers the bars a person's own advice waits for"
+                    "advice_personal_runs is at most {MAX_PERSONAL_RUNS} rewarded runs (0 unsets it, \"off\" turns it off): it only lowers the bars a person's own advice waits for"
                 );
             }
             if let Some(k) = &settings.advice_skills

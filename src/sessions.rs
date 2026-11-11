@@ -1119,20 +1119,24 @@ pub async fn tend_branches(store: &Store, scope: &Scope, ex: &Extractor) -> Resu
 /// What a session's advice step shows the agent.
 pub enum Served {
     /// A note, served for the first time in the session, with its evidence so far and the bar it is judged by
-    /// ([`min_evidence`]), and the skills it serves (`crate::advice::Skill`).
+    /// ([`min_evidence`]), and the skills it serves (`crate::advice::Skill`); with the person's own note for the same
+    /// task before it, when one is served beside it (`own`).
     Note {
         situation: String,
         note: String,
         evidence: Tally,
         bar: usize,
         skills: Vec<crate::advice::Skill>,
+        own: Option<Own>,
     },
     /// Procedures without a note: a situation's that has none (or none ratified yet), or a skill's no situation
-    /// links. Not recorded, as the judge judges notes.
+    /// links. Not recorded, as the judge judges notes. With the person's own note before them, when one is served
+    /// beside them (`own`), which is recorded.
     Procedures {
         situation: String,
         text: String,
         skills: Vec<crate::advice::Skill>,
+        own: Option<Own>,
     },
     /// A note the session was served before.
     Again { situation: String },
@@ -1143,6 +1147,15 @@ pub enum Served {
     /// Still being routed when its caller stopped waiting (`crate::server::routing`): the session's next advice
     /// call hands it on.
     Pending,
+}
+
+/// A person's own note (`mine:`), served in the same step before the team's note or procedures for the same task
+/// (`crate::advice::Advised::own`): never instead of them.
+#[derive(Clone, Debug)]
+pub struct Own {
+    pub situation: String,
+    pub note: String,
+    pub skills: Vec<crate::advice::Skill>,
 }
 
 /// The lookup under way (`crate::advice_lookups`), come to what the session was `served`; none outside one, and
@@ -1283,8 +1296,101 @@ pub async fn advise(
     Ok(served)
 }
 
-/// What session `s` is served of the advice `found`, recorded in it; whether that changed it.
+/// What session `s` is served of the advice `found`, recorded in it; whether that changed it. A person's own note
+/// served beside the team's answer ([`crate::advice::Advised::own`]) is recorded as a note of its own, before it: it
+/// comes with the team's answer when both are new to the session, alone when only it is.
 async fn serve(
+    store: &Store,
+    scope: &Scope,
+    s: &mut SessionPart,
+    found: Option<crate::advice::Advised>,
+) -> Result<(Served, bool)> {
+    let (found, own) = match found {
+        Some(mut a) => {
+            let own = a.own.take().map(|o| *o);
+            (Some(a), own)
+        }
+        None => (None, None),
+    };
+    // The holdout arm is served neither: both are recorded as withheld.
+    if s.arm == "holdout" {
+        let mut changed = false;
+        for a in own.iter().chain(found.iter()) {
+            if !s.withheld.contains(&a.key) {
+                s.withheld.push(a.key.clone());
+                changed = true;
+            }
+        }
+        let served = match found.is_some() || own.is_some() {
+            true => Served::Withheld,
+            false => Served::None,
+        };
+        return Ok((served, changed));
+    }
+    let mut changed = false;
+    // Theirs first, unless this session was served it already.
+    let own = match own {
+        Some(o) if !s.served.contains(&o.key) => {
+            s.served.push(o.key.clone());
+            if let Some(v) = o.version {
+                s.served_versions.insert(o.key.clone(), v);
+            }
+            changed = true;
+            Some(Own {
+                situation: o.key,
+                note: o.text,
+                skills: o.skills,
+            })
+        }
+        _ => None,
+    };
+    let (served, team_changed) = serve_team(store, scope, s, found).await?;
+    let Some(mine) = own else {
+        return Ok((served, changed || team_changed));
+    };
+    let served = match served {
+        Served::Note {
+            situation,
+            note,
+            evidence,
+            bar,
+            skills,
+            ..
+        } => Served::Note {
+            situation,
+            note,
+            evidence,
+            bar,
+            skills,
+            own: Some(mine),
+        },
+        Served::Procedures {
+            situation,
+            text,
+            skills,
+            ..
+        } => Served::Procedures {
+            situation,
+            text,
+            skills,
+            own: Some(mine),
+        },
+        // The team's served earlier in the session, or none at all: theirs alone, as their own note is served.
+        Served::Again { .. } | Served::Withheld | Served::None | Served::Pending => Served::Note {
+            situation: mine.situation,
+            note: mine.note,
+            evidence: Default::default(),
+            bar: evidence_bar(store, scope).await?,
+            skills: mine.skills,
+            own: None,
+        },
+    };
+    Ok((served, true))
+}
+
+/// What session `s` is served of the team's answer `found` (or a person's own note served alone), recorded in it;
+/// whether that changed it.
+async fn serve_team(
     store: &Store,
     scope: &Scope,
     s: &mut SessionPart,
@@ -1293,17 +1399,11 @@ async fn serve(
     let mut changed = false;
     let served = match found {
         None => Served::None,
-        Some(a) if s.arm == "holdout" => {
-            if !s.withheld.contains(&a.key) {
-                s.withheld.push(a.key);
-                changed = true;
-            }
-            Served::Withheld
-        }
         Some(a) if !a.note => Served::Procedures {
             situation: a.key,
             text: a.text,
             skills: a.skills,
+            own: None,
         },
         Some(a) if s.served.contains(&a.key) => Served::Again { situation: a.key },
         Some(crate::advice::Advised {
@@ -1330,6 +1430,7 @@ async fn serve(
                 evidence,
                 bar: evidence_bar(store, scope).await?,
                 skills,
+                own: None,
             }
         }
     };
