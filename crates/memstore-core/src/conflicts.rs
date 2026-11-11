@@ -77,12 +77,30 @@ pub fn from_env() -> bool {
 }
 
 /// Whether `scope` records conflicts and its reads mark them: its team's `conflicts` setting, else its org's, else
-/// [`ENV`]. Off unless one of them turns it on.
+/// [`ENV`]. Off unless one of them turns it on. A directory that can't be read now answers as this server last read
+/// it, and off before it ever has: never [`ENV`] alone, which a scope's own setting may contradict, so an error can't
+/// turn the setting over for one run.
 pub async fn on(store: &Store, scope: &crate::Scope) -> bool {
     match store.directory().await {
         Ok(d) => d.dir.marks_conflicts(scope),
-        Err(_) => from_env(),
+        Err(_) => store
+            .directory_held()
+            .await
+            .is_some_and(|d| d.dir.marks_conflicts(scope)),
     }
+}
+
+/// The two facts a record's key names (`conflicts/<known fact>/<new fact>`), if it is one.
+pub fn named(key: &str) -> Option<(&str, &str)> {
+    key.strip_prefix(PREFIX).and_then(|r| r.split_once('/'))
+}
+
+/// Whether `ep` is a record of a conflict ([`SOURCE`], filed under [`PREFIX`]), and if so the two facts it names.
+pub fn record_of(ep: &crate::Episode) -> Option<(&str, &str)> {
+    ep.source
+        .starts_with(SOURCE)
+        .then(|| named(ep.document.as_deref()?))
+        .flatten()
 }
 
 /// The recorded conflicts, from the committed documents' versions by key: each fact with the facts it was recorded
@@ -94,7 +112,7 @@ pub(crate) fn recorded(
 ) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for (key, versions) in documents {
-        let Some((a, b)) = key.strip_prefix(PREFIX).and_then(|r| r.split_once('/')) else {
+        let Some((a, b)) = named(key) else {
             continue;
         };
         if a == b || !versions.iter().any(|(_, id)| records.contains(id)) {

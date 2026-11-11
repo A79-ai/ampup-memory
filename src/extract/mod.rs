@@ -126,11 +126,13 @@ certain way. When unsure, answer new.
 ";
 
 /// [`RECONCILE`] where the scope keeps facts that disagree apart ([`crate::conflicts`]): each fact with when and
-/// where it was stated and its words, and a fourth answer. Another prompt, so another request to the model-call
+/// where it was stated (a number per source and the source's kind, never its name, which can hold its author's
+/// address) and its words, and a fourth answer. Another prompt, so another request to the model-call
 /// cache: scopes without the setting ask what they asked before.
 const RECONCILE_CONFLICTS: &str = "You are given facts just extracted from a new text (N1, N2, ...) and facts \
 already known about the same things (E1, E2, ...). Each line is: id | thing | attribute | value | the date it was \
-stated | where it was stated | the words it was taken from. For each new fact, say:
+stated | where it was stated: a source by number (facts from one source share it; S1 is the new text's) and its kind \
+| the words it was taken from (left out for a known fact from S1). For each new fact, say:
 - same: an existing fact already says this, perhaps in other words or units (give its id)
 - supersedes: the thing itself changed, so the new fact replaces an existing one that is no longer true: a new \
 owner, a reversed or changed decision, a different setting or version, a date or figure that moved or was revised \
@@ -1320,6 +1322,19 @@ type Found = (Vec<Fact>, Vec<String>, Option<String>);
 /// An episode read, the facts it gave and why each one it refused was: what reconcile takes.
 type Reading = (Episode, Vec<Fact>, Vec<String>);
 
+/// What reconcile does with an episode's facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Acts {
+    /// Keep what is new, drop what repeats a known fact, and end what a new fact replaces; with `conflicts` (the
+    /// scope keeps facts that disagree apart, [`crate::conflicts`]), record a new fact in conflict with a known one.
+    All { conflicts: bool },
+    /// Keep every fact and only record conflicts: for the facts a schema's `extract` section reads ([`goals`]),
+    /// whose repeats and supersession aggregation derives. A known fact from the episode's own source is left out
+    /// (one source saying otherwise later revises itself), nothing is ended, and a fact that gives the value a
+    /// known one gives is in conflict with what that one is in conflict with.
+    Conflicts,
+}
+
 /// What reading one episode came to.
 #[derive(Default)]
 struct Read {
@@ -1331,6 +1346,8 @@ struct Read {
     /// order.
     records: Vec<Episode>,
     disputed: Vec<Fact>,
+    /// The new fact each record is for, in the same order.
+    facts_disputing: Vec<String>,
     /// Dropped because the schema refused them: why each was (a drop's code).
     refused: Vec<String>,
     repeats: usize,
@@ -1423,8 +1440,7 @@ impl Extractor {
         Ok((facts, refused, why))
     }
 
-    /// One episode's facts reconciled with what is known (committed) now. With `conflicts` (the scope keeps facts
-    /// that disagree apart, [`crate::conflicts`]), a new fact may be recorded in conflict with a known one.
+    /// One episode's facts reconciled with what is known (committed) now, as `acts` says.
     #[allow(clippy::too_many_arguments)]
     async fn reconcile(
         &self,
@@ -1434,8 +1450,10 @@ impl Extractor {
         facts: Vec<Fact>,
         refused: Vec<String>,
         engine: &std::collections::HashSet<String>,
-        conflicts: bool,
+        acts: Acts,
     ) -> Result<Read> {
+        let only_conflicts = acts == Acts::Conflicts;
+        let conflicts = acts != Acts::All { conflicts: false };
         let mut out = Read {
             refused,
             ..Read::default()
@@ -1471,10 +1489,49 @@ impl Extractor {
             c.retain(|k| !k.source_episodes.contains(&ep.episode_id));
             known.push(c);
         }
-        // A repeat of a known value, open or ended, needs no model: a grown thread remembered again
-        // re-states its old owner, who mustn't come back after a newer one ended them.
+        // Where the scope keeps facts that disagree apart, where each known fact was stated: what tells another
+        // source's account from a revision. Read for the facts the model is shown, or, where only conflicts are
+        // recorded, for every known fact first, to leave out those from the episode's own source.
+        let mut session = None;
+        let mut sources: std::collections::HashMap<String, (String, i64)> = Default::default();
+        if let (true, Some(who)) = (
+            only_conflicts && known.iter().any(|k| !k.is_empty()),
+            readers.first(),
+        ) {
+            let s = store.pin(scope, MAIN).await?;
+            let ids: Vec<String> = known
+                .iter()
+                .flatten()
+                .flat_map(|f| f.source_episodes.iter().cloned())
+                .collect();
+            sources = s.episode_sources(store, who, &ids).await?;
+            session = Some(s);
+        }
+        // A known fact from the episode's own source: what that source says later corrects it.
+        let same_source = |sources: &std::collections::HashMap<String, (String, i64)>,
+                           old: &Fact| {
+            old.source_episodes
+                .iter()
+                .any(|e| sources.get(e).is_some_and(|(s, _)| *s == ep.source))
+        };
         let mut ask: Vec<(Fact, Vec<Fact>)> = vec![];
         for (f, mut k) in facts.into_iter().zip(known) {
+            if only_conflicts {
+                // Every fact is kept. What the episode's own source said before, and what is ended, is no
+                // conflict; a value a known fact already gives is in conflict with whatever that one is.
+                k.retain(|k| k.valid_to.is_none() && !same_source(&sources, k));
+                if let Some(said) = k.iter().find(|k| squash(&k.value) == squash(&f.value)) {
+                    self.disputes_as(&mut out, session.as_ref(), ep, &f, said, &k);
+                    out.facts.push(f);
+                } else if k.is_empty() {
+                    out.facts.push(f);
+                } else {
+                    ask.push((f, k));
+                }
+                continue;
+            }
+            // A repeat of a known value, open or ended, needs no model: a grown thread remembered again
+            // re-states its old owner, who mustn't come back after a newer one ended them.
             // An ended fact counts only if the engine extracted it: a value someone posted and closed must
             // not keep a later text that states it from being remembered.
             if k.iter().any(|k| {
@@ -1502,30 +1559,43 @@ impl Extractor {
                 }
             }
         }
+        if let (true, Some(who)) = (conflicts && !only_conflicts, readers.first()) {
+            let ids: Vec<String> = existing
+                .iter()
+                .flat_map(|f| f.source_episodes.iter().cloned())
+                .collect();
+            sources = store
+                .pin(scope, MAIN)
+                .await?
+                .episode_sources(store, who, &ids)
+                .await?;
+        }
         let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-        // Where the scope keeps facts that disagree apart, each fact says when and where it was stated and in what
-        // words: what tells another source's account from a revision.
-        let sources: std::collections::HashMap<String, (String, i64)> = match readers.first() {
-            Some(who) if conflicts => {
-                let ids: Vec<String> = existing
-                    .iter()
-                    .flat_map(|f| f.source_episodes.iter().cloned())
-                    .collect();
-                store
-                    .pin(scope, MAIN)
-                    .await?
-                    .episode_sources(store, who, &ids)
-                    .await?
+        // Where each fact was stated, named for the model by number and kind only (`S2 (email)`): a source's name
+        // can hold its author's address, which the model needs no more than a number to tell one source from
+        // another. S1 is the new text's own source.
+        let source_of = |f: &Fact| -> Option<&str> {
+            let first = f.source_episodes.first()?;
+            match *first == ep.episode_id {
+                true => Some(ep.source.as_str()),
+                false => sources.get(first).map(|(s, _)| s.as_str()),
             }
-            _ => Default::default(),
         };
-        let source_of = |f: &Fact| -> String {
-            let first = f.source_episodes.first();
-            match first.filter(|e| **e != ep.episode_id) {
-                Some(e) => sources.get(e).map_or(String::new(), |(s, _)| flat(s)),
-                None if first.is_some() => flat(&ep.source),
-                None => String::new(),
+        let mut numbered: Vec<&str> = vec![ep.source.as_str()];
+        for f in &existing {
+            if let Some(s) = source_of(f)
+                && !numbered.contains(&s)
+            {
+                numbered.push(s);
             }
+        }
+        let named = |f: &Fact| match source_of(f) {
+            Some(s) => format!(
+                "S{} ({})",
+                numbered.iter().position(|n| *n == s).unwrap_or(0) + 1,
+                crate::episode_types::name_of_source(s).unwrap_or("record")
+            ),
+            None => "unknown".to_string(),
         };
         let line = |f: &Fact| {
             let mut l = format!(
@@ -1535,11 +1605,18 @@ impl Extractor {
                 flat(&f.value)
             );
             if conflicts {
+                // The words only where they tell two sources' accounts apart: not for what the new text's own
+                // source said before.
+                let words = match f.source_episodes.first() != Some(&ep.episode_id)
+                    && source_of(f) == Some(ep.source.as_str())
+                {
+                    true => String::new(),
+                    false => flat(f.quote.as_deref().unwrap_or_default()),
+                };
                 l.push_str(&format!(
-                    " | {} | {} | \"{}\"",
+                    " | {} | {} | \"{words}\"",
                     crate::freshness::day(f.valid_from),
-                    source_of(f),
-                    flat(f.quote.as_deref().unwrap_or_default())
+                    named(f),
                 ));
             }
             l
@@ -1570,14 +1647,8 @@ impl Extractor {
         prompt.push('\n');
         let reply = self.complete(&prompt).await?;
         let verdicts = verdicts(&reply);
-        // A known fact from the episode's own source: what that source says later corrects it.
-        let same_source = |old: &Fact| {
-            old.source_episodes
-                .iter()
-                .any(|e| sources.get(e).is_some_and(|(s, _)| *s == ep.source))
-        };
         enum Verdict<'a> {
-            Same,
+            Same(&'a Fact),
             Ends(&'a Fact),
             Disputes(&'a Fact),
             New,
@@ -1591,12 +1662,18 @@ impl Extractor {
                 k.iter().any(|x| x.fact_id == e.fact_id).then_some(e)
             };
             let verdict = match verdicts.get(&label) {
-                Some((v, id)) if v == "same" && pick(id).is_some() => Verdict::Same,
-                Some((v, id)) if v == "supersedes" => pick(id).map_or(Verdict::New, Verdict::Ends),
+                Some((v, id)) if v == "same" => pick(id).map_or(Verdict::New, Verdict::Same),
+                // Where only conflicts are recorded, aggregation tells what replaced what.
+                Some((v, id)) if v == "supersedes" && !only_conflicts => {
+                    pick(id).map_or(Verdict::New, Verdict::Ends)
+                }
                 Some((v, id)) if conflicts && (v == "conflicts" || v == "conflict") => {
                     match pick(id) {
                         // The same source saying otherwise later corrects itself: never a conflict.
-                        Some(old) if same_source(old) => Verdict::Ends(old),
+                        Some(old) if same_source(&sources, old) && !only_conflicts => {
+                            Verdict::Ends(old)
+                        }
+                        Some(old) if same_source(&sources, old) => Verdict::New,
                         Some(old) => Verdict::Disputes(old),
                         None => Verdict::New,
                     }
@@ -1604,7 +1681,11 @@ impl Extractor {
                 _ => Verdict::New,
             };
             match verdict {
-                Verdict::Same => out.repeats += 1,
+                Verdict::Same(said) if only_conflicts => {
+                    self.disputes_as(&mut out, session.as_ref(), ep, &f, said, &k);
+                    out.facts.push(f);
+                }
+                Verdict::Same(_) => out.repeats += 1,
                 Verdict::Ends(old) => {
                     if old.valid_from < ep.occurred_at
                         && !out.closures.iter().any(|c| c.fact_id == old.fact_id)
@@ -1628,22 +1709,60 @@ impl Extractor {
                 }
                 // Both kept, and a record that they disagree: reads that serve one say what the other says.
                 Verdict::Disputes(old) => {
-                    if out.records.len() == MAX_CLOSURES {
-                        eprintln!(
-                            "extract {}: would record more than {MAX_CLOSURES} known facts in conflict; kept as new",
-                            ep.episode_id
-                        );
-                        out.facts.push(f);
-                        continue;
-                    }
-                    out.records.push(self.conflict_record(ep, old, &f));
-                    out.disputed.push(old.clone());
+                    self.dispute(&mut out, ep, old, &f);
                     out.facts.push(f);
                 }
                 Verdict::New => out.facts.push(f),
             }
         }
         Ok(out)
+    }
+
+    /// Records that `new`, from `ep`, is in conflict with the known fact `old`, unless the episode has already
+    /// recorded as many as it may or that pair.
+    fn dispute(&self, out: &mut Read, ep: &Episode, old: &Fact, new: &Fact) {
+        if out
+            .disputed
+            .iter()
+            .zip(&out.facts_disputing)
+            .any(|(o, n)| o.fact_id == old.fact_id && *n == new.fact_id)
+        {
+            return;
+        }
+        if out.records.len() == MAX_CLOSURES {
+            eprintln!(
+                "extract {}: would record more than {MAX_CLOSURES} known facts in conflict; kept as new",
+                ep.episode_id
+            );
+            return;
+        }
+        out.records.push(self.conflict_record(ep, old, new));
+        out.disputed.push(old.clone());
+        out.facts_disputing.push(new.fact_id.clone());
+    }
+
+    /// Where only conflicts are recorded: `new` says what the known fact `said` says, so it is in conflict with
+    /// each fact `said` is recorded in conflict with that is still among `known` (open, of the same thing and
+    /// attribute, from another source than the episode's).
+    fn disputes_as(
+        &self,
+        out: &mut Read,
+        session: Option<&crate::Session>,
+        ep: &Episode,
+        new: &Fact,
+        said: &Fact,
+        known: &[Fact],
+    ) {
+        let Some(s) = session else {
+            return;
+        };
+        for other in s.vis().conflicts_of(&said.fact_id) {
+            if let Some(old) = known.iter().find(|k| k.fact_id == *other)
+                && squash(&old.value) != squash(&new.value)
+            {
+                self.dispute(out, ep, old, new);
+            }
+        }
     }
 
     /// The record that `new`, from `ep`, is in conflict with the known fact `old` ([`crate::conflicts`]): an engine
@@ -2315,7 +2434,7 @@ async fn run_with(
                 .map(|(ep, facts, refused)| async move {
                     let log = train_log::Ctx::episode("reconcile", scope, &ep);
                     let r = log
-                        .run(ex.reconcile(store, scope, &ep, facts, refused, known, conflicts))
+                        .run(ex.reconcile(store, scope, &ep, facts, refused, known, Acts::All { conflicts }))
                         .await;
                     log.verdict(match &r {
                         Ok(r) => json!({"facts_kept": r.facts.len(), "repeats": r.repeats,

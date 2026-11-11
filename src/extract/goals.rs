@@ -31,7 +31,9 @@
 //! Status is never extracted: aggregation derives it. The prompt asks for no outcomes either, unless
 //! `extract.outcomes` asks for what the text reports happened (a result, a decision, a change, dated); never the
 //! progress of what is pending. Other repeats and supersession are left to aggregation too, so nothing else here
-//! is reconciled. An episode is read once (`extractions` under `schema`, and under `schema@v<n>` for the version of
+//! is reconciled: nothing is ended and no repeat dropped. Only where the scope records conflicts
+//! ([`crate::conflicts`]) are an episode's facts checked, on main, against the open facts of the same things and
+//! attributes from other sources, and what disagrees recorded beside both ([`Acts::Conflicts`]). An episode is read once (`extractions` under `schema`, and under `schema@v<n>` for the version of
 //! the schema that read it, the n-th set on the branch): a new version reads new episodes with what it now offers,
 //! and earlier episodes are read again only by a backfill ([`backfill`], GM3), which asks them only what was added
 //! since. The ledger's actor for a commit names the model, the prompt, the schema's name and version and a hash of
@@ -45,7 +47,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{Extractor, PARALLEL, Refused, Run};
+use super::{Acts, Extractor, PARALLEL, Refused, Run, train_log};
 use crate::episode_types::{self, EpisodeType, Unit};
 use crate::query::schema::{self, Aggregates, Schema, Sources, ValueType, overlay};
 use crate::{Episode, Extraction, FAILED_TRY, Fact, MAIN, Scope, Store};
@@ -1658,96 +1660,217 @@ pub(super) async fn run(
                     "ERROR extract {scope} with {as_said}: repeated items were not merged: {e:#}"
                 );
             }
-            // One commit per episode type: its facts and the episodes they were read from, under its actor.
-            let mut by_actor: BTreeMap<String, (Vec<Fact>, Vec<Extraction>)> = BTreeMap::new();
+            // Where the scope records conflicts ([`crate::conflicts`]), each episode's facts are checked on main
+            // against the open facts of the same things and attributes from other sources, and what disagrees is
+            // recorded; every fact is kept and nothing is ended ([`Acts::Conflicts`]). In waves, oldest first, as
+            // reconcile commits: an episode is checked against what an earlier one of the batch committed.
+            let check =
+                report.is_none() && branch == MAIN && crate::conflicts::on(store, scope).await;
+            let waves = match check {
+                true => waves(results),
+                false => vec![results],
+            };
+            let last = waves.len() - 1;
             let mut offer_of: HashMap<String, Arc<Offer>> = HashMap::new();
-            for (ep, o, r) in results {
-                offer_of.entry(o.actor.clone()).or_insert_with(|| o.clone());
-                match r {
-                    Ok(found) => {
-                        if let Some(rep) = report.as_deref_mut() {
-                            rep.push(described(&ep, &o, &found));
+            for (i, wave) in waves.into_iter().enumerate() {
+                let wave: Vec<(Got, Vec<Episode>)> = match check {
+                    true => {
+                        futures::stream::iter(wave)
+                            .map(|got| disputes(store, scope, ex, got))
+                            .buffered(ex.parallel(*PARALLEL))
+                            .collect()
+                            .await
+                    }
+                    false => wave.into_iter().map(|got| (got, vec![])).collect(),
+                };
+                // One commit per episode type: its facts, the episodes they were read from and the conflicts they are
+                // in, under its actor.
+                let mut by_actor: BTreeMap<String, Commit> = BTreeMap::new();
+                for ((ep, o, r), records) in wave {
+                    offer_of.entry(o.actor.clone()).or_insert_with(|| o.clone());
+                    match r {
+                        Ok(found) => {
+                            if let Some(rep) = report.as_deref_mut() {
+                                rep.push(described(&ep, &o, &found));
+                            }
+                            done.refuse(
+                                found
+                                    .dropped
+                                    .iter()
+                                    .map(|d| d["code"].as_str().unwrap_or("?")),
+                            );
+                            for d in &found.dropped {
+                                eprintln!(
+                                    "extract {} with {as_said}: dropped a fact: {}",
+                                    ep.episode_id,
+                                    drop_note(d)
+                                );
+                            }
+                            if let (Some(d), None) = (found.dropped.first(), &report) {
+                                super::record_refused(
+                                    scope,
+                                    &ep.episode_id,
+                                    found.dropped.len(),
+                                    drop_note(d),
+                                );
+                            }
+                            let e = by_actor.entry(o.actor.clone()).or_default();
+                            // The read's cost goes on one of its two rows: the contract's.
+                            for extractor in [k.clone(), version_key(g.version)] {
+                                let tokens = found.tokens.filter(|_| extractor == k);
+                                e.1.push(Extraction {
+                                    episode_id: ep.episode_id.clone(),
+                                    extractor,
+                                    facts: found.facts.len() as i64,
+                                    tokens,
+                                });
+                            }
+                            e.0.extend(found.facts);
+                            e.2.extend(records);
                         }
-                        done.refuse(
-                            found
-                                .dropped
-                                .iter()
-                                .map(|d| d["code"].as_str().unwrap_or("?")),
-                        );
-                        for d in &found.dropped {
+                        Err(e) if e.downcast_ref::<Refused>().is_some() => {
+                            eprintln!("extract {} with {as_said}: {e:#}", ep.episode_id);
+                            failed.push(try_failed(ep.episode_id));
+                        }
+                        Err(e) => {
+                            eprintln!("extract {} with {as_said}: {e:#}", ep.episode_id);
+                            done.failed += 1;
+                            done.unavailable += 1;
+                        }
+                    }
+                }
+                // Failed tries are recorded with the last wave.
+                if i == last {
+                    done.failed += failed.len();
+                    if !failed.is_empty() {
+                        by_actor
+                            .entry(format!("extract:{}@{PROMPT_VERSION}/{who}", ex.model))
+                            .or_default()
+                            .1
+                            .append(&mut failed);
+                    }
+                }
+                for (actor, (facts, read, records)) in by_actor {
+                    let n = read
+                        .iter()
+                        .filter(|x| x.facts != FAILED_TRY && x.extractor == k)
+                        .count();
+                    if report.is_none() {
+                        // Checked as `settle` checked each fact: what the read offered, laid over the scope's
+                        // schema now. A commit that fails still fails only its own episodes: the others go on,
+                        // and these are read again next run.
+                        let adds = offer_of.get(&actor).map(|o| &o.adds);
+                        let committed = match records.is_empty() {
+                            true => {
+                                store
+                                    .commit_extracted_on(
+                                        scope,
+                                        branch,
+                                        &actor,
+                                        &facts,
+                                        &read,
+                                        &[],
+                                        adds,
+                                    )
+                                    .await
+                            }
+                            // Only on main, where conflicts are checked.
+                            false => {
+                                store
+                                    .commit_reconciled(
+                                        scope,
+                                        &actor,
+                                        &facts,
+                                        &read,
+                                        &[],
+                                        &records,
+                                        adds,
+                                    )
+                                    .await
+                            }
+                        };
+                        if let Err(e) = committed {
                             eprintln!(
-                                "extract {} with {as_said}: dropped a fact: {}",
-                                ep.episode_id,
-                                drop_note(d)
+                                "ERROR extract {scope} with {as_said}: a commit of {n} episodes failed: {e:#}"
                             );
+                            done.failed += n;
+                            continue;
                         }
-                        if let (Some(d), None) = (found.dropped.first(), &report) {
-                            super::record_refused(
-                                scope,
-                                &ep.episode_id,
-                                found.dropped.len(),
-                                drop_note(d),
-                            );
-                        }
-                        let e = by_actor.entry(o.actor.clone()).or_default();
-                        // The read's cost goes on one of its two rows: the contract's.
-                        for extractor in [k.clone(), version_key(g.version)] {
-                            let tokens = found.tokens.filter(|_| extractor == k);
-                            e.1.push(Extraction {
-                                episode_id: ep.episode_id.clone(),
-                                extractor,
-                                facts: found.facts.len() as i64,
-                                tokens,
-                            });
-                        }
-                        e.0.extend(found.facts);
                     }
-                    Err(e) if e.downcast_ref::<Refused>().is_some() => {
-                        eprintln!("extract {} with {as_said}: {e:#}", ep.episode_id);
-                        failed.push(try_failed(ep.episode_id));
-                    }
-                    Err(e) => {
-                        eprintln!("extract {} with {as_said}: {e:#}", ep.episode_id);
-                        done.failed += 1;
-                        done.unavailable += 1;
-                    }
+                    done.episodes += n;
+                    done.facts += facts.len();
+                    done.conflicts += records.len();
                 }
-            }
-            done.failed += failed.len();
-            if !failed.is_empty() {
-                by_actor
-                    .entry(format!("extract:{}@{PROMPT_VERSION}/{who}", ex.model))
-                    .or_default()
-                    .1
-                    .append(&mut failed);
-            }
-            for (actor, (facts, read)) in by_actor {
-                let n = read
-                    .iter()
-                    .filter(|x| x.facts != FAILED_TRY && x.extractor == k)
-                    .count();
-                if report.is_none() {
-                    // Checked as `settle` checked each fact: what the read offered, laid over the scope's
-                    // schema now. A commit that fails still fails only its own episodes: the others go on,
-                    // and these are read again next run.
-                    let adds = offer_of.get(&actor).map(|o| &o.adds);
-                    if let Err(e) = store
-                        .commit_extracted_on(scope, branch, &actor, &facts, &read, &[], adds)
-                        .await
-                    {
-                        eprintln!(
-                            "ERROR extract {scope} with {as_said}: a commit of {n} episodes failed: {e:#}"
-                        );
-                        done.failed += n;
-                        continue;
-                    }
-                }
-                done.episodes += n;
-                done.facts += facts.len();
             }
         }
     }
     Ok(done)
+}
+
+/// An episode read under an offer, and what came of it.
+type Got = (Episode, Arc<Offer>, Result<Found>);
+
+/// What one actor commits: facts, the episodes they were read from, and the records of the conflicts they are in.
+type Commit = (Vec<Fact>, Vec<Extraction>, Vec<Episode>);
+
+/// Episodes read, in waves, oldest first: an episode goes in the wave after the last one holding an earlier episode
+/// with a fact of the same thing and attribute, so it is checked against what that one committed. Episodes with
+/// nothing in common share a wave.
+fn waves(got: Vec<Got>) -> Vec<Vec<Got>> {
+    let mut wave_of: HashMap<(String, String), usize> = HashMap::new();
+    let mut waves: Vec<Vec<Got>> = vec![vec![]];
+    for g in got {
+        let keys: Vec<(String, String)> = match &g.2 {
+            Ok(found) => found
+                .facts
+                .iter()
+                .map(|f| (f.entity.clone(), f.predicate.clone()))
+                .collect(),
+            Err(_) => vec![],
+        };
+        let w = keys
+            .iter()
+            .filter_map(|k| wave_of.get(k).map(|w| w + 1))
+            .max()
+            .unwrap_or(0);
+        for k in keys {
+            wave_of.insert(k, w);
+        }
+        if waves.len() <= w {
+            waves.resize_with(w + 1, Vec::new);
+        }
+        waves[w].push(g);
+    }
+    waves
+}
+
+/// An episode's facts checked against the open facts of the same things and attributes from other sources
+/// ([`Acts::Conflicts`]): the facts, every one kept, and the records of the conflicts they are in. A check that
+/// fails fails the episode, as a read that fails does: it is read again next run, or, refused, given up on.
+async fn disputes(store: &Store, scope: &Scope, ex: &Extractor, got: Got) -> (Got, Vec<Episode>) {
+    let (ep, o, r) = got;
+    let mut found = match r {
+        Ok(found) if !found.facts.is_empty() => found,
+        r => return ((ep, o, r), vec![]),
+    };
+    let log = train_log::Ctx::episode("reconcile", scope, &ep);
+    let facts = std::mem::take(&mut found.facts);
+    let none = HashSet::new();
+    let read = log
+        .run(ex.reconcile(store, scope, &ep, facts, vec![], &none, Acts::Conflicts))
+        .await;
+    log.verdict(match &read {
+        Ok(r) => json!({"facts_kept": r.facts.len(), "conflicts": r.records.len()}),
+        Err(e) => json!({"error": format!("{e:#}").chars().take(300).collect::<String>()}),
+    })
+    .await;
+    match read {
+        Ok(read) => {
+            found.facts = read.facts;
+            ((ep, o, Ok(found)), read.records)
+        }
+        Err(e) => ((ep, o, Err(e)), vec![]),
+    }
 }
 
 /// The types of the people an episode is about. Sharing one of them is not sharing a thread: the same rep is on

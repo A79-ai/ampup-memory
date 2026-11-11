@@ -2957,8 +2957,9 @@ impl Store {
     }
 
     /// [`Store::commit_extracted`] with the engine's own records of what reconcile found among the facts
-    /// ([`conflicts`]), in the same commit. Where what extraction read waits for its owners, the records follow it
-    /// in a commit of their own: a record names facts, and one whose facts aren't on main says nothing to anyone.
+    /// ([`conflicts`]), in the same commit. Where what extraction read waits for its owners, a record waits with the
+    /// fact it was made for, on the same branch ([`Store::stage_extracted`]): it reaches main when that fact is
+    /// published, and never if the fact is rejected.
     #[allow(clippy::too_many_arguments)]
     pub async fn commit_reconciled(
         &self,
@@ -2996,18 +2997,16 @@ impl Store {
             .await
         {
             Err(e) if governance::OwnerApprovalRequired::caused(&e) => {
-                let id = Box::pin(self.stage_extracted(
+                Box::pin(self.stage_extracted(
                     scope,
                     actor,
                     facts,
                     extractions,
                     closures,
+                    records,
                     adds,
                 ))
-                .await?;
-                self.commit_full(scope, MAIN, actor, records, &[], &[], &[], None)
-                    .await?;
-                Ok(id)
+                .await
             }
             r => r,
         }
@@ -3041,8 +3040,16 @@ impl Store {
         {
             // What it read about owned entities waits for their owners; the rest lands.
             Err(e) if branch == MAIN && governance::OwnerApprovalRequired::caused(&e) => {
-                Box::pin(self.stage_extracted(scope, actor, facts, extractions, closures, adds))
-                    .await
+                Box::pin(self.stage_extracted(
+                    scope,
+                    actor,
+                    facts,
+                    extractions,
+                    closures,
+                    &[],
+                    adds,
+                ))
+                .await
             }
             r => r,
         }
@@ -4700,6 +4707,17 @@ impl Store {
     pub async fn directory(&self) -> Result<Arc<directory::Folded>> {
         self.directory_loaded_after(Instant::now().checked_sub(self.max_staleness))
             .await
+    }
+
+    /// The directory as this server last folded it, however long ago, without reading the catalog: None before its
+    /// first load. What a setting falls back to when the catalog can't be read now.
+    pub async fn directory_held(&self) -> Option<Arc<directory::Folded>> {
+        self.dir
+            .folded
+            .lock()
+            .await
+            .as_ref()
+            .map(|(_, _, f)| f.clone())
     }
 
     /// The directory as loaded after `since` (none: any load will do), reading the catalog if this

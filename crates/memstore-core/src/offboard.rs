@@ -2299,6 +2299,10 @@ impl Store {
             if let Some(e) = erasure.as_ref().filter(|e| e.rows.is_none()) {
                 self.delete_bodies(ns, &e.gone).await?;
             }
+            // And the bodies of the records of conflicts that went with their facts.
+            if let Some(e) = erasure.as_ref() {
+                self.delete_bodies(ns, &e.dropped_records).await?;
+            }
         }
         let Some(r) = r else {
             return Ok(None);
@@ -2345,7 +2349,8 @@ pub const ERASED_TABLES: [&str; 8] = [
 ];
 
 /// What a deletion takes out of one namespace: the episodes `gone` names and everything drawn from them. The facts
-/// citing any of them, those facts' backfilled quotes, the closures they are evidence for, the summaries drawing on
+/// citing any of them, those facts' backfilled quotes and the records of conflicts naming them ([`crate::conflicts`]:
+/// rows and bodies), the closures they are evidence for, the summaries drawing on
 /// any of them, the logged answers and the feedback citing any of them (or an episode no longer stored at all), the
 /// review proposals citing any of them as evidence (their rows quote the proposed values) with the decisions on
 /// them, the episodes' bodies and the namespace's search indexes, and the episode rows themselves (all of a gone
@@ -2356,8 +2361,10 @@ pub const ERASED_TABLES: [&str; 8] = [
 pub struct Erasure<'a> {
     gone: HashSet<String>,
     rows: Option<&'a RowsGone<'a>>,
-    /// Facts left out so far: their quotes go too.
+    /// Facts left out so far: their quotes go too, and the records of conflicts naming them.
     dropped_facts: HashSet<String>,
+    /// The records of conflicts left out of the episodes table: their bodies go once it is rewritten.
+    dropped_records: HashSet<String>,
     /// The episode ids stored when the answer log is rewritten.
     stored: Option<HashSet<String>>,
     /// The review proposals citing a gone episode, read when the governance table is rewritten: they go, with
@@ -2374,6 +2381,7 @@ impl<'a> Erasure<'a> {
             gone,
             rows: None,
             dropped_facts: HashSet::new(),
+            dropped_records: HashSet::new(),
             stored: None,
             gone_proposals: HashSet::new(),
             counts: Forgotten::default(),
@@ -2471,17 +2479,36 @@ impl<'a> Erasure<'a> {
                         .collect())
                 }))
             }
+            // A record of two facts in conflict goes with either of them, as their quotes do: two bare fact ids
+            // outlive nothing they name.
             EPISODES => {
                 let rows = self.rows;
+                let (dropped, records) = (&self.dropped_facts, &mut self.dropped_records);
                 Some(Box::new(move |b| {
-                    Ok(strings(b, "episode_id")
+                    let (ids, sources) = (strings(b, "episode_id"), strings(b, "source"));
+                    let documents = optional_strings(b, "document");
+                    Ok(ids
                         .iter()
-                        .zip(strings(b, "source"))
-                        .map(|(id, source)| {
-                            Some(!match rows {
-                                Some(f) => f(id, &source),
-                                None => gone.contains(id),
-                            })
+                        .zip(sources)
+                        .zip(documents)
+                        .map(|((id, source), document)| {
+                            let record = source.starts_with(crate::conflicts::SOURCE)
+                                && document
+                                    .as_deref()
+                                    .and_then(crate::conflicts::named)
+                                    .is_some_and(|(a, b)| {
+                                        dropped.contains(a) || dropped.contains(b)
+                                    });
+                            if record {
+                                records.insert(id.clone());
+                            }
+                            Some(
+                                !(record
+                                    || match rows {
+                                        Some(f) => f(id, &source),
+                                        None => gone.contains(id),
+                                    }),
+                            )
                         })
                         .collect())
                 }))

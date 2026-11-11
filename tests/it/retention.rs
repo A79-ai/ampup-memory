@@ -8,8 +8,9 @@
 //!   sources and team a1 (its own scope, its own policy) stay;
 //! - a message that ages out while the server runs goes on its own, with no write to prompt it;
 //! - loosening the policy brings back what no purge has removed; `memstore org retention` shows it;
-//! - `memstore org purge acme` removes the aged-out messages from every file in the warehouse and index, though a
-//!   member pinned acme's memory before they aged out (a pin holds commits, not deleted memory).
+//! - `memstore org purge acme` removes the aged-out messages from every file in the warehouse and index, with the
+//!   record of a conflict one's fact was in, though a member pinned acme's memory before they aged out (a pin holds
+//!   commits, not deleted memory).
 //!
 //! And the nightly maintenance window's scheduled purge, held open: org admins alone turn it on (`purge`); in the
 //! org that did, what aged out and what its source deleted leave every file once hidden for the grace, in the
@@ -234,13 +235,25 @@ fn files_with(root: &Path, tag: &str) -> Vec<PathBuf> {
 /// A memory written straight to the catalog (as ingest would): an episode from `source` that happened
 /// `ago` microseconds back, holding `tag`, and a fact whose entity and value carry it. Returns its id.
 async fn seed(store: &Store, scope: &Scope, source: &str, tag: &str, ago: i64) -> String {
+    seed_fact(store, scope, source, tag, ago).await.0
+}
+
+/// [`seed`], and the id of the fact it commits.
+async fn seed_fact(
+    store: &Store,
+    scope: &Scope,
+    source: &str,
+    tag: &str,
+    ago: i64,
+) -> (String, String) {
     store.ensure_scope(scope).await.unwrap();
     let mut ep = Episode::sourced(source, format!("{tag} owner note").as_bytes(), &["*"]);
     ep.occurred_at = chrono::Utc::now().timestamp_micros() - ago;
     let id = ep.episode_id.clone();
     let f = Fact::new(&format!("deal:{tag}"), "owner", tag).from_episodes(&[&ep]);
+    let fact = f.fact_id.clone();
     store.commit(scope, "connector", &[ep], &[f]).await.unwrap();
-    id
+    (id, fact)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -325,8 +338,26 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     let acme = Scope::org("acme").unwrap();
     let a1 = Scope::team("acme", "a1").unwrap();
     // Ages out when the policy is set; younger; about to age out; kept for good; another source.
-    let old = seed(&store, &acme, "slack:C1:1.0", "xqoldslack", 100 * DAY).await;
-    let young = seed(&store, &acme, "slack:C1:2.0", "xqyoungslack", DAY).await;
+    let (old, old_fact) = seed_fact(&store, &acme, "slack:C1:1.0", "xqoldslack", 100 * DAY).await;
+    let (young, young_fact) = seed_fact(&store, &acme, "slack:C1:2.0", "xqyoungslack", DAY).await;
+    // Reconcile's record that the old message's fact and the young one's are in conflict
+    // (`memstore::conflicts`): ids only, so the purge that takes the old fact must take the record too.
+    let record = Episode::sourced(
+        "reconcile:test",
+        json!({"conflict": [old_fact, young_fact]})
+            .to_string()
+            .as_bytes(),
+        &[memstore::conflicts::ACL],
+    )
+    .without_text_index()
+    .version_of(&format!(
+        "{}{old_fact}/{young_fact}",
+        memstore::conflicts::PREFIX
+    ));
+    store
+        .commit(&acme, "extract:test", &[record], &[])
+        .await
+        .unwrap();
     let legal = seed(
         &store,
         &acme,
@@ -565,9 +596,10 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     )
     .await;
 
-    // Until a purge the aged-out messages are still stored; the purge removes them from every file, and
-    // nothing else.
+    // Until a purge the aged-out messages are still stored; the purge removes them from every file, the record of
+    // the conflict the old one's fact was in with them, and nothing else.
     assert!(!in_files("xqoldslack").is_empty());
+    assert!(!in_files(&old_fact).is_empty(), "the record is stored");
     let (ok, out, err) = memstore(&home, &["org", "purge", "acme"]);
     assert!(ok, "{out}{err}");
     let done: Value = serde_json::from_str(&out).unwrap();
@@ -575,9 +607,13 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     assert_eq!(done["purged"]["facts"], 3, "{out}");
     // The proposal built on the old message went with it: its quoted value is in no file, and the inbox
     // doesn't list it.
-    for t in ["xqoldslack", "xqcuspslack", "xqgovvalue"] {
+    for t in ["xqoldslack", "xqcuspslack", "xqgovvalue", &old_fact] {
         assert_eq!(in_files(t), Vec::<PathBuf>::new(), "{t}");
     }
+    assert!(
+        !in_files(&young_fact).is_empty(),
+        "the young fact went with the purge"
+    );
     let (status, body) = admin_as(s, &bob, json!({"op": "list_proposals", "org": "acme"})).await;
     assert_eq!(status, 200, "{body}");
     assert!(!body.contains("xqgov"), "{body}");

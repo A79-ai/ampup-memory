@@ -26,6 +26,10 @@
 //!   replaced, one matter at a time. A record of something that happened (`change`, `milestone`, `result`) is never
 //!   ended, nor a value a newer one restates, and nothing is ended by a fact dated after the pass (a meeting set for
 //!   next week replaces nothing yet), so no closure lands in the future;
+//! - two facts reconcile recorded in conflict ([`crate::conflicts`]: two sources that disagree, an estimate beside a
+//!   reported figure) are the people's to settle: neither ends the other, they are never linked as one, and another
+//!   fact ends one of them only as a newer source that settles it, begun after each fact it is in conflict with and
+//!   restating none of them;
 //! - a link joins only facts that state the same thing: of one kind of value, of no two different stated times, and
 //!   of one predicate unless one restates the other; a step someone will take never folds into a decision, issue or
 //!   claim (it would hide who does the work), and two steps or two people in a role only when one restates the
@@ -1129,6 +1133,14 @@ async fn run(
     let ids: HashSet<&str> = v.facts.iter().map(|(_, f)| f.entity.as_str()).collect();
     // When the pass began: what is dated after it ends nothing.
     let now = now_micros();
+    // The facts recorded in conflict with another: the people's to settle.
+    let disputed: HashMap<&str, &Fact> = v
+        .facts
+        .iter()
+        .map(|(_, f)| f)
+        .filter(|f| !v.vis.conflicts_of(&f.fact_id).is_empty())
+        .map(|f| (f.fact_id.as_str(), f))
+        .collect();
 
     // The shared audiences, widest first: each with the open facts every holder of its entry may read, and the newest
     // value of each one-valued predicate it may read, open or not (a read reads only that one as current).
@@ -1205,6 +1217,7 @@ async fn run(
             at: &at,
             ids: &ids,
             now,
+            disputed: &disputed,
         };
         let weigh: Vec<&Fact> = open.iter().copied().filter(|f| v.weighable(f)).collect();
         let shown: Vec<&Fact> = weigh
@@ -1483,6 +1496,8 @@ struct Audience<'a> {
     ids: &'a HashSet<&'a str>,
     /// When the pass began: a fact dated after it ends nothing.
     now: i64,
+    /// The facts recorded in conflict with another ([`crate::conflicts`]), by id.
+    disputed: &'a HashMap<&'a str, &'a Fact>,
 }
 
 impl Audience<'_> {
@@ -1574,7 +1589,8 @@ impl Audience<'_> {
     /// the schema types both, neither a value kept with others at once (a reference, a predicate named for people in
     /// a role, or one the schema marks a list), and an older fact that isn't a record of something that happened.
     fn may_end(&self, old: &Fact, by: &Fact) -> bool {
-        by.valid_from > old.valid_from
+        self.settles(old, by)
+            && by.valid_from > old.valid_from
             && by.valid_from <= self.now
             && squash(&old.value) != squash(&by.value)
             && !says_again(&old.value, &by.value)
@@ -1583,6 +1599,26 @@ impl Audience<'_> {
             && ![old, by]
                 .iter()
                 .any(|f| self.refers(f) || is_role(&f.predicate) || self.listed(f))
+    }
+
+    /// Whether `by` may end `old` as far as recorded conflicts go ([`crate::conflicts`]): two facts recorded in
+    /// conflict are the people's to settle, so neither ends the other, and another fact ends one of them only as a
+    /// newer source that settles it: begun after each fact `old` is in conflict with, and restating none of them (a
+    /// later restatement of one side is that side again, not a settlement).
+    fn settles(&self, old: &Fact, by: &Fact) -> bool {
+        self.v.vis.conflicts_of(&old.fact_id).iter().all(|o| {
+            *o != by.fact_id
+                && self.disputed.get(o.as_str()).is_none_or(|o| {
+                    by.valid_from > o.valid_from
+                        && squash(&o.value) != squash(&by.value)
+                        && !says_again(&o.value, &by.value)
+                })
+        })
+    }
+
+    /// Whether two facts were recorded in conflict ([`crate::conflicts`]): never linked as saying the same thing.
+    fn disputes(&self, a: &Fact, b: &Fact) -> bool {
+        self.v.vis.conflicts_of(&a.fact_id).contains(&b.fact_id)
     }
 }
 
@@ -1962,6 +1998,7 @@ async fn run_sweep<'a>(
                 || writes.ended.contains(&dup.fact_id)
                 || writes.dups.contains(&dup.fact_id)
                 || writes.dups.contains(&keep.fact_id)
+                || cx.disputes(keep, dup)
                 || !may_link(cx.schema, keep, dup)
             {
                 report.refused += 1;

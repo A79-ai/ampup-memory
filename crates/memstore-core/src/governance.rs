@@ -2723,9 +2723,12 @@ impl Store {
     /// owners, and the rest lands. The facts and closures of each episode a protected fact cites (shared evidence
     /// carries ownership, as [`Store::authorize_publication`] counts it) go to a branch named for those
     /// episodes, with a proposal for its owners made by [`EXTRACT_PROPOSER`]; the other facts, and every
-    /// episode's read, commit to main, so the extractor doesn't read the batch again. The branch is written
-    /// first: a failure before main's commit leaves the episodes unread, and the next run lands on the same
-    /// branch (and the same proposal) instead of a new one.
+    /// episode's read, commit to main, so the extractor doesn't read the batch again. The engine's `records` of
+    /// what reconcile found ([`crate::conflicts`]) go where the facts they name go: one naming a held fact waits on
+    /// the branch with it, so it reaches main only when that fact is published, and never if it is rejected. The
+    /// branch is written first: a failure before main's commit leaves the episodes unread, and the next run lands on
+    /// the same branch (and the same proposal) instead of a new one.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stage_extracted(
         &self,
         scope: &Scope,
@@ -2733,6 +2736,7 @@ impl Store {
         facts: &[Fact],
         extractions: &[Extraction],
         closures: &[Closure],
+        records: &[Episode],
         adds: Option<&schema::Schema>,
     ) -> Result<String> {
         let ledger = self.governance_ledger(scope).await?;
@@ -2788,6 +2792,12 @@ impl Store {
             !staged.is_empty() || !staged_ends.is_empty(),
             "owner approval required, though no fact of this extraction is protected"
         );
+        let held_facts: HashSet<&str> = staged.iter().map(|f| f.fact_id.as_str()).collect();
+        let (staged_records, landed_records): (Vec<Episode>, Vec<Episode>) =
+            records.iter().cloned().partition(|r| {
+                crate::conflicts::record_of(r)
+                    .is_some_and(|(a, b)| held_facts.contains(a) || held_facts.contains(b))
+            });
         // Named for what it holds (the episodes, and the facts and closures read from them), so a retry of this
         // write finds it again, and a later read of the same episodes that says something else gets its own.
         let mut what: Vec<String> = held.iter().cloned().collect();
@@ -2821,8 +2831,18 @@ impl Store {
         let extractor = &reads[0].extractor;
         let written = self.extracted_on(scope, &branch, extractor).await?;
         if !reads.iter().all(|x| written.contains(&x.episode_id)) {
-            self.commit_extracted_on(scope, &branch, actor, &staged, &reads, &staged_ends, adds)
-                .await?;
+            anyhow::ensure!(!reads.is_empty(), "nothing extracted");
+            self.commit_full(
+                scope,
+                &branch,
+                actor,
+                &staged_records,
+                &staged,
+                &reads,
+                &staged_ends,
+                adds,
+            )
+            .await?;
         }
         // A proposal that can't be made now (a conflict with main, say) leaves the branch for an admin in Branches;
         // the read still lands, so the extractor moves on.
@@ -2838,7 +2858,7 @@ impl Store {
                 scope,
                 MAIN,
                 actor,
-                &[],
+                &landed_records,
                 &landed,
                 extractions,
                 &landed_ends,
@@ -2847,15 +2867,17 @@ impl Store {
             .await
         {
             // The guard holds more than this split counted: the rest waits on the branch too (its proposal made
-            // again, the first one stale), and main takes the reads alone, which no owner holds.
+            // again, the first one stale), its records with it, and main takes the reads alone, which no owner
+            // holds.
             Err(e)
                 if OwnerApprovalRequired::caused(&e)
                     && !(landed.is_empty() && landed_ends.is_empty()) =>
             {
-                self.commit_extracted_on(
+                self.commit_full(
                     scope,
                     &branch,
                     actor,
+                    &landed_records,
                     &landed,
                     extractions,
                     &landed_ends,
@@ -2874,9 +2896,10 @@ impl Store {
             r => r?,
         };
         eprintln!(
-            "held {} facts and {} closures of {} episodes in {scope} on {branch} for their owners",
+            "held {} facts, {} closures and {} conflict records of {} episodes in {scope} on {branch} for their owners",
             staged.len(),
             staged_ends.len(),
+            staged_records.len(),
             held.len()
         );
         Ok(id)

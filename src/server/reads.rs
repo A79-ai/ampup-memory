@@ -500,8 +500,8 @@ impl Reads {
     }
 
     /// What another fact says against each of `facts` (`crate::conflicts`), by fact id, read at `valid_at` as these
-    /// facts were (None, a read over history: nothing), in each scope read: only where the caller's scope keeps
-    /// conflicts, and only of a fact the caller may read too.
+    /// facts were (None, a read over history: nothing), in each scope read that keeps conflicts itself (its own
+    /// setting, not the caller's scope's: a scope's records are its own), and only of a fact the caller may read too.
     pub async fn conflicts(
         &self,
         store: &Store,
@@ -510,14 +510,13 @@ impl Reads {
         valid_at: Option<i64>,
     ) -> Result<HashMap<String, crate::conflicts::Conflict>> {
         let mut out = HashMap::new();
-        if facts.is_empty()
-            || valid_at.is_none()
-            || !crate::conflicts::on(store, self.own.scope()).await
-        {
+        if facts.is_empty() || valid_at.is_none() {
             return Ok(out);
         }
         for s in self.sessions() {
-            out.extend(crate::conflicts::marks(store, s, who, facts, valid_at).await?);
+            if crate::conflicts::on(store, s.scope()).await {
+                out.extend(crate::conflicts::marks(store, s, who, facts, valid_at).await?);
+            }
         }
         Ok(out)
     }
