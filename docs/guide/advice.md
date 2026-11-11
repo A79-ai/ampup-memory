@@ -19,7 +19,8 @@ A session is one conversation, start to end.
 
 - `moment` says where in the task the agent is. `start` (the default) routes the task to its note. `fork`,
   `stuck` and `done` re-read the note the session was already served (steps and pitfalls, pitfalls, or pitfalls
-  and verification), with no model call. `next` is sent by the Claude Code hooks when a step finishes.
+  and verification), with no model call: the person's own note and the team's answer both, when they were served
+  together. `next` is sent by the Claude Code hooks when a step finishes.
 - Each note is served once per session; asked again, the answer says it was given earlier.
 - `get_advice` with no `session_id`, from a person, opens a session and returns its id.
 - A session nobody ends is ended after `MEMSTORE_SESSION_IDLE_SECS` (1800) without a step, with the last

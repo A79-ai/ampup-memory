@@ -50,6 +50,10 @@ pub struct Lookup {
     /// What the person's own advice came to first, when they have some and it served nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub own: Option<String>,
+    /// The person's own note (`mine:`) served in the same step before `key`, the team's answer: a later moment
+    /// re-reads both ([`crate::sessions::revisit`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beside: Option<String>,
     /// Why it failed, for an `error`; else what went wrong on the way (the decisions model failed and the chat
     /// router routed, a fit check wasn't answered).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -318,6 +322,7 @@ pub fn finish(outcome: &str, key: Option<&str>) -> Option<Lookup> {
                 when: step.and_then(|s| s.when).or(t.when).map(|(w, _)| w),
                 withhold: step.and_then(|s| s.when).or(t.when).and_then(|(_, h)| h),
                 own: own.filter(|o| o != ROUTED),
+                beside: None,
                 error: t.trouble.clone(),
                 ms: t.started.elapsed().as_millis() as u64,
             })
@@ -355,12 +360,15 @@ pub fn outside(found: Option<&crate::advice::Advised>) {
         None => (outcome::NO_MATCH, None),
     };
     if let Some(l) = finish(o, key) {
+        let own = found.and_then(|a| a.own.as_ref());
         eprintln!(
-            "advice lookup outside a session: {}{}{}{} ({} ms)",
+            "advice lookup outside a session: {}{}{}{}{} ({} ms)",
             l.outcome,
             l.key
                 .as_deref()
                 .map(|k| format!(" {k}"))
+                .unwrap_or_default(),
+            own.map(|o| format!(" (with their own {})", o.key))
                 .unwrap_or_default(),
             l.score
                 .map(|p| format!(", score {p:.2}"))

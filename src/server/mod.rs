@@ -12384,10 +12384,17 @@ async fn session_moment(
     .await?;
     use crate::advice_lookups::{finish, outcome};
     Ok(match cut {
-        Some((situation, text)) => {
-            let lookup = finish(outcome::REVISITED, Some(&situation));
+        Some(r) => {
+            let lookup = finish(outcome::REVISITED, Some(&r.key)).map(|mut l| {
+                l.beside = r.own.clone();
+                l
+            });
             crate::sessions::note_lookup(store, session.scope(), who, id, lookup).await;
-            Some(format!("Situation: `{situation}`\n{text}"))
+            Some(format!(
+                "{}\n{}",
+                crate::advice::situation_line(&r.key, r.own.as_deref()),
+                r.text
+            ))
         }
         None if moment == crate::sessions::Moment::Done => {
             let lookup = finish(outcome::NOTHING_NEW, None);

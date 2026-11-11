@@ -1193,7 +1193,15 @@ pub struct Own {
 /// none while it is still routing (the routing job records its own outcome when it ends).
 fn looked_up(served: &Served) -> Option<crate::advice_lookups::Lookup> {
     use crate::advice_lookups::{finish, outcome};
-    match served {
+    // The person's own note served before the team's answer: the step's lookup names it, so a later moment re-reads
+    // both ([`revisit`]).
+    let own = match served {
+        Served::Note { own, .. } | Served::Procedures { own, .. } => {
+            own.as_ref().map(|o| o.situation.clone())
+        }
+        _ => None,
+    };
+    let mut lookup = match served {
         Served::Note { situation, .. } if situation.starts_with(crate::advice::MINE_KEY) => {
             finish(outcome::SERVED_OWN, Some(situation))
         }
@@ -1203,7 +1211,9 @@ fn looked_up(served: &Served) -> Option<crate::advice_lookups::Lookup> {
         Served::Withheld => finish(outcome::WITHHELD, None),
         Served::None => finish(outcome::NO_MATCH, None),
         Served::Pending => None,
-    }
+    }?;
+    lookup.beside = own;
+    Some(lookup)
 }
 
 /// Records lookup `lookup` in open session `id` of `who`: a later moment's or a hook step's, which writes no other
@@ -2068,9 +2078,38 @@ pub async fn useful(
     Ok(if p >= min { Useful::Yes } else { Useful::No })
 }
 
-/// A later moment of open session `l` (not [`Moment::Start`]): the note it was served last, cut to what the
-/// moment needs, as `(situation, text)`, read without a model call; none when the session was served no note
-/// (or withheld one: the holdout arm reads alike). The conversation so far is kept as an advice step keeps it.
+/// What a later moment re-reads ([`revisit`]): the key its answer names (the team's, when the person's own note was
+/// served beside it), that own note's key then, and the text.
+pub struct Revisited {
+    pub key: String,
+    pub own: Option<String>,
+    pub text: String,
+}
+
+/// What session `s` was served in the step that served the note it was served last, `last`: the person's own note and
+/// the team's answer when that step served both (its lookup's `beside`), else `last` alone. A session whose lookups
+/// no longer reach that step reads `last` alone.
+fn served_with(s: &SessionPart, last: &str) -> (Option<String>, String) {
+    use crate::advice_lookups::outcome;
+    s.lookups
+        .iter()
+        .rev()
+        .filter(|l| {
+            matches!(
+                l.outcome.as_str(),
+                outcome::SERVED | outcome::SERVED_OWN | outcome::SERVED_PROCEDURES
+            )
+        })
+        .find(|l| l.key.as_deref() == Some(last) || l.beside.as_deref() == Some(last))
+        .and_then(|l| Some((l.beside.clone()?, l.key.clone()?)))
+        .map_or((None, last.to_string()), |(o, k)| (Some(o), k))
+}
+
+/// A later moment of open session `l` (not [`Moment::Start`]): what it was served last, cut to what the moment
+/// needs, read without a model call: the note it was served last, and where that was the person's own note served
+/// beside the team's answer, or the team's served beside theirs, both, theirs first (the team's procedures by their
+/// steps, at a moment that reads steps). None when the session was served no note (or withheld one: the holdout arm
+/// reads alike). The conversation so far is kept as an advice step keeps it.
 pub async fn revisit(
     store: &Store,
     scope: &Scope,
@@ -2079,7 +2118,7 @@ pub async fn revisit(
     mut l: Logged,
     moment: Moment,
     conversation: Option<&str>,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<Revisited>> {
     let id = l.answer_id.clone();
     let s = l.session.as_mut().expect("a session");
     if s.ended_at.is_some() {
@@ -2108,19 +2147,77 @@ pub async fn revisit(
     let Some(k) = last else {
         return Ok(None);
     };
-    let Some(note) = Box::pin(served_note(store, scope, who, &k)).await? else {
-        return Ok(None);
-    };
+    let (own, team) = served_with(s, &k);
     let (lead, sections) = moment.cut();
-    let body: Vec<String> = sections
+    let cut = |note: &str| -> String {
+        sections
+            .iter()
+            .filter_map(|h| {
+                crate::advice::section_body(note, h)
+                    .filter(|b| !b.is_empty())
+                    .map(|b| format!("## {h}\n{b}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let mine = match &own {
+        Some(o) => Box::pin(served_note(store, scope, who, o))
+            .await?
+            .map(|n| cut(&n))
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    // The team's: its note, when the step served one; else the procedures it served, by their steps, at a moment
+    // that reads steps.
+    let theirs = if s.served.contains(&team) {
+        Box::pin(served_note(store, scope, who, &team))
+            .await?
+            .map(|n| cut(&n))
+            .unwrap_or_default()
+    } else if sections
         .iter()
-        .filter_map(|h| {
-            crate::advice::section_body(&note, h)
-                .filter(|b| !b.is_empty())
-                .map(|b| format!("## {h}\n{b}"))
-        })
-        .collect();
-    Ok((!body.is_empty()).then(|| (k, format!("{lead}\n\n{}", body.join("\n\n")))))
+        .any(|h| matches!(*h, "Steps" | "Verification"))
+    {
+        Box::pin(crate::advice::served_procedures(store, scope, who, &team))
+            .await?
+            .iter()
+            .map(|p| {
+                let mut lines = p.lines().map(str::trim);
+                let title = lines
+                    .clone()
+                    .find(|t| t.starts_with("## "))
+                    .unwrap_or_default()
+                    .to_string();
+                let steps: Vec<&str> = lines.by_ref().filter(|t| is_step(t)).collect();
+                format!("{title}\n{}", steps.join("\n")).trim().to_string()
+            })
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    } else {
+        String::new()
+    };
+    Ok(match (own, mine.is_empty(), theirs.is_empty()) {
+        (Some(o), false, false) => Some(Revisited {
+            key: team,
+            own: Some(o),
+            text: format!(
+                "{lead}\n\nFrom your own advice, learned from your past sessions:\n\n{mine}\n\nFrom the team's advice:\n\n\
+                 {theirs}"
+            ),
+        }),
+        (Some(o), false, true) => Some(Revisited {
+            key: o,
+            own: None,
+            text: format!("{lead}\n\n{mine}"),
+        }),
+        (_, _, false) => Some(Revisited {
+            key: team,
+            own: None,
+            text: format!("{lead}\n\n{theirs}"),
+        }),
+        _ => None,
+    })
 }
 
 /// An event in a session's run, sent with `get_advice` (`event`): a tool about to be called, a tool's result,
