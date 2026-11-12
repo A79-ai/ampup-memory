@@ -11033,7 +11033,7 @@ fn browser_tools() -> Vec<Value> {
                 "category": strings("Category, or a list of them"),
                 "situation": strings("Situation, or a list of them"),
                 "text": {"type": "string", "description": "Substring of the situation's `when` or its note"},
-                "ratified": {"type": "boolean", "description": "Past the evidence bar (org admins also see the rest)"},
+                "ratified": {"type": "boolean", "description": "Past the evidence bar (reported only: every note is served either way)"},
                 "min_helped": {"type": "integer"},
                 "min_served": {"type": "integer"},
                 "learned": window("Window on when the note was written"),
