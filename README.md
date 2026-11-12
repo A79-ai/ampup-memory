@@ -82,6 +82,10 @@ from ampup_memory import AmpUpMemory
 mem = AmpUpMemory("http://127.0.0.1:8080", None)  # a local server; from_profile() uses `ampup-memory-client join`'s sign-in
 mem.remember("note:deploy", "Deploy billing with ./deploy.sh billing.")
 print(mem.query({"find": "passages", "text": "deploy billing"})["results"])
+
+run = mem.session("deploy the billing service")  # the learning loop: advice per task, rewarded at the end
+print(run.opening["advice"])
+run.end("deployed", reward=1)
 ```
 
 ## Docs

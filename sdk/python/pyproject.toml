@@ -1,6 +1,6 @@
 [project]
 name = "ampup-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "A thin Python client for an AmpUp Memory server: team memory for coding agents"
 readme = "README.md"
 license = "Apache-2.0"

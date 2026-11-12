@@ -1,5 +1,6 @@
-"""A thin client for an AmpUp Memory server: remember, search and read what your team knows."""
+"""A thin client for an AmpUp Memory server: remember and search what your team knows, and get advice that
+improves as sessions are rewarded."""
 
-from ampup_memory.client import AmpUpMemory, AmpUpMemoryError, Episode, Hit, micros
+from ampup_memory.client import Advice, AmpUpMemory, AmpUpMemoryError, Episode, Hit, Moment, Session, micros
 
-__all__ = ["AmpUpMemory", "AmpUpMemoryError", "Episode", "Hit", "micros"]
+__all__ = ["Advice", "AmpUpMemory", "AmpUpMemoryError", "Episode", "Hit", "Moment", "Session", "micros"]

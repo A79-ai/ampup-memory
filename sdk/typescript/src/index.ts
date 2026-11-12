@@ -31,6 +31,21 @@ export interface Hit {
 
 export type Json = Record<string, any>;
 
+/** What the server served: the situation it matched and its advice, both null when it has none yet. */
+export interface Advice {
+  situation: string | null;
+  advice: string | null;
+  evidence?: unknown; // how the advice has fared, when it was learned from runs
+  skills?: unknown[];
+  own_situation?: string; // your own note, served beside the team's
+  advice_pending?: string; // still being found: ask again at the next step
+  session_id?: string; // on a session's opening
+  [k: string]: unknown;
+}
+
+/** Where a session is when it asks: moving to the next step, choosing an approach, stuck, or done. */
+export type Moment = "next" | "fork" | "stuck" | "done";
+
 export class AmpUpMemoryError extends Error {
   constructor(
     readonly status: number,
@@ -145,4 +160,61 @@ export class AmpUpMemory {
     return this.row("/episode", episodeId);
   }
 
+  // The learning loop: a session per task, advice as it goes, and how it went at the end. Advice is learned from
+  // sessions that ended with a reward.
+
+  /**
+   * Start a session for `task`; its opening advice is `session.opening`. `harness` names what runs the session
+   * (your app, say). A name ending in ":sdk" marks the session a program's: advice isn't learned from it, nor
+   * served to it unless the org turns that on.
+   */
+  async session(opts: { task: string; harness?: string }): Promise<Session> {
+    const opening: Advice = await this.call("POST", "/sessions", { context: opts.task, harness: opts.harness });
+    return new Session(this, opening.session_id as string, opts.task, opening);
+  }
+
+  /** Advice for `question` outside any session. Needs a server with a routing model (503 without one). */
+  advice(question: string): Promise<Advice> {
+    return this.call("POST", "/advice", { question });
+  }
+
+  /**
+   * Reward a session or run you recorded, from -1 to 1, after it ended (say, once its change merged). An ended
+   * session can be rewarded once the server has written it, within a minute of its end by default (404 before
+   * then). To reward it as it ends, pass `reward` to `session.end`.
+   */
+  async reward(runId: string, reward: number, reason?: string): Promise<string> {
+    return (await this.call("POST", "/runs/reward", { run_id: runId, reward, reason })).run_id;
+  }
+}
+
+/** One task's session: from `AmpUpMemory.session`. */
+export class Session {
+  constructor(
+    private readonly memory: AmpUpMemory,
+    readonly id: string,
+    readonly task: string,
+    readonly opening: Advice,
+  ) {}
+
+  /**
+   * Advice for this session, recorded in it. `question` is the task (the default) or the step at hand; `moment`
+   * says where you are; `conversation` is a condensed account of the session so far.
+   */
+  advice(opts: { question?: string; moment?: Moment; conversation?: string } = {}): Promise<Advice> {
+    return this.memory["call"]("POST", "/advice", {
+      session_id: this.id,
+      question: opts.question || this.task,
+      moment: opts.moment,
+      conversation_so_far: opts.conversation,
+    });
+  }
+
+  /**
+   * End the session: what came of it, and a reward from -1 (failed) to 1 (succeeded) if you know it now (else
+   * reward it later with `memory.reward(session.id, ...)`). `transcript` is what happened.
+   */
+  end(opts: { outcome?: string; reward?: number; transcript?: string; reason?: string } = {}): Promise<Json> {
+    return this.memory["call"]("POST", "/sessions/end", { session_id: this.id, task: this.task, ...opts });
+  }
 }

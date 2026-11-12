@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
 import httpx
 
@@ -36,6 +36,21 @@ class Hit(TypedDict, total=False):
     quote: str | None
     score: float
     written_by: str | None
+
+
+class Advice(TypedDict, total=False):
+    """What the server served: the situation it matched and its advice, both None when it has none yet."""
+
+    situation: str | None
+    advice: str | None
+    evidence: Any  # how the advice has fared, when it was learned from runs
+    skills: list[Any]
+    own_situation: str  # your own note, served beside the team's
+    advice_pending: str  # still being found: ask again at the next step
+    session_id: str  # on a session's opening
+
+
+Moment = Literal["next", "fork", "stuck", "done"]
 
 
 class AmpUpMemoryError(Exception):
@@ -147,3 +162,71 @@ class AmpUpMemory:
     def episode(self, episode_id: str) -> str | None:
         """An episode's text, or None if it doesn't exist or you can't read it."""
         return cast("str | None", self._row("/episode", episode_id))
+
+    # The learning loop: a session per task, advice as it goes, and how it went at the end. Advice is learned from
+    # sessions that ended with a reward.
+
+    def session(self, task: str, *, harness: str | None = None) -> Session:
+        """Start a session for `task`; its opening advice is `session.opening`.
+
+        `harness` names what runs the session (your app, say). A name ending in ":sdk" marks the session a
+        program's: advice isn't learned from it, nor served to it unless the org turns that on.
+        """
+        req: dict[str, Any] = {"context": task}
+        if harness is not None:
+            req["harness"] = harness
+        opening = cast(Advice, self._call("POST", "/sessions", req))
+        return Session(self, opening["session_id"], task, opening)
+
+    def advice(self, question: str) -> Advice:
+        """Advice for `question` outside any session. Needs a server with a routing model (503 without one)."""
+        return cast(Advice, self._call("POST", "/advice", {"question": question}))
+
+    def reward(self, run_id: str, reward: float, reason: str | None = None) -> str:
+        """Reward a session or run you recorded, from -1 to 1, after it ended (say, once its change merged).
+
+        An ended session can be rewarded once the server has written it, within a minute of its end by default
+        (404 before then). To reward it as it ends, pass `reward` to `Session.end`."""
+        req: dict[str, Any] = {"run_id": run_id, "reward": reward}
+        if reason is not None:
+            req["reason"] = reason
+        return cast(str, self._call("POST", "/runs/reward", req)["run_id"])
+
+
+class Session:
+    """One task's session: from `AmpUpMemory.session`."""
+
+    def __init__(self, memory: AmpUpMemory, session_id: str, task: str, opening: Advice) -> None:
+        self._memory = memory
+        self.id = session_id
+        self.task = task
+        self.opening = opening
+
+    def advice(
+        self, question: str | None = None, *, moment: Moment | None = None, conversation: str | None = None
+    ) -> Advice:
+        """Advice for this session, recorded in it. `question` is the task (the default) or the step at hand;
+        `moment` says where you are: "next" (moving to the next step), "fork" (choosing an approach), "stuck" or
+        "done". `conversation` is a condensed account of the session so far."""
+        req: dict[str, Any] = {"session_id": self.id, "question": question or self.task}
+        if moment is not None:
+            req["moment"] = moment
+        if conversation is not None:
+            req["conversation_so_far"] = conversation
+        return cast(Advice, self._memory._call("POST", "/advice", req))
+
+    def end(
+        self,
+        outcome: str | None = None,
+        reward: float | None = None,
+        *,
+        transcript: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """End the session: what came of it, and a reward from -1 (failed) to 1 (succeeded) if you know it now
+        (else reward it later with `AmpUpMemory.reward(session.id, ...)`). `transcript` is what happened."""
+        req: dict[str, Any] = {"session_id": self.id, "task": self.task}
+        for k, v in (("outcome", outcome), ("reward", reward), ("transcript", transcript), ("reason", reason)):
+            if v is not None:
+                req[k] = v
+        return cast(dict[str, Any], self._memory._call("POST", "/sessions/end", req))

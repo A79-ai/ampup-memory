@@ -12,7 +12,7 @@ Examples below run against `ampup-memory serve --local` on `localhost:8080`.
 |---|---|---|
 | `POST /remember` | `{source, body, acl?, mine?, document?}` | `{episode_id, scope, readers}` |
 | `POST /sessions` | `{context?, harness?, max_chars?}` | `{session_id, situation, advice, evidence, skills}` |
-| `POST /advice` | `{question, session_id?, conversation_so_far?, format?, max_chars?, procedures?, notes?}` | `{situation, advice, skills}`; 503 with no routing model |
+| `POST /advice` | `{question, session_id?, moment?, conversation_so_far?, format?, max_chars?, procedures?, notes?}` | `{situation, advice, skills}`; 503 with no routing model |
 | `POST /sessions/end` | `{session_id, transcript?, outcome?, reward?, reason?}` | `{ended, served, session_id}` |
 | `POST /runs` | `{task, trace, used?, outcome?, advice?}` or `{runs: [...]}` | `{run_id}` or `{run_ids}` |
 | `POST /runs/reward` | `{run_id, reward, reason?}` or `{rewards: [...]}` | `{run_id}` or `{run_ids}` |

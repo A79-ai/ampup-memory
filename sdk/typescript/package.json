@@ -1,6 +1,6 @@
 {
   "name": "ampup-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A thin TypeScript client for an AmpUp Memory server: team memory for coding agents",
   "license": "Apache-2.0",
   "type": "module",
