@@ -14,7 +14,7 @@ npm install ampup-memory
 import { AmpUpMemory, micros } from "ampup-memory";
 
 const mem = await AmpUpMemory.fromProfile(); // the CLI's current context; or AmpUpMemory.fromProfile("work")
-// const mem = new AmpUpMemory("https://memory.example.com", "msk_...", { org: "acme" }); // an explicit API key
+// const mem = new AmpUpMemory("https://memory.example.com", "msk_...", { org: "acme" }); // an API key: yours (apikey create --personal) or a service's
 // const mem = new AmpUpMemory("http://127.0.0.1:8080", null); // a local `ampup-memory serve --local`
 
 const ep = await mem.remember("note:acme", "The Acme renewal is owned by Priya.");

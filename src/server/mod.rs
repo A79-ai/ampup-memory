@@ -2364,6 +2364,7 @@ async fn directory_auth(state: &State) -> Result<DirectoryAuth> {
                 role: k.role,
                 expires_at: k.expires_at,
                 sources: k.sources.clone(),
+                owner: k.owner.clone(),
                 sha256: k.sha256.clone(),
             })
         })
@@ -5389,6 +5390,18 @@ async fn handle(
     {
         return Ok(r);
     }
+    // A personal key is a person's bearer outside any sign-in: it reaches their memory, and nothing that
+    // manages, bulk-loads or retracts it.
+    if let Some(k) = via.key.as_ref().filter(|k| k.owner.is_some())
+        && !PERSONAL_KEY_ROUTES.contains(&path.as_str())
+    {
+        let org = member_org(&state, who.as_ref(), &via, sel_org.as_deref()).await;
+        refused(org, &k.user(), 403, audit::Reason::PersonalKeyRoute);
+        return Ok(reply(
+            StatusCode::FORBIDDEN,
+            json!({"error": format!("a personal key reaches {} only", PERSONAL_KEY_ROUTES.join(", "))}),
+        ));
+    }
     if admin {
         let who = who.expect("public port");
         // An `/admin` request is about the org it names (else the one selected): the audit's only if the
@@ -6459,8 +6472,14 @@ async fn handle(
         let store = state.store.read().unwrap().clone();
         let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         return Ok(
-            match crate::feedback::give(&store, &scope, &who, via.person || state.fixed(), &args)
-                .await
+            match crate::feedback::give(
+                &store,
+                &scope,
+                &who,
+                via.is_person() || state.fixed(),
+                &args,
+            )
+            .await
             {
                 Ok(id) => reply(StatusCode::OK, json!({"fact_id": id})),
                 Err(e) => match e.downcast_ref::<crate::feedback::Refused>() {
@@ -7199,6 +7218,31 @@ async fn member_org(
         .contains_key(org)
         .then(|| (org.to_string(), o.created_at))
 }
+
+/// The routes a personal key reaches: its member's reads, notes, sessions and advice, as an app or a script
+/// that isn't an MCP client calls them, and `/mcp` itself.
+const PERSONAL_KEY_ROUTES: &[&str] = &[
+    "/me",
+    "/doctor",
+    "/search",
+    "/query",
+    "/episode",
+    "/document",
+    "/browse",
+    "/facts/list",
+    "/advice/list",
+    "/brief",
+    "/remember",
+    "/forget",
+    "/sessions",
+    "/sessions/end",
+    "/advice",
+    "/runs",
+    "/runs/reward",
+    "/feedback",
+    "/pin",
+    "/mcp",
+];
 
 /// A service key's org (and incarnation, see [`member_org`]) and audit id: a directory key (imported
 /// file keys included) is `key:<org>/<name>` in its org. A keys-file key reads no org's memory.
@@ -10509,7 +10553,7 @@ async fn mcp(
                         .map_err(runs_error)
                 }
                 "feedback_memory" if writes == Writes::Scope => {
-                    crate::feedback::give(&store, scope, who, via.person || state.fixed(), args)
+                    crate::feedback::give(&store, scope, who, via.is_person() || state.fixed(), args)
                         .await
                         .map(|id| format!("feedback on fact {id} recorded"))
                         .map_err(|e| match e.downcast_ref::<crate::feedback::Refused>() {
@@ -11757,7 +11801,7 @@ fn session_tools() -> Vec<Value> {
 /// The ACL a caller's own record (a run's trace, a session's transcript) is kept to: theirs alone (a server
 /// that identifies no one has one caller, so its groups there, never `*`).
 fn own_acl(state: &State, who: &Principal, via: &SignIn, what: &str) -> Result<Vec<String>> {
-    if !(via.person || state.fixed()) {
+    if !(via.is_person() || state.fixed()) {
         return Err(crate::runs::Refused(format!(
             "a {what} is a person's: {} is a key",
             who.user()
@@ -12684,7 +12728,7 @@ async fn get_advice_step(
         } else {
             Err(ToolError(format!("sessions on {scope} aren't kept here")).into())
         }
-    } else if writes == Writes::Scope && (via.person || state.fixed()) {
+    } else if writes == Writes::Scope && (via.is_person() || state.fixed()) {
         // No session yet: this call opens one, so an agent that skipped start_session is
         // still followed to its end.
         // Under the app the call came from (`mcp` when it named none).
@@ -13209,7 +13253,7 @@ async fn record_run(
         store,
         scope,
         who,
-        via.person || state.fixed(),
+        via.is_person() || state.fixed(),
         &acl,
         &provenance(who, ""),
         args,
@@ -13231,7 +13275,7 @@ async fn record_runs(
         store,
         scope,
         who,
-        via.person || state.fixed(),
+        via.is_person() || state.fixed(),
         &acl,
         &provenance(who, ""),
         runs,

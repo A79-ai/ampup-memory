@@ -1333,6 +1333,45 @@ async fn closure_groups_don_t_reach_a_sign_in_through_an_org_s_own_provider() {
         !posed.as_array().unwrap().contains(&json!("group:board")),
         "acme's provider got gary's pushed groups: {posed}"
     );
+    // Nor does it get his personal key: a member makes theirs through a sign-in that counts in their org. Posing
+    // as gary through acme's provider, an app's JWT in his name, or a file key in a member's name, mints nothing.
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 86400;
+    let mint = |org: &str, name: &str| {
+        json!({"op": "create_key", "org": org, "name": name, "role": "writer", "personal": true,
+               "expires_at": exp, "key": format!("msk_{}{}", uuid::Uuid::new_v4().simple(), name)})
+    };
+    for (way, bearer, change) in [
+        (
+            "acme's provider as gary",
+            id_token_for(&acme_idp, "gary@globex.com", "acme-cli"),
+            mint("globex", "posed"),
+        ),
+        (
+            "an app's JWT",
+            app_jwt("gary@globex.com"),
+            mint("globex", "app"),
+        ),
+        (
+            "carol's file key",
+            CAROL_FILE_KEY.to_string(),
+            mint("acme", "file"),
+        ),
+    ] {
+        let (status, body) = post(&s, "/admin", &bearer, &change).await;
+        assert_eq!(status, 403, "{way} minted a personal key: {body}");
+    }
+    let (status, body) = post(
+        &s,
+        "/admin",
+        &id_token(&issuer, "gary@globex.com"),
+        &mint("globex", "own"),
+    )
+    .await;
+    assert_eq!(status, 200, "gary's own personal key: {body}");
 }
 
 /// A server that reads every request through the directory takes no non-admin file key. It imports each one a

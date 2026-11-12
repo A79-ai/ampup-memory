@@ -144,9 +144,10 @@ pub enum Reason {
     AsDenied,
     AsNotMember,
     RecorderAlone,
+    PersonalKeyRoute,
 }
 
-const REASONS: [Reason; 19] = [
+const REASONS: [Reason; 20] = [
     Reason::NoCredential,
     Reason::Unauthenticated,
     Reason::Expired,
@@ -166,6 +167,7 @@ const REASONS: [Reason; 19] = [
     Reason::AsDenied,
     Reason::AsNotMember,
     Reason::RecorderAlone,
+    Reason::PersonalKeyRoute,
 ];
 
 impl Reason {
@@ -190,6 +192,7 @@ impl Reason {
             Reason::AsDenied => "as_denied",
             Reason::AsNotMember => "as_not_member",
             Reason::RecorderAlone => "recorder_alone",
+            Reason::PersonalKeyRoute => "personal_key_route",
         }
     }
 
@@ -228,6 +231,7 @@ impl Reason {
             Reason::RecorderAlone => {
                 "a recorder key acts only for a member it names in x-memstore-as"
             }
+            Reason::PersonalKeyRoute => "a personal key reaches the member's memory routes only",
         }
     }
 

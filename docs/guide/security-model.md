@@ -105,6 +105,28 @@ ampup-memory apikey revoke dash
 - `x-memstore-as` is refused (403) on every route but `/runs`, `/runs/reward`, `/advice`, `/sessions*` and `/mcp`,
   and from any caller but a recorder key. The named email must be a member the directory holds.
 
+## Personal keys
+
+A member makes a key of their own for a script or an app that isn't an MCP client:
+
+```bash
+ampup-memory apikey create --personal --name laptop --role writer   # expires in 90 days unless --expires
+ampup-memory apikey list                                             # a member sees their own keys
+ampup-memory apikey revoke laptop
+```
+
+- Requests made with it are the member's: it reads what they read (their teams and their own notes included) and,
+  as a `writer`, writes as them. It is `reader` or `writer`, of the whole org (no `--team`), and expires within
+  365 days.
+- Only the member makes it, signed in as themselves: not an admin for someone else, and not with another key. They
+  or an admin revoke it.
+- It never administers: an admin's personal key reads as a member, and `/admin` refuses it.
+- It reaches the member's memory routes only: `/me`, `/doctor`, `/search`, `/query`, `/episode`, `/document`,
+  `/browse`, `/facts/list`, `/advice/list`, `/brief`, `/remember`, `/forget`, `/sessions`, `/sessions/end`,
+  `/advice`, `/runs`, `/runs/reward`, `/feedback`, `/pin` and `/mcp`. Anything else is 403
+  (`personal_key_route` in the audit). `x-memstore-as` is refused as for every key but a recorder's.
+- Removing the member from the org revokes it; disabling them refuses it.
+
 ## Notes, sessions and sharing
 
 - A person's notes, run traces and session transcripts are readable by them alone.

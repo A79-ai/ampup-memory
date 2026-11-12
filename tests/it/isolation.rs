@@ -1,7 +1,7 @@
 //! Isolation across every read path, end to end. A real `memstore serve` over HTTP on a local catalog holds
 //! two orgs, `acme` (teams `a1`, `a2`) and `globex` (team `b1`), plus the served scope, each with memories
 //! carrying a tag no other scope has. Every caller (signed-in people, org and team service keys, an ingest
-//! key, another org's writer key, the operator's `AMPUP_MEMORY_API_KEYS` key) reads through every read path
+//! key, another org's writer key, members' personal keys, the operator's `AMPUP_MEMORY_API_KEYS` key) reads through every read path
 //! with every selection, and every answer must hold no tag from outside the scope the caller is entitled to
 //! for that selection, while an entitled caller does see their own.
 //!
@@ -9,7 +9,8 @@
 //! own memory. Selecting an org gives its members the org's memory and never its teams'. Selecting a team
 //! gives that team's members the team's memory and never the org's, and an org admin who isn't in the team
 //! gets nothing there. A person who selects nothing gets their one org. A service key reads only its own
-//! scope (a team key never its org's), and an ingest key reads nothing. A key or a person never falls back
+//! scope (a team key never its org's), and an ingest key reads nothing. A member's personal key reads what
+//! they do (their teams and their own notes too), and manages nothing even when they are an admin. A key or a person never falls back
 //! to the served scope; the operator's key, which is in no org, reads only the served scope.
 //!
 //! Not covered: `ask_memory` needs an answer model (`AMPUP_MEMORY_ANSWER_MODEL`, Gemini on Vertex AI) and isn't
@@ -236,8 +237,15 @@ enum Kind {
         team: Option<&'static str>,
         ingest: bool,
     },
+    /// A member's personal key: reads as the person does in their orgs and teams, and manages nothing.
+    Personal(Vec<(&'static str, Vec<&'static str>)>),
     /// The platform operator's `AMPUP_MEMORY_API_KEYS` key: in no org.
     Operator,
+}
+
+/// Carol, signed in or through her personal key: the one caller who reads her own note and session.
+fn is_carol(c: &Caller) -> bool {
+    c.name.starts_with("a1 member")
 }
 
 struct Caller {
@@ -272,7 +280,7 @@ fn entitled(kind: &Kind, org: Option<&str>, team: Option<&str>) -> Result<Scope,
                 _ => Err(()),
             }
         }
-        Kind::Person(orgs) => {
+        Kind::Person(orgs) | Kind::Personal(orgs) => {
             let org = match org {
                 Some(o) => o,
                 None if orgs.len() == 1 => orgs[0].0,
@@ -600,7 +608,100 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
         .find(|l| l.answer_id == sid)
         .and_then(|l| l.episodes.first().cloned())
         .expect("the session's transcript");
+    // Members' personal keys, each made by the member signed in as themselves: carol's (in team a1), and the
+    // admin alice's, which reads as a member and manages nothing.
+    let in_30_days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 30 * 24 * 3600;
+    let personal = |name: &str, role: &str| {
+        let k = format!("msk_{}{}", uuid::Uuid::new_v4().simple(), name);
+        let change = json!({"op": "create_key", "org": "acme", "name": name, "role": role,
+                            "personal": true, "expires_at": in_30_days, "key": k});
+        (k, change)
+    };
+    let (carol_key, c) = personal("carol_cli", "writer");
+    let (status, raw) = post(&format!("{s}/admin"), &carol, &c).await;
+    assert_eq!(status, 200, "carol's personal key: {raw}");
+    let (alice_key, c) = personal("alice_cli", "reader");
+    let (status, raw) = post(&format!("{s}/admin"), &person("alice@acme.com"), &c).await;
+    assert_eq!(status, 200, "alice's personal key: {raw}");
+    // Refused: a member making a service key, a personal key of a team or a writing-only role or with no expiry,
+    // one in an org they aren't in, one made with a key, and revoking someone else's.
+    let (_, mut svc) = personal("carol_svc", "reader");
+    svc.as_object_mut().unwrap().remove("personal");
+    let (_, mut team) = personal("carol_team", "reader");
+    team["team"] = json!("a1");
+    let (_, mut never) = personal("carol_never", "reader");
+    never.as_object_mut().unwrap().remove("expires_at");
+    let (_, mut globex) = personal("carol_globex", "reader");
+    globex["org"] = json!("globex");
+    for (bearer, change, want) in [
+        (&carol, svc, 403),
+        (&carol, team, 400),
+        (&carol, personal("carol_ingest", "ingest").1, 400),
+        (&carol, never, 400),
+        (&carol, globex, 403),
+        (&carol_key, personal("carol_again", "reader").1, 403),
+        (
+            &person("bob@acme.com"),
+            json!({"op": "revoke_key", "org": "acme", "name": "carol_cli"}),
+            403,
+        ),
+    ] {
+        let (status, raw) = post(&format!("{s}/admin"), bearer, &change).await;
+        assert_eq!(status, want, "{change}: {raw}");
+    }
+    // A personal key reaches its member's memory routes only: not the org's admin, ingest or another member's runs,
+    // even an admin's.
+    let (status, raw) = post(
+        &format!("{s}/admin"),
+        &alice_key,
+        &json!({"op": "create_team", "org": "acme", "team": "a3"}),
+    )
+    .await;
+    assert_eq!(status, 403, "alice's personal key made a team: {raw}");
+    let (status, raw) = post(&format!("{s}/ingest"), &carol_key, &json!({"episodes": []})).await;
+    assert!(
+        status == 403 && raw.contains("a personal key reaches"),
+        "carol's personal key ingested: {status} {raw}"
+    );
+    let r = CLIENT
+        .post(format!("{s}/advice"))
+        .bearer_auth(&carol_key)
+        .header("x-memstore-as", "bob@acme.com")
+        .body(json!({"question": "next"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        403,
+        "carol's personal key acted as bob"
+    );
+    // Her key's own view lists it as hers, and no one else's.
+    let (_, raw) = post(
+        &format!("{s}/admin"),
+        &carol,
+        &json!({"op": "show", "org": "acme"}),
+    )
+    .await;
+    assert!(
+        raw.contains("carol_cli") && !raw.contains("alice_cli"),
+        "carol's view of her keys: {raw}"
+    );
     let callers = [
+        Caller {
+            name: "a1 member's personal key",
+            bearer: carol_key.clone(),
+            kind: Kind::Personal(vec![("acme", vec!["a1"])]),
+        },
+        Caller {
+            name: "acme admin's personal key",
+            bearer: alice_key.clone(),
+            kind: Kind::Personal(vec![("acme", vec![])]),
+        },
         Caller {
             name: "acme admin",
             bearer: person("alice@acme.com"),
@@ -688,11 +789,11 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
     // The server reads a snapshot up to ~1 s old: wait until each scope's facts reach an entitled reader.
     let readers = [
         (ADMIN_KEY, "", "xserved"),
-        (callers[1].bearer.as_str(), "", "xorgalpha"),
+        (callers[3].bearer.as_str(), "", "xorgalpha"),
         (carol.as_str(), "?team=a1", "xteamalpha1"),
-        (callers[3].bearer.as_str(), "?team=a2", "xteamalpha2"),
+        (callers[5].bearer.as_str(), "?team=a2", "xteamalpha2"),
         (b_writer.as_str(), "", "xorgbeta"),
-        (callers[4].bearer.as_str(), "?team=b1", "xteambeta1"),
+        (callers[6].bearer.as_str(), "?team=b1", "xteambeta1"),
     ];
     for (bearer, sel, tag) in readers {
         let t = Instant::now();
@@ -721,7 +822,6 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
         .iter()
         .flat_map(|c| selections.iter().map(move |&sel| (c, sel)));
     let (tags, entity_ids, all_ids) = (&tags, &entity_ids, &all_ids);
-    let carol = carol.as_str();
     let session_episode = session_episode.as_str();
     let mut checked: usize = futures::stream::iter(runs)
         .map(|(c, (org, team))| async move {
@@ -742,7 +842,7 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
             let scope = entitled(&c.kind, org, team).ok();
             let reads = scope.as_ref().filter(|_| !ingest);
             let mut foreign = tags.foreign(reads);
-            if c.bearer != carol {
+            if !is_carol(c) {
                 foreign.push(PRIVATE.to_string());
                 foreign.push(SESSION.to_string());
             }
@@ -867,7 +967,7 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
             );
             // Memberships name only the caller's own orgs (none for an ingest key or the operator).
             let orgs: Vec<&str> = match &c.kind {
-                Kind::Person(o) => o.iter().map(|(o, _)| *o).collect(),
+                Kind::Person(o) | Kind::Personal(o) => o.iter().map(|(o, _)| *o).collect(),
                 Kind::Key { org, ingest, .. } if !ingest => vec![*org],
                 _ => vec![],
             };
@@ -951,7 +1051,7 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
                 tools.push(("get_episode", json!({"episode_id": id}), want));
             }
             // The session's transcript by its id: its owner reads it in the org's memory, no one else anywhere.
-            let own = c.bearer == carol && reads.is_some_and(|s| s.to_string() == "org:acme");
+            let own = is_carol(c) && reads.is_some_and(|s| s.to_string() == "org:acme");
             let want = if own { vec![SESSION.to_string()] } else { vec![] };
             tools.push(("get_episode", json!({"episode_id": session_episode}), want));
             for (tool, args, want) in tools {
@@ -1062,7 +1162,7 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
             checked += 1;
         }
         match &c.kind {
-            Kind::Key { .. } => assert_eq!(status, 403, "{}: {all}", c.name),
+            Kind::Key { .. } | Kind::Personal(_) => assert_eq!(status, 403, "{}: {all}", c.name),
             Kind::Operator => assert_eq!(status, 200, "{all}"),
             Kind::Person(orgs) => {
                 assert_eq!(status, 200, "{}: {all}", c.name);
@@ -1079,8 +1179,37 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
         }
     }
 
-    checked += pinned_reads(s, &callers, &selections, tags, carol).await;
+    checked += pinned_reads(s, &callers, &selections, tags).await;
     checked += cross_scope_reads(s, &store, &callers, &selections, tags, &person).await;
+
+    // Taken out of the org, carol's personal key goes with her: refused on every read, at once.
+    admin(
+        s,
+        json!({"op": "remove_member", "org": "acme", "user": "carol@acme.com"}),
+    )
+    .await;
+    // A server's view of the keys may be up to 5 s behind.
+    let t = Instant::now();
+    loop {
+        let (status, raw) = post(
+            &format!("{s}/search?team=a1"),
+            &carol_key,
+            &json!({"calls": [["owner", 50]]}),
+        )
+        .await;
+        if status == 401 || status == 403 {
+            assert!(
+                !raw.contains("xteamalpha1") && !raw.contains(PRIVATE),
+                "{raw}"
+            );
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "carol's personal key still reads after she left: {status} {raw}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     eprintln!("checked {checked} responses");
 }
 
@@ -1094,7 +1223,6 @@ async fn pinned_reads(
     callers: &[Caller],
     selections: &[(Option<&str>, Option<&str>)],
     tags: &Tags,
-    carol: &str,
 ) -> usize {
     let sel_of = |org: Option<&str>, team: Option<&str>| {
         let q: Vec<String> = [
@@ -1164,7 +1292,7 @@ async fn pinned_reads(
             };
             let reads = scope.as_ref().filter(|s| !ingest && *s == pin_scope);
             let mut foreign = tags.foreign(reads);
-            if c.bearer != carol {
+            if !is_carol(c) {
                 foreign.push(PRIVATE.to_string());
                 foreign.push(SESSION.to_string());
             }
@@ -1454,7 +1582,7 @@ async fn cross_scope_reads(
                 .into_iter()
                 .filter(|t| !mine.contains(t))
                 .collect();
-            if c.name != "a1 member" {
+            if !is_carol(c) {
                 foreign.push(PRIVATE.to_string());
                 foreign.push(SESSION.to_string());
             }

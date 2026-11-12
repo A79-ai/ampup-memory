@@ -140,10 +140,11 @@ pub const INSTRUCTIONS: &[&str] = &["", "default", "purpose"];
 /// new meaning of an op it knows). Rolling deploys upgrade every reader before any writer writes the new
 /// version: an older reader that meets it stops folding there (it serves the directory as of the change
 /// before, signs no one in, refuses directory writes, and raises `memstore_directory_blocked`). Only a
-/// change that needs it is written at it ([`SOURCES_VERSION`], [`PURGE_VERSION`], [`USERS_VERSION`]); every
+/// change that needs it is written at it ([`SOURCES_VERSION`], [`PURGE_VERSION`], [`USERS_VERSION`],
+/// [`PERSONAL_VERSION`]); every
 /// other change stays at 1, so an older reader folds on until a change it would get wrong. An op this
 /// engine doesn't know stops the fold too, whatever its version ([`OPS`]).
-pub const EVENT_VERSION: i64 = 4;
+pub const EVENT_VERSION: i64 = 5;
 
 /// The version of a change whose op is newer than this engine ([`OPS_VERSION`] and up). From this engine on,
 /// every engine stops folding at an op it doesn't know, at any version; an engine before it reads at most
@@ -214,6 +215,17 @@ pub const SOURCES_VERSION: i64 = 2;
 /// let a user disabled through another server in, or keep a group removed through it. (`user.enable` stays
 /// at 1: an engine that misses it only refuses more.)
 pub const USERS_VERSION: i64 = 3;
+
+/// The version of a `key.create` that makes a member's personal key (one with an `owner`): an engine before it
+/// would fold it as a service key of the org, reading as the key rather than as its owner, and keep it after
+/// the owner is removed.
+pub const PERSONAL_VERSION: i64 = 5;
+
+/// The longest a personal key may live, in seconds: it is a person's bearer, so it always expires.
+pub const PERSONAL_KEY_MAX_SECS: i64 = 365 * 24 * 3600;
+
+/// The most personal keys one member holds in an org.
+pub const PERSONAL_KEYS_MAX: usize = 10;
 
 /// A user's closure edit (`closure.set`): groups added to, and removed from, what their token carries.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -349,9 +361,10 @@ impl Event {
                 Some(k) => {
                     format!(
                         "{} {} key {} for {}{}",
-                        match k.imported_user() {
-                            Some(u) => format!("import a file key acting as {u} as"),
-                            None => "create".into(),
+                        match (k.imported_user(), &k.owner) {
+                            (Some(u), _) => format!("import a file key acting as {u} as"),
+                            (None, Some(u)) => format!("create {u}'s personal"),
+                            (None, None) => "create".into(),
                         },
                         k.role.as_str(),
                         k.name,
@@ -501,7 +514,7 @@ pub struct Org {
 impl Org {
     /// The org as one of its members who isn't an admin sees it (`/admin {"op": "show"}`): themselves, with
     /// their role and teams, and the org's profile (which agents that connect are shown anyway). Not the
-    /// other members, the keys, the provider, the domains or who asked to join: those are its admins'.
+    /// other members, other people's keys, the provider, the domains or who asked to join: those are its admins'.
     pub fn member_view(&self, user: &str, access: &Access) -> Value {
         let user = user_id(user);
         let teams: BTreeMap<&String, [&String; 1]> =
@@ -509,6 +522,15 @@ impl Org {
         let mut v = json!({"members": {&user: access.role}, "teams": teams});
         if let Some(p) = &self.profile {
             v["profile"] = json!(p);
+        }
+        // Their own personal keys: theirs to see and revoke.
+        let keys: BTreeMap<&String, &ServiceKey> = self
+            .keys
+            .iter()
+            .filter(|(_, k)| k.owner.as_deref() == Some(user.as_str()))
+            .collect();
+        if !keys.is_empty() {
+            v["keys"] = json!(keys);
         }
         v
     }
@@ -589,6 +611,11 @@ pub struct ServiceKey {
     /// member there, and removing them revokes it.
     #[serde(skip)]
     pub imported_user: Option<String>,
+    /// A personal key's member ([`user_id`]): requests made with it are theirs, read and written as they
+    /// would be signed in (never as an admin), while the directory holds them in the org; removing them
+    /// revokes it. None: a service key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// A `key.create` event's detail.
@@ -611,6 +638,9 @@ pub struct KeyDetail {
     /// `imported_from` ([`KeyDetail::imported_user`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imported_user: Option<String>,
+    /// A personal key's member ([`ServiceKey::owner`]); written at [`PERSONAL_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 impl KeyDetail {
@@ -821,6 +851,17 @@ impl SignIn {
     /// The recorder key this caller signed in with, if they did (`KeyRole::Recorder`).
     pub fn recorder_key(&self) -> Option<&crate::auth::OrgKey> {
         self.key.as_ref().filter(|k| k.role == KeyRole::Recorder)
+    }
+
+    /// Whether requests are a person's own: signed in as themselves, or with their personal key. Their runs,
+    /// sessions and votes are theirs; a service key has none.
+    /// A reader personal key reads only: it records nothing, not even runs or votes.
+    pub fn is_person(&self) -> bool {
+        self.person
+            || self
+                .key
+                .as_ref()
+                .is_some_and(|k| k.owner.is_some() && k.role == KeyRole::Writer)
     }
 }
 
@@ -1310,6 +1351,8 @@ struct SnapKey {
     sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     imported_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
 }
 
 /// The directory folded from its log, and how much of the log that is.
@@ -1381,7 +1424,7 @@ fn chain(prev: &str, e: &Event) -> String {
 
 /// What a snapshot's state means changes when the fold does: a snapshot of another format is never
 /// loaded (the log is replayed instead). Bump it with any change to what [`Directory::apply_events`] does.
-pub const SNAPSHOT_FORMAT: i64 = 11;
+pub const SNAPSHOT_FORMAT: i64 = 12;
 
 /// A folded snapshot of the directory log (`memory_system.directory_snapshot`): the state after the log's
 /// first `events` changes, the last of them at `at`.
@@ -1779,6 +1822,7 @@ impl Directory {
                                 sha256: k.sha256,
                                 last_used_at: None,
                                 imported_user,
+                                owner: k.owner.map(|u| user_id(&u)),
                             },
                         );
                     }
@@ -1840,6 +1884,7 @@ impl Directory {
                             created_at: k.created_at,
                             sha256: k.sha256.clone(),
                             imported_user: k.imported_user.clone(),
+                            owner: k.owner.clone(),
                         };
                         (n.clone(), key)
                     })
@@ -1905,6 +1950,7 @@ impl Directory {
                             sha256: k.sha256,
                             last_used_at: None,
                             imported_user: k.imported_user,
+                            owner: k.owner,
                         };
                         (n, key)
                     })
@@ -1973,6 +2019,28 @@ impl Directory {
             if let Some(u) = &held.imported_user
                 && !self.holds_member(u, &k.org, held.team.as_deref())
             {
+                return out;
+            }
+            // A personal key holds what its member holds through the directory (never what a domain or a
+            // provider's group would give them: the key proves nothing about those), as a member, never an
+            // admin, and nothing once they are out.
+            if let Some(u) = &held.owner {
+                if !self.holds_member(u, &k.org, None) {
+                    return out;
+                }
+                let teams = org
+                    .teams
+                    .iter()
+                    .filter(|(_, m)| m.contains(u))
+                    .map(|(t, _)| t.clone())
+                    .collect();
+                out.insert(
+                    k.org.clone(),
+                    Access {
+                        role: Role::Member,
+                        teams,
+                    },
+                );
                 return out;
             }
             let teams = match &k.team {
@@ -2764,6 +2832,11 @@ pub enum Change {
         /// them (`email:`, `slack:acme:`). None: any source it may write.
         #[serde(default)]
         sources: Vec<String>,
+        /// A personal key: the asker's own, acting as them ([`ServiceKey::owner`]). Any member signed in as
+        /// a person makes one for themselves (never for anyone else, never with a key); it is a reader or
+        /// writer of the whole org, and expires within [`PERSONAL_KEY_MAX_SECS`].
+        #[serde(default)]
+        personal: bool,
     },
     /// Set an ingest key's source prefixes (an empty list: any source again). The list must be there: a
     /// change that leaves it out (or misspells it) is refused, never taken for "any source".
@@ -3130,8 +3203,11 @@ pub fn import_revokes(dir: &Directory, me: &str, events: &[Event]) -> Vec<Event>
             _ => continue,
         };
         for (name, k) in &org.keys {
-            let theirs = k.imported_user.as_deref() == Some(user.as_str())
-                && team.is_none_or(|t| k.team.as_deref() == Some(t));
+            // A personal key reads the whole org as its member, so leaving a team leaves it: the org's
+            // removal alone revokes it.
+            let theirs = (k.imported_user.as_deref() == Some(user.as_str())
+                && team.is_none_or(|t| k.team.as_deref() == Some(t)))
+                || (team.is_none() && k.owner.as_deref() == Some(user.as_str()));
             let revoked = events.iter().any(|r| {
                 r.op == "key.revoke" && r.org == e.org && r.detail.as_deref() == Some(name)
             });
@@ -3172,12 +3248,30 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
     let imports = matches!(change, Change::ImportKeys { .. });
     // Asking to join is the asker's own: checked below, where the org is known.
     let asks = matches!(change, Change::RequestJoin { .. });
+    // A member's own personal key: theirs to make and revoke, signed in as themselves through a sign-in that
+    // counts in this org (`access` applies [`Directory::vouched`]: another org's own provider could name
+    // anyone's email), never with a key, and only while the directory holds them there.
+    let own_key = actor.via.person
+        && actor.via.key.is_none()
+        && dir.access(me, &actor.via).contains_key(org_name)
+        && dir.holds_member(me, org_name, None)
+        && match change {
+            Change::CreateKey { personal, .. } => *personal,
+            Change::RevokeKey { org, name } => dir
+                .orgs
+                .get(org)
+                .and_then(|o| o.keys.get(name))
+                .and_then(|k| k.owner.as_deref())
+                .is_some_and(|o| o == user_id(me)),
+            _ => false,
+        };
     if let Some(k) = actor.via.directory_key() {
         // A directory key (a SCIM bridge's) manages its own org's people, never an admin, and nothing else.
         directory_key_may(dir, me, k, change)?;
     } else if !superuser
         && !imports
         && !asks
+        && !own_key
         && (owner_only || !dir.is_admin(me, &actor.via, org_name))
     {
         refuse!(
@@ -3715,9 +3809,48 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             expires_at,
             key,
             sources,
+            personal,
             ..
         } => {
             let sources = key_sources(*role, sources)?;
+            let owner = match personal {
+                false => None,
+                true => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_secs() as i64;
+                    if !own_key {
+                        refuse!(
+                            "{me} may not make a personal key in org {org_name}: a member the directory holds makes their own, signed in as themselves"
+                        );
+                    }
+                    if !matches!(role, KeyRole::Reader | KeyRole::Writer) {
+                        invalid!(
+                            "a personal key reads (reader) or reads and writes (writer) as its member, not {}",
+                            role.as_str()
+                        );
+                    }
+                    if team.is_some() {
+                        invalid!(
+                            "a personal key reads what its member reads, their teams included: leave out the team"
+                        );
+                    }
+                    if expires_at.is_none_or(|t| t > now + PERSONAL_KEY_MAX_SECS) {
+                        invalid!("a personal key expires within 365 days: give it an expiry");
+                    }
+                    let theirs = org
+                        .keys
+                        .values()
+                        .filter(|k| k.owner.as_deref() == Some(user_id(me).as_str()))
+                        .count();
+                    if theirs >= PERSONAL_KEYS_MAX {
+                        refuse!(
+                            "{me} has {theirs} personal keys in org {org_name}, the most one member may: revoke one first"
+                        );
+                    }
+                    Some(user_id(me))
+                }
+            };
             if check_name("key", name).is_err() {
                 invalid!(
                     "invalid key name {name:?}: use lower-case letters, digits and single underscores"
@@ -3772,12 +3905,17 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 created_by: user_id(me),
                 imported_from: None,
                 imported_user: None,
+                owner,
             };
             let mut e = ev("key.create").detail(&serde_json::to_string(&detail)?);
             e.team = team.clone();
             e.role = Some(role.as_str().into());
             if !detail.sources.is_empty() {
                 e.version = SOURCES_VERSION;
+            }
+            if detail.owner.is_some() {
+                e.user = detail.owner.clone();
+                e.version = PERSONAL_VERSION;
             }
             vec![e]
         }
@@ -3895,6 +4033,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                     created_by: user_id(me),
                     imported_from: None,
                     imported_user: Some(user.clone()),
+                    owner: None,
                 };
                 let mut e = ev("key.create").detail(&serde_json::to_string(&detail)?);
                 e.team = team.clone();

@@ -359,6 +359,9 @@ pub struct OrgKey {
     /// An ingest key writes and retracts only sources starting with one of these; none: any.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<String>,
+    /// A personal key's member: requests made with it run as them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     #[serde(skip)]
     pub sha256: String,
 }
@@ -369,7 +372,8 @@ impl OrgKey {
         self.sources.is_empty() || self.sources.iter().any(|p| source.starts_with(p.as_str()))
     }
 
-    /// The id requests made with this key run as.
+    /// The key's own id (`key:<org>/<name>`), as the audit and refusals name it. A personal key's requests
+    /// run as its owner ([`org_key_caller`]).
     pub fn user(&self) -> String {
         format!("key:{}/{}", self.org, self.name)
     }
@@ -402,7 +406,8 @@ pub fn org_key_caller(token: &str, keys: &[OrgKey]) -> Result<Caller> {
         "api key {} expired",
         k.user()
     );
-    let user = k.user();
+    // A personal key's requests are its member's: their id, so disabling them refuses it too.
+    let user = k.owner.clone().unwrap_or_else(|| k.user());
     Ok(Caller {
         aliases: vec![user.clone()],
         user,

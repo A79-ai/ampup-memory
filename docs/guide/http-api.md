@@ -2,7 +2,9 @@
 
 `ampup-memory serve` listens on port 8080 by default (`ampup-memory serve [scope] [port]`). Bodies are JSON. On a server
 with sign-in, send `Authorization: Bearer <token or msk_ key>` and select memory with `x-memstore-org` and
-`x-memstore-team` headers (or `?org=&team=`). `serve --local` takes no credentials.
+`x-memstore-team` headers (or `?org=&team=`). A client that isn't an MCP client can use a member's personal key
+(`ampup-memory apikey create --personal`), which acts as them on the memory routes below
+([security-model.md](security-model.md#personal-keys)). `serve --local` takes no credentials.
 
 Examples below run against `ampup-memory serve --local` on `localhost:8080`.
 

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from ampup_memory import AmpUpMemory, micros
 
 mem = AmpUpMemory.from_profile()  # the CLI's current context; or AmpUpMemory.from_profile("work")
-# mem = AmpUpMemory("https://memory.example.com", "msk_...", org="acme")  # an explicit API key
+# mem = AmpUpMemory("https://memory.example.com", "msk_...", org="acme")  # an API key: yours (apikey create --personal) or a service's
 # mem = AmpUpMemory("http://127.0.0.1:8080", None)  # a local `ampup-memory serve --local`
 
 ep = mem.remember("note:acme", "The Acme renewal is owned by Priya.")

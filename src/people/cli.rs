@@ -730,6 +730,11 @@ pub enum ApikeyCmd {
         /// retracts only sources starting with one of them (default: any source)
         #[arg(long)]
         sources: Option<String>,
+        /// Your own key, acting as you: it reads (and, as a writer, writes) what you do, your teams and
+        /// private notes included, and never administers. Any member makes one; it stops when you leave
+        /// the org, and always expires (default 90d, at most 365d)
+        #[arg(long, conflicts_with_all = ["team", "sources"])]
+        personal: bool,
     },
     /// Hold an ingest key to source prefixes, or (--any) let it write any source again
     Sources {
@@ -1353,10 +1358,15 @@ async fn apikey(to: &Target<'_>, cmd: &ApikeyCmd) -> Result<()> {
             role,
             expires,
             sources,
+            personal,
         } => {
             let org = org_of(org)?;
             let role = directory::KeyRole::parse(role)?;
-            let expires_at = match expires {
+            let expires = match (expires, personal) {
+                (None, true) => Some("90d".to_string()),
+                (e, _) => e.clone(),
+            };
+            let expires_at = match &expires {
                 Some(e) => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)?
@@ -1384,6 +1394,7 @@ async fn apikey(to: &Target<'_>, cmd: &ApikeyCmd) -> Result<()> {
                     .as_deref()
                     .map(crate::split_list)
                     .unwrap_or_default(),
+                personal: *personal,
             };
             to.change(change, false).await?;
             let server = Config::load()?
@@ -1395,7 +1406,10 @@ async fn apikey(to: &Target<'_>, cmd: &ApikeyCmd) -> Result<()> {
                     .map(|t| format!("&team={t}"))
                     .unwrap_or_default()
             );
-            println!("\nThe key (shown once; keep it in your CI's secrets):\n  {key}");
+            println!(
+                "\nThe key (shown once; keep it in your {} secrets):\n  {key}",
+                if *personal { "own" } else { "CI's" }
+            );
             if role == directory::KeyRole::Directory {
                 println!(
                     "\nA directory key manages org {org}'s members and teams (never its admins) through /admin, and reads no memory:"
@@ -1433,7 +1447,9 @@ async fn apikey(to: &Target<'_>, cmd: &ApikeyCmd) -> Result<()> {
                 let sources = k["sources"].as_array().map_or(String::new(), |a| {
                     let a: Vec<&str> = a.iter().filter_map(|v| v.as_str()).collect();
                     format!("\tsources {}", a.join(","))
-                });
+                }) + &k["owner"]
+                    .as_str()
+                    .map_or(String::new(), |o| format!("\tpersonal key of {o}"));
                 println!(
                     "{name}\t{}\t{}\texpires {}\tcreated by {} at {}\tlast used {}{sources}",
                     k["team"].as_str().unwrap_or("(org)"),
