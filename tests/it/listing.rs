@@ -4,8 +4,9 @@
 //! - facts narrow by source prefix, entity type, predicate, tags, status, valid time and text, page without
 //!   repeating or skipping one, and a caller sees only the facts whose episodes they may read, each with only
 //!   the sources of those;
-//! - advice lists a person's own notes to them alone, the team's only once past the evidence bar (their org's
-//!   admins also see the candidates), and narrows by space, category, text, evidence and when it was written.
+//! - advice lists a person's own notes to them alone, and every team note to everyone in the team (each marked
+//!   ratified or not, as it is served either way), and narrows by space, category, text, evidence and when it
+//!   was written.
 //!
 //! `isolation` drives the same two paths over HTTP for every caller and selection.
 
@@ -244,8 +245,8 @@ async fn facts_narrow_by_where_they_came_from_and_what_they_say() {
 }
 
 #[tokio::test]
-async fn advice_lists_a_persons_own_and_the_teams_once_ratified() {
-    if !crate::own_process("listing::advice_lists_a_persons_own_and_the_teams_once_ratified") {
+async fn advice_lists_a_persons_own_and_every_team_note() {
+    if !crate::own_process("listing::advice_lists_a_persons_own_and_every_team_note") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -281,12 +282,12 @@ async fn advice_lists_a_persons_own_and_the_teams_once_ratified() {
         .unwrap();
     assert!(done.learned.is_some() && done.personal >= 1, "{done:?}");
 
-    let list = |who: &Principal, admin: bool, req: Value| {
+    let list = |who: &Principal, req: Value| {
         let (store, scope) = (&store, &scope);
         let who = who.clone();
         async move {
             let session = store.pin(scope, memstore::MAIN).await.unwrap();
-            memstore::listing::advice(store, &session, &who, &req, admin)
+            memstore::listing::advice(store, &session, &who, &req)
                 .await
                 .unwrap()
         }
@@ -306,15 +307,17 @@ async fn advice_lists_a_persons_own_and_the_teams_once_ratified() {
             .collect()
     };
 
-    // Alice: her own note, with no tally; the team's note is a candidate (no one's session has ratified it),
-    // and a plain member doesn't see candidates.
-    let a = list(&alice, false, json!({})).await;
-    assert_eq!(spaces(&a), ["mine mine:work/do-it"], "{a}");
-    assert!(a["advice"][0]["evidence"].is_null(), "{a}");
-    assert_eq!(a["advice"][0]["ratified"], true);
-
-    // Her org's admin also sees the team's candidate, with its tally, marked as not ratified.
-    let a = list(&alice, true, json!({})).await;
+    // Alice, a plain member: her own note, with no tally, and the team's, which is served to everyone though no
+    // one's session has ratified it yet: listed with its tally, marked as not ratified.
+    let a = list(&alice, json!({})).await;
+    let mine = a["advice"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["space"] == "mine")
+        .unwrap();
+    assert!(mine["evidence"].is_null(), "{a}");
+    assert_eq!(mine["ratified"], true);
     let mut got = spaces(&a);
     got.sort();
     assert_eq!(got, ["mine mine:work/do-it", "team work/do-it"], "{a}");
@@ -328,20 +331,19 @@ async fn advice_lists_a_persons_own_and_the_teams_once_ratified() {
     assert_eq!(team["evidence"]["served"], 0, "{a}");
     assert!(team["note_chars"].as_u64().unwrap() > 0);
 
-    // Bob: none of alice's, and not the candidate without admin rights.
-    let b = list(&bob, false, json!({})).await;
-    assert!(spaces(&b).is_empty(), "{b}");
-    // Admin or not, asking for alice's space gives him his own (none), never hers.
-    let b = list(&bob, true, json!({"space": "mine"})).await;
+    // Bob: the team's note, and none of alice's; asking for his own space gives his own (none), never hers.
+    let b = list(&bob, json!({})).await;
+    assert_eq!(spaces(&b), ["team work/do-it"], "{b}");
+    let b = list(&bob, json!({"space": "mine"})).await;
     assert!(spaces(&b).is_empty(), "{b}");
 
-    // Filters, as the admin who sees both.
+    // Filters, as alice, who sees both.
     let only = |req: Value, want: &[&str]| {
         let list = &list;
         let alice = &alice;
         let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
         async move {
-            let a = list(alice, true, req.clone()).await;
+            let a = list(alice, req.clone()).await;
             let mut have = spaces(&a);
             have.sort();
             assert_eq!(have, want, "{req}: {a}");
@@ -382,9 +384,9 @@ async fn advice_lists_a_persons_own_and_the_teams_once_ratified() {
     only(json!({"learned": {"lt": "2020-01-01"}}), &[]).await;
 
     // The note's text only when asked for.
-    let plain = list(&alice, true, json!({"space": "mine"})).await;
+    let plain = list(&alice, json!({"space": "mine"})).await;
     assert!(plain["advice"][0].get("text").is_none(), "{plain}");
-    let full = list(&alice, true, json!({"space": "mine", "include": "text"})).await;
+    let full = list(&alice, json!({"space": "mine", "include": "text"})).await;
     assert!(
         full["advice"][0]["text"]
             .as_str()
@@ -394,11 +396,11 @@ async fn advice_lists_a_persons_own_and_the_teams_once_ratified() {
     );
 
     // Pages of one: both entries once, then no cursor.
-    let first = list(&alice, true, json!({"limit": 1})).await;
+    let first = list(&alice, json!({"limit": 1})).await;
     assert_eq!(first["advice"].as_array().unwrap().len(), 1, "{first}");
     let cursor = first["cursor"].clone();
     assert!(cursor.is_string(), "{first}");
-    let second = list(&alice, true, json!({"limit": 1, "cursor": cursor})).await;
+    let second = list(&alice, json!({"limit": 1, "cursor": cursor})).await;
     assert!(second["cursor"].is_null(), "{second}");
     let mut paged = spaces(&first);
     paged.extend(spaces(&second));
@@ -407,6 +409,6 @@ async fn advice_lists_a_persons_own_and_the_teams_once_ratified() {
 
     // Forgetting alice takes her own notes out of the list, and leaves the team's.
     store.forget_in(&scope.namespace(), "alice").await.unwrap();
-    let after = list(&alice, true, json!({})).await;
+    let after = list(&alice, json!({})).await;
     assert_eq!(spaces(&after), ["team work/do-it"], "{after}");
 }

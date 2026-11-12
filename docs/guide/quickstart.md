@@ -149,7 +149,7 @@ EOF
 ampup-memory runs load org runs.jsonl --local ~/.ampup-memory --as amy@example.com
 ampup-memory runs load org runs.jsonl --local ~/.ampup-memory --as ben@example.com
 OPENROUTER_API_KEY=... ampup-memory advice org --local ~/.ampup-memory
-OPENROUTER_API_KEY=... AMPUP_MEMORY_ADVICE_EVIDENCE=0 ampup-memory serve --local
+OPENROUTER_API_KEY=... ampup-memory serve --local
 ```
 
 Rules this example works around, on purpose:
@@ -157,8 +157,6 @@ Rules this example works around, on purpose:
 - A team note is learned only from runs of at least 2 people (`AMPUP_MEMORY_ADVICE_LEARN_PEOPLE`, default 3, never
   below 2). `serve --local` has one anonymous caller, so the runs are loaded as two people.
 - A situation needs at least 2 runs that went wrong (`--min-wrong`) or enough that went right.
-- A new note is a candidate, served only in 20% of sessions, until it has helped 3 people.
-  `AMPUP_MEMORY_ADVICE_EVIDENCE=0` serves it everywhere on this laptop.
 
 On a running `serve --local`, the same happens on its own: rewarded sessions and runs come in, and every 10 minutes
 the server learns once 10 new rewarded ones are waiting. See [advice.md](advice.md).

@@ -71,17 +71,11 @@ impl Ep {
 }
 
 /// Answers one `/browse` request as `who`.
-pub async fn run(
-    store: &Store,
-    session: &Session,
-    who: &Principal,
-    req: &Value,
-    admin: bool,
-) -> Result<Value> {
+pub async fn run(store: &Store, session: &Session, who: &Principal, req: &Value) -> Result<Value> {
     match req["op"].as_str().unwrap_or("ls") {
         // The filterable lists (`crate::listing`): `/facts/list` and `/advice/list` are these ops.
         "facts" => crate::listing::facts(store, session, who, req).await,
-        "advice" => crate::listing::advice(store, session, who, req, admin).await,
+        "advice" => crate::listing::advice(store, session, who, req).await,
         "ls" => {
             let path: Vec<String> = match &req["path"] {
                 Value::Null => vec![],

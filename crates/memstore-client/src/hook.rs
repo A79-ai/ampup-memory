@@ -1411,14 +1411,13 @@ async fn report(client: &Client) -> Result<()> {
         }
         let a = &d["advice"];
         println!(
-            "advice: {} notes, {} past the evidence bar (helped {} people); learning {}, routing {}; \
-             sessions: {}% trial, {}% holdout",
+            "advice: {} notes, all served, {} past the evidence bar (helped {} people); learning {}, routing {}; \
+             sessions: {}% holdout",
             a["notes"],
             a["ratified"],
             a["evidence_bar"],
             on(&a["learning"]),
             on(&a["routing"]),
-            (a["trial"].as_f64().unwrap_or(0.0) * 100.0).round(),
             (a["holdout"].as_f64().unwrap_or(0.0) * 100.0).round()
         );
     }

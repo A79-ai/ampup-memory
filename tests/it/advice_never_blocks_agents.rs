@@ -125,7 +125,6 @@ async fn an_agents_session_opens_before_its_advice_is_routed() {
         std::env::set_var("AMPUP_MEMORY_DECIDE", "off");
         std::env::set_var("AMPUP_MEMORY_ADVICE_WAIT_MS", "500");
         std::env::set_var("AMPUP_MEMORY_ADVICE_HOLDOUT", "0");
-        std::env::set_var("AMPUP_MEMORY_ADVICE_TRIAL", "0");
     }
     let dir = tempfile::tempdir().unwrap();
     let catalog = platform::local(&format!("file://{}", dir.path().display()))

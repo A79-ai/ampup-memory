@@ -266,8 +266,8 @@ pub enum OrgCmd {
         /// Serve a situation's learned note with its linked procedures (default false: the note alone)
         #[arg(long)]
         advice_procedures: Option<bool>,
-        /// The people a learned note must have helped before it is served outside the trial arm (default: the
-        /// server's AMPUP_MEMORY_ADVICE_EVIDENCE, else 3; 0 serves every note)
+        /// The people a learned note must have helped before it is reported ratified, which is reported only:
+        /// every note is served (default: the server's AMPUP_MEMORY_ADVICE_EVIDENCE, else 3)
         #[arg(long)]
         advice_evidence: Option<usize>,
         /// The people a team note learned from runs, and each of its items, must come from (default: the server's

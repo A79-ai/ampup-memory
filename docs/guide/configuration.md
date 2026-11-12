@@ -104,8 +104,8 @@ Requests carry `X-Title: ampup-memory`, so their spend shows apart on a shared k
 | `AMPUP_MEMORY_ADVICE_NOTE_MIN_NEW` (5) | New runs before a note is rewritten. |
 | `AMPUP_MEMORY_ADVICE_LEARN=off` | Stop the learning timer. |
 | `AMPUP_MEMORY_ADVICE_LEARN_PEOPLE` (3, never below 2) | People a team note's runs must come from. |
-| `AMPUP_MEMORY_ADVICE_EVIDENCE` (3) | People a note must have helped before it is served outside the trial arm. 0 serves every note. |
-| `AMPUP_MEMORY_ADVICE_TRIAL` (0.2), `AMPUP_MEMORY_ADVICE_HOLDOUT` (0) | Session arms. |
+| `AMPUP_MEMORY_ADVICE_EVIDENCE` (3) | People a note must have helped before it is reported ratified. Reported only: every note is served. |
+| `AMPUP_MEMORY_ADVICE_HOLDOUT` (0) | Share of sessions routed but served no advice, to measure lift. |
 | `AMPUP_MEMORY_ADVICE_PERSONAL_MAX` (3) | People whose personal notes are learned per round; 0 turns personal notes off. |
 | `AMPUP_MEMORY_ADVICE_JUDGE=off`, `AMPUP_MEMORY_ADVICE_JUDGE_AFTER_SECS` (1800), `AMPUP_MEMORY_ADVICE_JUDGE_MAX` (50) | Judging unrewarded runs. |
 | `AMPUP_MEMORY_ADVICE_FORMAT` | `notes` (default) or `checklist`. |

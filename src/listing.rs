@@ -16,8 +16,8 @@
 //!
 //! `advice`: the situations whose advice the caller may read, from their own space (`space: "mine"`), the
 //! team's (`"team"`) or both (`"all"`, the default), narrowed by `category`, `situation`, `text` (a substring of
-//! the situation's `when` or its note), `ratified` (past the evidence bar: only org admins also see the
-//! candidates, whose evidence is still being gathered), `min_helped`, `min_served` and `learned` (`{gte, gt, lte,
+//! the situation's `when` or its note), `ratified` (past the evidence bar; every note is listed and
+//! served either way, the bar is reported only), `min_helped`, `min_served` and `learned` (`{gte, gt, lte,
 //! lt}` on when the note was written). With `include: "text"` each entry carries its note. A person's own
 //! entries show no evidence: a tally is the team's, and counts other people's sessions. Where the scope curates
 //! advice (`crate::advice_curate`), a note withheld by reward says so (`withheld`: its served runs against the rest),
@@ -269,14 +269,12 @@ pub async fn facts(
     Ok(json!({"facts": page, "count": total, "cursor": next}))
 }
 
-/// `advice`: see the module's description. `admin`: the caller administers the org, so the team's candidates
-/// (notes short of the evidence bar) are theirs to review too.
+/// `advice`: see the module's description.
 pub async fn advice(
     store: &Store,
     session: &Session,
     who: &Principal,
     req: &Value,
-    admin: bool,
 ) -> Result<Value> {
     let space = req["space"].as_str().unwrap_or("all");
     if !["mine", "team", "all"].contains(&space) {
@@ -371,11 +369,9 @@ pub async fn advice(
         let tallies = crate::sessions::evidence(store, scope).await?;
         for l in crate::advice::listed(session, store, who, &crate::advice::Space::team()).await? {
             let tally = tallies.get(&l.key).cloned().unwrap_or_default();
+            // Everyone reads what the team serves, and it serves every note: the bar is reported only.
             let past = tally.ratified(bar);
-            // Everyone reads what the team serves; the candidates are for the org's admins.
-            if past || admin {
-                add("team", l, Some(&tally), past);
-            }
+            add("team", l, Some(&tally), past);
         }
     }
     entries.sort_by(|(a, av), (b, bv)| {

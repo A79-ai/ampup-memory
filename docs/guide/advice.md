@@ -35,18 +35,18 @@ per note, whether the agent applied it and whether it helped, and whether the se
 unclear. A session's judged outcome is its reward when the agent gave none. Each note keeps a tally (served,
 applied, helped, not helped), counting each person's latest judged session only.
 
-### Holdout and trial arms
+### Holdout arm
 
 - `AMPUP_MEMORY_ADVICE_HOLDOUT` (0 to 1, default 0): that share of new sessions is routed but served nothing.
   Comparing served against withheld outcomes measures lift.
-- `AMPUP_MEMORY_ADVICE_TRIAL` (0 to 1, default 0.2): the share of sessions that may be served candidate notes.
 
-### Evidence gate
+### Evidence
 
-A team note is a candidate until it helped more people than it didn't, counted by each person's latest judged
-session, up to the scope's evidence bar: the team's `advice_evidence` setting, else the org's, else
-`AMPUP_MEMORY_ADVICE_EVIDENCE` (default 3). Outside the trial arm a candidate isn't served. A bar of 0 serves every
-note. Runs are not evidence; only judged sessions are. `ampup-memory doctor` shows the bar and how many notes passed it.
+Every note learning writes is served to everyone it is learned for; there is no trial arm and no gate. A note is
+reported ratified once it helped more people than it didn't, counted by each person's latest judged session, up to
+the scope's evidence bar: the team's `advice_evidence` setting, else the org's, else `AMPUP_MEMORY_ADVICE_EVIDENCE`
+(default 3). The bar is reported only (`list_advice`, `ampup-memory doctor`); it changes nothing that is served.
+Runs are not evidence; only judged sessions are.
 
 ## Runs and rewards
 

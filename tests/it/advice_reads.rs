@@ -5,8 +5,8 @@
 //! Once the operator lets org acme read team eng, acme's readers are routed over eng's compiled skills and
 //! situations too, on one list with acme's own: a line from eng is keyed `team:acme/eng#<key>`, served from eng and
 //! named by its scope. Each is read as the caller, so an eng skill only carol may read reaches carol through acme and
-//! no one else, not even the routing model's prompt. An eng note is served past eng's own evidence bar only, and as
-//! procedures are (a session doesn't count it). Team eng's own readers don't take acme's lines, and with `reads`
+//! no one else, not even the routing model's prompt. An eng note is served whatever its evidence, as every note is,
+//! and as procedures are (a session doesn't count it). Team eng's own readers don't take acme's lines, and with `reads`
 //! unset acme is advised from its own memory alone again.
 
 use std::sync::{Arc, Mutex};
@@ -389,14 +389,7 @@ async fn advice_routes_over_the_scopes_a_scope_reads_as_the_caller_may_read_them
         "{got}"
     );
 
-    // Eng's note isn't past eng's evidence bar (3 people), so no one is served it from acme; at 0 it is.
-    let got = ask(s, &bob, "an xtriage alert fired").await;
-    assert_eq!(got["situation"], Value::Null, "{got}");
-    admin(
-        s,
-        json!({"op": "set_settings", "org": "acme", "team": "eng", "settings": {"advice_evidence": 0}}),
-    )
-    .await;
+    // Eng's note is served from acme though it isn't past eng's evidence bar (3 people): every note is served.
     let up = Instant::now();
     loop {
         let got = ask(s, &bob, "an xtriage alert fired").await;

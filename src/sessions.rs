@@ -15,15 +15,15 @@
 //! whether the agent applied it and whether it helped, and how the session turned out. Helped is counterfactual:
 //! an item helped only where it gave the agent what it wouldn't have known or done by itself, and an item the
 //! agent followed but would have anyway is `redundant` ([`verdicts`]). Its verdicts are kept on the entry, as
-//! candidate evidence: [`evidence`] tallies them per situation, with the outcomes of the sessions in each arm.
-//! A note is served only once its tally ratifies it ([`Tally::ratified`]) against the
-//! scope's evidence bar ([`min_evidence`]: its org's or team's `advice_evidence`, else the server's), except in the
-//! trial arm (`AMPUP_MEMORY_ADVICE_TRIAL`, default 0.2 of sessions), whose sessions are where a candidate is tried.
+//! evidence: [`evidence`] tallies them per situation, with the outcomes of the sessions in each arm. Every note
+//! learning writes is served (outside the holdout arm): there is no trial arm and no bar a note waits behind. Its
+//! tally says whether it is ratified ([`Tally::ratified`]) against the scope's evidence bar ([`min_evidence`]: its
+//! org's or team's `advice_evidence`, else the server's), which is reported only.
 //!
 //! Apart from the judge, each tally also counts the outcomes people gave the same sessions ([`checked_outcome`]:
 //! their rating, or whether they accepted or corrected each request), and reports whether the holdout proves the
-//! note by those ([`Tally::proven`]). That is reported only (the advice listing, the server's status, the line an
-//! agent is shown); what is served still follows [`Tally::ratified`].
+//! note by those ([`Tally::proven`]). Both are reported only (the advice listing, the server's status, the line an
+//! agent is shown): neither changes what is served.
 
 use crate::qa_log::StoreQaLog as _;
 use std::collections::BTreeMap;
@@ -85,12 +85,6 @@ pub fn holdout_share() -> f64 {
     share("AMPUP_MEMORY_ADVICE_HOLDOUT", 0.0)
 }
 
-/// The share of new sessions in the trial arm, served candidate notes too: `AMPUP_MEMORY_ADVICE_TRIAL`, 0 to 1,
-/// default 0.2. With the holdout, at most every session.
-pub fn trial_share() -> f64 {
-    share("AMPUP_MEMORY_ADVICE_TRIAL", 0.2).min(1.0 - holdout_share())
-}
-
 fn share(var: &str, default: f64) -> f64 {
     std::env::var(var)
         .ok()
@@ -98,9 +92,9 @@ fn share(var: &str, default: f64) -> f64 {
         .map_or(default, |s| s.clamp(0.0, 1.0))
 }
 
-/// The people a note must have helped before `scope` serves it outside the trial arm: its team's or org's
-/// `advice_evidence` setting (`Directory::advice_evidence`), else the server's `AMPUP_MEMORY_ADVICE_EVIDENCE`,
-/// default 3 (0 serves every note).
+/// The people a note must have helped before `scope` reports it ratified ([`Tally::ratified`]): its team's or
+/// org's `advice_evidence` setting (`Directory::advice_evidence`), else the server's `AMPUP_MEMORY_ADVICE_EVIDENCE`,
+/// default 3 (0 reports every note ratified). Reported only: every note is served whatever its tally.
 pub fn min_evidence(dir: Option<&Directory>, scope: &Scope) -> usize {
     dir.and_then(|d| d.advice_evidence(scope))
         .unwrap_or_else(|| {
@@ -413,8 +407,6 @@ pub async fn start(
         u32::from_be_bytes(random.as_bytes()[..4].try_into().unwrap()) as f64 / u32::MAX as f64;
     let arm = if draw < holdout_share() {
         "holdout"
-    } else if draw < holdout_share() + trial_share() {
-        "trial"
     } else {
         "advice"
     };
@@ -1165,7 +1157,7 @@ pub enum Served {
         skills: Vec<crate::advice::Skill>,
         own: Option<Own>,
     },
-    /// Procedures without a note: a situation's that has none (or none ratified yet), or a skill's no situation
+    /// Procedures without a note: a situation's that has none (or none it may serve), or a skill's no situation
     /// links. Not recorded, as the judge judges notes. With the person's own note before them, when one is served
     /// beside them (`own`), which is recorded.
     Procedures {
@@ -3577,7 +3569,7 @@ impl Tally {
         )
     }
 
-    /// Whether the note has the evidence to be served outside the trial arm. With a holdout comparison
+    /// Whether the note's evidence ratifies it (reported only: every note is served). With a holdout comparison
     /// ([`value`](Self::value)): the sessions it was served in succeeded more often than those it was withheld
     /// from, and the judge didn't find it unhelpful more often than helpful. Without one: it helped at least
     /// `bar` ([`min_evidence`]) people (each by their latest judged session), more than it didn't help.
@@ -3621,7 +3613,7 @@ impl Tally {
     /// The tally in a line, as an agent is shown it with the note, judged by `bar` ([`min_evidence`]).
     pub fn line(&self, bar: usize) -> String {
         if self.served + self.withheld == 0 {
-            return "Evidence: none yet (a candidate: no judged session has used it).".into();
+            return "Evidence: none yet (no judged session has used it).".into();
         }
         let value = match self.value(bar) {
             Some(v) => format!(
@@ -3637,7 +3629,7 @@ impl Tally {
             if self.ratified(bar) {
                 "Evidence (ratified)"
             } else {
-                "Evidence (a candidate, still being tried)"
+                "Evidence (not yet ratified)"
             },
             self.served,
             self.applied,
@@ -3756,30 +3748,6 @@ pub async fn outcomes(store: &Store, scope: &Scope) -> Result<Outcomes> {
         }
     }
     Ok(o)
-}
-
-/// The notes a session in `arm` (none: a caller outside sessions) may be served: in the trial arm, or with no
-/// bar in `scope` ([`min_evidence`]), every one (`None`); else those [`Tally::ratified`].
-pub async fn notes_for(
-    store: &Store,
-    scope: &Scope,
-    arm: Option<&str>,
-) -> Result<Option<std::collections::BTreeSet<String>>> {
-    if arm == Some("trial") {
-        return Ok(None);
-    }
-    let bar = evidence_bar(store, scope).await?;
-    if bar == 0 {
-        return Ok(None);
-    }
-    Ok(Some(
-        evidence(store, scope)
-            .await?
-            .into_iter()
-            .filter(|(_, t)| t.ratified(bar))
-            .map(|(k, _)| k)
-            .collect(),
-    ))
 }
 
 /// Sessions each side of a note's holdout comparison needs, by outcomes people gave, before it can prove the note

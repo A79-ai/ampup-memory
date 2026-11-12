@@ -892,8 +892,8 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice_procedures: Option<bool>,
     /// The people a note learned from runs must have helped (each by their latest judged session) before it is
-    /// served outside the trial arm (`crate::sessions`), over the server's `AMPUP_MEMORY_ADVICE_EVIDENCE`. 0 serves
-    /// every note: where agents ask outside sessions (a review bot's `POST /advice`), no session ever judges one.
+    /// reported ratified (`crate::sessions`), over the server's `AMPUP_MEMORY_ADVICE_EVIDENCE`. Reported only: every
+    /// note is served whatever its tally. 0 reports every note ratified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice_evidence: Option<usize>,
     /// The people whose runs a team note learned from runs must come from, and each of its items (by the runs it
@@ -2141,8 +2141,8 @@ impl Directory {
 
     /// Whether the engine learns advice in `scope` on its own and judges its unrewarded runs
     /// (`crate::advice_loop`): its team's `advice` setting, else its org's; on where neither sets it (the
-    /// sessions its people end teach advice, which is served beyond their own only once others ratify it;
-    /// `advice: false` turns it off), and off in a scope the directory doesn't hold.
+    /// sessions its people end teach advice, served to everyone it is learned for; `advice: false` turns it off),
+    /// and off in a scope the directory doesn't hold.
     pub fn learns_advice(&self, scope: &crate::Scope) -> bool {
         self.setting(scope, |s| s.advice, self.holds(scope))
     }
@@ -2187,7 +2187,7 @@ impl Directory {
         self.setting(scope, |s| s.error_leads, false)
     }
 
-    /// The people a learned note must have helped before `scope` serves it outside the trial arm
+    /// The people a learned note must have helped before `scope` reports it ratified
     /// (`crate::sessions::min_evidence`): its team's `advice_evidence` setting, else its org's; none (the server's
     /// `AMPUP_MEMORY_ADVICE_EVIDENCE`) where neither sets it, or in a scope the directory doesn't hold.
     pub fn advice_evidence(&self, scope: &crate::Scope) -> Option<usize> {

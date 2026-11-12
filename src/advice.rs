@@ -71,8 +71,8 @@
 //! **Other scopes.** Where the caller's scope also reads others (its `reads` setting, the operator's: the server's
 //! `reads`), [`get_across`] routes over their lines too, on one list with the caller's own, each read as the caller
 //! (so its ACLs apply there as they do for its own readers) and served from its own scope, keyed `<scope>#<key>`.
-//! Another scope's note is served only past that scope's evidence bar, and as procedures are: its evidence is that
-//! scope's own, so no session of the caller's counts it.
+//! Another scope's notes are served as its own readers are served them (every one), and as procedures are: its
+//! evidence is that scope's own, so no session of the caller's counts it.
 //!
 //! Why the note alone. On ORCA-bench's mini (132 tasks, Claude Haiku 5.5 as the agent, the notes learned from its
 //! own practice runs on 2 day folds), by what `get_advice` served:

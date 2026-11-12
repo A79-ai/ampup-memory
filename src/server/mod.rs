@@ -6685,7 +6685,6 @@ async fn handle(
                     &who,
                     &question,
                     (format, max_chars, procedures),
-                    None,
                     notes,
                     &also,
                     None,
@@ -6783,15 +6782,6 @@ async fn handle(
         if let Some(op) = list_op {
             req["op"] = json!(op);
         }
-        // An org's admin also lists the team's candidate advice: a person, not a key, who administers the org.
-        let admin = list_op == Some("advice")
-            && via.key.is_none()
-            && match scope.org_name() {
-                Some(org) => crate::people::directory::Directory::load(&store)
-                    .await
-                    .is_ok_and(|d| d.is_admin(who.user(), &via, org)),
-                None => false,
-            };
         // Which scopes there are to browse: every one in the catalog on the dev loop's server, else this one.
         if req["op"] == "scopes" {
             let scopes = if state.any_scope {
@@ -6816,7 +6806,7 @@ async fn handle(
         }
         // Boxed: browse's future is large, and inline it would grow the handler's for every request.
         return Ok(
-            match Box::pin(crate::browse::run(&store, &session, &who, &req, admin)).await {
+            match Box::pin(crate::browse::run(&store, &session, &who, &req)).await {
                 Ok(v) => {
                     crate::usage::METER.op(crate::usage::Op::Read, who.user());
                     reply(StatusCode::OK, v)
@@ -10433,18 +10423,9 @@ async fn mcp(
                 "list_facts" => crate::listing::facts(&store, session, who, args)
                     .await
                     .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default()),
-                "list_advice" => {
-                    let admin = via.key.is_none()
-                        && match scope.org_name() {
-                            Some(org) => crate::people::directory::Directory::load(&store)
-                                .await
-                                .is_ok_and(|d| d.is_admin(who.user(), via, org)),
-                            None => false,
-                        };
-                    crate::listing::advice(&store, session, who, args, admin)
-                        .await
-                        .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
-                }
+                "list_advice" => crate::listing::advice(&store, session, who, args)
+                    .await
+                    .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default()),
                 "get_entity" => {
                     let mut ir = json!({"id": args["id"], "include": ["evidence"]});
                     if args["type"].is_string() {
@@ -11265,12 +11246,14 @@ async fn doctor_report(
                 .map(String::from)
         })
         .collect();
-    let ratified = match crate::sessions::notes_for(&store, scope, None).await? {
-        None => notes.len(),
-        Some(r) => notes.iter().filter(|k| r.contains(*k)).count(),
-    };
-    // The team's notes the holdout proves by outcomes people gave, and those it shows don't help (reported only).
+    // The team's notes past the evidence bar, the holdout proves by outcomes people gave, and those it shows don't
+    // help: reported only, as every note is served.
     let tallies = crate::sessions::evidence(&store, scope).await?;
+    let bar = crate::sessions::min_evidence(dir.as_ref(), scope);
+    let ratified = notes
+        .iter()
+        .filter(|k| bar == 0 || tallies.get(*k).is_some_and(|t| t.ratified(bar)))
+        .count();
     let proof = |want: bool| {
         notes
             .iter()
@@ -11313,8 +11296,7 @@ async fn doctor_report(
             "proven": proof(true),
             "not_proven": proof(false),
             "proof_sessions": crate::sessions::proof_sessions(),
-            "evidence_bar": crate::sessions::min_evidence(dir.as_ref(), scope),
-            "trial": crate::sessions::trial_share(),
+            "evidence_bar": bar,
             "holdout": crate::sessions::holdout_share(),
         },
         // What the schema's `extract` section reads (goal-oriented extraction), if it has one, and whether it
@@ -11340,12 +11322,12 @@ fn advice_procedures(args: &Value) -> Result<Option<bool>, ()> {
     }
 }
 
-/// The advice for `question` (`crate::advice::get_across`), routed by the extraction model, for a session in `arm`
-/// (none: a caller outside sessions), with the notes it may be served (`crate::sessions::notes_for`), or none at all
+/// The advice for `question` (`crate::advice::get_across`), routed by the extraction model, with every note
+/// learning wrote, or none at all
 /// when `notes` is false (`POST /advice {notes: false}`): the compiled procedures alone, as if no note had been
 /// learned. A note comes alone unless the call or the scope's admins (`set_settings {advice_procedures: true}`)
 /// ask for its procedures too. `also` are the other scopes the caller's scope reads ([`advice_reads`]): their
-/// lines are routed over too, each with the notes it serves a caller there outside a session (whatever `arm`).
+/// lines are routed over too, with every note each serves.
 /// The caller's own advice for the question, when they have some, comes before the team's, beside it and never
 /// instead of it (`crate::advice::beside`).
 #[allow(clippy::too_many_arguments)]
@@ -11355,7 +11337,6 @@ async fn advice(
     who: &Principal,
     question: &str,
     (format, max_chars, procedures): Asked,
-    arm: Option<&str>,
     notes: bool,
     also: &[Session],
     asked: Option<crate::advice_route::Asked>,
@@ -11368,7 +11349,6 @@ async fn advice(
             who,
             question,
             (format, max_chars, procedures),
-            arm,
             notes,
             also,
             None,
@@ -11380,9 +11360,10 @@ async fn advice(
     };
     // A route slower than an agent's get_advice waits is counted (the `advice_slow` alert).
     let _timed = routing::Timed::start();
+    // Every note learning wrote is served (none withheld behind a trial or an evidence bar), or none at all.
     let own_notes = notes;
     let notes = if notes {
-        crate::sessions::notes_for(store, session.scope(), arm).await?
+        None
     } else {
         Some(Default::default())
     };
@@ -11404,21 +11385,11 @@ async fn advice(
         procedures,
         skills,
     };
-    // Another scope's notes as its own readers outside a session are served them: past its evidence bar only. One
-    // that can't be read now serves its procedures alone.
+    // Another scope's notes as its own readers are served them: every one, read as the caller may read them.
     let mut others = vec![];
     for o in also {
         let notes = if own_notes {
-            crate::sessions::notes_for(store, o.scope(), None)
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!(
-                        "advice: {}'s evidence, read by {}, failed: {e:#}",
-                        o.scope(),
-                        session.scope()
-                    );
-                    Some(Default::default())
-                })
+            None
         } else {
             Some(Default::default())
         };
@@ -11876,7 +11847,6 @@ async fn open_session(
             (session.scope().namespace(), l.answer_id.clone()),
         );
         let job = async move {
-            let arm = opening.session.as_ref().map(|s| s.arm.clone());
             let asked = (crate::advice::Format::from_env(), None, procedures);
             let routed = Box::pin(advice(
                 &session,
@@ -11884,7 +11854,6 @@ async fn open_session(
                 &who,
                 &context,
                 asked,
-                arm.as_deref(),
                 true,
                 &also,
                 Some(crate::advice_route::Asked::opening()),
@@ -11905,14 +11874,12 @@ async fn open_session(
     } else {
         let max_chars = args["max_chars"].as_u64().map(|n| n.max(500) as usize);
         let procedures = advice_procedures(args).unwrap_or_default();
-        let arm = l.session.as_ref().map(|s| s.arm.as_str());
         match advice(
             session,
             store,
             who,
             context,
             (crate::advice::Format::from_env(), max_chars, procedures),
-            arm,
             true,
             &also,
             Some(crate::advice_route::Asked::opening()),
@@ -12085,7 +12052,6 @@ async fn session_advice(
                 who,
                 question,
                 asked,
-                arm.as_deref(),
                 true,
                 &also,
                 Some(place),
@@ -12157,7 +12123,6 @@ async fn session_advice(
     let (question, conversation) = (question.to_string(), conversation.map(String::from));
     let id = id.to_string();
     let job = async move {
-        let arm = l.session.as_ref().map(|s| s.arm.clone());
         let served = async {
             let routed = Box::pin(advice(
                 &session,
@@ -12165,7 +12130,6 @@ async fn session_advice(
                 &who,
                 &question,
                 asked,
-                arm.as_deref(),
                 true,
                 &also,
                 Some(place),
@@ -12764,9 +12728,7 @@ async fn get_advice_step(
         );
         let also = advice_reads(state, store, session).await;
         let (found, leads) = tokio::join!(
-            advice(
-                session, store, who, question, asked, None, true, &also, None
-            ),
+            advice(session, store, who, question, asked, true, &also, None),
             error_leads(session, store, who, question, &also),
         );
         found.map(|found| {
