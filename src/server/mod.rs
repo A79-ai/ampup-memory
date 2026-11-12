@@ -31,6 +31,7 @@ mod cards;
 pub mod cell;
 pub mod compaction;
 mod conflict_ops;
+mod decision_ops;
 mod dream_jobs;
 mod episode_page;
 mod file_keys;
@@ -7747,6 +7748,14 @@ async fn directory_change(
         }
     }
     let store = state.store.read().unwrap().clone();
+    if req["op"] == "decisions" {
+        return decision_ops::handle(state, &store, who, via, &req)
+            .await
+            .map_err(|e| match e.is::<Invalid>() {
+                true => e,
+                false => Refused(format!("{e:#}")).into(),
+            });
+    }
     if matches!(
         req["op"].as_str(),
         Some(

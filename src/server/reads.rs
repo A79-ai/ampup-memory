@@ -216,12 +216,7 @@ impl Reads {
         };
         if !self.fans_out() {
             let items = one(&self.own).await?;
-            self.note(
-                items.len(),
-                items
-                    .iter()
-                    .flat_map(|h| h.fact.source_episodes.iter().map(String::as_str)),
-            );
+            self.note(items.len(), served_episodes(&items));
             return Ok(Scoped {
                 items,
                 from: HashMap::new(),
@@ -244,12 +239,7 @@ impl Reads {
             &sources,
         );
         let out = scoped(merged, k, |h| h.fact.fact_id.clone());
-        self.note(
-            out.items.len(),
-            out.items
-                .iter()
-                .flat_map(|h| h.fact.source_episodes.iter().map(String::as_str)),
-        );
+        self.note(out.items.len(), served_episodes(&out.items));
         Ok(out)
     }
 
@@ -651,4 +641,14 @@ async fn episode_sources(
         }
     }
     Ok(out)
+}
+
+/// The episodes search hits' facts are from: each hit's own fact's first, in rank order, then those of the facts
+/// each holds (`group`: the same value from other sources), which the reader is served too. Own first, so a large
+/// group doesn't push a lower hit's own episodes past the audit row's cap.
+fn served_episodes(hits: &[search::Hit]) -> impl Iterator<Item = &str> {
+    let own = hits.iter().map(|h| &h.fact);
+    let held = hits.iter().flat_map(|h| &h.group);
+    own.chain(held)
+        .flat_map(|f| f.source_episodes.iter().map(String::as_str))
 }

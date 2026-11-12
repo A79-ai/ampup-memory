@@ -78,9 +78,49 @@ pub(super) async fn handle(
                     .into());
                 }
             };
-            resolve(store, who, admin, scope, (a, b), choice).await
+            let expires_at = expiry(req)?;
+            resolve(store, who, admin, scope, (a, b), choice, expires_at).await
         }
         _ => unreachable!(),
+    }
+}
+
+/// When an approval made now ends: `expires_days` from now, or the default lifetime when it isn't given.
+pub(super) fn expiry(req: &Value) -> Result<i64> {
+    use crate::people::directory::Invalid;
+    let days = match &req["expires_days"] {
+        Value::Null => None,
+        v => Some(
+            v.as_i64()
+                .ok_or_else(|| Invalid("expires_days is a whole number of days".into()))?,
+        ),
+    };
+    crate::governance::approval_expiry(crate::now_micros(), days)
+        .map_err(|e| Invalid(format!("{e:#}")).into())
+}
+
+/// Records an admin's statement as a decision ([`Store::record_stated`]) once its facts are on main. The facts stand
+/// whether or not the record is made, so a failure is said (a warning) rather than refused: a refusal would have the
+/// admin state it again, and a second account of the same fact would conflict with the first.
+#[allow(clippy::too_many_arguments)]
+async fn stated(
+    store: &Store,
+    who: &Principal,
+    scope: &Scope,
+    added: &[String],
+    kept: Option<&str>,
+    ended: &[String],
+    expires_at: i64,
+) -> Option<String> {
+    match store
+        .record_stated(scope, who, added, kept, ended, expires_at)
+        .await
+    {
+        Ok(()) => None,
+        Err(e) => {
+            eprintln!("decision not recorded in {scope}: {e:#}");
+            Some("published, but not recorded in the decision log; it won't show there".into())
+        }
     }
 }
 
@@ -116,6 +156,7 @@ async fn add_fact(
 ) -> Result<Value> {
     use crate::people::directory::Invalid;
     let note = req["note"].as_str().unwrap_or_default().trim();
+    let expires_at = expiry(req)?;
     let mut body = format!("{entity} {predicate}: {value}");
     if !note.is_empty() {
         body.push_str(&format!("\n{note}"));
@@ -147,9 +188,37 @@ async fn add_fact(
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
     let review = store
-        .commit_reviewed(scope, who, true, &branch, from_ref(&ep), from_ref(&f), &[])
+        .commit_reviewed(
+            scope,
+            who,
+            true,
+            &branch,
+            from_ref(&ep),
+            from_ref(&f),
+            &[],
+            Some(expires_at),
+        )
         .await?;
-    Ok(json!({"fact_id": f.fact_id, "episode_id": ep.episode_id, "review": review}))
+    // Published on main with no proposal (nobody owns it): the admin's statement is the decision.
+    let warning = match review {
+        Some(_) => None,
+        None => {
+            stated(
+                store,
+                who,
+                scope,
+                from_ref(&f.fact_id),
+                None,
+                &[],
+                expires_at,
+            )
+            .await
+        }
+    };
+    Ok(
+        json!({"fact_id": f.fact_id, "episode_id": ep.episode_id, "expires_at": expires_at,
+        "review": review, "warning": warning}),
+    )
 }
 
 /// Whether `f` is one answer two sources can disagree on: a schema predicate holding one value that is not free
@@ -347,6 +416,7 @@ async fn resolve(
     scope: &Scope,
     (a, b): (&str, &str),
     choice: Choice<'_>,
+    expires_at: i64,
 ) -> Result<Value> {
     use crate::people::directory::Invalid;
     let session = store.pin(scope, MAIN).await?;
@@ -456,14 +526,36 @@ async fn resolve(
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
     let review = store
-        .commit_reviewed(scope, who, admin, &branch, from_ref(&ep), &new, &closures)
+        .commit_reviewed(
+            scope,
+            who,
+            admin,
+            &branch,
+            from_ref(&ep),
+            &new,
+            &closures,
+            Some(expires_at),
+        )
         .await?;
+    let mut warning = None;
+    if review.is_none() && admin {
+        // Settled on main with no proposal: nobody owns the thing, so only an admin could resolve it, and their
+        // resolution is the decision. (An owner's resolution of what they own always goes through review.)
+        let added: Vec<String> = new.iter().map(|f| f.fact_id.clone()).collect();
+        let ended: Vec<String> = ended.iter().map(|f| f.fact_id.clone()).collect();
+        let kept = kept
+            .filter(|_| restated.is_none())
+            .map(|f| f.fact_id.as_str());
+        warning = stated(store, who, scope, &added, kept, &ended, expires_at).await;
+    }
     Ok(json!({
         "kept": kept.map(|f| &f.fact_id),
         "added": new.first().map(|f| &f.fact_id),
         "ended": ended.iter().map(|f| &f.fact_id).collect::<Vec<_>>(),
         "episode_id": ep.episode_id,
         "status": review.as_ref().map_or("published", |r| r.status.as_str()),
+        "expires_at": expires_at,
+        "warning": warning,
         "review": review,
     }))
 }

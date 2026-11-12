@@ -72,6 +72,11 @@ pub(super) async fn handle(
                 "reject" => false,
                 _ => return Err(Invalid("decision is approve or reject".into()).into()),
             };
+            // A rejection ends nothing, so it takes no expiry.
+            let expires_at = match approve {
+                true => Some(super::conflict_ops::expiry(req)?),
+                false => None,
+            };
             serde_json::to_value(
                 store
                     .review_proposal(
@@ -82,6 +87,7 @@ pub(super) async fn handle(
                         approve,
                         req["note"].as_str(),
                         admin,
+                        expires_at,
                     )
                     .await?,
             )

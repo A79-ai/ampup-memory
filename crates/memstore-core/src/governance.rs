@@ -109,6 +109,50 @@ pub struct Decision {
     /// Decided by an org admin who isn't one of its required owners: it decides for all of them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub admin: bool,
+    /// An approval's end, µs since the epoch ([`Approval`]): the decision log shows it expired after. Nothing
+    /// un-publishes or re-reviews the facts on their own yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+/// How long an approval lasts when the person approving doesn't say: a year.
+pub const DEFAULT_APPROVAL_DAYS: i64 = 365;
+/// The longest an approval may last.
+pub const MAX_APPROVAL_DAYS: i64 = 3650;
+
+/// When an approval given now for `days` ends (the default lifetime when None), µs since the epoch.
+pub fn approval_expiry(now: i64, days: Option<i64>) -> Result<i64> {
+    let days = days.unwrap_or(DEFAULT_APPROVAL_DAYS);
+    anyhow::ensure!(
+        (1..=MAX_APPROVAL_DAYS).contains(&days),
+        "expires_days is a number of days from 1 to {MAX_APPROVAL_DAYS}"
+    );
+    Ok(now + days * 86_400_000_000)
+}
+
+/// A person's decision that published facts to main, and what makes the facts it
+/// published approved until it expires. Made from an owner's or admin's approval of a published proposal, or from
+/// an org admin stating a fact (or settling a conflict) on a thing nobody owns, which publishes with no proposal.
+/// A decisions model's approval is not one: what it publishes is published, not approved.
+/// Ids and times only: what the facts say is read from the facts, as the reader may read them.
+#[derive(Clone, Debug, Serialize)]
+pub struct Approval {
+    /// The proposal's id, or the commit that recorded the statement.
+    pub id: String,
+    /// `review` (a proposal approved and published) or `stated` (an admin stated it on main).
+    pub kind: &'static str,
+    /// Who decided: the approving owners or admin.
+    pub deciders: Vec<String>,
+    /// When it took effect on main (µs).
+    pub at: i64,
+    /// When the approval ends (µs); None for an approval recorded before expiries were.
+    pub expires_at: Option<i64>,
+    /// The fact versions it published.
+    pub added: Vec<String>,
+    /// A fact it kept as it was (a conflict settled for the older side).
+    pub kept: Option<String>,
+    /// The facts it ended.
+    pub ended: Vec<String>,
 }
 
 /// An episode a proposal rests on, as the reader may know it. A proposal is shown only to someone
@@ -214,6 +258,17 @@ enum Event {
         /// they administer the org before recording it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         admin: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<i64>,
+    },
+    /// An org admin stated facts on main where no owner reviews them ([`Store::record_stated`]): fact ids only.
+    Stated {
+        user: String,
+        added: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kept: Option<String>,
+        ended: Vec<String>,
+        expires_at: Option<i64>,
     },
     /// A decisions model's decision, in an org that has them decide ([`Store::auto_review`]): it stands in for the
     /// owners until one of them decides. `confidence` is how sure the model was of its decision.
@@ -240,6 +295,8 @@ struct State {
     decisions: BTreeMap<String, Vec<Decision>>,
     /// The ledger time of the latest event about each proposal.
     updated: BTreeMap<String, i64>,
+    /// What org admins stated on main with no review, in ledger order.
+    stated: Vec<Approval>,
     metadata: HashSet<String>,
     /// Open proposals main has moved past without touching what they change ([`Store::moved_past`]).
     clear: HashSet<String>,
@@ -516,6 +573,14 @@ pub(crate) fn names(body: &str) -> Option<Names> {
             user: Some(user),
             entity: None,
         },
+        // Names the admin who stated it, and goes when they are forgotten, as their decisions do. Fact ids only.
+        Event::Stated { user, .. } => Names {
+            proposal: None,
+            is_proposal: false,
+            evidence: BTreeSet::new(),
+            user: Some(user),
+            entity: None,
+        },
         // Goes with its proposal; it names no person.
         Event::AutoDecision { proposal, .. } => Names {
             proposal: Some(proposal),
@@ -600,6 +665,7 @@ impl Store {
                     approve,
                     note,
                     admin,
+                    expires_at,
                 } => {
                     // A decision on a proposal no longer stored (its evidence was erased) or that doesn't fit
                     // its proposal grants nothing and is left out.
@@ -618,6 +684,7 @@ impl Store {
                                 at: row.recorded_at,
                                 note,
                                 admin,
+                                expires_at,
                             });
                         if approve {
                             if admin {
@@ -663,9 +730,34 @@ impl Store {
                                 confidence * 100.0
                             )),
                             admin: false,
+                            expires_at: None,
                         });
                     state.auto.insert(proposal, approve);
                 }
+                Event::Stated {
+                    user,
+                    added,
+                    kept,
+                    ended,
+                    expires_at,
+                } if !state
+                    .stated
+                    .iter()
+                    .any(|s| s.added == added && s.ended == ended) =>
+                {
+                    // A retried record whose first try landed after all is the same decision: kept once.
+                    state.stated.push(Approval {
+                        id: row.commit_id.clone(),
+                        kind: "stated",
+                        deciders: vec![user],
+                        at: row.recorded_at,
+                        expires_at,
+                        added,
+                        kept,
+                        ended,
+                    })
+                }
+                Event::Stated { .. } => {}
             }
         }
         state.clear = self.moved_past(scope, ledger, &state).await?;
@@ -2163,6 +2255,7 @@ impl Store {
         approve: bool,
         note: Option<&str>,
         admin: bool,
+        expires_at: Option<i64>,
     ) -> Result<Review> {
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
@@ -2204,6 +2297,8 @@ impl Store {
                         .filter(|n| !n.trim().is_empty())
                         .map(|n| n.trim().to_string()),
                     admin,
+                    // A rejection ends nothing.
+                    expires_at: expires_at.filter(|_| approve),
                 },
                 sorted(ledger.heads(MAIN)),
             )
@@ -2232,6 +2327,7 @@ impl Store {
         episodes: &[Episode],
         facts: &[Fact],
         closures: &[Closure],
+        expires_at: Option<i64>,
     ) -> Result<Option<Review>> {
         episode_types::check_stored(episodes)?;
         not_held(branch)?;
@@ -2285,8 +2381,107 @@ impl Store {
         }
         let (id, digest) = (review.proposal.id.clone(), review.proposal.digest.clone());
         Ok(Some(
-            Box::pin(self.review_proposal(scope, &id, &digest, who, true, None, admin)).await?,
+            Box::pin(self.review_proposal(scope, &id, &digest, who, true, None, admin, expires_at))
+                .await?,
         ))
+    }
+
+    /// Records that an org admin stated `added` on main (and ended `ended`, or kept `kept`) where no owner reviews
+    /// it: a decision with no proposal ([`Approval`], `stated`). The caller checked they administer the org and
+    /// committed the facts first. Ids only. Retried while main moves under it; a record that still can't be made is
+    /// an error, though the facts stay committed.
+    pub async fn record_stated(
+        &self,
+        scope: &Scope,
+        who: &Principal,
+        added: &[String],
+        kept: Option<&str>,
+        ended: &[String],
+        expires_at: i64,
+    ) -> Result<()> {
+        let event = Event::Stated {
+            user: auth::norm_id(who.user()),
+            added: added.to_vec(),
+            kept: kept.map(str::to_string),
+            ended: ended.to_vec(),
+            expires_at: Some(expires_at),
+        };
+        let mut last = None;
+        for attempt in 0..8u64 {
+            if attempt > 0 {
+                // A busy main (extraction commits every few seconds) moves under the record: wait a little longer
+                // each time.
+                tokio::time::sleep(std::time::Duration::from_millis(50 * attempt * attempt)).await;
+            }
+            let ledger = self.governance_ledger(scope).await?;
+            match self
+                .governance_event(scope, who, event.clone(), sorted(ledger.heads(MAIN)))
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap().context("recording the decision"))
+    }
+
+    /// Every decision that published facts to main ([`Approval`]), oldest first: approved proposals once
+    /// published, and what admins stated with no review. A proposal published on a decisions model's approval
+    /// alone isn't one. Ids and times only, so it is the org admin's to read whole; the caller reads the facts.
+    pub async fn approvals(&self, scope: &Scope) -> Result<Vec<Approval>> {
+        let ledger = self.governance_ledger(scope).await?;
+        let state = self.governance_state(scope, &ledger).await?;
+        let mut out = state.stated.clone();
+        for p in state.proposals.values() {
+            let standing = Self::status_of(&ledger, &state, p)?;
+            let (Some(at), false) = (standing.published_at, standing.rejected) else {
+                continue;
+            };
+            let human: Vec<&Decision> = state
+                .decisions
+                .get(&p.id)
+                .into_iter()
+                .flatten()
+                .filter(|d| d.approve && d.user != AUTO_REVIEWER)
+                .collect();
+            let Some(last) = human.last() else {
+                continue;
+            };
+            let id_of = |c: &serde_json::Value| {
+                c["id"]
+                    .as_str()
+                    .or(c["fact_id"].as_str())
+                    .map(str::to_string)
+            };
+            let mut added = vec![];
+            let mut ended = vec![];
+            for c in &p.changes {
+                let Some(id) = id_of(c) else { continue };
+                if c["kind"] == "fact" && c["valid_to"].is_null() {
+                    added.push(id);
+                } else if !c["valid_to"].is_null() {
+                    ended.push(id);
+                }
+            }
+            let mut deciders: Vec<String> = vec![];
+            for d in &human {
+                if !deciders.contains(&d.user) {
+                    deciders.push(d.user.clone());
+                }
+            }
+            out.push(Approval {
+                id: p.id.clone(),
+                kind: "review",
+                deciders,
+                at,
+                expires_at: last.expires_at,
+                added,
+                kept: None,
+                ended,
+            });
+        }
+        out.sort_by_key(|a| a.at);
+        Ok(out)
     }
 
     /// Publishes what the decisions model approved but didn't reach main (its merge failed after the decision was
