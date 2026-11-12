@@ -37,6 +37,8 @@ pub fn view(entries: &[Logged], user: Option<&str>, since: i64, limit: usize) ->
     }
     let recent: Vec<&Logged> = entries
         .iter()
+        // Dream candidates have source ACLs of their own; only the job API may expose them.
+        .filter(|l| l.kind.as_deref() != Some(crate::dream_jobs::KIND))
         .filter(|l| l.updated_at.max(l.asked_at) >= since)
         // A session that kept nothing (a harness's subprocess, or one closed before anything was asked) isn't a
         // conversation anyone had.
@@ -303,7 +305,10 @@ pub async fn transcript(
     log: &[Logged],
     id: &str,
 ) -> Result<Option<Value>> {
-    let Some(l) = log.iter().find(|l| l.answer_id == id) else {
+    let Some(l) = log
+        .iter()
+        .find(|l| l.answer_id == id && l.kind.as_deref() != Some(crate::dream_jobs::KIND))
+    else {
         return Ok(None);
     };
     let mut v = entry(l);

@@ -82,6 +82,8 @@ struct Place {
 }
 
 pub struct Lease {
+    /// A short-lived task lease uses a separate directory and does not report server readiness.
+    directory: Option<String>,
     /// No lease kept: this server writes alone (`AMPUP_MEMORY_WRITER_LEASE=off`).
     alone: bool,
     /// Never taken: this server only serves (`AMPUP_MEMORY_ROLE=serve`), and the background writing, the index
@@ -149,6 +151,7 @@ impl Lease {
         let host = std::env::var("HOSTNAME").unwrap_or_default();
         mono();
         Arc::new(Lease {
+            directory: None,
             alone,
             reader,
             held: AtomicBool::new(false),
@@ -175,6 +178,18 @@ impl Lease {
     /// A lease to be kept beside the catalog's system tables by [`Lease::run`]; not held until then.
     pub fn kept() -> Arc<Lease> {
         Lease::new(false, false)
+    }
+
+    fn named(directory: String) -> Arc<Lease> {
+        let mut lease = Self::new(false, false);
+        Arc::get_mut(&mut lease).unwrap().directory = Some(directory);
+        lease
+    }
+
+    fn directory(&self) -> String {
+        self.directory
+            .clone()
+            .unwrap_or_else(super::cell::lease_dir)
     }
 
     /// No lease, ever: this server serves reads and request writes, and leaves the background writing to the
@@ -225,6 +240,9 @@ impl Lease {
     }
 
     fn report(&self) {
+        if self.directory.is_some() {
+            return;
+        }
         crate::metrics::WRITER_LEASE_HELD.set(i64::from(self.holds()));
         let failing =
             self.unplaceable.lock().unwrap().is_some() || self.failing.lock().unwrap().is_some();
@@ -245,9 +263,7 @@ impl Lease {
             }
             // Bounded: a catalog or store that hangs is a failure to say (and retry), not a silent wait.
             let located =
-                match tokio::time::timeout(3 * BEAT, locate(&store(), &super::cell::lease_dir()))
-                    .await
-                {
+                match tokio::time::timeout(3 * BEAT, locate(&store(), &self.directory())).await {
                     Ok(r) => r,
                     Err(_) => Err(anyhow::anyhow!(
                         "finding it took over {}s",
@@ -354,14 +370,13 @@ impl Lease {
     /// holds at the old place and moves, so it never holds one apart from its peers for long. A failure keeps
     /// the place and credentials it had.
     async fn relocate(&self, store: &Store) {
-        let found =
-            match tokio::time::timeout(3 * BEAT, locate(store, &super::cell::lease_dir())).await {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!(
-                    "finding it took over {}s",
-                    (3 * BEAT).as_secs()
-                )),
-            };
+        let found = match tokio::time::timeout(3 * BEAT, locate(store, &self.directory())).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "finding it took over {}s",
+                (3 * BEAT).as_secs()
+            )),
+        };
         let place = match found {
             Ok(Located::At(p)) => p,
             Ok(Located::Never(why)) => {
@@ -598,6 +613,76 @@ pub(super) async fn beside(
         Located::At(p) => Some((p.op, p.until)),
         Located::Never(_) => None,
     })
+}
+
+/// A cross-process task lock. Drop fences it immediately; after an abort its heartbeat must expire.
+/// Normal completion releases it only after the operation and any grouped commits have settled.
+pub(crate) struct Turn {
+    lease: Arc<Lease>,
+    heartbeat: tokio::task::JoinHandle<()>,
+    monitor: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Turn {
+    pub(crate) async fn acquire(
+        store: &Store,
+        key: &str,
+        deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Self> {
+        use sha2::Digest;
+        let hash = crate::auth::hex(&sha2::Sha256::digest(key.as_bytes()));
+        let lease = Lease::named(format!("_task-{hash}"));
+        let source = store.clone();
+        let heartbeat = tokio::spawn(lease.clone().run(move || source.clone()));
+        let mut turn = Self {
+            lease,
+            heartbeat,
+            monitor: None,
+        };
+        while !turn.lease.holds() {
+            if let Some(why) = turn.lease.unplaceable() {
+                anyhow::bail!("task lease is unavailable: {why}");
+            }
+            store.check_fence()?;
+            anyhow::ensure!(
+                chrono::Utc::now() < deadline,
+                "timed out waiting for task lease"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // A lost task lease is never reacquired by this operation; a new attempt gets a new Turn.
+        let lease = turn.lease.clone();
+        turn.monitor = Some(tokio::spawn(async move {
+            while lease.holds() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            lease.stop();
+        }));
+        Ok(turn)
+    }
+
+    pub(crate) fn store(&self, store: &Store) -> Store {
+        let parent = store.clone();
+        let lease = self.lease.clone();
+        store.clone().fenced(Arc::new(move || {
+            parent.check_fence().is_ok() && lease.holds()
+        }))
+    }
+
+    pub(crate) async fn finish(self, store: &Store) {
+        store.commits_settled().await;
+        self.lease.release().await;
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        self.lease.stop();
+        self.heartbeat.abort();
+        if let Some(monitor) = &self.monitor {
+            monitor.abort();
+        }
+    }
 }
 
 /// When credentials taken now from file IO properties `props` are to be taken again: after [`RECREDENTIAL`], or

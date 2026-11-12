@@ -311,6 +311,9 @@ impl Config {
 /// what it did as counts for the night's line. Whatever it returns, or however long it takes, the rewrite and the
 /// sweep run after it ([`run_dream`] catches its failure).
 pub async fn dream_step(store: &Store, scope: &Scope, budget: Duration) -> Result<Value> {
+    if !crate::dream::internal_scheduler()? {
+        return Ok(json!({"result":"external_scheduler"}));
+    }
     let on = crate::dream::On::from_env().is_some_and(|on| on.covers(scope));
     let ex = crate::extract::Extractor::dream_from_env()?;
     match (on, ex) {
@@ -591,6 +594,18 @@ async fn reindex(
             json!({"result": "left_for_the_next_night"}),
         );
     };
+    let turn = match super::writer::Turn::acquire(store, &format!("index:{scope}"), deadline).await
+    {
+        Ok(turn) => turn,
+        Err(e) => {
+            return (
+                None,
+                json!({"result":"left_for_the_next_night", "error":super::writer::redacted(&e)}),
+            );
+        }
+    };
+    let indexed = turn.store(store);
+    let store = &indexed;
     let reindexed = if rewritten {
         let r = async {
             let (facts, _) = crate::search::update(store, scope).await?;
@@ -610,6 +625,10 @@ async fn reindex(
         None
     };
     let started = Instant::now();
+    if reindexed.as_ref().is_some_and(|r| r["result"] != "ok") {
+        turn.finish(store).await;
+        return (reindexed, json!({"result":"left_for_the_next_night"}));
+    }
     let r = async {
         let facts = crate::search::tidy_night(store, scope).await?;
         let passages = crate::search::passages::tidy_night(store, scope).await?;
@@ -624,6 +643,7 @@ async fn reindex(
         Err(e) => json!({"result": "failed", "error": super::writer::redacted(&e),
                          "duration_ms": started.elapsed().as_millis() as u64}),
     };
+    turn.finish(store).await;
     (reindexed, tidied)
 }
 

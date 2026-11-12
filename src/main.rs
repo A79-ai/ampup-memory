@@ -37,6 +37,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Record and launch one scheduled fact-dreaming pass, then exit (for a Kubernetes CronJob).
+    DreamSchedule {
+        #[arg(long)]
+        scope: String,
+        #[arg(long, env = "AMPUP_MEMORY_DREAM_SCHEDULE_TICK")]
+        tick: String,
+        #[arg(long, default_value_t = 600)]
+        budget_seconds: u64,
+        #[arg(long)]
+        compact: bool,
+    },
+    /// Execute one approved dream in a Kubernetes Job; opens only the shared catalog and worker.
+    DreamJob {
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        execution: String,
+    },
     /// Write and read back a small fixture, checking visibility, as-of reads and branches
     Smoke { scope: String },
     /// Record one fact as its own episode
@@ -2354,6 +2376,59 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
     let catalog = platform::catalog_from_env().await?;
     let store = Store::new(catalog.clone());
     match cmd {
+        Cmd::DreamSchedule {
+            scope,
+            tick,
+            budget_seconds,
+            compact,
+        } => {
+            anyhow::ensure!(
+                std::env::var("AMPUP_MEMORY_PLATFORM").is_ok_and(|p| p != "local"),
+                "Kubernetes dream schedulers require a shared catalog"
+            );
+            let job = memstore::dream_jobs::kubernetes::schedule(
+                &store,
+                &Scope::parse(&scope)?,
+                &tick,
+                budget_seconds,
+                compact,
+            )
+            .await?;
+            println!("dream {}: {:?}", job.id, job.status);
+            anyhow::ensure!(
+                job.error.is_none(),
+                "dream launch was not confirmed; retry this schedule tick"
+            );
+        }
+        Cmd::DreamJob {
+            scope,
+            id,
+            owner,
+            execution,
+        } => {
+            anyhow::ensure!(
+                std::env::var("AMPUP_MEMORY_PLATFORM").is_ok_and(|p| p != "local"),
+                "Kubernetes dream workers require a shared catalog, not a local platform"
+            );
+            let job = memstore::dream_jobs::kubernetes::worker(
+                &store,
+                &Scope::parse(&scope)?,
+                &id,
+                &owner,
+                &execution,
+            )
+            .await?;
+            println!("dream {}: {:?}", job.id, job.status);
+            anyhow::ensure!(
+                matches!(
+                    job.status,
+                    memstore::dream_jobs::Status::Completed
+                        | memstore::dream_jobs::Status::Canceled
+                ),
+                "dream failed: {}",
+                job.error.as_deref().unwrap_or("unknown failure")
+            );
+        }
         Cmd::Smoke { scope } => println!("{}", smoke(&store, &Scope::parse(&scope)?).await?),
         Cmd::Put {
             scope,

@@ -157,11 +157,11 @@ pub async fn log(store: &Store, scope: &Scope, who: &Principal, args: &Value) ->
         let Some(rating) = rating else {
             return Err(refuse("rating an answer needs rating".into()));
         };
-        let Some(was) = list(store, scope, None)
-            .await?
-            .into_iter()
-            .find(|l| l.answer_id == id && l.asker == who.user())
-        else {
+        let Some(was) = list(store, scope, None).await?.into_iter().find(|l| {
+            l.answer_id == id
+                && l.asker == who.user()
+                && l.kind.as_deref() != Some(crate::dream_jobs::KIND)
+        }) else {
             return Err(refuse(format!("no answer {id} that you logged")));
         };
         store

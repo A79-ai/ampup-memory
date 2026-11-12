@@ -31,6 +31,7 @@ mod cards;
 pub mod cell;
 pub mod compaction;
 mod conflict_ops;
+mod dream_jobs;
 mod episode_page;
 mod file_keys;
 mod governance;
@@ -936,7 +937,11 @@ pub async fn serve_with(
         // of model calls (`AMPUP_MEMORY_DREAM_CALLS`, `AMPUP_MEMORY_DREAM_PARALLEL` at a time). The nightly maintenance window's dream step runs the same step
         // (`maintenance::dream_step`); the gate is the dreamer's last pass in the ledger, so the two share it.
         match (
-            crate::dream::On::from_env(),
+            if crate::dream::internal_scheduler()? {
+                crate::dream::On::from_env()
+            } else {
+                None
+            },
             crate::extract::Extractor::dream_from_env()?,
         ) {
             (None, _) => {}
@@ -4590,8 +4595,20 @@ async fn refresh(state: &Arc<State>) -> Result<()> {
                     break;
                 }
                 let r = crate::log_org::with(scope.org_name(), async {
-                    search::update(&store, &scope).await?;
-                    crate::search::passages::update(&store, &scope).await
+                    let turn = writer::Turn::acquire(
+                        &store,
+                        &format!("index:{scope}"),
+                        chrono::Utc::now() + chrono::Duration::seconds(30),
+                    )
+                    .await?;
+                    let indexed = turn.store(&store);
+                    let result = async {
+                        search::update(&indexed, &scope).await?;
+                        crate::search::passages::update(&indexed, &scope).await
+                    }
+                    .await;
+                    turn.finish(&indexed).await;
+                    result
                 })
                 .await;
                 if let Err(e) = r {
@@ -8365,6 +8382,14 @@ async fn directory_change(
             if hold { "held" } else { "released" }
         );
         return Ok(json!({"org": org, "scope": scope.to_string(), "held": held}));
+    }
+    if matches!(
+        req["op"].as_str(),
+        Some("create_dream" | "get_dream" | "list_dreams" | "run_dream" | "cancel_dream")
+    ) {
+        return dream_jobs::handle(state, who, via, superuser, &req)
+            .await
+            .map_err(|e| Refused(format!("{e:#}")).into());
     }
     if req["op"] == "learn_advice" {
         // Learning reads every rewarded run in the scope, traces kept to their recorders included, so only the

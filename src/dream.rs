@@ -310,6 +310,17 @@ impl Gate {
     }
 }
 
+/// Kubernetes owns the trigger when selected; the engine keeps serving and other maintenance.
+pub fn internal_scheduler() -> Result<bool> {
+    match std::env::var("AMPUP_MEMORY_DREAM_SCHEDULER").as_deref() {
+        Err(_) | Ok("") | Ok("internal") => Ok(true),
+        Ok("kubernetes") => Ok(false),
+        Ok(other) => anyhow::bail!(
+            "AMPUP_MEMORY_DREAM_SCHEDULER must be internal or kubernetes, not {other:?}"
+        ),
+    }
+}
+
 fn positive(var: &str, default: usize) -> Result<usize> {
     match std::env::var(var) {
         Err(_) => Ok(default),
@@ -1070,6 +1081,32 @@ async fn marks(store: &Store, scope: &Scope, actor: &str, v: &View) -> Result<Ma
 }
 
 async fn run(
+    store: &Store,
+    scope: &Scope,
+    ex: &Extractor,
+    budget: &Budget,
+    dry_run: bool,
+    gate: Option<&Gate>,
+    tell: &mut (dyn FnMut(&Value) + Send),
+) -> Result<Report> {
+    if dry_run {
+        return run_inner(store, scope, ex, budget, dry_run, gate, tell).await;
+    }
+    // The hourly loop, nightly maintenance, CLI and one-off pods share this scope lock. A pod
+    // never borrows the continuously held server writer lease, so extraction stays independent.
+    let turn = crate::server::writer::Turn::acquire(
+        store,
+        &format!("dream-pass:{scope}"),
+        chrono::Utc::now() + chrono::Duration::seconds(90),
+    )
+    .await?;
+    let writing = turn.store(store);
+    let result = run_inner(&writing, scope, ex, budget, dry_run, gate, tell).await;
+    turn.finish(&writing).await;
+    result
+}
+
+async fn run_inner(
     store: &Store,
     scope: &Scope,
     ex: &Extractor,

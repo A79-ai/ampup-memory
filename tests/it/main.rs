@@ -21,6 +21,7 @@ mod cache_budget;
 mod cells;
 mod classic_ranking;
 mod compile_settings;
+mod dream_jobs;
 mod error_leads;
 mod governance;
 mod hooks_never_block;
