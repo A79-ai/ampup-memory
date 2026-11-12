@@ -443,7 +443,11 @@ pub(super) async fn search(
                 .iter()
                 .filter(|f| members.contains(f.entity.as_str()))
                 .collect();
-            more.sort_by_key(|f| std::cmp::Reverse((f.valid_from, f.fact_id.as_str())));
+            // Newest first, save that a value a live decision approved comes first of its attribute's (`Vis::rank`).
+            more.sort_by_key(|f| {
+                let approved = reads.sessions().any(|r| r.vis().approved_at(f, i64::MAX));
+                std::cmp::Reverse((approved, f.valid_from, f.fact_id.as_str()))
+            });
             let more = more
                 .into_iter()
                 .filter(|f| seen.insert(f.fact_id.as_str()))

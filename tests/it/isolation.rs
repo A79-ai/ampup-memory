@@ -2885,3 +2885,169 @@ async fn stand_in(
     });
     url
 }
+
+/// A value an owner approved outranks a newer statement no one approved on read, but only for readers of the approved
+/// fact: someone who may not read it gets the newest value they may read, never the approved one, never an empty answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approved_value_reaches_only_its_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = platform::local_dir(dir.path()).await.unwrap();
+    let store =
+        Store::new(catalog.clone()).with_index_base(dir.path().join("index").display().to_string());
+    store.ensure_scope(&Scope::Org).await.unwrap();
+    let issuer = start_idp().await;
+    let keys = json!([{"id":"platform","sha256":auth::hex(&sha2::Sha256::digest(ADMIN_KEY.as_bytes())),"user":"svc:platform","admin":true}]);
+    let tauth = TokenAuth::new(Some(&keys.to_string()), None)
+        .unwrap()
+        .allow_local_issuers()
+        .with_oidc(
+            OidcConfig::discover(&issuer, vec![CLIENT_ID.into()])
+                .await
+                .unwrap(),
+        );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(serve_with(
+        port,
+        Scope::Org,
+        vec![],
+        Options {
+            listener: Some(listener),
+            catalog: Some(catalog),
+            index_base: Some(store.index_base().to_string()),
+            token_auth: Some(tauth),
+            ..Default::default()
+        },
+    ));
+    let url = format!("http://127.0.0.1:{port}");
+    for change in [
+        json!({"op":"create_org","org":"acme","admin":"alice@acme.com"}),
+        json!({"op":"invite","org":"acme","members":[{"user":"carol@acme.com"},{"user":"dave@acme.com"}]}),
+        json!({"op":"set_schema","org":"acme","schema":{"name":"policies","types":{"policy":{"predicates":{"refund_days":{"type":"string"}}}}}}),
+    ] {
+        admin(&url, change).await;
+    }
+    let scope = Scope::org("acme").unwrap();
+    let (alice, carol, dave) = (
+        id_token(&issuer, "alice@acme.com"),
+        id_token(&issuer, "carol@acme.com"),
+        id_token(&issuer, "dave@acme.com"),
+    );
+    let call = async |token: &str, req: Value| {
+        let mut req = req;
+        req["org"] = "acme".into();
+        let (status, body) = post(&format!("{url}/admin"), token, &req).await;
+        assert_eq!(status, 200, "{req}: {body}");
+        serde_json::from_str::<Value>(&body).unwrap()["result"].clone()
+    };
+    let owner = call(
+        &alice,
+        json!({"op":"set_entity_owner","entity":"policy:refunds","owner":"carol@acme.com"}),
+    )
+    .await;
+    // A note only Carol and Alice may read (one only Carol read would be her own, which no one reviews), proposed
+    // as a change to what Carol owns, and approved by her.
+    store.create_branch(&scope, "draft", "agent").await.unwrap();
+    let mine = Episode::sourced(
+        "policy:refunds-draft",
+        b"policy:refunds refund days forty-five",
+        &["user:carol@acme.com", "user:alice@acme.com"],
+    );
+    let approved = Fact::new("policy:refunds", "refund_days", "forty-five").from_episodes(&[&mine]);
+    store
+        .commit_on(
+            &scope,
+            "draft",
+            "agent",
+            std::slice::from_ref(&mine),
+            std::slice::from_ref(&approved),
+        )
+        .await
+        .unwrap();
+    let p = call(&alice, json!({"op":"propose_branch","branch":"draft"})).await;
+    let r = call(&carol, json!({"op":"review_proposal","proposal":p["proposal"]["id"],"digest":p["proposal"]["digest"],"decision":"approve","expires_days":30})).await;
+    assert_eq!(r["status"], "published", "{r}");
+    // No one owns it now, so a later call goes straight to main (an owned thing's would wait for its owner), and
+    // everyone may read that one.
+    call(
+        &alice,
+        json!({"op":"remove_entity_owner","entity":"policy:refunds","revision":owner["revision"]}),
+    )
+    .await;
+    let call_ep = Episode::sourced(
+        "call:later",
+        b"policy:refunds refund days thirty",
+        &["group:acme.all"],
+    );
+    let newer = Fact::new("policy:refunds", "refund_days", "thirty").from_episodes(&[&call_ep]);
+    store
+        .commit(
+            &scope,
+            "extract",
+            std::slice::from_ref(&call_ep),
+            std::slice::from_ref(&newer),
+        )
+        .await
+        .unwrap();
+    let served = async |token: &str| -> Vec<String> {
+        let (status, body) = post(
+            &format!("{url}/search?org=acme"),
+            token,
+            &json!({"calls":[["refund days of the refunds policy",10]]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        v["replies"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|h| std::iter::once(h).chain(h["facts"].as_array().into_iter().flatten()))
+            .filter(|f| f["entity"] == "policy:refunds" && f["predicate"] == "refund_days")
+            .map(|f| f["value"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // Both facts reach the index before anyone reads.
+    let start = Instant::now();
+    while served(&dave).await.is_empty() && start.elapsed() < Duration::from_secs(20) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    while served(&carol).await.first().map(String::as_str) != Some("forty-five")
+        && start.elapsed() < Duration::from_secs(20)
+    {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let (theirs, outsider) = (served(&carol).await, served(&dave).await);
+    assert_eq!(theirs, ["forty-five"], "the owner reads her approved value");
+    assert_eq!(
+        outsider,
+        ["thirty"],
+        "someone who may not read the approved fact gets the newest they may read"
+    );
+    // Once the approved value ends, it hides nothing: its readers get the newest that holds, not an empty answer.
+    let why = Episode::sourced(
+        "policy:refunds-retired",
+        b"the forty-five day refund rule is retired",
+        &["user:carol@acme.com", "user:alice@acme.com"],
+    );
+    store
+        .close_facts(
+            &scope,
+            "main",
+            "alice@acme.com",
+            &[(approved.fact_id.as_str(), memstore::now_micros(), &why)],
+        )
+        .await
+        .unwrap();
+    let start = Instant::now();
+    while served(&carol).await.first().map(String::as_str) != Some("thirty")
+        && start.elapsed() < Duration::from_secs(20)
+    {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        served(&carol).await,
+        ["thirty"],
+        "an ended approval hides nothing"
+    );
+}

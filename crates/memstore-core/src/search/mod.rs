@@ -2824,6 +2824,9 @@ pub type VersionKey = (String, String);
 /// ends. History is read (superseded rows live in the closed part): when the keys of one predicate
 /// are more than a chunk and their entities are all of type `ty`, in one scan of that type's
 /// versions of the predicate; the other keys, by the key index, a chunk of keys per scan.
+/// How a version ranks among its key's ([`crate::Vis::rank`]): approved by a live decision, then newest.
+pub type VersionRank = (bool, i64, String);
+
 pub async fn newest_versions(
     store: &Store,
     scope: &Scope,
@@ -2832,7 +2835,7 @@ pub async fn newest_versions(
     keys: &std::collections::BTreeSet<VersionKey>,
     t: i64,
     ty: Option<&str>,
-) -> Result<HashMap<VersionKey, (i64, String)>> {
+) -> Result<HashMap<VersionKey, VersionRank>> {
     const CHUNK: usize = 500;
     // Only keys with another version can have a newer one: more than one row in the index, or rows it
     // doesn't hold yet. The rest have one version, which nothing supersedes.
@@ -2872,7 +2875,7 @@ pub async fn newest_versions(
             chunk.iter().map(|k| Lit::Str(k.clone())).collect(),
         ));
     }
-    let mut out: HashMap<VersionKey, (i64, String)> = HashMap::new();
+    let mut out: HashMap<VersionKey, VersionRank> = HashMap::new();
     for filter in filters {
         for (commit, f) in scan(store, scope, &filter, true).await? {
             // A version a merge set aside by `t` lost to the kept side's value: it supersedes nothing.
@@ -2881,11 +2884,15 @@ pub async fn newest_versions(
                 continue;
             }
             // The type scan reads entities no key names.
+            let v = {
+                let (approved, from, id) = vis.rank(&f, t);
+                (approved, from, id.to_string())
+            };
             let key = (f.entity, f.predicate);
             if !keys.contains(&key) {
                 continue;
             }
-            let v = (f.valid_from, f.fact_id);
+
             let n = out.entry(key).or_insert(v.clone());
             if v > *n {
                 *n = v;
@@ -3574,16 +3581,17 @@ async fn ranked(
                 s.card(f.entity_type.as_deref(), &f.predicate) == crate::query::schema::Card::One
             })
     };
-    let mut newest: HashMap<VersionKey, (i64, String)> = HashMap::new();
+    let mut newest: HashMap<VersionKey, VersionRank> = HashMap::new();
     let mut looked_up: std::collections::BTreeSet<VersionKey> = Default::default();
-    let superseded = |f: &Fact, newest: &HashMap<VersionKey, (i64, String)>| {
+    let rank_at = valid_at.unwrap_or(i64::MAX);
+    let superseded = |f: &Fact, newest: &HashMap<VersionKey, VersionRank>| {
         one(f)
             && newest
                 .get(&(f.entity.clone(), f.predicate.clone()))
-                .is_some_and(|(from, id)| (*from, id) > (f.valid_from, &f.fact_id))
+                .is_some_and(|(a, from, id)| (*a, *from, id.as_str()) > vis.rank(f, rank_at))
     };
     // Looks up the keys of one-valued hits not looked up yet; returns how many hits are current.
-    let settle = async |newest: &mut HashMap<VersionKey, (i64, String)>,
+    let settle = async |newest: &mut HashMap<VersionKey, VersionRank>,
                         looked_up: &mut std::collections::BTreeSet<VersionKey>|
            -> Result<usize> {
         let todo: std::collections::BTreeSet<VersionKey> = hits

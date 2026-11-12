@@ -1019,7 +1019,7 @@ impl Exec<'_> {
             }
             let key = (f.entity.clone(), f.predicate.clone());
             match latest.get(&key) {
-                Some(g) if (g.valid_from, &g.fact_id) >= (f.valid_from, &f.fact_id) => {}
+                Some(g) if self.session.vis().rank(g, t) >= self.session.vis().rank(&f, t) => {}
                 _ => {
                     latest.insert(key, f);
                 }
@@ -1041,9 +1041,9 @@ impl Exec<'_> {
         )
         .await?;
         out.extend(latest.into_iter().filter_map(|(key, f)| {
-            let superseded = newest
-                .get(&key)
-                .is_some_and(|(from, id)| (*from, id) > (f.valid_from, &f.fact_id));
+            let superseded = newest.get(&key).is_some_and(|(a, from, id)| {
+                (*a, *from, id.as_str()) > self.session.vis().rank(&f, t)
+            });
             (!superseded).then_some(f)
         }));
         Ok(out)

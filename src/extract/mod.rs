@@ -1797,6 +1797,9 @@ impl Extractor {
         prompt.push('\n');
         let reply = self.complete(&prompt).await?;
         let verdicts = verdicts(&reply);
+        // A value a person's live decision approved is theirs to change: a new text that says otherwise is in
+        // conflict with it where the scope keeps conflicts, and else kept beside it, never ending it.
+        let main = store.visibility(scope, MAIN).await?;
         enum Verdict<'a> {
             Same(&'a Fact),
             Ends(&'a Fact),
@@ -1829,6 +1832,13 @@ impl Extractor {
                     }
                 }
                 _ => Verdict::New,
+            };
+            let verdict = match verdict {
+                Verdict::Ends(old) if main.approved_at(old, i64::MAX) => match conflicts {
+                    true => Verdict::Disputes(old),
+                    false => Verdict::New,
+                },
+                v => v,
             };
             match verdict {
                 Verdict::Same(said) if only_conflicts => {

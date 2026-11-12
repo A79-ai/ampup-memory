@@ -800,6 +800,9 @@ pub struct Vis {
     closures: HashMap<String, Vec<(i64, String)>>,
     /// The committed merge records ([`MERGE_SOURCE`]): a version one closes lost a merge's conflict.
     merges: HashSet<String>,
+    /// On main, the facts a person's decision approved, each with the window the approval holds
+    /// ([`governance::approved_facts`]): see [`Vis::rank`].
+    approved: HashMap<String, (i64, i64)>,
     /// The facts each fact was recorded in conflict with ([`conflicts::PREFIX`]), both ways, whoever reads: a read
     /// serves one only to a reader who may read both facts ([`conflicts::marks`]).
     conflicts: HashMap<String, Vec<String>>,
@@ -1194,6 +1197,29 @@ impl Vis {
             .any(|(_, episode)| self.merges.contains(episode))
     }
 
+    /// Whether a person's decision approves `f` at `t` (`i64::MAX` reads as now): decided by then, not expired, and
+    /// the fact not ended by then (by its own `valid_to` or any closure, whoever may read why): an ended approved
+    /// value ranks as any other, so it never hides a newer one that holds.
+    pub fn approved_at(&self, f: &Fact, t: i64) -> bool {
+        let t = if t == i64::MAX { now_micros() } else { t };
+        self.approved
+            .get(&f.fact_id)
+            .is_some_and(|(from, until)| *from <= t && t < *until)
+            && f.valid_to.is_none_or(|e| e > t)
+            && self
+                .closures
+                .get(&f.fact_id)
+                .is_none_or(|c| c.iter().all(|(end, _)| *end > t))
+    }
+
+    /// How a version of a one-valued attribute ranks at `t`: the newest wins, save that a version a live decision
+    /// approved wins over every version none approves, newer or not (the newest approved one among them). A reader
+    /// ranks only the versions it may read (callers compare what [`Vis::allows`] lets through), so one who can't
+    /// read the approved version gets the newest it can.
+    pub fn rank<'a>(&self, f: &'a Fact, t: i64) -> (bool, i64, &'a str) {
+        (self.approved_at(f, t), f.valid_from, f.fact_id.as_str())
+    }
+
     /// Whether, by `t`, a merge set this version aside for the other side's value of its key: a closure the
     /// reader can see comes from a merge record (any of them, so a later ordinary end doesn't undo it). Such a
     /// version never held on main once merged, so it supersedes nothing there (an ordinary end still leaves the
@@ -1249,7 +1275,7 @@ impl Vis {
 
 type Plan = (Instant, Table, Vec<FileScanTask>);
 type DecodedFiles = HashMap<String, Arc<Vec<RecordBatch>>>;
-type CachedVis = ([Arc<Vec<RecordBatch>>; 7], Arc<Vis>);
+type CachedVis = ([Arc<Vec<RecordBatch>>; 8], Arc<Vis>);
 /// Held while one visibility state is built (see `Store::visibility_at`).
 type VisBuild = Arc<tokio::sync::Mutex<()>>;
 
@@ -5546,14 +5572,15 @@ impl Store {
         pinned: Option<(&str, &[String])>,
     ) -> Result<Arc<Vis>> {
         let ns = scope.namespace();
-        let (ledger, episodes, quotes, schemas, closures, retractions, retention) = tokio::try_join!(
+        let (ledger, episodes, quotes, schemas, closures, retractions, retention, decisions) = tokio::try_join!(
             self.rows(SYSTEM_NS, LEDGER),
             self.rows(&ns, EPISODES),
             self.rows(&ns, QUOTES),
             self.side_rows(&ns, SCHEMAS),
             self.side_rows(&ns, CLOSURES),
             self.side_rows(&ns, RETRACTIONS),
-            self.side_rows(&ns, RETENTION)
+            self.side_rows(&ns, RETENTION),
+            self.side_rows(&ns, governance::TABLE)
         )?;
         let stamp = [
             ledger.rows.clone(),
@@ -5563,6 +5590,7 @@ impl Store {
             closures.clone(),
             retractions.clone(),
             retention.clone(),
+            decisions.clone(),
         ];
         let key = match pinned {
             None => (ns.clone(), branch.to_string()),
@@ -5632,6 +5660,13 @@ impl Store {
             }
             let ledger = Ledger::from_batches(&ledger.rows, &ns);
             let pinned_read = heads.is_some();
+            // Approvals hold on main, read now: a branch's draft is no one's decision yet, and a pinned read (a
+            // `/query` cursor's pages) ranks as when it was pinned, newest first, so a later decision never
+            // reorders its pages.
+            let approved = match branch == MAIN && !pinned_read {
+                true => governance::approved_facts(&decisions, &ledger),
+                false => HashMap::new(),
+            };
             let mut committed = match &heads {
                 None => ledger.visible(&branch),
                 Some(h) => ledger.reachable(h),
@@ -5812,6 +5847,7 @@ impl Store {
                 schemas,
                 closures,
                 merges,
+                approved,
                 conflicts,
                 documents,
                 kinds,

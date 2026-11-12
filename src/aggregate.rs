@@ -635,6 +635,7 @@ fn day(t: i64) -> String {
 
 /// Code's part: superseded, stale and passed facts, as flags keyed by fact id.
 fn flags(
+    vis: &crate::Vis,
     a: &Aggregates,
     facts: &[Fact],
     schema: Option<&crate::query::schema::Schema>,
@@ -648,7 +649,7 @@ fn flags(
             let k = (f.entity.clone(), f.predicate.clone());
             if newest
                 .get(&k)
-                .is_none_or(|g| (g.valid_from, &g.fact_id) < (f.valid_from, &f.fact_id))
+                .is_none_or(|g| vis.rank(g, i64::MAX) < vis.rank(f, i64::MAX))
             {
                 newest.insert(k, f);
             }
@@ -1095,7 +1096,7 @@ async fn summarise_scope(
                     .filter(|f| f.source_episodes.iter().all(|e| ids.contains(e.as_str())))
                     .cloned()
                     .collect();
-                let flagged = flags(a, &facts, schema.as_deref(), &catalogs, now);
+                let flagged = flags(&vis, a, &facts, schema.as_deref(), &catalogs, now);
                 attempted(scope, &subject, &audience, now);
                 match summarise(ex, g, a, &subject, &audience, &eps, &facts, &flagged, now).await {
                     Ok(rows) => {

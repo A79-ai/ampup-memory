@@ -611,155 +611,7 @@ impl Store {
 
     async fn governance_state(&self, scope: &Scope, ledger: &Ledger) -> Result<State> {
         let rows = self.governance_rows(scope, TABLE).await?;
-        let visible = ledger.visible(MAIN);
-        let mut events = HashMap::new();
-        for b in rows.iter() {
-            for (id, body) in strings(b, "commit_id").into_iter().zip(strings(b, "body")) {
-                if visible.contains(&id) {
-                    // A row this engine can't read is left out, not a reason to refuse every write to the
-                    // scope: nothing it would have granted is granted (a decision it held doesn't count).
-                    let Ok(event) = serde_json::from_str::<Event>(&body) else {
-                        eprintln!("governance: skipping an unreadable row at commit {id}");
-                        continue;
-                    };
-                    anyhow::ensure!(
-                        events.insert(id, event).is_none(),
-                        "duplicate governance commit"
-                    );
-                }
-            }
-        }
-        let mut ordered: Vec<_> = ledger
-            .rows
-            .iter()
-            .filter(|r| events.contains_key(&r.commit_id))
-            .collect();
-        ordered.sort_by_key(|r| r.recorded_at);
-        let mut state = State::default();
-        for row in ordered {
-            state.metadata.insert(row.commit_id.clone());
-            match events.remove(&row.commit_id).unwrap() {
-                Event::Owner { entity, user } => {
-                    state.owners.insert(
-                        entity.clone(),
-                        Owner {
-                            entity,
-                            user,
-                            revision: row.commit_id.clone(),
-                            since: row.recorded_at,
-                        },
-                    );
-                }
-                Event::OwnerRemoved { entity } => {
-                    state.owners.remove(&entity);
-                }
-                Event::Proposal { mut proposal } => {
-                    proposal.created_at = row.recorded_at;
-                    state.updated.insert(proposal.id.clone(), row.recorded_at);
-                    state.proposals.insert(proposal.id.clone(), proposal);
-                }
-                Event::Decision {
-                    proposal,
-                    digest,
-                    user,
-                    approve,
-                    note,
-                    admin,
-                    expires_at,
-                } => {
-                    // A decision on a proposal no longer stored (its evidence was erased) or that doesn't fit
-                    // its proposal grants nothing and is left out.
-                    let Some(p) = state.proposals.get(&proposal) else {
-                        continue;
-                    };
-                    if p.digest == digest && (admin || p.required_owners.contains(&user)) {
-                        state.updated.insert(proposal.clone(), row.recorded_at);
-                        state
-                            .decisions
-                            .entry(proposal.clone())
-                            .or_default()
-                            .push(Decision {
-                                user: user.clone(),
-                                approve,
-                                at: row.recorded_at,
-                                note,
-                                admin,
-                                expires_at,
-                            });
-                        if approve {
-                            if admin {
-                                state.admin_approved.insert(proposal.clone());
-                            }
-                            state.approvals.entry(proposal).or_default().insert(user);
-                        } else {
-                            state.rejected.insert(proposal);
-                        }
-                    } else {
-                        eprintln!(
-                            "governance: skipping a decision that doesn't fit proposal {proposal}"
-                        );
-                    }
-                }
-                Event::AutoDecision {
-                    proposal,
-                    digest,
-                    approve,
-                    model,
-                    confidence,
-                } => {
-                    let Some(p) = state.proposals.get(&proposal) else {
-                        continue;
-                    };
-                    if p.digest != digest {
-                        eprintln!(
-                            "governance: skipping a model's decision that doesn't fit proposal {proposal}"
-                        );
-                        continue;
-                    }
-                    state.updated.insert(proposal.clone(), row.recorded_at);
-                    state
-                        .decisions
-                        .entry(proposal.clone())
-                        .or_default()
-                        .push(Decision {
-                            user: AUTO_REVIEWER.into(),
-                            approve,
-                            at: row.recorded_at,
-                            note: Some(format!(
-                                "decided by {model}, {:.0}% sure",
-                                confidence * 100.0
-                            )),
-                            admin: false,
-                            expires_at: None,
-                        });
-                    state.auto.insert(proposal, approve);
-                }
-                Event::Stated {
-                    user,
-                    added,
-                    kept,
-                    ended,
-                    expires_at,
-                } if !state
-                    .stated
-                    .iter()
-                    .any(|s| s.added == added && s.ended == ended) =>
-                {
-                    // A retried record whose first try landed after all is the same decision: kept once.
-                    state.stated.push(Approval {
-                        id: row.commit_id.clone(),
-                        kind: "stated",
-                        deciders: vec![user],
-                        at: row.recorded_at,
-                        expires_at,
-                        added,
-                        kept,
-                        ended,
-                    })
-                }
-                Event::Stated { .. } => {}
-            }
-        }
+        let mut state = fold(&rows, ledger)?;
         state.clear = self.moved_past(scope, ledger, &state).await?;
         Ok(state)
     }
@@ -899,6 +751,8 @@ impl Store {
             OnConflict::Recommit,
         )
         .await?;
+        // Reads rank approved facts from this table (`Vis`): the first event makes it, and they must see it.
+        self.forget_missing(&ns, TABLE);
         self.invalidate(&ns, TABLE);
         self.append_ledger(&id, scope, MAIN, who.user(), &|ledger| {
             anyhow::ensure!(
@@ -2431,57 +2285,7 @@ impl Store {
     pub async fn approvals(&self, scope: &Scope) -> Result<Vec<Approval>> {
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
-        let mut out = state.stated.clone();
-        for p in state.proposals.values() {
-            let standing = Self::status_of(&ledger, &state, p)?;
-            let (Some(at), false) = (standing.published_at, standing.rejected) else {
-                continue;
-            };
-            let human: Vec<&Decision> = state
-                .decisions
-                .get(&p.id)
-                .into_iter()
-                .flatten()
-                .filter(|d| d.approve && d.user != AUTO_REVIEWER)
-                .collect();
-            let Some(last) = human.last() else {
-                continue;
-            };
-            let id_of = |c: &serde_json::Value| {
-                c["id"]
-                    .as_str()
-                    .or(c["fact_id"].as_str())
-                    .map(str::to_string)
-            };
-            let mut added = vec![];
-            let mut ended = vec![];
-            for c in &p.changes {
-                let Some(id) = id_of(c) else { continue };
-                if c["kind"] == "fact" && c["valid_to"].is_null() {
-                    added.push(id);
-                } else if !c["valid_to"].is_null() {
-                    ended.push(id);
-                }
-            }
-            let mut deciders: Vec<String> = vec![];
-            for d in &human {
-                if !deciders.contains(&d.user) {
-                    deciders.push(d.user.clone());
-                }
-            }
-            out.push(Approval {
-                id: p.id.clone(),
-                kind: "review",
-                deciders,
-                at,
-                expires_at: last.expires_at,
-                added,
-                kept: None,
-                ended,
-            });
-        }
-        out.sort_by_key(|a| a.at);
-        Ok(out)
+        approvals_in(&ledger, &state)
     }
 
     /// Publishes what the decisions model approved but didn't reach main (its merge failed after the decision was
@@ -3317,4 +3121,253 @@ fn text_column<'a>(b: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
 /// Row `i` of text column `c`, if it has the column and the row a value.
 fn cell(c: Option<&StringArray>, i: usize) -> Option<&str> {
     c.filter(|c| !c.is_null(i)).map(|c| c.value(i))
+}
+
+/// The governance state main's ledger holds: its events folded in ledger order.
+fn fold(rows: &[RecordBatch], ledger: &Ledger) -> Result<State> {
+    let visible = ledger.visible(MAIN);
+    let mut events = HashMap::new();
+    for b in rows.iter() {
+        for (id, body) in strings(b, "commit_id").into_iter().zip(strings(b, "body")) {
+            if visible.contains(&id) {
+                // A row this engine can't read is left out, not a reason to refuse every write to the
+                // scope: nothing it would have granted is granted (a decision it held doesn't count).
+                let Ok(event) = serde_json::from_str::<Event>(&body) else {
+                    eprintln!("governance: skipping an unreadable row at commit {id}");
+                    continue;
+                };
+                anyhow::ensure!(
+                    events.insert(id, event).is_none(),
+                    "duplicate governance commit"
+                );
+            }
+        }
+    }
+    let mut ordered: Vec<_> = ledger
+        .rows
+        .iter()
+        .filter(|r| events.contains_key(&r.commit_id))
+        .collect();
+    ordered.sort_by_key(|r| r.recorded_at);
+    let mut state = State::default();
+    for row in ordered {
+        state.metadata.insert(row.commit_id.clone());
+        match events.remove(&row.commit_id).unwrap() {
+            Event::Owner { entity, user } => {
+                state.owners.insert(
+                    entity.clone(),
+                    Owner {
+                        entity,
+                        user,
+                        revision: row.commit_id.clone(),
+                        since: row.recorded_at,
+                    },
+                );
+            }
+            Event::OwnerRemoved { entity } => {
+                state.owners.remove(&entity);
+            }
+            Event::Proposal { mut proposal } => {
+                proposal.created_at = row.recorded_at;
+                state.updated.insert(proposal.id.clone(), row.recorded_at);
+                state.proposals.insert(proposal.id.clone(), proposal);
+            }
+            Event::Decision {
+                proposal,
+                digest,
+                user,
+                approve,
+                note,
+                admin,
+                expires_at,
+            } => {
+                // A decision on a proposal no longer stored (its evidence was erased) or that doesn't fit
+                // its proposal grants nothing and is left out.
+                let Some(p) = state.proposals.get(&proposal) else {
+                    continue;
+                };
+                if p.digest == digest && (admin || p.required_owners.contains(&user)) {
+                    state.updated.insert(proposal.clone(), row.recorded_at);
+                    state
+                        .decisions
+                        .entry(proposal.clone())
+                        .or_default()
+                        .push(Decision {
+                            user: user.clone(),
+                            approve,
+                            at: row.recorded_at,
+                            note,
+                            admin,
+                            expires_at,
+                        });
+                    if approve {
+                        if admin {
+                            state.admin_approved.insert(proposal.clone());
+                        }
+                        state.approvals.entry(proposal).or_default().insert(user);
+                    } else {
+                        state.rejected.insert(proposal);
+                    }
+                } else {
+                    eprintln!(
+                        "governance: skipping a decision that doesn't fit proposal {proposal}"
+                    );
+                }
+            }
+            Event::AutoDecision {
+                proposal,
+                digest,
+                approve,
+                model,
+                confidence,
+            } => {
+                let Some(p) = state.proposals.get(&proposal) else {
+                    continue;
+                };
+                if p.digest != digest {
+                    eprintln!(
+                        "governance: skipping a model's decision that doesn't fit proposal {proposal}"
+                    );
+                    continue;
+                }
+                state.updated.insert(proposal.clone(), row.recorded_at);
+                state
+                    .decisions
+                    .entry(proposal.clone())
+                    .or_default()
+                    .push(Decision {
+                        user: AUTO_REVIEWER.into(),
+                        approve,
+                        at: row.recorded_at,
+                        note: Some(format!(
+                            "decided by {model}, {:.0}% sure",
+                            confidence * 100.0
+                        )),
+                        admin: false,
+                        expires_at: None,
+                    });
+                state.auto.insert(proposal, approve);
+            }
+            Event::Stated {
+                user,
+                added,
+                kept,
+                ended,
+                expires_at,
+            } if !state
+                .stated
+                .iter()
+                .any(|s| s.added == added && s.ended == ended) =>
+            {
+                // A retried record whose first try landed after all is the same decision: kept once.
+                state.stated.push(Approval {
+                    id: row.commit_id.clone(),
+                    kind: "stated",
+                    deciders: vec![user],
+                    at: row.recorded_at,
+                    expires_at,
+                    added,
+                    kept,
+                    ended,
+                })
+            }
+            Event::Stated { .. } => {}
+        }
+    }
+    Ok(state)
+}
+
+/// The decisions `state` holds that published facts to main, oldest first (see [`Store::approvals`]).
+fn approvals_in(ledger: &Ledger, state: &State) -> Result<Vec<Approval>> {
+    let mut out = state.stated.clone();
+    // When each commit reached main, as [`Store::status_of`] tells it (the earliest main row that brought it in: the
+    // commit itself or a merge of it), read once for every proposal: this runs on each rebuild of a read's view.
+    let main = ledger.visible(MAIN);
+    let mut reached: HashMap<&str, i64> = HashMap::new();
+    for r in ledger
+        .rows
+        .iter()
+        .filter(|r| r.branch == MAIN && main.contains(&r.commit_id))
+    {
+        for c in std::iter::once(&r.commit_id).chain(&r.parents) {
+            let at = reached.entry(c.as_str()).or_insert(r.recorded_at);
+            *at = (*at).min(r.recorded_at);
+        }
+    }
+    for p in state.proposals.values() {
+        let human: Vec<&Decision> = state
+            .decisions
+            .get(&p.id)
+            .into_iter()
+            .flatten()
+            .filter(|d| d.approve && d.user != AUTO_REVIEWER)
+            .collect();
+        let Some(last) = human.last() else {
+            continue;
+        };
+        let published = !p.heads.is_empty() && p.heads.iter().all(|h| main.contains(h));
+        let rejected = state.rejected.contains(&p.id) || state.auto_rejected(p);
+        let at = p.heads.iter().filter_map(|h| reached.get(h.as_str())).min();
+        let (Some(&at), true, false) = (at, published, rejected) else {
+            continue;
+        };
+        let id_of = |c: &serde_json::Value| {
+            c["id"]
+                .as_str()
+                .or(c["fact_id"].as_str())
+                .map(str::to_string)
+        };
+        let mut added = vec![];
+        let mut ended = vec![];
+        for c in &p.changes {
+            let Some(id) = id_of(c) else { continue };
+            if c["kind"] == "fact" && c["valid_to"].is_null() {
+                added.push(id);
+            } else if !c["valid_to"].is_null() {
+                ended.push(id);
+            }
+        }
+        let mut deciders: Vec<String> = vec![];
+        for d in &human {
+            if !deciders.contains(&d.user) {
+                deciders.push(d.user.clone());
+            }
+        }
+        out.push(Approval {
+            id: p.id.clone(),
+            kind: "review",
+            deciders,
+            at,
+            expires_at: last.expires_at,
+            added,
+            kept: None,
+            ended,
+        });
+    }
+    out.sort_by_key(|a| a.at);
+    Ok(out)
+}
+
+/// The facts a person's decision put on main, each with the window its approval holds (`[from, until)`, until
+/// its `expires_at`, or [`DEFAULT_APPROVAL_DAYS`] after it for a decision recorded before approvals expired).
+/// Read from the governance rows and main's ledger alone, for [`crate::Vis`]: while its window holds, a read of
+/// a one-valued attribute serves the approved fact over a newer statement no one approved.
+pub fn approved_facts(rows: &[RecordBatch], ledger: &Ledger) -> HashMap<String, (i64, i64)> {
+    let approvals = match fold(rows, ledger).and_then(|state| approvals_in(ledger, &state)) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("governance: approvals not read, reads serve the newest statement: {e:#}");
+            return HashMap::new();
+        }
+    };
+    let mut out = HashMap::new();
+    for a in approvals {
+        let until = a
+            .expires_at
+            .unwrap_or(a.at.saturating_add(DEFAULT_APPROVAL_DAYS * 86_400_000_000));
+        for id in a.added.iter().chain(&a.kept) {
+            out.insert(id.clone(), (a.at, until));
+        }
+    }
+    out
 }

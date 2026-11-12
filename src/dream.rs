@@ -1197,7 +1197,7 @@ async fn run_inner(
         .filter_map(|entry| {
             let who = audience(std::slice::from_ref(&entry)).pop()?;
             let mut open: Vec<&Fact> = vec![];
-            let mut newest: HashMap<(&str, &str), (i64, &str)> = HashMap::new();
+            let mut newest: HashMap<(&str, &str), (bool, i64, &str)> = HashMap::new();
             for (c, f) in &v.facts {
                 if !v.vis.allows(c, f, &who, None) {
                     continue;
@@ -1208,11 +1208,12 @@ async fn run_inner(
                 if one_valued(schema.as_deref(), f) {
                     let n = newest
                         .entry((f.entity.as_str(), f.predicate.as_str()))
-                        .or_insert((f.valid_from, f.fact_id.as_str()));
-                    *n = (*n).max((f.valid_from, f.fact_id.as_str()));
+                        .or_insert(v.vis.rank(f, now));
+                    *n = (*n).max(v.vis.rank(f, now));
                 }
             }
-            let current: HashSet<String> = newest.values().map(|(_, id)| id.to_string()).collect();
+            let current: HashSet<String> =
+                newest.values().map(|(_, _, id)| id.to_string()).collect();
             Some((entry, who, open, current))
         })
         .collect();
@@ -1626,7 +1627,9 @@ impl Audience<'_> {
     /// the schema types both, neither a value kept with others at once (a reference, a predicate named for people in
     /// a role, or one the schema marks a list), and an older fact that isn't a record of something that happened.
     fn may_end(&self, old: &Fact, by: &Fact) -> bool {
-        self.settles(old, by)
+        // A value a person's live decision approved is theirs to change: only another approved one ends it.
+        (!self.v.vis.approved_at(old, self.now) || self.v.vis.approved_at(by, self.now))
+            && self.settles(old, by)
             && by.valid_from > old.valid_from
             && by.valid_from <= self.now
             && squash(&old.value) != squash(&by.value)
