@@ -152,8 +152,8 @@ async fn add_fact(
     Ok(json!({"fact_id": f.fact_id, "episode_id": ep.episode_id, "review": review}))
 }
 
-/// Whether facts of `f`'s attribute hold one value at a time: not a list, a many-valued or a reference predicate
-/// of the schema (a new one joins the others), nor one the engine keeps for itself (`_alias`).
+/// Whether `f` is one answer two sources can disagree on: a schema predicate holding one value that is not free
+/// text or a reference, or an undeclared one whose value is a short label. Never one the engine keeps (`_alias`).
 fn single_valued(schema: Option<&query::schema::Schema>, f: &Fact) -> bool {
     if f.predicate.starts_with('_') {
         return false;
@@ -173,13 +173,24 @@ fn single_valued(schema: Option<&query::schema::Schema>, f: &Fact) -> bool {
                 .unwrap_or("")
                 .into()
         });
-    schema
-        .and_then(|s| s.predicate(&ty, &f.predicate))
-        .is_none_or(|p| {
-            !p.list
-                && p.card != query::schema::Card::Many
-                && p.value != query::schema::ValueType::Ref
-        })
+    use query::schema::{Card, ValueType};
+    match schema.and_then(|s| s.predicate(&ty, &f.predicate)) {
+        // Free text and references are notes and links, not one answer that two sources can disagree on.
+        Some(p) => {
+            !p.list && p.card != Card::Many && !matches!(p.value, ValueType::Text | ValueType::Ref)
+        }
+        // Undeclared: only a short label (a date, an amount, a name), never a sentence.
+        None => short_label(&f.value),
+    }
+}
+
+/// A value short enough to be one answer: one line, at most six words and sixty characters.
+fn short_label(v: &str) -> bool {
+    let v = v.trim();
+    !v.is_empty()
+        && !v.contains('\n')
+        && v.chars().count() <= 60
+        && v.split_whitespace().count() <= 6
 }
 
 async fn check(store: &Store, who: &Principal, scope: &Scope) -> Result<Value> {
