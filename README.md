@@ -98,6 +98,7 @@ run.end("deployed", reward=1)
 - [Self-hosting](docs/guide/self-hosting.md): Iceberg REST (Polaris), BigLake, Snowflake, Databricks; GCS, S3,
   Azure.
 - [Configuration](docs/guide/configuration.md) and [security model](docs/guide/security-model.md).
+- [Benchmarks](benchmarks/README.md): how each published benchmark was run and scored, with its results.
 
 ## Develop
 
