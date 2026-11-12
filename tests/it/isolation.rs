@@ -61,6 +61,16 @@ pub(crate) fn id_token(issuer: &str, user: &str) -> String {
 /// is the platform's own, `samlp|…` an Organization's enterprise one), and no `org_id`: the person signed in as
 /// themselves, not into an Organization.
 pub(crate) fn tenant_token(issuer: &str, user: &str, sub: &str) -> String {
+    tenant_token_for(issuer, user, sub, None)
+}
+
+/// [`tenant_token`] issued for an Auth0 Organization (its `org_id`), as signing in to an org does.
+pub(crate) fn tenant_token_for(
+    issuer: &str,
+    user: &str,
+    sub: &str,
+    org_id: Option<&str>,
+) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -69,7 +79,7 @@ pub(crate) fn tenant_token(issuer: &str, user: &str, sub: &str) -> String {
     header.kid = Some("k1".into());
     jsonwebtoken::encode(
         &header,
-        &json!({"iss": issuer, "aud": CLIENT_ID, "sub": sub, "email": user,
+        &json!({"iss": issuer, "aud": CLIENT_ID, "sub": sub, "email": user, "org_id": org_id,
                 "email_verified": true, "iat": now, "exp": now + 3600}),
         &jsonwebtoken::EncodingKey::from_rsa_pem(include_bytes!("../fixtures/idp_key.pem"))
             .unwrap(),
@@ -2021,6 +2031,60 @@ async fn asking_to_join_grants_nothing_until_an_admin_approves() {
         !reads_acme(&lin).await,
         "asking through the lobby let her in"
     );
+
+    // Where a person belongs, with each org's Auth0 Organization: what the control plane adds them to, so
+    // every org they were added to shows where they choose one, however they were added. Told to a sign-in
+    // for no org and to one already in another org's Organization, through the tenant's own connections.
+    // An enterprise connection's token learns nothing, with an Organization or without, nor does a stranger.
+    admin(
+        s,
+        json!({"op": "create_org", "org": "beta", "admin": "ann@acme.com"}),
+    )
+    .await;
+    for (org, id) in [("acme", "org_acme"), ("beta", "org_beta")] {
+        admin(
+            s,
+            json!({"op": "set_auth0_org", "org": org, "auth0_org": id}),
+        )
+        .await;
+    }
+    let acme = json!([{"org": "acme", "auth0_org": "org_acme"}]);
+    let in_beta = |user: &str, sub: &str| tenant_token_for(&tenant, user, sub, Some("org_beta"));
+    for (who, t) in [
+        ("no Organization", bob_google.clone()),
+        (
+            "beta's Organization",
+            in_beta("bob@acme.com", "google-oauth2|bob"),
+        ),
+        (
+            "a password, in beta's",
+            in_beta("bob@acme.com", "auth0|bob"),
+        ),
+    ] {
+        let t0 = Instant::now();
+        loop {
+            let v = me(&t).await;
+            if v["auth0_orgs"] == acme {
+                break;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(15), "{who}: {v}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    for (who, t) in [
+        ("an enterprise connection", bob_saml.clone()),
+        (
+            "an enterprise connection, in beta's",
+            in_beta("bob@acme.com", "samlp|corp|bob"),
+        ),
+        (
+            "a stranger, in beta's",
+            in_beta("zed@x.com", "google-oauth2|zed"),
+        ),
+    ] {
+        let v = me(&t).await;
+        assert_eq!(v["auth0_orgs"], json!([]), "{who}: {v}");
+    }
 }
 
 /// `/agent/run` (the console's Ask, on its arms) answers with what the tools its caller names returned, run as

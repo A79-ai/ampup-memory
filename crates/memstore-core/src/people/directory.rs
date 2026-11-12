@@ -2521,16 +2521,17 @@ impl Directory {
         }
     }
 
-    /// Where a person signed in through the platform's Auth0 tenant for no Organization belongs: each org
-    /// whose own members include them, with the Auth0 Organization it is bound to. Only for an email the
-    /// tenant vouches for itself (its own connections: `verified_email`), never an Organization's
-    /// enterprise connection, which asserts whatever email it likes. It grants nothing: such a sign-in
-    /// still reaches no org ([`Directory::vouched`]). The control plane makes the person a member of those
-    /// Organizations, so their next sign-in lands in one; a domain admits nobody through Auth0, so only the
-    /// directory's own members are named, and never in an org that requires its own provider.
+    /// Where a person belongs, to sign in to: each org whose own members include them, with the Auth0
+    /// Organization it is bound to. For a sign-in that names no org (`orgs` none: the Auth0 tenant's own
+    /// connections, or the server's provider), and for one through the tenant for any Organization, so a
+    /// person already signed in to one org learns of the others they were added to since. Only for an
+    /// email the deployment vouches for (`verified_email`), never an Organization's enterprise connection,
+    /// which asserts whatever email it likes. It grants nothing: the token still reaches only what it did
+    /// ([`Directory::vouched`]). The control plane makes the person a member of those Organizations, so
+    /// they can sign in to each; a domain admits nobody through Auth0, so only the directory's own members
+    /// are named, and never in an org that requires its own provider.
     pub fn auth0_orgs_of(&self, user: &str, via: &SignIn) -> Vec<(String, String)> {
-        if !(via.auth0 && via.person && via.verified_email)
-            || via.auth0_org.is_some()
+        if !(via.person && via.verified_email && (via.auth0 || via.orgs.is_none()))
             || via.operator
             || via.key.is_some()
         {
