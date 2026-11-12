@@ -3,6 +3,9 @@
 The memory for agents that gets better with use: it learns advice from the runs that went well and serves it
 before the next one.
 
+**[Docs](https://docs.ampup.ai/integrations/overview)** · **[Website](https://www.ampup.ai/companybrain)** ·
+[Quickstart](https://docs.ampup.ai/ampup-memory/quickstart)
+
 A conversation is a session. Each task in it asks for advice (`get_advice`) and gets one skill for that kind of
 task: a note learned from earlier rewarded runs, or, before any exist, a procedure compiled from your documents.
 When the session ends, its transcript and outcome are judged or rewarded, and a rewarded session teaches the next
@@ -21,7 +24,7 @@ cargo install --locked --path crates/memstore-client --root ~/.local   # ampup-m
 ```
 
 For Claude Code, add this checkout as a plugin marketplace: `/plugin marketplace add /path/to/ampup-memory`, then
-`/plugin install ampup-memory@ampup-memory` ([coding agents](docs/guide/coding-agents.md)). The command was `memstore`
+`/plugin install ampup-memory@ampup-memory` ([coding agents](https://docs.ampup.ai/ampup-memory/coding-agents)). The command was `memstore`
 before the rename, and `memstore` still works as a link to it.
 
 ## Run it locally
@@ -33,7 +36,7 @@ claude mcp add --transport http ampup-memory http://localhost:8080/mcp
 
 `--local` needs no Docker, catalog service or sign-in, and binds to 127.0.0.1. Without a model key it stores and
 searches but learns nothing; any OpenAI-compatible, Anthropic, Bedrock or Vertex AI endpoint, or a local Ollama,
-works instead of OpenRouter ([configuration](docs/guide/configuration.md#models)).
+works instead of OpenRouter ([configuration](https://docs.ampup.ai/ampup-memory/configuration#models)).
 
 ### Offline, on your laptop
 
@@ -50,7 +53,7 @@ AMPUP_MEMORY_LLM=ollama AMPUP_MEMORY_CLIENT_UPDATE=off ampup-memory serve --loca
 LM Studio, llama.cpp, vLLM). Started in a terminal with nothing configured, `serve --local` asks once whether to
 use a key, the local Ollama, or no model, and keeps the answer in `~/.ampup-memory/llm.json`. Without the embedding
 model (`HF_HUB_OFFLINE=1`, nothing fetched yet), search ranks by keyword alone. More in the
-[quickstart](docs/guide/quickstart.md#offline-on-your-laptop).
+[quickstart](https://docs.ampup.ai/ampup-memory/quickstart#offline-on-your-laptop).
 
 ## First memory, search and advice
 
@@ -64,10 +67,10 @@ curl -s localhost:8080/sessions/end -d '{"session_id": "<id>", "transcript": "�
 ```
 
 A new memory has no advice to give until it has rewarded runs to learn from or documents to compile; the
-[quickstart](docs/guide/quickstart.md) walks through both.
+[quickstart](https://docs.ampup.ai/ampup-memory/quickstart) walks through both.
 
 HTTP routes: `/remember`, `/search`, `/query`, `/advice`, `/sessions`, `/sessions/end`, `/runs`, `/runs/reward`,
-and `/mcp` ([all routes](docs/guide/http-api.md)).
+and `/mcp` ([all routes](https://docs.ampup.ai/ampup-memory/http-api)).
 
 From code, the Python and TypeScript clients wrap the same routes:
 
@@ -90,14 +93,17 @@ run.end("deployed", reward=1)
 
 ## Docs
 
-- [Quickstart](docs/guide/quickstart.md) and [concepts](docs/guide/concepts.md): episodes, facts, sessions,
+The docs live at **[docs.ampup.ai](https://docs.ampup.ai/integrations/overview)**; the same guides are in
+[docs/guide](docs/guide) here.
+
+- [Quickstart](https://docs.ampup.ai/ampup-memory/quickstart) and [concepts](https://docs.ampup.ai/ampup-memory/concepts): episodes, facts, sessions,
   advice, rewards.
-- [Advice](docs/guide/advice.md): how notes are learned, judged and gated.
-- [MCP](docs/guide/mcp.md), [HTTP API](docs/guide/http-api.md), [CLI](docs/guide/cli.md).
-- [Schemas and queries](docs/guide/schemas-and-queries.md): typed memory, extraction, search ranking.
-- [Self-hosting](docs/guide/self-hosting.md): Iceberg REST (Polaris), BigLake, Snowflake, Databricks; GCS, S3,
+- [Advice](https://docs.ampup.ai/ampup-memory/advice): how notes are learned, judged and gated.
+- [MCP](https://docs.ampup.ai/ampup-memory/mcp), [HTTP API](https://docs.ampup.ai/ampup-memory/http-api), [CLI](https://docs.ampup.ai/ampup-memory/cli).
+- [Schemas and queries](https://docs.ampup.ai/ampup-memory/schemas-and-queries): typed memory, extraction, search ranking.
+- [Self-hosting](https://docs.ampup.ai/ampup-memory/self-hosting): Iceberg REST (Polaris), BigLake, Snowflake, Databricks; GCS, S3,
   Azure.
-- [Configuration](docs/guide/configuration.md) and [security model](docs/guide/security-model.md).
+- [Configuration](https://docs.ampup.ai/ampup-memory/configuration) and [security model](https://docs.ampup.ai/ampup-memory/security-model).
 - [Benchmarks](benchmarks/README.md): how each published benchmark was run and scored, with its results.
 
 ## Develop
