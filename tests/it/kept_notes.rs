@@ -715,9 +715,20 @@ async fn preferences_are_kept_from_what_people_type() {
     })
     .await;
 
-    // Every message she typed in it was read once, with the reply before it; nothing else was.
-    let mut typed = seen.typed();
-    typed.retain(|(said, _)| !said.starts_with("Tidy the changelog"));
+    // Every message she typed in it was read once, with the reply before it; nothing else was. Read in the
+    // background, the end's messages may still be with the model when the Stops' notes land: waited for, then a
+    // moment more, so a message read twice would show.
+    let hers = || {
+        let mut typed = seen.typed();
+        typed.retain(|(said, _)| !said.starts_with("Tidy the changelog"));
+        typed
+    };
+    until("all five of her messages read", async || {
+        (hers().len() >= 5).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let typed = hers();
     let users: Vec<&str> = typed.iter().map(|(u, _)| u.as_str()).collect();
     assert_eq!(users.len(), 5, "each of her five messages once: {users:#?}");
     for (i, start) in [
