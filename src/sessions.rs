@@ -1568,8 +1568,8 @@ async fn serve_team(
 
 /// Whether `source` is a session's conversation so far (`<signed>memstore:session:<id>:conversation`): an episode of the
 /// asker's own, written again at every advice step, which the session's end copies into its transcript
-/// (`<signed>session:<id>`). Facts aren't extracted from it unless `AMPUP_MEMORY_EXTRACT_CONVERSATIONS` is on
-/// ([`crate::extract::typed`]): the transcript is, once the session ends.
+/// (`<signed>session:<id>`). Facts aren't extracted from it, nor from the record, unless
+/// `AMPUP_MEMORY_EXTRACT_SESSIONS` is on ([`crate::extract::typed`]).
 pub fn conversation_so_far(source: &str) -> bool {
     // `<signed>memstore:session:<id>:conversation`, or `<signed>session:<id>:conversation` as sessions before it kept.
     source

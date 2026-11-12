@@ -67,6 +67,7 @@ Requests carry `X-Title: ampup-memory`, so their spend shows apart on a shared k
 | Variable | What it does |
 |---|---|
 | `AMPUP_MEMORY_EXTRACT_GOAL_BLIND=1` | Also extract episodes the schema's `extract` section doesn't name, on every scope. |
+| `AMPUP_MEMORY_EXTRACT_SESSIONS=on` | Also extract sessions: each one's record once it ends and its conversation so far. Off, a session teaches advice and keeps notes, not facts. |
 | `AMPUP_MEMORY_EXTRACT_SECS` (5) | How soon after landing an episode is read. |
 | `AMPUP_MEMORY_EXTRACT_SCOPES` (4) | Scopes extracted at once. |
 | `AMPUP_MEMORY_EXTRACT_PARALLEL` (8) | Requests in flight. |

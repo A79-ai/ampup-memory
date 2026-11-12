@@ -2149,10 +2149,11 @@ pub fn goal_blind() -> bool {
     })
 }
 
-/// Whether facts are extracted from sessions' conversations so far (`AMPUP_MEMORY_EXTRACT_CONVERSATIONS`,
-/// `on`/`1`/`true`/`yes`; off by default: [`crate::sessions::conversation_so_far`]).
-fn extract_conversations() -> bool {
-    std::env::var("AMPUP_MEMORY_EXTRACT_CONVERSATIONS").is_ok_and(|v| {
+/// Whether facts are extracted from sessions (`AMPUP_MEMORY_EXTRACT_SESSIONS`, `on`/`1`/`true`/`yes`; off by
+/// default): a session's record once it ends and its conversation so far ([`session_source`]). What a session
+/// teaches is advice's ([`crate::advice`]), and what the person prefers is kept as their notes ([`crate::keep`]).
+fn extract_sessions() -> bool {
+    std::env::var("AMPUP_MEMORY_EXTRACT_SESSIONS").is_ok_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "1" | "on" | "true" | "yes"
@@ -2160,9 +2161,17 @@ fn extract_conversations() -> bool {
     })
 }
 
+/// Whether `source` is a session's: its record (`<signed>memstore:session:<id>`, or `<signed>session:<id>` as
+/// sessions before it kept) or its conversation so far.
+fn session_source(source: &str) -> bool {
+    crate::session_record_source(source).is_some()
+        || crate::sessions::conversation_so_far(source)
+        || crate::profile::author_of(source).is_some_and(|(_, rest)| rest.starts_with("session:"))
+}
+
 /// Whether extraction reads `ep`: every episode but the engine's own documents (goals, what is compiled for
-/// them), which nothing extracts, a hook's session note, a note the server kept, and a session's conversation so far unless
-/// [`extract_conversations`] (its transcript is extracted once it ends). A source no type claims, such as a loaded corpus's, is a document
+/// them), which nothing extracts, a hook's session note, a note the server kept, and a session's record or
+/// conversation so far unless [`extract_sessions`]. A source no type claims, such as a loaded corpus's, is a document
 /// ([`crate::episode_types::of`]).
 pub(crate) fn typed(scope: &Scope, ep: &Episode) -> bool {
     // A conversation kept to train an advice model on, tool output and all: never read for facts.
@@ -2173,22 +2182,20 @@ pub(crate) fn typed(scope: &Scope, ep: &Episode) -> bool {
     if crate::transcripts::is_transcript(&ep.source) {
         return false;
     }
-    // A hook's note of a coding session: its session's record is extracted once the session ends, so the same
-    // session isn't read for facts twice.
+    // A hook's note of a coding session: a session is no source of facts.
     if crate::keep::hook_session_note(&ep.source) {
         return false;
     }
-    // A preference the server kept from what the person typed ([`crate::keep`]): their words are read for facts
-    // once, from the session's record, not again from the note.
+    // A preference the server kept from what the person typed ([`crate::keep`]): a note, not a source of facts.
     if crate::profile::author_of(&ep.source).is_some_and(|(_, rest)| crate::keep::is_kept(rest)) {
         return false;
     }
-    if crate::sessions::conversation_so_far(&ep.source) && !extract_conversations() {
+    if session_source(&ep.source) && !extract_sessions() {
         static SAID: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
         if SAID.lock().unwrap().insert(scope.namespace()) {
             eprintln!(
-                "extract {scope}: sessions' conversations so far aren't extracted, their transcripts are once \
-                 they end (the first: source {:?}; AMPUP_MEMORY_EXTRACT_CONVERSATIONS=on extracts them)",
+                "extract {scope}: sessions aren't extracted (the first: source {:?}; AMPUP_MEMORY_EXTRACT_SESSIONS=on \
+                 extracts them)",
                 ep.source
             );
         }

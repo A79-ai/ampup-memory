@@ -60,7 +60,8 @@ session's work taught (a correction, a step that went wrong) is learned as the p
 requests, and the `[preference]` items of that advice are handed at a session's start with their notes. An agent's
 own `get_advice` question and its account of a session are its words, not the person's, and keep nothing; neither
 does a recorder key's session. Only a caller with a `user:` entry of their own has anything kept, so
-`serve --local` and service keys keep nothing this way. `AMPUP_MEMORY_KEEP=off` turns it off.
+`serve --local` and service keys keep nothing this way. `AMPUP_MEMORY_KEEP=off` turns it off. Sessions themselves aren't read for
+facts, neither the record of one that ended nor its conversation so far, unless `AMPUP_MEMORY_EXTRACT_SESSIONS=on`.
 
 **Filed in a map.** Each kept note is filed under a category and a topic, picked from the person's own map so far
 (a new one only when none fits), as `keep:<category>:<topic>` after their signature, so a person's notes read as
