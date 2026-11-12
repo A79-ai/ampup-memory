@@ -51,11 +51,20 @@ turn a user states a preference, correction, decision or procedure.
 
 ## What the server keeps from the user's words
 
-Hosts without hooks (Claude Desktop, ChatGPT, an IDE) don't always call `remember_memory`. The user's words still
-reach the server in `start_session`'s context and `end_session`'s transcript. After a session call answers, one
-small model call finds the preferences, corrections, decisions and procedures the user stated, and the server
-remembers each as the caller's own note. Only a caller with a `user:` entry of their own has anything kept, so
+Hosts without hooks (Claude Desktop, ChatGPT, an IDE) don't always call `remember_memory`. So each message the
+person types, as it reaches the server, is read once by one small model call, with the end of the assistant's reply
+before it: `start_session`'s context, a hook's question, the conversation a hook sends every few minutes, and the
+transcript at the session's end. The preferences they show there, how they want things done in every session from
+now on, are kept as the person's own notes. Instructions for the task at hand, facts and decisions aren't: what a
+session's work taught (a correction, a step that went wrong) is learned as the person's own advice from its graded
+requests, and the `[preference]` items of that advice are handed at a session's start with their notes. An agent's
+own `get_advice` question and its account of a session are its words, not the person's, and keep nothing; neither
+does a recorder key's session. Only a caller with a `user:` entry of their own has anything kept, so
 `serve --local` and service keys keep nothing this way. `AMPUP_MEMORY_KEEP=off` turns it off.
+
+**Filed in a map.** Each kept note is filed under a category and a topic, picked from the person's own map so far
+(a new one only when none fits), as `keep:<category>:<topic>` after their signature, so a person's notes read as
+folders. A note their kept notes already say isn't kept again. Callers can't write under `keep` themselves.
 
 **Shared once three people said it.** A personal note stays the author's until at least three distinct people
 have each said the same thing. Then one sentence, built only from words all their notes share, is written as a

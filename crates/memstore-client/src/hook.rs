@@ -3,8 +3,8 @@
 //!
 //! - `session-end` (PreCompact), `end` (SessionEnd) and `stop` (Stop, every [`EVERY`] prompts): the session so far, condensed to what was asked, what Claude
 //!   said and the files it changed, with secret-looking words redacted, is remembered with `POST /remember`
-//!   under the source `claude-code:<repo>:<session id>`. With goal-blind extraction on, `serve` turns it into
-//!   facts; a session remembered again as it grows adds only what is new (reconcile on write).
+//!   under the source `claude-code:<repo>:<session id>`, for its author. Facts aren't extracted from it: the
+//!   memstore session's own record (`end`, below) is, once the session ends, so a session is read for facts once.
 //! - `session-start` (SessionStart): what the memory holds about the repo is added to Claude's context, and a
 //!   memstore session is opened for it (`start_session`, memstore's `sessions`).
 //! - `prompt` (UserPromptSubmit): on a session's first prompt, the facts that best match it (a long one's start

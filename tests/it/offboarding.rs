@@ -1106,6 +1106,17 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         .unwrap_or_default()
         .to_string();
     assert!(!sid.is_empty(), "{raw}");
+    // A step of it keeps her conversation so far as her session's own record (`memstore:session:<id>:conversation`),
+    // which the forget takes too.
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "get_advice", "arguments": {"session_id": sid, "question": "wrap up the launch plan",
+            "moment": "done", "conversation_so_far": "User: xqcarolconvo the launch plan goes to legal first"}}});
+    let (status, raw) = post(&format!("{s}/mcp?org=acme"), &carol, &call).await;
+    assert_eq!(status, 200, "{raw}");
+    assert!(
+        !in_files("xqcarolconvo").is_empty(),
+        "her conversation so far wasn't kept: {raw}"
+    );
     let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "remember_memory", "arguments": {"source": "notes", "body": "xqcarolbranch owner note",
             "for": "team", "session_id": sid}}});
@@ -1491,9 +1502,9 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     .await;
     assert_eq!(status, 200, "{body}");
     let done: Value = serde_json::from_str(&body).unwrap();
-    // Her four notes, both parts of her advice trace and her session transcript's three versions of two parts (the
-    // two she forgot too).
-    assert_eq!(done["forgotten"]["acme"]["episodes"], 9, "{body}");
+    // Her four notes, both parts of her advice trace, her session transcript's three versions of two parts (the
+    // two she forgot too) and her session's conversation so far.
+    assert_eq!(done["forgotten"]["acme"]["episodes"], 10, "{body}");
     assert_eq!(done["forgotten"]["acme"]["facts"], 3, "{body}");
     // Her ownership, her decision and the proposal built on her note are in no file; the entity is unowned, the
     // inbox doesn't list the proposal, and a change to the entity publishes without review.
@@ -1641,7 +1652,7 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     // And from every file: tables, old snapshots, bodies, the search index. Her held session row too: the flush
     // after the forget doesn't bring it back. The two live pins keep none of it.
     memstore::sessions::flush().await.unwrap();
-    for t in carol_tags.iter().chain(&["xqcarolsession"]) {
+    for t in carol_tags.iter().chain(&["xqcarolsession", "xqcarolconvo"]) {
         assert!(
             in_files(t).is_empty(),
             "{t} still stored: {:?}",

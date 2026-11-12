@@ -2273,6 +2273,7 @@ async fn request_principal(
                 auth0: c.auth0,
                 auth0_org: c.auth0_org,
                 operator: c.operator,
+                recorded: false,
             };
             let who = if c.person || via.key.is_some() {
                 // Anyone an identity provider knows can sign in, and an org's key reads its own scope:
@@ -7568,6 +7569,7 @@ async fn act_as(
     let as_via = SignIn {
         person: true,
         orgs: Some(std::collections::BTreeSet::from([k.org.clone()])),
+        recorded: true,
         ..Default::default()
     };
     Ok((Principal::from_parts(person, groups), as_via))
@@ -10516,18 +10518,7 @@ async fn mcp(
                 "remember_memory" if writes == Writes::Inbox => remember(state, who, args).await,
                 "remember_memory" if writes == Writes::Scope => match remember_for(state, who, args) {
                     Err(e) => Err(e),
-                    Ok(args) => {
-                        // What the server just kept for the user, from what they said, isn't written for them again.
-                        let key = format!("{}\u{0}{scope}", who.user());
-                        let body = args["body"].as_str().unwrap_or_default();
-                        let mine = args["mine"].as_bool() == Some(true);
-                        match crate::keep::written(&key, false, body).filter(|_| mine) {
-                            Some(kept) => Ok(format!("already {kept}: AmpUp Memory kept it from what the user said")),
-                            None => remember_here(state, &store, scope, who, &args).await.inspect(|answer| {
-                                crate::keep::wrote(&key, false, body, answer);
-                            }),
-                        }
-                    }
+                    Ok(args) => remember_here(state, &store, scope, who, &args).await,
                 },
                 "forget_memory" if !may_write => Err(ToolError(format!(
                     "{} only reads: it is a reader key",
@@ -10632,9 +10623,11 @@ async fn mcp(
                     );
                     started
                         .map(|(l, served)| {
-                            // What the user opened with is checked for what to keep once the session answered.
-                            let said = args["context"].as_str().unwrap_or_default();
-                            keep_later(state, &store, scope, who, via, args, said, &l.answer_id);
+                            // What the person opened with, in their words: the preferences in it are kept.
+                            if args["keep"].as_bool() != Some(false) {
+                                let said = args["context"].as_str().unwrap_or_default();
+                                crate::sessions::keep_later(&store, scope, &l, &provenance(who, ""), said, false);
+                            }
                             crate::sessions::notes_at_start(
                                 scope,
                                 who,
@@ -10653,27 +10646,10 @@ async fn mcp(
                 ))
                 .into()),
                 "end_session" if writes == Writes::Scope => {
-                    // The transcript holds what the user said since: what the session hasn't kept yet is kept.
-                    let id = args["session_id"].as_str().unwrap_or_default().trim();
-                    let said = args["transcript"].as_str().unwrap_or_default();
-                    keep_later(state, &store, scope, who, via, args, said, id);
                     end_session(state, &store, scope, who, via, args)
                         .await
                         .map(|v| v.to_string())
                         .map_err(runs_error)
-                }
-                // A hook's task question (not a tool event) is what the user asked next. It comes after the
-                // conversation's tools ran, so, like a transcript, what it yields is the caller's alone. An agent's
-                // own get_advice keeps nothing: it is offered read-only (so ChatGPT doesn't ask the user to approve
-                // every call), and what the user said is kept from start_session, end_session's transcript and
-                // remember_memory. A hook's call is the one that fits the advice to its context (`max_chars`).
-                "get_advice"
-                    if args["event"].is_null() && !args["max_chars"].is_null() && writes == Writes::Scope =>
-                {
-                    let id = args["session_id"].as_str().unwrap_or_default().trim();
-                    let said = args["question"].as_str().unwrap_or_default();
-                    keep_later(state, &store, scope, who, via, args, said, id);
-                    Box::pin(get_advice_tool(state, session, &store, scope, who, via, writes, args)).await
                 }
                 "get_advice" => {
                     Box::pin(get_advice_tool(state, session, &store, scope, who, via, writes, args)).await
@@ -11890,6 +11866,17 @@ async fn open_session(
         );
     }
     let acl = own_acl(state, who, via, "session")?;
+    // A recorder key's session for a member is marked so ([`crate::sessions::RECORDED`]).
+    let marked;
+    let args = match via.recorded {
+        true => {
+            let mut a = args.clone();
+            a["harness"] = json!(crate::sessions::recorded_harness(args["harness"].as_str()));
+            marked = a;
+            &marked
+        }
+        false => args,
+    };
     // Its row is written once the advice is found, in the background (`crate::sessions::opened`).
     let l = crate::sessions::start(store, session.scope(), who, &acl, args, None).await?;
     crate::phases::mark("session opened");
@@ -12091,6 +12078,7 @@ async fn session_advice(
         );
     }
     let mut l = crate::sessions::active(store, session.scope(), who, id).await?;
+    recorder_writes(via, &l)?;
     // Where in the session the question came, read before it names the task: its first request, a later message
     // (with `seen`, the conversation it was asked in), or the agent's own words.
     let place = match agent {
@@ -12104,6 +12092,15 @@ async fn session_advice(
         crate::sessions::name_task(store, session.scope(), who, &mut l, question);
     }
     let signed = provenance(who, "");
+    // A hook's question is what the person typed, and the conversation it sends holds their messages: the
+    // preferences in them are kept ([`crate::keep`]). An agent's question and account are its own words, and a
+    // hook's step (`decide`) asks about the agent's work.
+    if keep && !agent && !decide {
+        crate::sessions::keep_later(store, session.scope(), &l, &signed, question, false);
+        if let Some(c) = conversation {
+            crate::sessions::keep_later(store, session.scope(), &l, &signed, c, true);
+        }
+    }
     // A program's session is served nothing, at once, unless its scope asks ([`routes_for`]): its conversation is
     // still kept.
     if !routes_for(store, session.scope(), &l).await {
@@ -12246,6 +12243,7 @@ async fn session_moment(
         );
     }
     let l = Box::pin(crate::sessions::active(store, session.scope(), who, id)).await?;
+    recorder_writes(via, &l)?;
     // A hook's step (`decide`): the lines of the served notes that fit the step, not the note again.
     if let Some(step) = step {
         // Whether the user's last message came since the last step, noted before anything else reads it.
@@ -12665,6 +12663,7 @@ async fn get_advice_step(
                 id,
                 event,
                 conversation,
+                args["keep"].as_bool() != Some(false),
             ))
             .await
             .map(|f| serde_json::to_string_pretty(&f).unwrap_or_default())
@@ -12828,6 +12827,7 @@ async fn session_fire(
     id: &str,
     event: &crate::sessions::Event,
     conversation: Option<&str>,
+    keep: bool,
 ) -> Result<crate::sessions::Fired> {
     if !via.may_write() {
         return Err(
@@ -12836,6 +12836,7 @@ async fn session_fire(
     }
     // The session first: a stranger to it is told no more than that, whatever the server runs.
     let mut l = crate::sessions::active(store, session.scope(), who, id).await?;
+    recorder_writes(via, &l)?;
     // The conversation so far, with the event (a harness's Stop sends it every few minutes): kept, with no model
     // call, and the row read again so steps that landed while it was kept aren't lost.
     if let Some(c) = conversation.map(str::trim).filter(|c| !c.is_empty()) {
@@ -12850,6 +12851,10 @@ async fn session_fire(
         ))
         .await?;
         l = Box::pin(crate::sessions::find(store, session.scope(), who, id)).await?;
+        // The person's messages in it: the preferences in them are kept ([`crate::keep`]).
+        if keep {
+            crate::sessions::keep_later(store, session.scope(), &l, &signed, c, true);
+        }
     }
     let Some(router) = crate::extract::Extractor::route_from_env()? else {
         return Err(ToolError(NO_ROUTER.into()).into());
@@ -12859,6 +12864,20 @@ async fn session_fire(
 
 /// Ends session `args.session_id` of the caller (`crate::sessions::end`), opening it first if the caller named
 /// it and nothing opened it yet ([`open_named`]).
+/// Refuses a recorder key acting for a member ([`SignIn::recorded`]) a write to session `l` it didn't open: what a
+/// key records goes only to the sessions marked as its ([`crate::sessions::RECORDED`]), from which nothing is kept
+/// as the member's own words, never to one the member opened themselves.
+fn recorder_writes(via: &SignIn, l: &crate::qa_log::Logged) -> Result<()> {
+    if via.recorded && !crate::sessions::recorded(l) {
+        return Err(crate::runs::Refused(format!(
+            "session {} is the member's own: a recorder key writes only to the sessions it opened",
+            l.answer_id
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 async fn end_session(
     state: &State,
     store: &Store,
@@ -12884,7 +12903,14 @@ async fn end_session(
     )
     .await?;
     let l = crate::sessions::find(store, scope, who, &resolved).await?;
-    let l = crate::sessions::end(store, scope, who.user(), &provenance(who, ""), l, args).await?;
+    recorder_writes(via, &l)?;
+    let signed = provenance(who, "");
+    let l = crate::sessions::end(store, scope, who.user(), &signed, l, args).await?;
+    // The person's messages in its transcript the session hasn't read yet: the preferences in them are kept.
+    if args["keep"].as_bool() != Some(false) {
+        let t = args["transcript"].as_str().unwrap_or_default();
+        crate::sessions::keep_later(store, scope, &l, &signed, t, true);
+    }
     let served = l.session.map(|s| s.served).unwrap_or_default();
     Ok(json!({"session_id": id, "ended": true, "served": served}))
 }
@@ -12910,6 +12936,10 @@ async fn open_named(
     let Ok(acl) = own_acl(state, who, via, "session") else {
         return Ok(id.to_string());
     };
+    let marked = via
+        .recorded
+        .then(|| crate::sessions::recorded_harness(harness));
+    let harness = marked.as_deref().or(harness);
     crate::sessions::open_named(store, scope, who, &acl, id, context, harness).await
 }
 
@@ -13813,6 +13843,15 @@ fn remember_args(args: &Value) -> Result<(&str, &str)> {
         ))
         .into());
     }
+    // What the server keeps from what a person typed (`crate::keep`) is filed under `keep`: no caller writes as it,
+    // so what the share counts as people having said is only what the server kept.
+    if crate::keep::is_kept(&source.to_ascii_lowercase()) {
+        return Err(ToolError(format!(
+            "source {source:?}: {} is where AmpUp Memory files what it keeps",
+            crate::keep::SOURCE
+        ))
+        .into());
+    }
     // A hook's whole session (up to 1,500,000 characters) fits, with room for its request around it.
     if body.len() > MAX_INGEST_BODY * 7 / 8 {
         return Err(ToolError("body is too long".into()).into());
@@ -13834,72 +13873,6 @@ async fn remember_here(
     Ok(format!(
         "remembered in {scope} as episode {id}, visible to {readers}"
     ))
-}
-
-/// What the user said in a session call (`said`), kept where the agent may not remember it ([`crate::keep`]):
-/// each thing kept, with who may read it: the caller alone, a decision too ([`crate::keep::share`] shares what
-/// enough people said). Nothing when keeping is off, there is no model, the caller may not write here or has
-/// no entry of their own, or a step fails: it never fails the call it rides on.
-#[allow(clippy::too_many_arguments)]
-async fn keep_said(
-    state: &State,
-    store: &Store,
-    scope: &Scope,
-    who: &Principal,
-    via: &SignIn,
-    writes: Writes,
-    said: &str,
-    already: &[String],
-) -> Vec<(crate::keep::Kept, String)> {
-    // Only a caller who writes straight into the scope: an inbox writer, a branch or a snapshot doesn't.
-    // No entry of their own (a local or service caller): what is theirs alone has nowhere to go.
-    let own = own_entry(who);
-    if !crate::keep::on()
-        || !via.may_write()
-        || writes != Writes::Scope
-        || own.contains('<')
-        || said.trim().is_empty()
-    {
-        return vec![];
-    }
-    let Ok(Some(model)) = crate::extract::Extractor::route_from_env() else {
-        return vec![];
-    };
-    let found = match crate::keep::find(&model, said, already).await {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("keep: finding what to keep failed: {e:#}");
-            return vec![];
-        }
-    };
-    let key = format!("{}\u{0}{scope}", who.user());
-    let mut out = vec![];
-    let found_n = found.len();
-    for k in found {
-        // Written even where the agent remembered it already: what [`crate::keep::share`] counts is what the
-        // server kept, so each person who said it counts once.
-        let args = json!({"source": "keep", "body": k.text, "acl": [own]});
-        match commit_remembered(state, store, scope, who, &args).await {
-            Ok((id, readers)) => {
-                let answer = format!("remembered in {scope} as episode {id}, visible to {readers}");
-                crate::keep::wrote(&key, true, &k.text, &answer);
-                out.push((k, readers))
-            }
-            Err(e) => eprintln!("keep: remembering failed: {e:#}"),
-        }
-    }
-    // Counts only, never what was said or who said it.
-    eprintln!(
-        "keep: {scope}: kept {} of {} found in {} chars said",
-        out.len(),
-        found_n,
-        said.chars().count()
-    );
-    out
-}
-
-fn kept_texts(kept: &[(crate::keep::Kept, String)]) -> Vec<String> {
-    kept.iter().map(|(k, _)| k.text.clone()).collect()
 }
 
 /// What a person typed into an advice or session call (`question`, `context`, `conversation_so_far`, `task`,
@@ -13939,49 +13912,6 @@ fn said_redacted(mut args: Value) -> Value {
         event.values_mut().for_each(mask);
     }
     args
-}
-
-/// [`keep_said`] for session `session_id`, run on after the session call answers: the call never waits for its
-/// model call. What the session kept so far isn't kept again ([`crate::keep::kept_in`]), and what the agent then
-/// remembers of it isn't written twice ([`crate::keep::written`]). Only the session arms call it, each where the
-/// caller writes into the scope. A call with `keep: false` (the hooks' with AMPUP_MEMORY_CAPTURE=off) keeps nothing.
-#[allow(clippy::too_many_arguments)]
-fn keep_later(
-    state: &Arc<State>,
-    store: &Store,
-    scope: &Scope,
-    who: &Principal,
-    via: &SignIn,
-    args: &Value,
-    said: &str,
-    session_id: &str,
-) {
-    if !crate::keep::on() || args["keep"].as_bool() == Some(false) || said.trim().is_empty() {
-        return;
-    }
-    let (state, store, scope, who, via) = (
-        state.clone(),
-        store.clone(),
-        scope.clone(),
-        who.clone(),
-        via.clone(),
-    );
-    let (said, id) = (said.to_string(), session_id.to_string());
-    tokio::spawn(async move {
-        let already = crate::keep::kept_in(&id);
-        let kept = keep_said(
-            &state,
-            &store,
-            &scope,
-            &who,
-            &via,
-            Writes::Scope,
-            &said,
-            &already,
-        )
-        .await;
-        crate::keep::note(&id, &kept_texts(&kept));
-    });
 }
 
 /// `text` as `scope` stores it: with its personal identifiers replaced where the scope's team or org asks

@@ -110,6 +110,17 @@ struct Soon {
 
 static SOON: LazyLock<Mutex<HashMap<Scope, Soon>>> = LazyLock::new(Default::default);
 
+/// Session of `person` in `scope` graded request by request (`crate::sessions::grade_tasks`): their runs are looked at
+/// again at the next sweep ([`personal_soon`]). Grading changes a session's row, not how many there are, and the row
+/// reaches the log's table a flush later, so neither the log nor their count says it changed; a person looked at
+/// between the judge and the grades would wait for some other change to their log.
+pub fn graded(scope: &Scope, person: &str) {
+    if let Some(s) = SOON.lock().unwrap().get_mut(scope) {
+        s.log = None;
+        s.seen.remove(&crate::auth::acl::norm_id(person.trim()));
+    }
+}
+
 /// A scope's learning in flight: the scope is free again once this is dropped.
 pub struct Claim(Scope);
 
@@ -426,7 +437,9 @@ async fn rewarded_by_person(
     scope: &Scope,
 ) -> Result<BTreeMap<String, Vec<(String, bool)>>> {
     let mut by_person: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
-    for l in crate::qa_log::list(store, scope, None)
+    // With the session rows this server holds still (`crate::sessions::list`): a session graded a moment ago is
+    // graded here, not a flush later.
+    for l in crate::sessions::list(store, scope)
         .await?
         .into_iter()
         .filter(crate::advice::sorts)

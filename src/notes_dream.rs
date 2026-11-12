@@ -159,15 +159,20 @@ fn whole(rest: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A session's id from what follows its author in a session record's source: `memstore:session:<id>…`, or
+/// `session:<id>…` as sessions before it kept.
+fn session_rest(rest: &str) -> Option<&str> {
+    rest.strip_prefix(crate::SESSION_SOURCE)
+        .or_else(|| rest.strip_prefix("session:"))
+}
+
 fn ended(rest: &str) -> Option<String> {
-    let id = rest.strip_prefix("session:")?;
+    let id = session_rest(rest)?;
     (!id.is_empty() && !id.contains(':')).then(|| format!("session:{id}"))
 }
 
 fn so_far(rest: &str) -> Option<String> {
-    let id = rest
-        .strip_prefix("session:")?
-        .strip_suffix(":conversation")?;
+    let id = session_rest(rest)?.strip_suffix(":conversation")?;
     (!id.is_empty() && !id.contains(':')).then(|| format!("session:{id}"))
 }
 

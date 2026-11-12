@@ -2161,8 +2161,8 @@ fn extract_conversations() -> bool {
 }
 
 /// Whether extraction reads `ep`: every episode but the engine's own documents (goals, what is compiled for
-/// them), which nothing extracts, and a session's conversation so far unless [`extract_conversations`] (its
-/// transcript is extracted once it ends). A source no type claims, such as a loaded corpus's, is a document
+/// them), which nothing extracts, a hook's session note, a note the server kept, and a session's conversation so far unless
+/// [`extract_conversations`] (its transcript is extracted once it ends). A source no type claims, such as a loaded corpus's, is a document
 /// ([`crate::episode_types::of`]).
 pub(crate) fn typed(scope: &Scope, ep: &Episode) -> bool {
     // A conversation kept to train an advice model on, tool output and all: never read for facts.
@@ -2171,6 +2171,16 @@ pub(crate) fn typed(scope: &Scope, ep: &Episode) -> bool {
     }
     // A session's whole transcript, kept for its author to check notes against: never read for facts.
     if crate::transcripts::is_transcript(&ep.source) {
+        return false;
+    }
+    // A hook's note of a coding session: its session's record is extracted once the session ends, so the same
+    // session isn't read for facts twice.
+    if crate::keep::hook_session_note(&ep.source) {
+        return false;
+    }
+    // A preference the server kept from what the person typed ([`crate::keep`]): their words are read for facts
+    // once, from the session's record, not again from the note.
+    if crate::profile::author_of(&ep.source).is_some_and(|(_, rest)| crate::keep::is_kept(rest)) {
         return false;
     }
     if crate::sessions::conversation_so_far(&ep.source) && !extract_conversations() {

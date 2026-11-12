@@ -931,6 +931,101 @@ fn still_theirs(dir: &Directory, scope: &Scope, l: &Logged) -> bool {
         .is_some_and(|o| !o.removed(&id) && l.asked_at >= o.created_at)
 }
 
+/// The messages each session's keep read already, by session, in this process ([`keep_later`]), as their words
+/// ([`words_of`]): a message is read once however many times, and in whatever form, the conversation it is in reaches
+/// the server. A restart reads some again, and what they keep is a note the person has already
+/// ([`crate::keep::from_user`]).
+static KEEP_READ: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+> = std::sync::LazyLock::new(Default::default);
+/// Sessions [`KEEP_READ`] holds at most: past it, the oldest go.
+const KEEP_SESSIONS: usize = 2_000;
+
+/// A message's words, lowercased, one space apart: the same message as a hook's question (masked on its own) and in
+/// the conversation a Stop sends (clipped, masked with the rest) reads the same, or one starts with the other.
+fn words_of(t: &str) -> String {
+    t.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether two messages' words ([`words_of`]) are one message: the same, or one starts with the other, six words or
+/// more (one form clipped or added to). "yes" is never the start of "yes, and always use pnpm".
+fn same_message(a: &str, b: &str) -> bool {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    short == long || (short.split(' ').count() >= 6 && long.starts_with(&format!("{short} ")))
+}
+
+/// The person's messages in `text`, each with the end of the reply before it: its `User:` turns where `turns` (a
+/// hook's conversation so far, a transcript), else the text as one message (a session's opening, a hook's
+/// question). An agent's own account of a session, with no turns, holds none of the person's words.
+fn typed_in(text: &str, turns: bool) -> Vec<crate::keep::Typed> {
+    let asks = asks(text);
+    if asks.is_empty() && !turns {
+        let (said, _) = person_said(text);
+        return match an_ask(said) {
+            true => vec![crate::keep::Typed {
+                before: String::new(),
+                said: said.to_string(),
+            }],
+            false => vec![],
+        };
+    }
+    let mut before = String::new();
+    asks.into_iter()
+        .map(|a| {
+            let t = crate::keep::Typed {
+                before: std::mem::take(&mut before),
+                said: a.said,
+            };
+            before = a.reply;
+            t
+        })
+        .collect()
+}
+
+/// Keeps, in the background, the preferences the person shows in what they typed into session `l` (`text`, read as
+/// [`typed_in`] reads it), signed `signed` ([`crate::keep::from_user`]): each message once ([`KEEP_READ`]). Never
+/// from a recorder key's session (the key's account of their work isn't their words) or a program's, and never
+/// where the call that carried it is waiting: it answers first.
+pub fn keep_later(store: &Store, scope: &Scope, l: &Logged, signed: &str, text: &str, turns: bool) {
+    if !crate::keep::on() || recorded(l) || automated(l) || text.trim().is_empty() {
+        return;
+    }
+    let typed: Vec<crate::keep::Typed> = {
+        let mut read = KEEP_READ.lock().unwrap();
+        if read.len() >= KEEP_SESSIONS && !read.contains_key(&l.answer_id) {
+            read.clear();
+        }
+        let seen = read.entry(l.answer_id.clone()).or_default();
+        typed_in(text, turns)
+            .into_iter()
+            .filter(|t| {
+                let w = words_of(&t.said);
+                let new = !w.is_empty() && !seen.iter().any(|s| same_message(s, &w));
+                if new {
+                    seen.push(w);
+                }
+                new
+            })
+            .collect()
+    };
+    if typed.is_empty() {
+        return;
+    }
+    let (store, scope, l, signed) = (store.clone(), scope.clone(), l.clone(), signed.to_string());
+    tokio::spawn(async move {
+        let theirs = |dir: &Directory| still_theirs(dir, &scope, &l);
+        if let Err(e) =
+            crate::keep::from_user(&store, &scope, &l.asker, &signed, typed, theirs).await
+        {
+            eprintln!("keep: {scope}: {e:#}");
+        }
+    });
+}
+
 /// Flushes the held session rows every [`flush_interval`], or sooner when many are held.
 pub async fn flush_every() {
     loop {
@@ -1471,14 +1566,18 @@ async fn serve_team(
     Ok((served, changed))
 }
 
-/// Whether `source` is a session's conversation so far (`<signed>session:<id>:conversation`): an episode of the
+/// Whether `source` is a session's conversation so far (`<signed>memstore:session:<id>:conversation`): an episode of the
 /// asker's own, written again at every advice step, which the session's end copies into its transcript
 /// (`<signed>session:<id>`). Facts aren't extracted from it unless `AMPUP_MEMORY_EXTRACT_CONVERSATIONS` is on
 /// ([`crate::extract::typed`]): the transcript is, once the session ends.
 pub fn conversation_so_far(source: &str) -> bool {
+    // `<signed>memstore:session:<id>:conversation`, or `<signed>session:<id>:conversation` as sessions before it kept.
     source
         .strip_suffix(":conversation")
-        .and_then(|s| s.rsplit_once(":session:"))
+        .and_then(|s| {
+            s.rsplit_once(&format!(":{}", crate::SESSION_SOURCE))
+                .or_else(|| s.rsplit_once(":session:"))
+        })
         .is_some_and(|(signed, id)| {
             signed.starts_with(&format!("{}:", crate::REMEMBER_SOURCE))
                 && !id.is_empty()
@@ -1506,7 +1605,7 @@ async fn keep_conversation(
     let body = crate::hook::redact(&tail(c, MAX_TRANSCRIPT));
     let acl: Vec<&str> = s.acl.iter().map(String::as_str).collect();
     let ep = Episode::sourced(
-        &format!("{signed}session:{id}:conversation"),
+        &format!("{signed}{}{id}:conversation", crate::SESSION_SOURCE),
         body.as_bytes(),
         &acl,
     )
@@ -2476,6 +2575,31 @@ fn one_line(s: &str) -> String {
 /// ([`mark_automated`]).
 pub const AUTOMATED: &str = ":sdk";
 
+/// The suffix of the harness of a session a recorder key opened for a member (`x-memstore-as`): the key's account
+/// of their work, from which nothing is kept as the member's own words ([`crate::keep`]).
+pub const RECORDED: &str = ":recorded";
+
+/// A recorder key's session's harness: `harness` (else `mcp`), cut to fit, with [`RECORDED`] after it.
+pub fn recorded_harness(harness: Option<&str>) -> String {
+    let h = harness
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or("mcp");
+    let h: String = h.chars().take(30).collect();
+    match h.ends_with(RECORDED) {
+        true => h,
+        false => format!("{h}{RECORDED}"),
+    }
+}
+
+/// Whether a recorder key opened session `l` for its person ([`RECORDED`]).
+pub fn recorded(l: &Logged) -> bool {
+    l.session
+        .as_ref()
+        .and_then(|s| s.harness.as_deref())
+        .is_some_and(|h| h.ends_with(RECORDED))
+}
+
 /// Whether session `l` was an automated one ([`AUTOMATED`]): advice learns from people's sessions only.
 pub fn automated(l: &Logged) -> bool {
     l.session
@@ -2632,7 +2756,7 @@ pub async fn end(
     Ok(l)
 }
 
-/// Session `id`'s transcript `t` as the episode its end keeps (`<signed>session:<id>`, readable by `acl`), with its
+/// Session `id`'s transcript `t` as the episode its end keeps (`<signed>memstore:session:<id>`, readable by `acl`), with its
 /// task and outcome: as a run's trace is kept (`crate::runs::record`), so advice can learn from a rewarded session.
 fn transcript_episode(
     signed: &str,
@@ -2647,7 +2771,11 @@ fn transcript_episode(
         body.push_str(&format!("\nOutcome: {o}\n"));
     }
     let acl: Vec<&str> = acl.iter().map(String::as_str).collect();
-    Episode::sourced(&format!("{signed}session:{id}"), body.as_bytes(), &acl)
+    Episode::sourced(
+        &format!("{signed}{}{id}", crate::SESSION_SOURCE),
+        body.as_bytes(),
+        &acl,
+    )
 }
 
 /// What became of a PR, for `who`'s sessions that opened it or pushed to its branch (`POST /sessions/prs`,
@@ -3501,7 +3629,10 @@ pub async fn sweep(
                 // many calls, not one per ungraded session in the scope.
                 tried += 1;
                 match grade_tasks(store, scope, d, &l).await {
-                    Ok(true) => done.graded += 1,
+                    Ok(true) => {
+                        done.graded += 1;
+                        crate::advice_loop::graded(scope, &l.asker);
+                    }
                     Ok(false) => {}
                     Err(e) => eprintln!("sessions {scope}: grading {}: {e:#}", l.answer_id),
                 }

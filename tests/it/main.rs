@@ -28,6 +28,7 @@ mod hooks_never_block;
 mod index_known_cap;
 mod index_old_versions;
 mod isolation;
+mod kept_notes;
 mod listing;
 mod local_serve;
 mod mcp_act_as;

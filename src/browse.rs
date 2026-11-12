@@ -5,6 +5,15 @@
 //! - `skills/<slug>`: the skills compiled from the scope's documents (`crate::compile`), there only when the
 //!   caller may read one on the branch read. The folder lists the routing index and each skill with when it
 //!   applies; a skill reads as its markdown with its AIP step graph.
+//! - `notes/…`: the caller's own notes: the preferences AmpUp Memory kept from what they typed, by
+//!   `<category>/<topic>` (`crate::keep`), `unfiled` what it kept before it filed notes, `remembered` what they
+//!   asked to be remembered, and `team` what it shared with everyone once enough people said the same.
+//! - `advice/<team|mine>/<category>/<situation>`: the advice the caller may read (`crate::listing::advice`), each a
+//!   note to read in full.
+//! - `sessions/…`: the caller's own sessions: `ended/<day>` their records (what facts are extracted from) and
+//!   `<harness>/<repo>` what a coding session's hooks kept as it went.
+//!
+//! In those three, a leaf has a `title` (its first line, or a session's first request) to show for its name.
 //!
 //! A path is a JSON array of segments, so a segment may hold `/`. Every listing is built from what the
 //! caller may read and nothing else: an episode they can't see is in no count and names no folder, and a
@@ -152,15 +161,87 @@ async fn ls(
                 tokio::try_join!(episodes(store, session, who), facts(store, session, who))?;
             let entities = by_entity(&facts).len();
             let skills = skill_keys(session, who).len();
+            let (notes, sessions) = (
+                filed(&eps, who, Tree::Notes).len(),
+                filed(&eps, who, Tree::Sessions).len(),
+            );
+            let advice = advice(store, session, who).await?.len();
             let mut children = vec![
+                json!({"name": "advice", "kind": "folder", "path": ["advice"], "count": advice}),
                 json!({"name": "entities", "kind": "folder", "path": ["entities"], "count": entities}),
+                json!({"name": "notes", "kind": "folder", "path": ["notes"], "count": notes}),
+                json!({"name": "sessions", "kind": "folder", "path": ["sessions"], "count": sessions}),
                 json!({"name": "skills", "kind": "folder", "path": ["skills"], "count": skills}),
                 json!({"name": "sources", "kind": "folder", "path": ["sources"], "count": eps.len()}),
             ];
-            children.retain(|c| c["name"] != "skills" || skills > 0);
+            children
+                .retain(|c| c["name"] == "entities" || c["name"] == "sources" || c["count"] != 0);
             Ok(page(children))
         }
         Some("skills") => skills(store, session, who, path, page).await,
+        Some(root @ ("notes" | "sessions")) => {
+            let tree = if root == "notes" {
+                Tree::Notes
+            } else {
+                Tree::Sessions
+            };
+            let eps = episodes(store, session, who).await?;
+            let leaves = filed(&eps, who, tree);
+            let children = folder(path, &leaves)?;
+            titled(store, session.scope(), tree, page(children)).await
+        }
+        Some("advice") => {
+            let advice = advice(store, session, who).await?;
+            let leaves: Vec<(Vec<String>, Value)> = advice
+                .into_iter()
+                .map(|a| {
+                    let at = vec![
+                        a["space"].as_str().unwrap_or("team").to_string(),
+                        a["category"]
+                            .as_str()
+                            .unwrap_or("uncategorized")
+                            .to_string(),
+                        a["situation"].as_str().unwrap_or("general").to_string(),
+                    ];
+                    (at, a)
+                })
+                .collect();
+            let at = &path[1..];
+            if let [space, category, situation] = at {
+                // One piece of advice: its note in full, with how it has done.
+                let found = leaves
+                    .into_iter()
+                    .find(|(p, _)| p == &[space.clone(), category.clone(), situation.clone()]);
+                return match found {
+                    Some((_, a)) => Ok(json!({"path": path, "advice": a})),
+                    None => Err(NotFound.into()),
+                };
+            }
+            let mut folders: BTreeMap<&str, (usize, Option<&Value>)> = BTreeMap::new();
+            for (p, a) in &leaves {
+                if p.starts_with(at) {
+                    let e = folders.entry(p[at.len()].as_str()).or_default();
+                    e.0 += 1;
+                    e.1 = Some(a);
+                }
+            }
+            if folders.is_empty() && !at.is_empty() {
+                return Err(NotFound.into());
+            }
+            let children = folders
+                .into_iter()
+                .map(|(name, (n, a))| {
+                    let mut p = path.to_vec();
+                    p.push(name.to_string());
+                    match (at.len(), a) {
+                        (2, Some(a)) => json!({"name": name, "kind": "advice", "path": p, "title": name,
+                            "status": advice_status(a), "runs": a["runs"], "learned_at": a["learned_at"]}),
+                        _ => json!({"name": name, "kind": "folder", "path": p, "count": n}),
+                    }
+                })
+                .collect();
+            Ok(page(children))
+        }
         Some("sources") => {
             let at: Vec<&str> = path[1..].iter().map(String::as_str).collect();
             let eps = episodes(store, session, who).await?;
@@ -452,6 +533,149 @@ pub(crate) fn once_each(mut facts: Vec<Fact>) -> Vec<Fact> {
     let mut seen = std::collections::HashSet::new();
     facts.retain(|f| seen.insert(f.fact_id.clone()));
     facts
+}
+
+/// The advice the caller may read, each with its note's text.
+async fn advice(store: &Store, session: &Session, who: &Principal) -> Result<Vec<Value>> {
+    let req = json!({"op": "advice", "include": "text"});
+    let listed = crate::listing::advice(store, session, who, &req).await?;
+    Ok(listed["advice"].as_array().cloned().unwrap_or_default())
+}
+
+/// How a piece of advice stands, in a word for a list: `merged`, `held`, `needs backing` or `served`.
+fn advice_status(a: &Value) -> &'static str {
+    if !a["merged_into"].is_null() {
+        "merged"
+    } else if a["held"] == true || !a["withheld"].is_null() {
+        "held"
+    } else if !a["needs_backing"].is_null() {
+        "needs backing"
+    } else {
+        "served"
+    }
+}
+
+/// The derived trees of episodes: what a caller's own notes and sessions are filed as.
+#[derive(Clone, Copy, PartialEq)]
+enum Tree {
+    Notes,
+    Sessions,
+}
+
+/// The caller's own episodes in `tree`, each with the folders it is filed under (below the tree's root).
+fn filed<'a>(eps: &'a [Ep], who: &Principal, tree: Tree) -> Vec<(Vec<String>, &'a Ep)> {
+    let me = who.user();
+    eps.iter()
+        .filter_map(|e| {
+            let (author, rest) = crate::profile::author_of(&e.source)?;
+            let shared = author == crate::keep::SHARER && rest == "shared";
+            if !shared && !author.eq_ignore_ascii_case(me) {
+                return None;
+            }
+            let at: Vec<String> = match tree {
+                Tree::Notes if shared => vec!["team".into()],
+                Tree::Notes if crate::keep::is_kept(rest) => {
+                    match rest.splitn(3, ':').collect::<Vec<_>>()[..] {
+                        [_, category, topic] => vec![category.into(), topic.into()],
+                        _ => vec!["unfiled".into()],
+                    }
+                }
+                Tree::Notes if crate::profile::is_note(rest) => vec!["remembered".into()],
+                Tree::Sessions
+                    if crate::session_record_source(&e.source).is_some()
+                        || rest.starts_with("session:") =>
+                {
+                    vec!["ended".into(), day(e.occurred_at)]
+                }
+                Tree::Sessions if crate::keep::hook_session_note(&e.source) => {
+                    let parts: Vec<&str> = rest.split(':').collect();
+                    vec![parts[0].into(), parts[1].into()]
+                }
+                _ => return None,
+            };
+            Some((at, e))
+        })
+        .collect()
+}
+
+/// A time's day, `YYYY-MM-DD` (UTC).
+fn day(us: i64) -> String {
+    chrono::DateTime::from_timestamp_micros(us)
+        .map_or_else(|| "undated".into(), |t| t.format("%Y-%m-%d").to_string())
+}
+
+/// The children at `path` (its root first) of a derived tree's `leaves`: a folder per next segment with how
+/// many are under it, and each leaf filed right here, newest first by name (`<day>-<id8>`).
+fn folder(path: &[String], leaves: &[(Vec<String>, &Ep)]) -> Result<Vec<Value>> {
+    let at = &path[1..];
+    let mut folders: BTreeMap<&str, (usize, i64)> = BTreeMap::new();
+    let mut here = vec![];
+    for (p, e) in leaves.iter().filter(|(p, _)| p.starts_with(at)) {
+        match p.get(at.len()) {
+            Some(s) => {
+                let f = folders.entry(s).or_default();
+                f.0 += 1;
+                f.1 = f.1.max(e.occurred_at);
+            }
+            None => here.push(*e),
+        }
+    }
+    if folders.is_empty() && here.is_empty() && !at.is_empty() {
+        return Err(NotFound.into());
+    }
+    let mut children: Vec<Value> = folders
+        .into_iter()
+        .map(|(name, (n, latest))| {
+            let mut p = path.to_vec();
+            p.push(name.to_string());
+            json!({"name": name, "kind": "folder", "path": p, "count": n, "latest": latest})
+        })
+        .collect();
+    here.sort_by_key(|e| std::cmp::Reverse(e.occurred_at));
+    children.extend(here.into_iter().map(|e| {
+        let name = format!("{}-{}", day(e.occurred_at), &e.id[..e.id.len().min(8)]);
+        json!({"name": name, "kind": "episode", "path": path, "episode_id": e.id, "occurred_at": e.occurred_at})
+    }));
+    Ok(children)
+}
+
+/// Page `listed`, with each episode on it titled by its first line, or a session record by its first request.
+async fn titled(store: &Store, scope: &Scope, tree: Tree, mut listed: Value) -> Result<Value> {
+    let ids: Vec<String> = listed["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c["episode_id"].as_str().map(String::from))
+        .collect();
+    if ids.is_empty() {
+        return Ok(listed);
+    }
+    let bodies = store.episode_bodies(scope, ids).await?;
+    for c in listed["children"].as_array_mut().into_iter().flatten() {
+        let Some(b) = c["episode_id"].as_str().and_then(|id| bodies.get(id)) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(b);
+        let line = text
+            .lines()
+            .map(|l| l.trim().trim_start_matches('#').trim())
+            .map(|l| match tree {
+                Tree::Sessions => l
+                    .strip_prefix("User:")
+                    .or(l.strip_prefix("Task:"))
+                    .unwrap_or(l)
+                    .trim(),
+                Tree::Notes => l,
+            })
+            .find(|l| !l.is_empty())
+            .unwrap_or_default();
+        let mut title: String = line.chars().take(90).collect();
+        if line.chars().count() > 90 {
+            title.push('…');
+        }
+        c["title"] = json!(title);
+    }
+    Ok(listed)
 }
 
 /// Every committed episode the session sees that the caller may read, once each.

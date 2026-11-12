@@ -64,15 +64,34 @@ pub const NOTES_DREAM_SOURCE_TAIL: &str = "memstore:dream";
 /// take it. A retention rule whose prefix starts with it is for transcripts alone ([`retention::Retention`]).
 pub const TRANSCRIPT_SOURCE: &str = "memstore:transcript:";
 
-/// A session transcript's part's author and what follows them (`memstore:transcript:…`), from its source: the author
-/// a service key's `key:<org>/<name>`, else everything up to the next `:`. None for any other source.
-pub fn transcript_source(source: &str) -> Option<(&str, &str)> {
+/// What follows a person in the source of their session records (`mcp:remember_memory:<them>:memstore:session:<id>`,
+/// its conversation so far `…:<id>:conversation`, `memstore::sessions`): a session is no note, and no note may take
+/// it. A retention rule whose prefix starts with it is for session records alone ([`retention::Retention`]).
+pub const SESSION_SOURCE: &str = "memstore:session:";
+
+/// An author's own record's author and what follows them, from its source, where what follows starts with one of
+/// `tails`: the author a service key's `key:<org>/<name>`, else everything up to the next `:`.
+fn own_record<'a>(source: &'a str, tails: &[&str]) -> Option<(&'a str, &'a str)> {
     let rest = source.strip_prefix(REMEMBER_SOURCE)?.strip_prefix(':')?;
     let skip = if rest.starts_with("key:") { 4 } else { 0 };
     let end = skip + rest[skip..].find(':')?;
     let own = &rest[end + 1..];
-    own.starts_with(TRANSCRIPT_SOURCE)
+    tails
+        .iter()
+        .any(|t| own.starts_with(t))
         .then_some((&rest[..end], own))
+}
+
+/// A session transcript's part's author and what follows them (`memstore:transcript:…`), from its source. None for
+/// any other source.
+pub fn transcript_source(source: &str) -> Option<(&str, &str)> {
+    own_record(source, &[TRANSCRIPT_SOURCE])
+}
+
+/// A session record's or a transcript's part's author and what follows them (`memstore:session:…` or
+/// `memstore:transcript:…`), from its source: what retention matches past the author. None for any other source.
+pub fn session_record_source(source: &str) -> Option<(&str, &str)> {
+    own_record(source, &[SESSION_SOURCE, TRANSCRIPT_SOURCE])
 }
 
 /// Whether `source` is what the server derives from one person's own notes and sessions and files under their

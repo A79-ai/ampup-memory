@@ -819,6 +819,9 @@ pub struct SignIn {
     /// (`AMPUP_MEMORY_AUTH0_OPERATORS_ORG`): they manage orgs (create them, bind them to Auth0, set their
     /// admins and members, see every org) and nothing else: [`Change::operators`].
     pub operator: bool,
+    /// A recorder key acting for the member this names (`x-memstore-as`): what it records is the key's account of
+    /// the member's work, never the member's own words, so nothing is kept as theirs from it (`memstore::keep`).
+    pub recorded: bool,
 }
 
 impl SignIn {

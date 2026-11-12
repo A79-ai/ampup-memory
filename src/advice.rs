@@ -1328,7 +1328,9 @@ async fn runs_and_overrides(
     scope: &Scope,
     only: Option<&str>,
 ) -> Result<(Vec<Run>, usize)> {
-    let mut logged: Vec<_> = crate::qa_log::list(store, scope, None)
+    // With the session rows this server holds still (`crate::sessions::list`): a session graded a moment ago
+    // teaches by its graded requests here, not as a whole until a flush.
+    let mut logged: Vec<_> = crate::sessions::list(store, scope)
         .await?
         .into_iter()
         .filter(sorts)
@@ -3481,6 +3483,48 @@ pub(crate) fn served_text(note: &str, today: chrono::NaiveDate) -> String {
         text = without_section(&text, &format!("## {h}"));
     }
     curate::without_ids(&text)
+}
+
+/// The most `[preference]` items of a person's own advice handed at a session's start ([`own_preferences`]).
+pub const OWN_PREFERENCES: usize = 10;
+
+/// The `[preference]` items of `who`'s own advice ([`Space::mine`]): how they want work done, learned from how they
+/// reacted to it (their graded requests), each once and without what it cites, at most [`OWN_PREFERENCES`]. Handed
+/// at a session's start with their notes ([`crate::keep::for_session`]), so a preference learned in one kind of task
+/// reaches every session, not only that task's. Read as their advice is now: forgetting them leaves none.
+pub async fn own_preferences(
+    session: &crate::Session,
+    store: &Store,
+    who: &crate::Principal,
+) -> Result<Vec<String>> {
+    let space = Space::mine(who.user());
+    let prefix = space.note("");
+    let (map, index) = (space.map(), space.index());
+    let today = chrono::Utc::now().date_naive();
+    let mut out: Vec<String> = vec![];
+    for key in session.documents(who, &prefix, None) {
+        if key == map || key == index {
+            continue;
+        }
+        let Some((_, _, body)) = session.document(store, who, &key, None).await? else {
+            continue;
+        };
+        let note = served_text(&String::from_utf8_lossy(&body), today);
+        for line in note.lines() {
+            let Some((_, rest)) = line.split_once("[preference]") else {
+                continue;
+            };
+            let text = rest.rfind("(runs:").map_or(rest, |at| &rest[..at]).trim();
+            if text.is_empty() || out.iter().any(|o| crate::keep::says_same(o, text)) {
+                continue;
+            }
+            out.push(text.to_string());
+            if out.len() == OWN_PREFERENCES {
+                return Ok(out);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `note` (of situation `key`) with a permanent id on each item of a [`KINDED`] section: an item's own if it has
