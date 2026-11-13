@@ -207,14 +207,20 @@ impl OidcConfig {
 /// their verified email, which is what the directory names. A subject id is never used instead: some
 /// providers let it look like an email, which would let it pose as one.
 pub fn email_of(c: &serde_json::Value) -> Result<String> {
-    let email = c["email"]
-        .as_str()
-        .filter(|e| !e.is_empty())
-        .context("the token carries no email (ask the provider for the email scope)")?;
     anyhow::ensure!(
         c["email_verified"] != false && c["email_verified"] != "false",
         "the token's email is not verified"
     );
+    claimed_email(c)
+}
+
+/// The email a token's claims name, lower-cased, verified or not. Only for a sign-in that is marked
+/// unverified and reaches nothing on its email alone (the Auth0 tenant's unapproved password accounts).
+pub fn claimed_email(c: &serde_json::Value) -> Result<String> {
+    let email = c["email"]
+        .as_str()
+        .filter(|e| !e.is_empty())
+        .context("the token carries no email (ask the provider for the email scope)")?;
     // ASCII letters only, as user ids are compared (`directory::user_id`): never a lookalike folded into
     // someone's address.
     Ok(email.to_ascii_lowercase())

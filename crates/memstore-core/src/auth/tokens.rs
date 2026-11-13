@@ -344,6 +344,10 @@ pub struct Caller {
     pub auth0_org: Option<String>,
     /// Signed in through the platform's Auth0 tenant for the operators' Organization.
     pub operator: bool,
+    /// Signed in through the platform's Auth0 tenant with a password account (`auth0|…`) whose email it
+    /// hasn't verified, for an Organization: that account's `sub`. It reaches only an org whose admins
+    /// approved that account ([`crate::people::directory::Directory::access`]).
+    pub unverified: Option<String>,
 }
 
 /// A service account's key as the server matches bearers against it, read from the directory.
@@ -549,13 +553,33 @@ impl Auth0 {
                 }
             }
         }
-        let user = super::oidc::email_of(&claims)?;
-        // The provider check lets an absent claim pass; here only an email said to be verified signs in.
-        anyhow::ensure!(says_verified(&claims), "the token's email is not verified");
         let org_id = claims["org_id"]
             .as_str()
             .filter(|o| !o.is_empty())
             .map(String::from);
+        // The provider check lets an absent claim pass; here only an email said to be verified signs in as
+        // that email. Except a password account (the tenant's database: `auth0|`) signing in to an
+        // Organization, not the operators': it signs in marked unverified, and reaches only an org whose
+        // admins approved that very account (the directory's `signin_approved`), so it can ask them to.
+        let unverified = match says_verified(&claims) {
+            true => None,
+            false => {
+                let sub = claims["sub"].as_str().unwrap_or_default();
+                anyhow::ensure!(
+                    sub.starts_with("auth0|")
+                        && sub.len() > "auth0|".len()
+                        && !for_resource
+                        && org_id.is_some()
+                        && org_id.as_deref() != self.operators.as_deref(),
+                    "the token's email is not verified"
+                );
+                Some(sub.to_string())
+            }
+        };
+        let user = match unverified {
+            None => super::oidc::email_of(&claims)?,
+            Some(_) => super::oidc::claimed_email(&claims)?,
+        };
         let orgs: Vec<&String> = bound
             .iter()
             .filter(|(_, id)| Some(id) == org_id.as_ref())
@@ -589,11 +613,12 @@ impl Auth0 {
             aliases: vec![user.clone()],
             user,
             person: true,
-            email_verified: platform,
+            email_verified: platform && unverified.is_none(),
             orgs: if by_directory { None } else { Some(orgs) },
             auth0: !by_directory,
             auth0_org: org_id,
             operator,
+            unverified,
             ..Default::default()
         })
     }

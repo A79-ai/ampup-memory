@@ -35,6 +35,9 @@ pub struct Authorization {
     verified_email: bool,
     auth0: bool,
     auth0_org: Option<String>,
+    /// An unverified password sign-in's Auth0 account: the job reaches only what an approval let it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unverified: Option<String>,
 }
 
 impl Authorization {
@@ -49,6 +52,7 @@ impl Authorization {
             verified_email: via.verified_email,
             auth0: via.auth0,
             auth0_org: via.auth0_org.clone(),
+            unverified: via.unverified.clone(),
         }
     }
 
@@ -69,6 +73,7 @@ impl Authorization {
             verified_email: self.verified_email,
             auth0: self.auth0,
             auth0_org: self.auth0_org.clone(),
+            unverified: self.unverified.clone(),
             ..Default::default()
         };
         if !self.superuser {

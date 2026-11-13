@@ -71,6 +71,17 @@ pub(crate) fn tenant_token_for(
     sub: &str,
     org_id: Option<&str>,
 ) -> String {
+    tenant_token_verified(issuer, user, sub, org_id, true)
+}
+
+/// [`tenant_token_for`], saying whether the tenant verified the email (a password account may not have).
+pub(crate) fn tenant_token_verified(
+    issuer: &str,
+    user: &str,
+    sub: &str,
+    org_id: Option<&str>,
+    verified: bool,
+) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -80,7 +91,7 @@ pub(crate) fn tenant_token_for(
     jsonwebtoken::encode(
         &header,
         &json!({"iss": issuer, "aud": CLIENT_ID, "sub": sub, "email": user, "org_id": org_id,
-                "email_verified": true, "iat": now, "exp": now + 3600}),
+                "email_verified": verified, "iat": now, "exp": now + 3600}),
         &jsonwebtoken::EncodingKey::from_rsa_pem(include_bytes!("../fixtures/idp_key.pem"))
             .unwrap(),
     )
@@ -2084,6 +2095,144 @@ async fn asking_to_join_grants_nothing_until_an_admin_approves() {
     ] {
         let v = me(&t).await;
         assert_eq!(v["auth0_orgs"], json!([]), "{who}: {v}");
+    }
+
+    // A password account whose email the tenant never verified: anyone can make one under any email, so
+    // it reads nothing on its own. Signed in for no Organization it is refused outright; for an org's
+    // Organization it asks that org's admins, and once one approves, that account (and no other) reads
+    // that org (and no other). A member can't approve it, nor can it approve itself.
+    let unverified = |user: &str, sub: &str, org: Option<&str>| {
+        tenant_token_verified(&tenant, user, sub, org, false)
+    };
+    let (status, body) = get(
+        &format!("{s}/me"),
+        &unverified("bob@acme.com", "auth0|rob", None),
+    )
+    .await;
+    assert_eq!(
+        status, 401,
+        "an unverified email signed in for no org: {body}"
+    );
+    let (status, body) = get(
+        &format!("{s}/me"),
+        &unverified("bob@acme.com", "google-oauth2|rob", Some("org_acme")),
+    )
+    .await;
+    assert_eq!(
+        status, 401,
+        "an unverified email that isn't a password account: {body}"
+    );
+    let rob = unverified("bob@acme.com", "auth0|rob", Some("org_acme"));
+    let v = me(&rob).await;
+    assert_eq!(v["memberships"], json!({}), "{v}");
+    assert_eq!(
+        v["signin"],
+        json!({"org": "acme", "status": "waiting"}),
+        "{v}"
+    );
+    assert_eq!(v["auth0_orgs"], json!([]), "{v}");
+    assert!(
+        !reads_acme(&rob).await,
+        "an unverified password account read acme"
+    );
+    let (status, b) = changes(&rob, json!({"op": "show", "org": "acme"})).await;
+    assert_eq!(status, 403, "{b}");
+    // Someone acme doesn't hold asks nobody.
+    let v = me(&unverified("zed@x.com", "auth0|zed", Some("org_acme"))).await;
+    assert_eq!(
+        v["signin"],
+        json!({"org": "acme", "status": "not_member"}),
+        "{v}"
+    );
+    let (status, b) = changes(&ann, json!({"op": "show", "org": "acme"})).await;
+    assert_eq!(status, 200, "{b}");
+    assert_eq!(
+        b["view"]["signin_requests"]["bob@acme.com"]["sub"],
+        json!("auth0|rob"),
+        "{b}"
+    );
+    assert!(
+        b["view"]["signin_requests"].get("zed@x.com").is_none(),
+        "{b}"
+    );
+    let approve = json!({"op": "approve_signin", "org": "acme", "user": "bob@acme.com"});
+    for (who, t) in [("a member", &bob), ("the account itself", &rob)] {
+        let (status, b) = changes(t, approve.clone()).await;
+        assert_eq!(status, 403, "{who} approved an unverified sign-in: {b}");
+    }
+    assert!(!reads_acme(&rob).await);
+    let (status, b) = changes(&ann, approve.clone()).await;
+    assert_eq!(status, 200, "{b}");
+    let t = Instant::now();
+    while !reads_acme(&rob).await {
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "approved, still refused"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let v = me(&rob).await;
+    assert_eq!(v["memberships"]["acme"]["role"], json!("member"), "{v}");
+    assert_eq!(v["signin"], Value::Null, "{v}");
+    // Approved is that account only: another password account under the same email still waits.
+    let other = unverified("bob@acme.com", "auth0|other", Some("org_acme"));
+    assert!(
+        !reads_acme(&other).await,
+        "an approval let in another account"
+    );
+    assert_eq!(me(&other).await["signin"]["status"], json!("waiting"));
+    // And in acme only: beta's admins vouched for nobody, even once beta holds bob.
+    let (status, b) = changes(
+        &ann,
+        json!({"op": "invite", "org": "beta", "members": [{"user": "bob@acme.com"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    let rob_beta = unverified("bob@acme.com", "auth0|rob", Some("org_beta"));
+    let v = me(&rob_beta).await;
+    assert_eq!(
+        v["memberships"],
+        json!({}),
+        "acme's approval reached beta: {v}"
+    );
+    assert_eq!(
+        v["signin"],
+        json!({"org": "beta", "status": "waiting"}),
+        "{v}"
+    );
+    // Declined: still out, and told so.
+    let (status, b) = changes(
+        &ann,
+        json!({"op": "decline_signin", "org": "acme", "user": "bob@acme.com"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    assert!(!reads_acme(&other).await);
+    assert_eq!(me(&other).await["signin"]["status"], json!("declined"));
+    assert!(
+        reads_acme(&rob).await,
+        "a decline of another account undid the approval"
+    );
+    // Removed from acme, the approval goes too: an invite back starts over.
+    let (status, b) = changes(
+        &ann,
+        json!({"op": "remove_member", "org": "acme", "user": "bob@acme.com"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    let (status, b) = changes(
+        &ann,
+        json!({"op": "invite", "org": "acme", "members": [{"user": "bob@acme.com"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    let t = Instant::now();
+    while reads_acme(&rob).await {
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "the approval outlived the removal"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 

@@ -171,6 +171,9 @@ pub const OPS: &[&str] = &[
     "member.forget",
     "member.request",
     "member.decline",
+    "signin.request",
+    "signin.approve",
+    "signin.decline",
     "auth.provider",
     "domain.add",
     "domain.remove",
@@ -264,6 +267,11 @@ impl Event {
     }
     pub fn detail(mut self, detail: &str) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+    /// Written at [`OPS_VERSION`]: an op newer than some engines, which must stop at it, not skip it.
+    fn new_op(mut self) -> Self {
+        self.version = self.version.max(OPS_VERSION);
         self
     }
 
@@ -504,11 +512,34 @@ pub struct Org {
     /// a decline isn't answered with another mail to every admin at once. An invite clears it.
     #[serde(skip)]
     declined: BTreeMap<String, i64>,
+    /// Members who signed in with a password the platform's Auth0 tenant hasn't verified the email of
+    /// (`request_signin`): each with the Auth0 account that signed in and when (µs). Nothing until an
+    /// admin approves it (`approve_signin`): anyone can make a password account under any email, so the
+    /// email alone vouches for no one.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub signin_requests: BTreeMap<String, SignInRequest>,
+    /// The Auth0 account (`sub`) an admin approved for each member whose email the tenant hasn't verified:
+    /// that account, and no other, signs in to this org as them ([`Directory::access`]), and in no other
+    /// org, since only this org's admins vouched for it.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub signin_approved: BTreeMap<String, String>,
+    /// Unverified sign-ins an admin turned away, with when (µs): asked again after [`ASK_AGAIN_AFTER`].
+    #[serde(skip)]
+    signin_declined: BTreeMap<String, i64>,
     /// Which org of this name it is: the time (µs) the directory's log stamped on its `org.create` (0: the
     /// default org, or one created before the log). A name taken again after a delete is another org, with
     /// another incarnation; audit rows carry the one they were recorded for ([`crate::audit`]).
     #[serde(skip)]
     pub created_at: i64,
+}
+
+/// A member's sign-in whose email the platform's Auth0 tenant hasn't verified, waiting for an admin.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInRequest {
+    /// The Auth0 account that signed in (its `sub`, a password account: `auth0|…`).
+    pub sub: String,
+    /// When it last asked (µs).
+    pub at: i64,
 }
 
 impl Org {
@@ -533,6 +564,14 @@ impl Org {
             v["keys"] = json!(keys);
         }
         v
+    }
+
+    /// Whether an admin turned down `user`'s unverified sign-in (a [`user_id`]) less than
+    /// [`ASK_AGAIN_AFTER`] before `now` (µs).
+    pub fn signin_declined_since(&self, user: &str, now: i64) -> bool {
+        self.signin_declined
+            .get(user)
+            .is_some_and(|at| now - at < ASK_AGAIN_AFTER)
     }
 
     /// Whether an admin removed `user` (a [`user_id`]) and no invite brought them back.
@@ -815,6 +854,10 @@ pub struct SignIn {
     pub auth0: bool,
     /// That Organization (the token's `org_id`).
     pub auth0_org: Option<String>,
+    /// Signed in through the platform's Auth0 tenant with a password account whose email it hasn't
+    /// verified: that account's `sub`. It counts only in an org whose admins approved that very account
+    /// for this email (`approve_signin`), and nowhere else ([`Directory::access`]).
+    pub unverified: Option<String>,
     /// Signed in through the platform's Auth0 tenant for the operators' Organization
     /// (`AMPUP_MEMORY_AUTH0_OPERATORS_ORG`): they manage orgs (create them, bind them to Auth0, set their
     /// admins and members, see every org) and nothing else: [`Change::operators`].
@@ -1332,6 +1375,12 @@ struct SnapOrg {
     pending: BTreeMap<String, i64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     declined: BTreeMap<String, i64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    signin_requests: BTreeMap<String, SignInRequest>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    signin_approved: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    signin_declined: BTreeMap<String, i64>,
     created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace: Option<crate::workspace::Spec>,
@@ -1730,9 +1779,37 @@ impl Directory {
                     org.pending.remove(&u);
                     org.declined.insert(u, e.at);
                 }
+                ("signin.request", _, Some(u)) => {
+                    if let Some(sub) = e.detail.clone().filter(|s| !s.is_empty())
+                        && org.members.contains_key(&u)
+                        && org.signin_approved.get(&u) != Some(&sub)
+                    {
+                        // The first account to ask stands until answered: never swapped for another.
+                        org.signin_requests
+                            .entry(u)
+                            .or_insert(SignInRequest { sub, at: e.at });
+                    }
+                }
+                ("signin.approve", _, Some(u)) => {
+                    if let Some(sub) = e.detail.clone().filter(|s| !s.is_empty())
+                        && org.members.contains_key(&u)
+                    {
+                        org.signin_requests.remove(&u);
+                        org.signin_declined.remove(&u);
+                        org.signin_approved.insert(u, sub);
+                    }
+                }
+                ("signin.decline", _, Some(u)) => {
+                    org.signin_requests.remove(&u);
+                    org.signin_declined.insert(u, e.at);
+                }
                 ("member.remove", _, Some(u)) => {
                     org.members.remove(&u);
                     org.pending.remove(&u);
+                    // Approved again from scratch if they come back: whoever invites them vouches anew.
+                    org.signin_requests.remove(&u);
+                    org.signin_approved.remove(&u);
+                    org.signin_declined.remove(&u);
                     org.removed.insert(u.clone());
                     for m in org.teams.values_mut() {
                         m.remove(&u);
@@ -1904,6 +1981,9 @@ impl Directory {
                     removed: o.removed.clone(),
                     pending: o.pending.clone(),
                     declined: o.declined.clone(),
+                    signin_requests: o.signin_requests.clone(),
+                    signin_approved: o.signin_approved.clone(),
+                    signin_declined: o.signin_declined.clone(),
                     created_at: o.created_at,
                     workspace: o.workspace.clone(),
                     settings: o.settings.clone(),
@@ -1970,6 +2050,9 @@ impl Directory {
                     removed: o.removed,
                     pending: o.pending,
                     declined: o.declined,
+                    signin_requests: o.signin_requests,
+                    signin_approved: o.signin_approved,
+                    signin_declined: o.signin_declined,
                     created_at: o.created_at,
                     workspace: o.workspace,
                     settings: o.settings,
@@ -2060,6 +2143,13 @@ impl Directory {
         }
         for (name, org) in &self.orgs {
             if !self.vouched(name, via) {
+                continue;
+            }
+            // An email nobody verified is anyone's to type: only the account this org's admins approved
+            // for it counts, and only here.
+            if let Some(sub) = &via.unverified
+                && org.signin_approved.get(&user) != Some(sub)
+            {
                 continue;
             }
             let removed = org.removed.contains(&user);
@@ -2762,6 +2852,30 @@ pub enum Change {
         org: String,
         user: String,
     },
+    /// Ask the org's admins to let in the caller's own password sign-in through the platform's Auth0 tenant,
+    /// whose email the tenant hasn't verified: recorded (`signin_requests`), granting nothing until an admin
+    /// approves it. Only a member of the org asks, through a sign-in for the org's own Auth0 Organization.
+    #[serde(rename = "request_signin")]
+    RequestSignIn {
+        org: String,
+    },
+    /// Let in the Auth0 account a member's unverified sign-in asked for: that account signs in to this org
+    /// as them from now on (and in no other org). An admin's answer.
+    #[serde(rename = "approve_signin")]
+    ApproveSignIn {
+        org: String,
+        user: String,
+        /// The account the admin reviewed (the request's `sub`): approved only if it is still the one
+        /// waiting. None approves whichever waits (a terminal, where the admin just listed it).
+        #[serde(default)]
+        sub: Option<String>,
+    },
+    /// Turn away a member's unverified sign-in: they may ask again after [`ASK_AGAIN_AFTER`].
+    #[serde(rename = "decline_signin")]
+    DeclineSignIn {
+        org: String,
+        user: String,
+    },
     /// Set what the org wants from memory (`memstore org init`).
     SetProfile {
         org: String,
@@ -2906,7 +3020,9 @@ impl Change {
             | Change::AddMember { .. }
             | Change::RemoveMember { .. }
             | Change::Invite { .. }
-            | Change::Decline { .. } => true,
+            | Change::Decline { .. }
+            | Change::ApproveSignIn { .. }
+            | Change::DeclineSignIn { .. } => true,
             // An org's models, its training log and which scopes its readers also search, and nothing else of
             // its settings.
             Change::SetSettings { settings, .. } => {
@@ -2963,6 +3079,9 @@ impl Change {
             | Change::Invite { org, .. }
             | Change::RequestJoin { org }
             | Change::Decline { org, .. }
+            | Change::RequestSignIn { org }
+            | Change::ApproveSignIn { org, .. }
+            | Change::DeclineSignIn { org, .. }
             | Change::SetProfile { org, .. }
             | Change::SetSettings { org, .. }
             | Change::Sync { org, .. }
@@ -3251,7 +3370,10 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
     );
     let imports = matches!(change, Change::ImportKeys { .. });
     // Asking to join is the asker's own: checked below, where the org is known.
-    let asks = matches!(change, Change::RequestJoin { .. });
+    let asks = matches!(
+        change,
+        Change::RequestJoin { .. } | Change::RequestSignIn { .. }
+    );
     // A member's own personal key: theirs to make and revoke, signed in as themselves through a sign-in that
     // counts in this org (`access` applies [`Directory::vouched`]: another org's own provider could name
     // anyone's email), never with a key, and only while the directory holds them there.
@@ -3495,6 +3617,83 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 refuse!("{u} hasn't asked to join {org_name}");
             }
             vec![ev("member.decline").user(&u)]
+        }
+        Change::RequestSignIn { .. } => {
+            // The caller's own: a password account the platform's Auth0 tenant signed in, for this org's own
+            // Organization, under an email it hasn't verified.
+            let Some(sub) = actor.via.unverified.as_deref().filter(|_| {
+                actor.via.person
+                    && actor.via.key.is_none()
+                    && actor.via.auth0
+                    && !actor.via.operator
+            }) else {
+                refuse!(
+                    "{me} didn't sign in with an unverified password account: there is nothing for {org_name}'s admins to approve"
+                );
+            };
+            if dir.auth0_bound(actor.via.auth0_org.as_deref()) != Some(org_name) {
+                refuse!(
+                    "{me} signed in for another org: ask {org_name}'s admins through {org_name}'s own sign-in"
+                );
+            }
+            let u = user_id(me);
+            if !plain_email(&u) {
+                invalid!("{u:?} is not a plain email address (letters, digits, . _ + - @)");
+            }
+            // Only the org's own people: anyone else asks to join, which needs a verified email.
+            if !org.members.contains_key(&u) || org.removed.contains(&u) {
+                refuse!("{u} is not a member of {org_name}: an admin adds them first");
+            }
+            if org.signin_approved.get(&u).map(String::as_str) == Some(sub) {
+                refuse!("{u}'s sign-in is approved in {org_name} already");
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            if org
+                .signin_declined
+                .get(&u)
+                .is_some_and(|at| now - at < ASK_AGAIN_AFTER)
+            {
+                refuse!(
+                    "an admin of {org_name} turned {u}'s sign-in down today: verify your email, or ask again tomorrow"
+                );
+            }
+            match org.signin_requests.get(&u) {
+                // Asked already, by this account: the admins were told.
+                Some(r) if r.sub == sub => vec![],
+                // Another account under this email waits: never swapped for it under an admin's eyes.
+                Some(_) => refuse!(
+                    "another account's sign-in as {u} waits for {org_name}'s admins: they answer that one first"
+                ),
+                _ if org.signin_requests.len() >= MAX_PENDING => refuse!(
+                    "{MAX_PENDING} sign-ins wait for {org_name}'s admins already: ask again once they have answered them"
+                ),
+                _ => vec![ev("signin.request").user(&u).detail(sub).new_op()],
+            }
+        }
+        Change::ApproveSignIn { user, sub, .. } => {
+            let u = user_id(user);
+            let Some(r) = org.signin_requests.get(&u) else {
+                refuse!("{u} has no sign-in waiting in {org_name}");
+            };
+            if sub.as_ref().is_some_and(|s| *s != r.sub) {
+                refuse!(
+                    "{u}'s waiting sign-in is another account's than the one reviewed: look again"
+                );
+            }
+            if !org.members.contains_key(&u) {
+                refuse!("{u} is not a member of {org_name}");
+            }
+            vec![ev("signin.approve").user(&u).detail(&r.sub).new_op()]
+        }
+        Change::DeclineSignIn { user, .. } => {
+            let u = user_id(user);
+            if !org.signin_requests.contains_key(&u) {
+                refuse!("{u} has no sign-in waiting in {org_name}");
+            }
+            vec![ev("signin.decline").user(&u).new_op()]
         }
         Change::Invite { members, .. } => {
             let mut out = vec![];

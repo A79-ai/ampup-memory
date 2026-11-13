@@ -44,6 +44,7 @@ pub mod ratelimit;
 mod reads;
 mod reports;
 mod routing;
+mod signin;
 pub mod writer;
 
 /// Rebuild the catalog this often (`AMPUP_MEMORY_CATALOG_REFRESH_SECS`, default 300): inside SPCS its session
@@ -2274,6 +2275,7 @@ async fn request_principal(
                 auth0: c.auth0,
                 auth0_org: c.auth0_org,
                 operator: c.operator,
+                unverified: c.unverified,
                 recorded: false,
             };
             let who = if c.person || via.key.is_some() {
@@ -5569,7 +5571,7 @@ async fn handle(
         let pending: Vec<String> = dir
             .as_ref()
             .ok()
-            .filter(|_| via.person)
+            .filter(|_| via.person && via.verified_email)
             .map(|d| d.pending_of(who.user()))
             .unwrap_or_default();
         // A sign-in through the Auth0 tenant for no Organization: where the person belongs, to sign in to.
@@ -5580,6 +5582,12 @@ async fn handle(
             .into_iter()
             .map(|(org, auth0_org)| json!({"org": org, "auth0_org": auth0_org}))
             .collect();
+        // An unverified password sign-in the org doesn't let in yet: its admins are asked (once), and the
+        // console says so instead of showing an empty org.
+        let signin = match &dir {
+            Ok(d) => signin::on_me(&state, who.user(), &via, d).await,
+            Err(_) => None,
+        };
         let profile = match (&dir, &scope) {
             (Ok(d), Ok(s)) if reads => json!(
                 s.org_name()
@@ -5598,7 +5606,7 @@ async fn handle(
             json!({"user": who.user(), "groups": who.groups(), "admin": superuser || via.operator, "scope": scope,
                    "refused": refused, "memberships": memberships, "profile": profile,
                    "signed_in_for": via.orgs, "provider_groups": via.groups, "api_key": via.key,
-                   "auth0_orgs": auth0_orgs, "pending": pending}),
+                   "auth0_orgs": auth0_orgs, "pending": pending, "signin": signin}),
         ));
     }
     if let Ok(s) = &scope {
