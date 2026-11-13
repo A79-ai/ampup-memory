@@ -3,7 +3,7 @@
 The memory for agents that gets better with use: it learns advice from the runs that went well and serves it
 before the next one.
 
-**[Docs](https://docs.ampup.ai/integrations/overview)** · **[Website](https://www.ampup.ai/companybrain)** ·
+**[Docs](https://docs.ampup.ai/ampup-memory/overview)** · **[Website](https://www.ampup.ai/ampup-memory)** ·
 [Quickstart](https://docs.ampup.ai/ampup-memory/quickstart)
 
 A conversation is a session. Each task in it asks for advice (`get_advice`) and gets one skill for that kind of
@@ -15,17 +15,33 @@ Apache Iceberg tables in a catalog and bucket you run.
 
 ## Install
 
-Build from source; there are no public release binaries yet. You need `rustup` (the toolchain is pinned in
-`rust-toolchain.toml`) and `protoc` on your `PATH`. macOS on Apple Silicon or Linux on arm64/x86_64.
+AmpUp also runs it for you: [hosted AmpUp Memory](https://www.ampup.ai/ampup-memory) needs no install beyond the
+plugin. To run it yourself:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/install.sh | sh
+```
+
+That puts `ampup-memory` (server and CLI) and `ampup-memory-client` (hooks for coding agents) in `~/.local/bin`, from
+the newest [release](https://github.com/A79-ai/ampup-memory/releases), for macOS on Apple Silicon or Linux on
+arm64/x86_64. It needs only `curl` (or `wget`) and `tar`; `AMPUP_MEMORY_INSTALL=client` installs the client alone.
+The command was `memstore` before the rename, and `memstore` still works as a link to it.
+
+To build from source instead, you need `rustup` (the toolchain is pinned in `rust-toolchain.toml`) and `protoc` on
+your `PATH`:
 
 ```bash
 cargo install --locked --path .                                        # ampup-memory: server and CLI
 cargo install --locked --path crates/memstore-client --root ~/.local   # ampup-memory-client: hooks for coding agents
 ```
 
-For Claude Code, add this checkout as a plugin marketplace: `/plugin marketplace add /path/to/ampup-memory`, then
-`/plugin install ampup-memory@ampup-memory` ([coding agents](https://docs.ampup.ai/ampup-memory/coding-agents)). The command was `memstore`
-before the rename, and `memstore` still works as a link to it.
+For Claude Code, add this repository as a plugin marketplace and install the plugin; it downloads its client from the
+releases if none is installed ([coding agents](https://docs.ampup.ai/ampup-memory/coding-agents)):
+
+```text
+/plugin marketplace add A79-ai/ampup-memory
+/plugin install ampup-memory@ampup-memory
+```
 
 ## Run it locally
 
@@ -93,7 +109,7 @@ run.end("deployed", reward=1)
 
 ## Docs
 
-The docs live at **[docs.ampup.ai](https://docs.ampup.ai/integrations/overview)**; the same guides are in
+The docs live at **[docs.ampup.ai](https://docs.ampup.ai/ampup-memory/overview)**; the same guides are in
 [docs/guide](docs/guide) here.
 
 - [Quickstart](https://docs.ampup.ai/ampup-memory/quickstart) and [concepts](https://docs.ampup.ai/ampup-memory/concepts): episodes, facts, sessions,

@@ -24,8 +24,12 @@ name: Release
 # binaries, ONNX Runtime's and the embedding model's, kept current by .github/scripts/third-party-notices.sh.
 #
 # Platforms: Linux x86_64 and arm64 (glibc 2.39 or newer: built on Ubuntu 24.04) and Apple Silicon macOS. No Intel
-# macOS: onnxruntime (ort) ships no prebuilt library for it. macOS builds aren't signed or notarized yet:
-# install.sh clears the quarantine flag.
+# macOS: onnxruntime (ort) ships no prebuilt library for it.
+#
+# macOS builds are signed with a Developer ID and notarized when the signing secrets are set
+# (.github/scripts/macos-sign.sh names them); without them they're unsigned, and install.sh clears the quarantine
+# flag of an unsigned binary. The secrets live in the `release` environment, which only release tags (v*,
+# client-v*) may use: the build job names it, and nothing a pull request runs can reach them.
 on:
   push:
     tags: ["v*", "client-v*"]
@@ -47,6 +51,7 @@ jobs:
     # Dispatched on anything but a release tag, it builds nothing.
     if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/client-v')
     runs-on: ${{ matrix.runner }}
+    environment: release # the signing secrets (above)
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -74,6 +79,20 @@ jobs:
         env:
           AMPUP_MEMORY_RELEASE: ${{ steps.kind.outputs.version }}
         run: cargo build --release --locked --bin ampup-memory --bin ampup-memory-client
+      # Stripped before signing (stripping a signed binary breaks its signature), and both checked as they ship.
+      - name: Strip
+        run: strip target/release/ampup-memory target/release/ampup-memory-client
+      # Every macOS build: signed with the Developer ID certificate and notarized by Apple when the signing secrets
+      # are set, unsigned as before (and it says so) when they aren't. .github/scripts/macos-sign.sh says which.
+      - name: Sign and notarize
+        if: runner.os == 'macOS'
+        env:
+          MACOS_SIGNING_CERT_P12: ${{ secrets.MACOS_SIGNING_CERT_P12 }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: .github/scripts/macos-sign.sh target/release/ampup-memory target/release/ampup-memory-client
       - name: Check the build
         run: .github/scripts/release-check.sh target/release/ampup-memory target/release/ampup-memory-client
       # The committed THIRD-PARTY-NOTICES.txt must be what the script makes of this Cargo.lock (a crate under a
@@ -93,7 +112,6 @@ jobs:
           KIND: ${{ steps.kind.outputs.kind }}
           TARGET: ${{ matrix.target }}
         run: |
-          strip target/release/ampup-memory target/release/ampup-memory-client
           # The binaries beside the license, the notice and the third-party notices, all at the archive's top, each
           # binary with a link by its old name (memstore, memstore-client).
           docs=(LICENSE NOTICE THIRD-PARTY-NOTICES.txt)

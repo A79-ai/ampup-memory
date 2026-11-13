@@ -126,8 +126,11 @@ bin=$tmp/out/ampup-memory-client
 # Moved into place whole: a hook running the old copy keeps it, the next one runs the new.
 mv "$bin" "$dir/ampup-memory-client.new"
 chmod 755 "$dir/ampup-memory-client.new"
-# Not signed yet: a download is quarantined, and Gatekeeper would refuse it.
-[ "$os" = apple-darwin ] && xattr -d com.apple.quarantine "$dir/ampup-memory-client.new" 2>/dev/null || true
+# Signed with a Developer ID and notarized (a release built with the signing secrets): any quarantine flag stays, for
+# Gatekeeper to check. Unsigned (one built without them): a quarantined download would be refused, so its flag goes.
+if [ "$os" = apple-darwin ] && ! codesign --verify -R='anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13]' "$dir/ampup-memory-client.new" 2>/dev/null; then
+  xattr -d com.apple.quarantine "$dir/ampup-memory-client.new" 2>/dev/null || true
+fi
 mv -f "$dir/ampup-memory-client.new" "$dir/ampup-memory-client"
 # The old name, for what still runs it (an older plugin, a script): a link, so it is always this one.
 ln -sf ampup-memory-client "$dir/memstore-client.new" && mv -f "$dir/memstore-client.new" "$dir/memstore-client"

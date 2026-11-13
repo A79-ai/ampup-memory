@@ -4,16 +4,18 @@ The plugin in [`plugins/ampup-memory`](../../plugins/ampup-memory) closes the le
 it never depends on the model choosing to call a tool. The same hooks install into Codex, Gemini CLI, Cursor and
 Copilot with one command.
 
-There are no public release binaries yet. Build the client from source.
-
 ## Claude Code
 
-1. Build `ampup-memory-client`, the small binary the plugin runs (sign-in, hooks, MCP bridge), into `~/.local/bin`,
-   where the plugin looks first:
+1. Nothing to build: the plugin runs `ampup-memory-client`, a small binary (sign-in, hooks, MCP bridge), and
+   downloads it from the [public releases](https://github.com/A79-ai/ampup-memory/releases) when none is installed.
+   To install it ahead of time, or with the server:
 
    ```bash
-   cargo install --locked --path crates/memstore-client --root ~/.local
+   curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/install.sh | sh
    ```
+
+   A client built from source (`cargo install --locked --path crates/memstore-client --root ~/.local`) also works;
+   the plugin looks in `~/.local/bin` first.
 
 2. Run a server. On a laptop:
 
@@ -27,7 +29,7 @@ There are no public release binaries yet. Build the client from source.
 3. Add this repository as a plugin marketplace and install the plugin (in Claude Code):
 
    ```text
-   /plugin marketplace add /path/to/ampup-memory
+   /plugin marketplace add A79-ai/ampup-memory
    /plugin install ampup-memory@ampup-memory
    ```
 

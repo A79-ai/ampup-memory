@@ -1,9 +1,19 @@
 # Quickstart
 
-From a checkout of this repository to a running memory, a first note, a first search and a first piece of advice.
-Everything here runs on one machine with no cloud account.
+From nothing to a running memory, a first note, a first search and a first piece of advice. Everything here runs on
+one machine with no cloud account.
 
-## 1. Build
+## 1. Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/install.sh | sh
+```
+
+That installs `ampup-memory` (server and CLI) and `ampup-memory-client` into `~/.local/bin` from the newest
+[release](https://github.com/A79-ai/ampup-memory/releases), with only `curl` (or `wget`) and `tar`. Set
+`AMPUP_MEMORY_INSTALL_DIR` for another directory, or `AMPUP_MEMORY_VERSION` for a given release.
+
+### Or build from source
 
 You need:
 
@@ -18,8 +28,6 @@ You need:
 cargo install --locked --path .                                    # ampup-memory: server and CLI
 cargo install --locked --path crates/memstore-client --root ~/.local   # ampup-memory-client: hooks and MCP bridge
 ```
-
-There are no public release binaries yet.
 
 ## 2. Run it
 

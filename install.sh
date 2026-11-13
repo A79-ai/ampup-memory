@@ -166,8 +166,12 @@ for bin in ampup-memory ampup-memory-client memstore memstore-client; do
   [ -f "$tmp/out/$bin" ] && [ ! -L "$tmp/out/$bin" ] || continue
   mv -f "$tmp/out/$bin" "$dir/$bin"
   chmod 755 "$dir/$bin"
-  # Not signed yet: a file the browser or AirDrop downloaded is quarantined, and Gatekeeper would refuse it.
-  [ "$os" = apple-darwin ] && xattr -d com.apple.quarantine "$dir/$bin" 2>/dev/null || true
+  # A release built with the signing secrets is signed with a Developer ID and notarized: it keeps any quarantine
+  # flag, for Gatekeeper to check. One built without them is unsigned, and once quarantined (a file the browser or
+  # AirDrop downloaded) Gatekeeper would refuse it, so its flag is cleared.
+  if [ "$os" = apple-darwin ] && ! codesign --verify -R='anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13]' "$dir/$bin" 2>/dev/null; then
+    xattr -d com.apple.quarantine "$dir/$bin" 2>/dev/null || true
+  fi
   echo "installed $("$dir/$bin" --version) to $dir/$bin"
   # The command's name before the rename, a link to it (made beside it, then moved over whatever was there).
   case "$bin" in
