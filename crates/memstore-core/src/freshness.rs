@@ -9,13 +9,16 @@
 //!   in the same words with different numbers ("later on <date>: <its value>"). It says what replaced a value and
 //!   when, which neither the dates beside each value nor a `stale` mark do. A word match, not an understanding;
 //! - **stale** (only where [`KINDS_ENV`] names it): not stated again within the predicate's `freshness_days` ("as
-//!   of <date>, not confirmed since"); a status with `pending` values ages only while pending;
+//!   of <date>, not confirmed since"); a status with `pending` values ages only while pending. Stated again means by
+//!   a source independent of the ones that stated it ([`Stated`]): the same source or an agent saying it again,
+//!   or an echo of it, confirms nothing;
 //! - **overdue**: a plan date that has passed while nothing says its entity is settled (no status, or a status
 //!   still at a `pending` value), and that pending status. The note says what is known, not what to conclude:
 //!   "passed; nothing since says it happened or was dropped". A settled status (`done`, `won`) marks nothing.
 //!
 //! A fact both later and stale is later. Nothing is written, no model is asked and no job runs: the marks come from
-//! the facts' own times and words on every read, so a value stated again is fresh again at once, and history
+//! the facts' own times and words (and the restatements reconcile recorded, [`crate::corroboration`]) on every read,
+//! so a value stated again is fresh again at once, and history
 //! (`as_of`, `changes`) reads as it did. Nothing is dropped and nothing ranks differently either: a mark is a note on
 //! what is served. Reads mark facts only where the scope asks ([`on`]), so the two can be compared.
 
@@ -278,11 +281,26 @@ fn squash(v: &str) -> String {
         .collect()
 }
 
+/// What tells a value stated again from one only repeated, for the stale rule ([`crate::corroboration::Said`]).
+pub trait Stated {
+    /// Whether `by`, a fact giving `f`'s value, states it again: a source independent of every one that stated `f`,
+    /// whose words aren't an agent's.
+    fn again(&self, f: &Fact, by: &Fact) -> bool;
+    /// When such a source last stated `f`'s value where reconcile kept no fact of it (a repeat it dropped).
+    fn restated(&self, f: &Fact) -> Option<i64>;
+}
+
 /// The marks on `facts` (current facts, each entity's plans and statuses among them) as of `at`, by fact id, of
-/// the kinds reads give ([`KINDS_ENV`]). A fact later and stale is later; stale and overdue, overdue.
-pub fn marks(schemas: &[&Schema], facts: &[&Fact], at: i64) -> HashMap<String, Mark> {
+/// the kinds reads give ([`KINDS_ENV`]). A fact later and stale is later; stale and overdue, overdue. `stated` says
+/// what states a value again.
+pub fn marks(
+    schemas: &[&Schema],
+    facts: &[&Fact],
+    at: i64,
+    stated: &dyn Stated,
+) -> HashMap<String, Mark> {
     let kinds = kinds();
-    let mut out = passed_and_stale(schemas, facts, at);
+    let mut out = passed_and_stale(schemas, facts, at, stated);
     out.retain(|_, m| kinds.contains(m.kind()));
     if kinds.contains("later") {
         out.extend(later(schemas, facts, at));
@@ -444,7 +462,12 @@ fn later(schemas: &[&Schema], facts: &[&Fact], at: i64) -> HashMap<String, Mark>
 }
 
 /// Plans passed and values gone stale (`marks` before restatements): a fact both is overdue.
-fn passed_and_stale(schemas: &[&Schema], facts: &[&Fact], at: i64) -> HashMap<String, Mark> {
+fn passed_and_stale(
+    schemas: &[&Schema],
+    facts: &[&Fact],
+    at: i64,
+    stated: &dyn Stated,
+) -> HashMap<String, Mark> {
     let mut out = HashMap::new();
     let ruled: Vec<(&Fact, Rule)> = facts
         .iter()
@@ -517,14 +540,14 @@ fn passed_and_stale(schemas: &[&Schema], facts: &[&Fact], at: i64) -> HashMap<St
             );
         }
     }
-    // Stale: last stated (this value, by any of its facts here) longer ago than the predicate's window.
-    let mut stated: HashMap<(&str, &str, String), i64> = HashMap::new();
+    // Stale: last stated (this value, by the fact itself or a source independent of it) longer ago than the
+    // predicate's window.
+    let mut same: HashMap<(&str, &str, String), Vec<&Fact>> = HashMap::new();
     for (f, r) in &ruled {
         if r.days.is_some() {
-            let t = stated
-                .entry((f.entity.as_str(), f.predicate.as_str(), squash(&f.value)))
-                .or_insert(f.valid_from);
-            *t = (*t).max(f.valid_from);
+            same.entry((f.entity.as_str(), f.predicate.as_str(), squash(&f.value)))
+                .or_default()
+                .push(f);
         }
     }
     for (f, r) in &ruled {
@@ -535,7 +558,12 @@ fn passed_and_stale(schemas: &[&Schema], facts: &[&Fact], at: i64) -> HashMap<St
         if out.contains_key(&f.fact_id) || (!r.pending.is_empty() && !r.pends(f)) {
             continue;
         }
-        let last = stated[&(f.entity.as_str(), f.predicate.as_str(), squash(&f.value))];
+        let last = same[&(f.entity.as_str(), f.predicate.as_str(), squash(&f.value))]
+            .iter()
+            .filter(|g| g.fact_id == f.fact_id || stated.again(f, g))
+            .map(|g| g.valid_from)
+            .chain(stated.restated(f))
+            .fold(f.valid_from, i64::max);
         if at.saturating_sub(last) > days as i64 * DAY_US {
             out.insert(f.fact_id.clone(), Mark::Stale { since: last });
         }

@@ -118,7 +118,11 @@ pub async fn brief(
                 .iter()
                 .filter(|f| f.valid_to.is_none_or(|t| t > now))
                 .collect();
-            crate::freshness::marks(&schemas, &current, now)
+            let said = crate::corroboration::Said {
+                vis: vec![session.vis()],
+                who,
+            };
+            crate::freshness::marks(&schemas, &current, now, &said)
         }
         false => HashMap::new(),
     };

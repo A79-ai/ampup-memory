@@ -9,8 +9,10 @@
 //! - a message that ages out while the server runs goes on its own, with no write to prompt it;
 //! - loosening the policy brings back what no purge has removed; `memstore org retention` shows it;
 //! - `memstore org purge acme` removes the aged-out messages from every file in the warehouse and index, with the
-//!   record of a conflict one's fact was in, though a member pinned acme's memory before they aged out (a pin holds
-//!   commits, not deleted memory).
+//!   record of a conflict one's fact was in, the records that one stated a fact again (`memstore::corroboration`)
+//!   and the records of what a note's writer was served naming one or its note (`memstore::echo`), though a member
+//!   pinned acme's memory before they aged out (a pin holds commits, not deleted memory); a message hidden by the
+//!   policy no longer counts as a fact's support (`corroboration`) or as stating it again (its `stale` mark).
 //!
 //! And the nightly maintenance window's scheduled purge, held open: org admins alone turn it on (`purge`); in the
 //! org that did, what aged out and what its source deleted leave every file once hidden for the grace, in the
@@ -190,6 +192,45 @@ async fn reads(s: &str, sel: &str, bearer: &str, ids: &[&str]) -> Option<String>
     Some(out)
 }
 
+/// What `bearer`'s search of acme (`search_memory`, JSON) says of the fact whose value is `tag`, once `check` holds
+/// for it (within the servers' staleness window): how many independent sources support it, and its freshness note.
+async fn support(
+    s: &str,
+    bearer: &str,
+    tag: &str,
+    what: &str,
+    check: impl Fn(&Value, &Value) -> bool,
+) {
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_memory",
+                      "arguments": {"query": tag, "format": "json", "k": 5}}});
+    let t = Instant::now();
+    loop {
+        let (status, text) = post(&format!("{s}/mcp?org=acme"), bearer, &call).await;
+        assert_eq!(status, 200, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let hits: Value =
+            serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap_or("null"))
+                .unwrap_or(Value::Null);
+        let hit = hits["hits"]
+            .as_array()
+            .or(hits.as_array())
+            .into_iter()
+            .flatten()
+            .find(|h| h["value"] == tag)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let (n, fresh) = (&hit["corroboration"], &hit["freshness"]["note"]);
+        if check(n, fresh) {
+            return;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "{what}: corroboration {n}, freshness {fresh}: {hits}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Waits until `check` holds for what `bearer` reads (within the servers' staleness window).
 async fn until(
     s: &str,
@@ -233,7 +274,7 @@ fn files_with(root: &Path, tag: &str) -> Vec<PathBuf> {
 }
 
 /// A memory written straight to the catalog (as ingest would): an episode from `source` that happened
-/// `ago` microseconds back, holding `tag`, and a fact whose entity and value carry it. Returns its id.
+/// `ago` microseconds back, holding `tag`, and a fact whose entity and value carry it, stated then. Returns its id.
 async fn seed(store: &Store, scope: &Scope, source: &str, tag: &str, ago: i64) -> String {
     seed_fact(store, scope, source, tag, ago).await.0
 }
@@ -250,7 +291,9 @@ async fn seed_fact(
     let mut ep = Episode::sourced(source, format!("{tag} owner note").as_bytes(), &["*"]);
     ep.occurred_at = chrono::Utc::now().timestamp_micros() - ago;
     let id = ep.episode_id.clone();
-    let f = Fact::new(&format!("deal:{tag}"), "owner", tag).from_episodes(&[&ep]);
+    let mut f = Fact::new(&format!("deal:{tag}"), "owner", tag).from_episodes(&[&ep]);
+    // Stated when the episode happened.
+    f.valid_from = ep.occurred_at;
     let fact = f.fact_id.clone();
     store.commit(scope, "connector", &[ep], &[f]).await.unwrap();
     (id, fact)
@@ -269,6 +312,9 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     std::fs::create_dir_all(&warehouse).unwrap();
     // The index lives under this test's directory, so its files are checked too. Set before any store.
     unsafe { std::env::set_var("AMPUP_MEMORY_INDEX_URI", &index_dir) };
+    // Reads mark a value not stated again within its predicate's `freshness_days` (acme's schema, below) stale.
+    unsafe { std::env::set_var("AMPUP_MEMORY_FRESHNESS", "1") };
+    unsafe { std::env::set_var("AMPUP_MEMORY_FRESHNESS_MARKS", "stale") };
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =
         |tag: &str| -> Vec<PathBuf> { roots.iter().flat_map(|r| files_with(r, tag)).collect() };
@@ -318,6 +364,8 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
         json!({"op": "invite", "org": "acme", "members": [
             {"user": "bob@acme.com"}, {"user": "carol@acme.com", "teams": ["a1"]}]}),
         json!({"op": "create_org", "org": "globex", "admin": "gary@globex.com"}),
+        json!({"op": "set_schema", "org": "acme", "schema": {"name": "deals", "types": {"deal": {"predicates": {
+            "owner": {"type": "string", "freshness_days": 120}}}}}}),
     ] {
         admin(s, change).await;
     }
@@ -358,7 +406,7 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
         .commit(&acme, "extract:test", &[record], &[])
         .await
         .unwrap();
-    let legal = seed(
+    let (legal, legal_fact) = seed_fact(
         &store,
         &acme,
         "slack:C-legal:1.0",
@@ -367,12 +415,85 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     )
     .await;
     let note = seed(&store, &acme, "note:1", "xqoldnote", 100 * DAY).await;
+    // Reconcile's records that an episode stated a fact again (`memstore::corroboration`), as of when it happened:
+    // the old message states the young message's fact and the legal channel's again, the young message the old
+    // one's. Ids only, so the purge that takes the old message or its fact must take each record naming either.
+    let restated = |fact: &str, by: &str, ago: i64| {
+        let mut e = Episode::sourced(
+            "reconcile:test",
+            json!({"restated": [fact, by]}).to_string().as_bytes(),
+            &[memstore::corroboration::ACL],
+        )
+        .without_text_index()
+        .version_of(&memstore::corroboration::key(fact, by));
+        e.occurred_at = chrono::Utc::now().timestamp_micros() - ago;
+        e
+    };
+    // And the records of what Bob's agent was served just before writing a note (`memstore::echo`): one naming the
+    // old message, one whose note is the old note (which ages out later), one naming the young message alone.
+    let served = |note: &str, eps: &[&str]| {
+        Episode::sourced(
+            &format!(
+                "mcp:remember_memory:bob@acme.com:{}",
+                memstore::SERVED_SOURCE_TAIL
+            ),
+            json!({"note": note, "served": eps}).to_string().as_bytes(),
+            &[memstore::echo::ACL],
+        )
+        .without_text_index()
+        .version_of(&format!("{}{note}", memstore::SERVED_PREFIX))
+    };
+    let [bob_note, bob_other] =
+        [b"xqbobnote1".as_slice(), b"xqbobnote2"].map(|n| auth::hex(&sha2::Sha256::digest(n)));
+    let restatements = [
+        memstore::corroboration::key(&young_fact, &old),
+        memstore::corroboration::key(&old_fact, &young),
+        memstore::corroboration::key(&legal_fact, &old),
+    ];
+    let served_keys = [
+        format!("{}{bob_note}", memstore::SERVED_PREFIX),
+        format!("{}{note}", memstore::SERVED_PREFIX),
+        format!("{}{bob_other}", memstore::SERVED_PREFIX),
+    ];
+    store
+        .commit(
+            &acme,
+            "extract:test",
+            &[
+                restated(&young_fact, &old, 100 * DAY),
+                restated(&old_fact, &young, DAY),
+                restated(&legal_fact, &old, 100 * DAY),
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+    store
+        .commit(
+            &acme,
+            "bob@acme.com",
+            &[
+                served(&bob_note, &[&old]),
+                served(&note, &[&young]),
+                served(&bob_other, &[&young]),
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
     let team_old = seed(&store, &a1, "slack:T1:1.0", "xqteamslack", 100 * DAY).await;
     let ids = [old.as_str(), young.as_str(), legal.as_str(), note.as_str()];
     let all = ["xqoldslack", "xqyoungslack", "xqlegalslack", "xqoldnote"];
     until(s, "?org=acme", &bob, &ids, "bob reads acme", |r| {
         r.as_ref()
             .is_some_and(|r| all.iter().all(|t| r.contains(t)))
+    })
+    .await;
+    // The old message supports the young message's fact and the legal channel's (two sources each), and states the
+    // legal channel's again within its 120 days: not stale.
+    support(s, &bob, "xqyoungslack", "two sources", |n, _| n == 2).await;
+    support(s, &bob, "xqlegalslack", "stated again", |n, f| {
+        n == 2 && f.is_null()
     })
     .await;
 
@@ -484,6 +605,14 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
         })
         .await;
     }
+    // The old message no longer counts: one source each, and the legal channel's value, 400 days old, is stale.
+    support(s, &bob, "xqyoungslack", "one source", |n, _| n == 1).await;
+    support(s, &bob, "xqlegalslack", "not stated again", |n, f| {
+        n == 1
+            && f.as_str()
+                .is_some_and(|f| f.contains("not confirmed since"))
+    })
+    .await;
     // A pin holds commits, not who may read what: what aged out is gone through Bob's pin too.
     until(
         s,
@@ -600,6 +729,9 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     // the conflict the old one's fact was in with them, and nothing else.
     assert!(!in_files("xqoldslack").is_empty());
     assert!(!in_files(&old_fact).is_empty(), "the record is stored");
+    for k in restatements.iter().chain(&served_keys) {
+        assert!(!in_files(k).is_empty(), "{k} is stored");
+    }
     let (ok, out, err) = memstore(&home, &["org", "purge", "acme"]);
     assert!(ok, "{out}{err}");
     let done: Value = serde_json::from_str(&out).unwrap();
@@ -610,6 +742,15 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     for t in ["xqoldslack", "xqcuspslack", "xqgovvalue", &old_fact] {
         assert_eq!(in_files(t), Vec::<PathBuf>::new(), "{t}");
     }
+    // Every record naming the old message or its fact went with them; the record of what Bob's agent was served
+    // that names the young message alone, and the one whose note is still stored, stay.
+    for k in restatements.iter().chain(&served_keys[..1]) {
+        assert_eq!(in_files(k), Vec::<PathBuf>::new(), "{k}");
+    }
+    for k in &served_keys[1..] {
+        assert!(!in_files(k).is_empty(), "{k} went with the purge");
+    }
+    support(s, &bob, "xqyoungslack", "one source, purged", |n, _| n == 1).await;
     assert!(
         !in_files(&young_fact).is_empty(),
         "the young fact went with the purge"
@@ -768,6 +909,9 @@ async fn old_messages_age_out_for_everyone_and_a_purge_removes_them() {
     let (ok, out, err) = memstore(&home, &["org", "purge", "acme"]);
     assert!(ok, "{out}{err}");
     assert_eq!(episode_files(&note), Vec::<PathBuf>::new());
+    // The record whose note aged out went with it; the one naming the young message alone stays.
+    assert_eq!(in_files(&served_keys[1]), Vec::<PathBuf>::new());
+    assert!(!in_files(&served_keys[2]).is_empty(), "went with the purge");
     for t in ["xqscriptfirst", "xqscriptmore"] {
         assert_eq!(in_files(t), Vec::<PathBuf>::new(), "{t} still stored");
     }

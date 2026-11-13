@@ -76,6 +76,17 @@ observed or stated, only another agent's: the model's `supersedes` is kept as `c
 them, else as new. Search ranks it a little below what was observed or stated and says so beside it ("an agent
 concluded, 2026-11-12"; `origin` in JSON).
 
+Saying something again is no news. A new fact that gives the value an open fact gives, in the same words or in
+others, is a repeat from any source and however much later: the known fact keeps the time it was first stated, and
+only a changed value supersedes. A repeat counts as support only from an independent source: another source than
+every one that stated the fact (a note's author counts once, whatever they label their notes), not an agent's text,
+and not an echo. An echo is a note whose writer was served the fact by a read (`search_memory`, `get_episode`,
+`/search`) on the same server in the hour before writing it (`AMPUP_MEMORY_ECHO_MINUTES`): it is dropped and counts
+for nothing. Reads give `corroboration`, how many independent sources the reader may read say what a fact says (a
+search's text says "3 sources say so" beside a value more than one says), and a value marked `stale` is fresh again
+only when an independent source states it again. Nothing ranks by `corroboration`: what is said often never ranks
+first for being said often.
+
 An episode the model refuses is tried three times, then given up on. While the API is down or refuses the key,
 nothing is given up on and the worker backs off. Refused facts are counted on `/metrics`
 (`memstore_extraction_refused_facts_total{reason}`) and in `GET /doctor`.

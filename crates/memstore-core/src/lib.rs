@@ -19,6 +19,7 @@ pub mod audit;
 pub mod auth;
 pub mod cell;
 pub mod conflicts;
+pub mod corroboration;
 pub mod episode_types;
 pub mod freshness;
 pub mod governance;
@@ -65,6 +66,15 @@ pub const NOTES_DREAM_SOURCE_TAIL: &str = "memstore:dream";
 /// take it. A retention rule whose prefix starts with it is for transcripts alone ([`retention::Retention`]).
 pub const TRANSCRIPT_SOURCE: &str = "memstore:transcript:";
 
+/// What follows a person in the source of the record of what they were served just before writing a note
+/// (`mcp:remember_memory:<them>:memstore:served`, `memstore::echo`), filed as [`SERVED_PREFIX`]`<note>`: no note may
+/// take it. A record names the episodes by id, so an erasure of any of them, or of its note, takes it
+/// ([`is_served_source`]).
+pub const SERVED_SOURCE_TAIL: &str = "memstore:served";
+
+/// Where a note's record of what its writer was served is filed, `served/<note>` ([`SERVED_SOURCE_TAIL`]).
+pub const SERVED_PREFIX: &str = "served/";
+
 /// What follows a person in the source of their session records (`mcp:remember_memory:<them>:memstore:session:<id>`,
 /// its conversation so far `…:<id>:conversation`, `memstore::sessions`): a session is no note, and no note may take
 /// it. A retention rule whose prefix starts with it is for session records alone ([`retention::Retention`]).
@@ -93,6 +103,11 @@ pub fn transcript_source(source: &str) -> Option<(&str, &str)> {
 /// `memstore:transcript:…`), from its source: what retention matches past the author. None for any other source.
 pub fn session_record_source(source: &str) -> Option<(&str, &str)> {
     own_record(source, &[SESSION_SOURCE, TRANSCRIPT_SOURCE])
+}
+
+/// Whether `source` is a record of what a note's writer was served ([`SERVED_SOURCE_TAIL`]).
+pub fn is_served_source(source: &str) -> bool {
+    own_record(source, &[SERVED_SOURCE_TAIL]).is_some_and(|(_, own)| own == SERVED_SOURCE_TAIL)
 }
 
 /// Whether `source` is what the server derives from one person's own notes and sessions and files under their
@@ -809,9 +824,12 @@ pub struct Vis {
     conflicts: HashMap<String, Vec<String>>,
     /// Which committed episodes are versions of a document.
     documents: Documents,
-    /// Each committed episode's type (`sales_call`, `slack_thread`, …) and origin ([`origin::Origin::of_source`]), as
-    /// its source names them.
-    kinds: HashMap<String, (&'static str, origin::Origin)>,
+    /// Each committed episode's type (`sales_call`, `slack_thread`, …), origin ([`origin::Origin::of_source`]) and
+    /// who said it (a hash of [`origin::sayer`]), as its source names them.
+    kinds: HashMap<String, (&'static str, origin::Origin, u64)>,
+    /// The episodes that stated each fact again where reconcile kept no fact of theirs ([`corroboration::PREFIX`]),
+    /// each with when it happened, whoever reads: a read counts one only for a reader who may read it.
+    restated: HashMap<String, Vec<(i64, String)>>,
     /// Committed retracted episodes: deleted, superseded and not written since, or aged out. They are left out
     /// of `acls` and `index`, so no reader sees them.
     retracted: HashSet<String>,
@@ -1124,14 +1142,26 @@ impl Vis {
     /// Whether the reader may see a committed episode.
     /// An episode's type (`sales_call`, `slack_thread`, …), if this state holds it.
     pub fn episode_type(&self, episode: &str) -> Option<&'static str> {
-        self.kinds.get(episode).map(|(t, _)| *t)
+        self.kinds.get(episode).map(|(t, _, _)| *t)
     }
 
     /// Where an episode's words came from, as its source says ([`origin::Origin::of_source`]); None for one this
     /// state doesn't hold, or one of the engine's own documents. A bot's message only its body marks
     /// ([`origin::Origin::of_episode`]) reads here as its source's.
     pub fn episode_origin(&self, episode: &str) -> Option<origin::Origin> {
-        self.kinds.get(episode).map(|(_, o)| *o)
+        self.kinds.get(episode).map(|(_, o, _)| *o)
+    }
+
+    /// Who said what an episode holds ([`origin::sayer`]), as a number only this state compares; None for one this
+    /// state doesn't hold, or one of the engine's own documents.
+    pub fn episode_sayer(&self, episode: &str) -> Option<u64> {
+        self.kinds.get(episode).map(|(_, _, s)| *s)
+    }
+
+    /// The episodes that stated `fact_id` again where reconcile kept no fact of theirs ([`corroboration`]), each with
+    /// when it happened, whoever reads.
+    pub fn restated(&self, fact_id: &str) -> &[(i64, String)] {
+        self.restated.get(fact_id).map_or(&[], Vec::as_slice)
     }
 
     /// Where a fact's words came from: the strongest origin of the episodes it cites ([`origin::of_fact`]).
@@ -1143,7 +1173,7 @@ impl Vis {
     pub fn episodes_of_type(&self, kind: &str, who: &Principal) -> BTreeSet<String> {
         self.kinds
             .iter()
-            .filter(|(e, (t, _))| *t == kind && self.can_see_episode(e, who))
+            .filter(|(e, (t, _, _))| *t == kind && self.can_see_episode(e, who))
             .map(|(e, _)| e.clone())
             .collect()
     }
@@ -1151,7 +1181,7 @@ impl Vis {
     /// How many episodes of each type `who` may read.
     pub fn episode_type_counts(&self, who: &Principal) -> BTreeMap<&'static str, usize> {
         let mut n = BTreeMap::new();
-        for (e, (t, _)) in &self.kinds {
+        for (e, (t, _, _)) in &self.kinds {
             if self.can_see_episode(e, who) {
                 *n.entry(*t).or_default() += 1;
             }
@@ -5767,7 +5797,14 @@ impl Store {
                         continue;
                     }
                     if let Some(t) = episode_types::name_of_source(&source[i]) {
-                        kinds.insert(id[i].clone(), (t, origin::Origin::of_source(&source[i])));
+                        kinds.insert(
+                            id[i].clone(),
+                            (
+                                t,
+                                origin::Origin::of_source(&source[i]),
+                                origin::sayer_id(&source[i]),
+                            ),
+                        );
                     }
                     if source[i].starts_with(MERGE_SOURCE) {
                         merges.insert(id[i].clone());
@@ -5784,6 +5821,7 @@ impl Store {
                 }
             }
             let conflicts = conflicts::recorded(&documents.versions, &conflict_records);
+            let restated = corroboration::recorded(&documents.versions, &conflict_records);
             let mut latest: HashMap<String, (i64, String)> = HashMap::new();
             for b in quotes.rows.iter() {
                 let (commit, fid, q) = (
@@ -5863,6 +5901,7 @@ impl Store {
                 merges,
                 approved,
                 conflicts,
+                restated,
                 documents,
                 kinds,
                 retracted,

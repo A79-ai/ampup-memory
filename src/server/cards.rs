@@ -589,8 +589,9 @@ pub(super) async fn search(
     let tallies = reads.tallies(store, who, &shown_facts).await?;
     // What has gone stale or overdue, where the scope asks (`crate::freshness`): said beside the fact. A result
     // holds its entities' every current fact, plans and statuses among them.
-    // And what another fact says against one, where the scope keeps conflicts (`crate::conflicts`), and that only an
-    // agent wrote one (`crate::origin`).
+    // And what another fact says against one, where the scope keeps conflicts (`crate::conflicts`), that only an
+    // agent wrote one (`crate::origin`), or how many independent sources say it, where more than one does
+    // (`crate::corroboration`).
     let (marks, conflicts, origins) = {
         let all: Vec<&crate::Fact> = window
             .iter()
@@ -603,7 +604,16 @@ pub(super) async fn search(
             .collect();
         let origins: HashMap<String, String> = all
             .iter()
-            .filter_map(|f| Some((f.fact_id.clone(), reads.fact_origin(f)?.note(f.valid_from)?)))
+            .filter_map(|f| {
+                let note = match reads.fact_origin(f)?.note(f.valid_from) {
+                    Some(n) => n,
+                    None => match reads.corroboration(who, f, &all) {
+                        n if n > 1 => format!("{n} sources say so"),
+                        _ => return None,
+                    },
+                };
+                Some((f.fact_id.clone(), note))
+            })
             .collect();
         (
             reads.marks(store, who, &all, ask.valid_at, true).await?,
@@ -776,7 +786,8 @@ struct Text<'a> {
     marks: &'a HashMap<String, crate::freshness::Mark>,
     /// What another fact says against one, by fact id (`crate::conflicts`).
     conflicts: &'a HashMap<String, crate::conflicts::Conflict>,
-    /// That only an agent wrote one, said beside it (`crate::origin`), by fact id.
+    /// Where one's words came from, said beside it, by fact id: that only an agent wrote it (`crate::origin`), or how
+    /// many independent sources say it (`crate::corroboration`).
     origins: &'a HashMap<String, String>,
     words: &'a Words,
     query: &'a str,

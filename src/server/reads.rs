@@ -475,6 +475,26 @@ impl Reads {
         })
     }
 
+    /// How many independent sources the caller may read say what `f` says ([`crate::corroboration::count`]): `f` and
+    /// the facts of `with` that give its value (of the same entity, the same value but for case, spacing and
+    /// punctuation, as a search folds them), each episode as the first scope read that holds it says.
+    pub fn corroboration(&self, who: &Principal, f: &Fact, with: &[&Fact]) -> usize {
+        let same = |v: &str| -> String {
+            v.chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect()
+        };
+        let value = same(&f.value);
+        let facts: Vec<&Fact> = std::iter::once(f)
+            .chain(with.iter().copied().filter(|g| {
+                g.fact_id != f.fact_id && g.entity == f.entity && same(&g.value) == value
+            }))
+            .collect();
+        let vis: Vec<&crate::Vis> = self.sessions().map(|s| s.vis()).collect();
+        crate::corroboration::count(&vis, who, &facts)
+    }
+
     /// The episodes of type `kind` the caller may read, in every scope read.
     pub fn episodes_of_type(&self, kind: &str, who: &Principal) -> BTreeSet<String> {
         self.sessions()
@@ -547,7 +567,11 @@ impl Reads {
             .copied()
             .chain(beside.iter().filter(|f| !have.contains(f.fact_id.as_str())))
             .collect();
-        let mut marks = freshness::marks(&schemas, &all, at);
+        let said = crate::corroboration::Said {
+            vis: self.sessions().map(|s| s.vis()).collect(),
+            who,
+        };
+        let mut marks = freshness::marks(&schemas, &all, at, &said);
         // Only the facts of a scope that marks: a fact is its scope's, as the episodes it cites are.
         if on.contains(&false) {
             let marking: Vec<&Session> = self

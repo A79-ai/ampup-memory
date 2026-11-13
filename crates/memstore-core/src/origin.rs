@@ -136,8 +136,26 @@ fn remembered(source: &str) -> Option<&str> {
     Some(&rest[end + 1..])
 }
 
+/// Who said what an episode from `source` holds, as one source is told from another where who supports a fact is
+/// counted ([`crate::corroboration`]): a note's author (each note they remember is theirs, whatever they label it),
+/// else the source itself (a ticket, a thread, a call, a document).
+pub fn sayer(source: &str) -> &str {
+    match remembered(source) {
+        Some(rest) => &source[..source.len() - rest.len() - 1],
+        None => source,
+    }
+}
+
+/// [`sayer`] as a number, as [`crate::Vis::episode_sayer`] holds it: the same in every state of this process.
+pub fn sayer_id(source: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    sayer(source).hash(&mut h);
+    h.finish()
+}
+
 /// Whether a citation (as a fact's `cite` holds it) is of a message a bot or an app posted.
-fn by_bot(cite: &str) -> bool {
+pub(crate) fn by_bot(cite: &str) -> bool {
     matches!(
         serde_json::from_str::<Cite>(cite),
         Ok(Cite::Message { bot: true, .. })

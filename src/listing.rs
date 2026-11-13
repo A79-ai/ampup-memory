@@ -260,6 +260,8 @@ pub async fn facts(
             if let Some(o) = session.vis().fact_origin(f) {
                 v["origin"] = json!(o.name());
             }
+            // How many independent sources say it (`crate::corroboration`): its own and those that stated it again.
+            v["corroboration"] = json!(crate::corroboration::count(&[session.vis()], who, &[f]));
             v["sources"] = json!(
                 f.source_episodes
                     .iter()

@@ -2156,6 +2156,76 @@ impl Store {
         Ok(out)
     }
 
+    /// The records among the episodes of `ns` that name what an erasure takes: that an episode stated a fact again
+    /// ([`crate::corroboration`]), naming an episode `gone` holds or a fact `dropped` holds; and of what a note's
+    /// writer was served ([`crate::is_served_source`]), naming an episode `gone` holds as their note
+    /// (`served/<note>`) or among what was served, which only the body says. One of the latter whose body is gone is
+    /// one an erasure stopped before its rows went: it goes too.
+    async fn records_naming(
+        &self,
+        ns: &str,
+        gone: &HashSet<String>,
+        dropped: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        let mut out = HashSet::new();
+        if gone.is_empty() {
+            return Ok(out);
+        }
+        let table = self.table(ns, EPISODES).await?;
+        let mut records = vec![];
+        for b in read_files(&table, HashMap::new())
+            .await?
+            .values()
+            .flat_map(|v| v.iter())
+        {
+            let (ids, sources) = (strings(b, "episode_id"), strings(b, "source"));
+            for ((id, source), document) in ids
+                .into_iter()
+                .zip(sources)
+                .zip(optional_strings(b, "document"))
+            {
+                if source.starts_with(crate::conflicts::SOURCE)
+                    && document
+                        .as_deref()
+                        .and_then(crate::corroboration::named)
+                        .is_some_and(|(f, e)| dropped.contains(f) || gone.contains(e))
+                {
+                    out.insert(id);
+                    continue;
+                }
+                if !crate::is_served_source(&source) {
+                    continue;
+                }
+                let note = document
+                    .as_deref()
+                    .and_then(|d| d.strip_prefix(crate::SERVED_PREFIX));
+                match note.is_some_and(|n| gone.contains(n)) {
+                    true => out.insert(id),
+                    false => {
+                        records.push(id);
+                        false
+                    }
+                };
+            }
+        }
+        let io = table.file_io();
+        for id in records {
+            let path = body_path(&table, &id);
+            if !io.exists(&path).await? {
+                out.insert(id);
+                continue;
+            }
+            let body = io.new_input(path)?.read().await?;
+            if String::from_utf8_lossy(&body)
+                .split(|c: char| !c.is_ascii_hexdigit())
+                .any(|w| w.len() == 64 && gone.contains(w))
+            {
+                out.insert(id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete the episodes `ids` of `scope` for good, and what was drawn from them (an [`Erasure`], as a forget
     /// does): for a row the engine derived that must not outlive what it was drawn from (a person's profile
     /// version committed just as a note it cites was forgotten or deleted).
@@ -2271,6 +2341,18 @@ impl Store {
         {
             e.gone_proposals = self.proposals_citing(ns, &e.gone).await?;
         }
+        // The records of restatements and of what a note's writer was served that name what goes: read before the
+        // episodes table is rewritten (only a body says what the latter name), their bodies deleted before their rows
+        // as the episodes' are, so a run stopped halfway finds them again.
+        if erasing
+            && name == EPISODES
+            && let Some(e) = erasure.as_mut()
+            && e.naming.is_none()
+        {
+            let naming = self.records_naming(ns, &e.gone, &e.dropped_facts).await?;
+            self.delete_bodies(ns, &naming).await?;
+            e.naming = Some(naming);
+        }
         let mut older_runs = match (compact, scope) {
             (true, Some(s)) if name == AGGREGATES => Some(self.aggregates_keep(s).await?),
             _ => None,
@@ -2299,7 +2381,8 @@ impl Store {
             if let Some(e) = erasure.as_ref().filter(|e| e.rows.is_none()) {
                 self.delete_bodies(ns, &e.gone).await?;
             }
-            // And the bodies of the records of conflicts that went with their facts.
+            // And the bodies of the records (of conflicts, restatements and what a note's writer was served) that went
+            // with what they name.
             if let Some(e) = erasure.as_ref() {
                 self.delete_bodies(ns, &e.dropped_records).await?;
             }
@@ -2350,7 +2433,9 @@ pub const ERASED_TABLES: [&str; 8] = [
 
 /// What a deletion takes out of one namespace: the episodes `gone` names and everything drawn from them. The facts
 /// citing any of them, those facts' backfilled quotes and the records of conflicts naming them ([`crate::conflicts`]:
-/// rows and bodies), the closures they are evidence for, the summaries drawing on
+/// rows and bodies), the records of restatements naming any of them or those facts ([`crate::corroboration`]) and of
+/// what a note's writer was served naming any of them or the note ([`crate::SERVED_SOURCE_TAIL`]), the closures they
+/// are evidence for, the summaries drawing on
 /// any of them, the logged answers and the feedback citing any of them (or an episode no longer stored at all), the
 /// review proposals citing any of them as evidence (their rows quote the proposed values) with the decisions on
 /// them, the episodes' bodies and the namespace's search indexes, and the episode rows themselves (all of a gone
@@ -2365,6 +2450,9 @@ pub struct Erasure<'a> {
     dropped_facts: HashSet<String>,
     /// The records of conflicts left out of the episodes table: their bodies go once it is rewritten.
     dropped_records: HashSet<String>,
+    /// The records of restatements and of what a note's writer was served naming what goes, read when the episodes
+    /// table is rewritten: they go.
+    naming: Option<HashSet<String>>,
     /// The episode ids stored when the answer log is rewritten.
     stored: Option<HashSet<String>>,
     /// The review proposals citing a gone episode, read when the governance table is rewritten: they go, with
@@ -2382,6 +2470,7 @@ impl<'a> Erasure<'a> {
             rows: None,
             dropped_facts: HashSet::new(),
             dropped_records: HashSet::new(),
+            naming: None,
             stored: None,
             gone_proposals: HashSet::new(),
             counts: Forgotten::default(),
@@ -2480,10 +2569,12 @@ impl<'a> Erasure<'a> {
                 }))
             }
             // A record of two facts in conflict goes with either of them, as their quotes do: two bare fact ids
-            // outlive nothing they name.
+            // outlive nothing they name. So do the records of restatements and of what a note's writer was served
+            // that name what goes, read before the rewrite (`Store::records_naming`).
             EPISODES => {
                 let rows = self.rows;
                 let (dropped, records) = (&self.dropped_facts, &mut self.dropped_records);
+                let naming = self.naming.as_ref();
                 Some(Box::new(move |b| {
                     let (ids, sources) = (strings(b, "episode_id"), strings(b, "source"));
                     let documents = optional_strings(b, "document");
@@ -2492,13 +2583,14 @@ impl<'a> Erasure<'a> {
                         .zip(sources)
                         .zip(documents)
                         .map(|((id, source), document)| {
-                            let record = source.starts_with(crate::conflicts::SOURCE)
+                            let record = (source.starts_with(crate::conflicts::SOURCE)
                                 && document
                                     .as_deref()
                                     .and_then(crate::conflicts::named)
                                     .is_some_and(|(a, b)| {
                                         dropped.contains(a) || dropped.contains(b)
-                                    });
+                                    }))
+                                || naming.is_some_and(|n| n.contains(id.as_str()));
                             if record {
                                 records.insert(id.clone());
                             }

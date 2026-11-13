@@ -1715,7 +1715,11 @@ impl Exec<'_> {
         }
         let have: BTreeSet<&str> = facts.iter().map(|f| f.fact_id.as_str()).collect();
         all.extend(beside.iter().filter(|f| !have.contains(f.fact_id.as_str())));
-        Ok(freshness::marks(&schemas, &all, at))
+        let said = crate::corroboration::Said {
+            vis: vec![self.session.vis()],
+            who: self.who,
+        };
+        Ok(freshness::marks(&schemas, &all, at, &said))
     }
 
     /// What another fact says against each of `facts` (`crate::conflicts`), under `now` or `as_of` and where the

@@ -58,6 +58,7 @@ pub mod decide;
 pub mod deployment;
 pub mod dream;
 pub mod dream_jobs;
+pub mod echo;
 pub mod error_leads;
 pub mod extract;
 pub mod feedback;

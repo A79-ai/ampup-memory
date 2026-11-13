@@ -6197,6 +6197,8 @@ async fn handle(
             && v["result"]["isError"] != true
         {
             audit_read(&state, Some(&who), &via, &scope, path, &reads).await;
+            // And what it served, so a note its caller writes next can be told an echo (`crate::echo`).
+            crate::echo::note(&scope, who.user(), &reads.took().1);
         }
         return Ok(match answer {
             Some(v) => reply(StatusCode::OK, v),
@@ -6884,6 +6886,9 @@ async fn handle(
         match search_rows(&state, &reads, who.as_ref(), &body, &path).await {
             Ok(v) => {
                 audit_read(&state, who.as_ref(), &via, &scope, route, &reads).await;
+                if let Some(w) = &who {
+                    crate::echo::note(&scope, w.user(), &reads.took().1);
+                }
                 let mut r = reply(StatusCode::OK, v);
                 // server-side search time, for benchmarks that call through a tunnel
                 r.headers_mut().insert(
@@ -9964,6 +9969,9 @@ async fn facts(
             v["conflict"] = c.to_json();
         }
         origin_json(&mut v, h.origin, h.fact.valid_from);
+        // How many independent sources say it (`crate::corroboration`): for the reader, never for ranking.
+        let group: Vec<&crate::Fact> = h.group.iter().collect();
+        v["corroboration"] = json!(reads.corroboration(who, &h.fact, &group));
         for (k, x) in [("unit", &h.fact.unit), ("time_basis", &h.fact.time_basis)] {
             if let Some(x) = x {
                 v[k] = json!(x);
@@ -10006,6 +10014,9 @@ async fn facts(
                             g["conflict"] = c.to_json();
                         }
                         origin_json(&mut g, reads.fact_origin(f), f.valid_from);
+                        let with: Vec<&crate::Fact> =
+                            std::iter::once(&h.fact).chain(&h.group).collect();
+                        g["corroboration"] = json!(reads.corroboration(who, f, &with));
                         g
                     })
                     .collect::<Vec<_>>()
@@ -13899,6 +13910,8 @@ async fn forget(
         let more = crate::transcripts::forgotten(store, scope, me, episode_id).await?;
         // Nor any record their notes dream rests on it (or on another version of the same part).
         crate::notes_dream::forgotten(store, scope, me, state.fixed(), episode_id).await?;
+        // Nor the record of what they were served just before writing it (`crate::echo`).
+        crate::echo::forgotten(store, scope, me, episode_id).await?;
         if more > 0 {
             return Ok(format!(
                 "forgot episode {episode_id}, and {more} other version{} of the same transcript part",
@@ -14121,8 +14134,15 @@ async fn commit_remembered(
         _ => return Err(ToolError("document is a key of at most 512 bytes".into()).into()),
     }
     let id = ep.episode_id.clone();
+    // What its writer's reads served them just before, recorded with it so reconcile can tell an echo of it
+    // (`crate::echo`).
+    let served = crate::echo::before(scope, who.user());
+    let mut eps = vec![ep];
+    if !served.is_empty() {
+        eps.push(crate::echo::record(&eps[0], who.user(), &served));
+    }
     // A note theirs alone: their profile may be due a fold (`crate::profile`).
-    let note = ep.document.is_none()
+    let note = eps[0].document.is_none()
         && match entries.as_slice() {
             [one] => *one == format!("user:{}", who.user()) || (state.fixed() && *one == "*"),
             _ => false,
@@ -14138,13 +14158,13 @@ async fn commit_remembered(
     };
     let readers = match &branch {
         Some(b) => {
-            store.commit_on(scope, b, who.user(), &[ep], &[]).await?;
+            store.commit_on(scope, b, who.user(), &eps, &[]).await?;
             format!(
                 "{readers}, on this session's branch {b} (it merges into main once the session ends)"
             )
         }
         None => {
-            store.commit(scope, who.user(), &[ep], &[]).await?;
+            store.commit(scope, who.user(), &eps, &[]).await?;
             readers
         }
     };
