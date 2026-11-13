@@ -9488,6 +9488,8 @@ async fn search_rows(
 /// Passages `search_memory` adds to its facts: at most this many, each this many characters around the match.
 const PASSAGES: usize = 5;
 const PASSAGE_CHARS: usize = 600;
+/// Episodes not read for facts yet that a dated search names, newest first ([`crate::arrivals`]).
+const ARRIVALS_LISTED: usize = 5;
 
 /// `search_memory`'s `episode_type`: a type's name or a list of them, each one that exists.
 fn episode_kinds(v: &Value) -> std::result::Result<Vec<&'static str>, String> {
@@ -9596,6 +9598,37 @@ fn uncited_passages(
         }
     }
     out
+}
+
+/// What arrived in a dated search's window as its JSON answer carries it ([`crate::arrivals`]): the window
+/// (`from`, `to`, microseconds), how many episodes, per kind of source how many, the latest one's time and how many
+/// no extraction has read for facts yet (`unread`), and the newest of those (`unread_episodes`), each naming its
+/// scope when more than the caller's own is read.
+fn arrived_json(
+    reads: &Reads,
+    a: &crate::arrivals::Arrivals,
+    from: &HashMap<String, usize>,
+    when: (Option<i64>, Option<i64>),
+) -> Value {
+    let kinds: Vec<Value> = a
+        .kinds
+        .iter()
+        .map(|k| json!({"kind": k.kind, "episodes": k.episodes, "latest": k.latest, "unread": k.unread}))
+        .collect();
+    let unread: Vec<Value> = a
+        .listed
+        .iter()
+        .map(|u| {
+            let mut v = json!({"episode_id": u.episode_id, "source": u.source, "occurred_at": u.occurred_at,
+                               "title": u.title});
+            if reads.fans_out() {
+                v["scope"] = json!(reads.scope_of(from, &u.episode_id).to_string());
+            }
+            v
+        })
+        .collect();
+    json!({"from": when.0, "to": when.1, "episodes": a.episodes, "by_kind": kinds, "unread": a.unread,
+           "unread_episodes": unread})
 }
 
 /// Whether a query word names something memory either mentions or doesn't (`AI-VeriSim`, `AutoDrive`, `IDPS`,
@@ -10381,6 +10414,7 @@ async fn mcp(
                     };
                     let when = occurred_window(&window, rank_at);
                     let since = when.0;
+                    let dated = !window.is_empty();
                     only.extend(window);
                     // Only facts citing an episode of these types (`slack_thread`, `sales_call`, …).
                     let kinds = match episode_kinds(&args["episode_type"]) {
@@ -10425,6 +10459,7 @@ async fn mcp(
                                 .as_u64()
                                 .map_or(cards::DEFAULT_CHARS, |n| n as usize)
                                 .clamp(cards::MIN_CHARS, cards::MAX_CHARS),
+                            dated,
                         };
                         let cards = cards::search(reads, &store, who, &ask).await;
                         crate::phases::mark("cards search");
@@ -10432,7 +10467,23 @@ async fn mcp(
                     } else {
                     // The first page's source text is searched while the facts are.
                     let first = matches!(page, Value::Null);
-                    let (searched, pool) = tokio::join!(
+                    // And what arrived in the window, from the episodes' rows: a dated search's first page says so.
+                    let arrived = async {
+                        match first && dated {
+                            true => {
+                                let a = crate::arrivals::Ask {
+                                    from: when.0,
+                                    to: when.1,
+                                    kinds: &[],
+                                    types: &kinds,
+                                    list: ARRIVALS_LISTED,
+                                };
+                                Some(reads.arrivals(&store, who, &a).await)
+                            }
+                            false => None,
+                        }
+                    };
+                    let (searched, pool, arrived) = tokio::join!(
                         facts(
                             reads,
                             &store,
@@ -10452,8 +10503,17 @@ async fn mcp(
                                 true => Some(passage_pool(reads, &store, who, query, when).await),
                                 false => None,
                             }
-                        }
+                        },
+                        arrived
                     );
+                    // Not counted, the search still answers.
+                    let arrived = match arrived.transpose() {
+                        Ok(a) => a.map(|(a, from)| arrived_json(reads, &a, &from, when)),
+                        Err(e) => {
+                            eprintln!("search_memory: arrivals: {}", writer::redacted(&e));
+                            None
+                        }
+                    };
                     match searched {
                         Ok((hits, next)) => {
                             // A name the search asks about that nothing in memory mentions: say so, so the
@@ -10474,10 +10534,14 @@ async fn mcp(
                             };
                             crate::phases::mark("unmentioned + uncited");
                             found.map(|(missing, passages)| {
-                            let v = match (first, missing.is_empty() && passages.is_empty()) {
+                            let plain = missing.is_empty() && passages.is_empty() && arrived.is_none();
+                            let v = match (first, plain) {
                                 (true, true) => json!(hits),
                                 (true, false) => {
                                     let mut v = json!({"hits": hits});
+                                    if let Some(a) = arrived {
+                                        v["arrived"] = a;
+                                    }
                                     if !passages.is_empty() {
                                         v["passages"] = json!(passages);
                                     }
@@ -10942,8 +11006,10 @@ fn lean_search() -> Value {
         "description": "Search the team memory: facts extracted from the organization's conversations, documents \
             and systems, with their source text. One numbered result per entity: its id and name, when, the \
             facts about it, and pointers such as [e1 t192] (episode e1, its turn 192; get_episode reads it). \
-            For what was said or happened in a period, pass start_date and end_date. When the query names \
-            something nothing in memory mentions, the answer says so. A cursor at the end reads the next page.",
+            For what was said or happened in a period, pass start_date and end_date: the answer then also \
+            says what arrived in it by kind of source, whatever the query's words, and which items have no \
+            facts yet. When the query names something nothing in memory mentions, the answer says so. A \
+            cursor at the end reads the next page.",
         "inputSchema": {"type": "object", "properties": {
             "query": {"type": "string", "description": "Words to search for"},
             "k": {"type": "integer", "description": "How many results (default 10, at most 50)"},
@@ -11111,7 +11177,10 @@ fn tools(schema: Option<&crate::query::schema::Schema>) -> Value {
                     with Acme\") come first; then the best matches, newer facts ranking a little higher as of \
                     the search's date (as_of; else now). Asking about an earlier time? Pass as_of: the memory as \
                     it stood on that date, with the values that held then. For what was said or happened in a \
-                    period, pass start_date and end_date. Facts that share no word with the query are left out \
+                    period, pass start_date and end_date: the answer then also says what arrived in the period, \
+                    counted from what was ingested whatever the query's words (per kind of source, how many and \
+                    the latest), and lists the newest items no fact has been extracted from yet, which a search \
+                    finds only by their words. Facts that share no word with the query are left out \
                     when others do, and the answer says how many; when none does, it says the results are only \
                     nearest in meaning. Source text that matches in episodes no result cites follows the \
                     results; then the full ids of the episodes cited (get_episode reads one), and a cursor when \
@@ -11119,7 +11188,8 @@ fn tools(schema: Option<&crate::query::schema::Schema>) -> Value {
                     or 5G) that nothing in memory mentions, the answer says so: memory holds no answer about \
                     it. format \"json\" returns the matching facts one by one instead, with fact ids, scores and \
                     full citations (and {hits, note} when the query names something nothing mentions; each fact names its \
-                    episode_type, and the first page adds `passages`: matching source text from episodes no hit cites). \
+                    episode_type, and the first page adds `passages`: matching source text from episodes no hit cites, \
+                    and with dates `arrived`: {from, to, episodes, by_kind, unread, unread_episodes}). \
                     Every fact comes from an episode of a type (sales_call, slack_thread, email, crm_update, doc): \
                     episode_type narrows the search to one or more, and start_session says how many of each this \
                     memory holds (memory_holds).",

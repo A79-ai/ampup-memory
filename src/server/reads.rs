@@ -303,6 +303,55 @@ impl Reads {
         Ok(out)
     }
 
+    /// What arrived in the window `ask` names ([`crate::arrivals`]) across the scopes read, an episode two of them
+    /// hold (by id or source) counted once, the listed ones with their titles; and the scope each listed one is from
+    /// where it isn't the caller's own. Another scope that can't be read now is left out (and logged).
+    pub async fn arrivals(
+        &self,
+        store: &Store,
+        who: &Principal,
+        ask: &crate::arrivals::Ask<'_>,
+    ) -> Result<(crate::arrivals::Arrivals, HashMap<String, usize>)> {
+        let mut seen = HashSet::new();
+        let mut out = crate::arrivals::Arrivals::default();
+        let mut from = HashMap::new();
+        for (i, s) in self.sessions().enumerate() {
+            let one =
+                crate::arrivals::of(store, s, who, ask, self.fans_out().then_some(&mut seen)).await;
+            let mut a = match one {
+                Ok(a) => a,
+                Err(e) if i > 0 => {
+                    eprintln!(
+                        "arrivals in {} (read by {}) failed: {}",
+                        s.scope(),
+                        self.own.scope(),
+                        writer::redacted(&e)
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            // Untitled, they are still listed.
+            if let Err(e) = crate::arrivals::titles(store, s, who, &mut a.listed).await {
+                eprintln!(
+                    "arrivals in {}: titles: {}",
+                    s.scope(),
+                    writer::redacted(&e)
+                );
+            }
+            if i > 0 {
+                from.extend(a.listed.iter().map(|u| (u.episode_id.clone(), i)));
+            }
+            out.add(a, ask.list);
+        }
+        from.retain(|id, _| out.listed.iter().any(|u| &u.episode_id == id));
+        self.note(
+            out.listed.len(),
+            out.listed.iter().map(|u| u.episode_id.as_str()),
+        );
+        Ok((out, from))
+    }
+
     /// Each scope's list, the caller's own first; another scope's that failed is left out (and logged).
     fn lists<T>(&self, own: Vec<T>, also: Vec<Result<Vec<T>>>, what: &str) -> Vec<Vec<T>> {
         let mut lists = vec![own];

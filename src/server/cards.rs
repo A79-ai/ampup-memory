@@ -69,6 +69,9 @@ pub(super) struct Ask<'a> {
     pub kinds: &'a [&'a str],
     pub order: Order,
     pub max_chars: usize,
+    /// Whether the search names dates (`start_date` or `end_date`): its first page then says what arrived from
+    /// `since` to `until` ([`crate::arrivals`]).
+    pub dated: bool,
 }
 
 /// The query's words as results are judged by them: the entity types it names (`meetings`: results of that type
@@ -302,7 +305,28 @@ pub(super) async fn search(
             _ => None,
         }
     };
-    let (pool, found) = tokio::join!(facts, source_text);
+    // What arrived in the window, for a dated search's first page: from the episodes' rows, whatever the words.
+    let arrived = async {
+        match (offset, ask.dated) {
+            (0, true) => {
+                let a = crate::arrivals::Ask {
+                    from: ask.since,
+                    to: ask.until,
+                    kinds: &[],
+                    types: ask.kinds,
+                    list: super::ARRIVALS_LISTED,
+                };
+                Some(reads.arrivals(store, who, &a).await)
+            }
+            _ => None,
+        }
+    };
+    let (pool, found, arrived) = tokio::join!(facts, source_text, arrived);
+    // Not counted, the search still answers.
+    let arrived = arrived.and_then(|a| {
+        a.map_err(|e| eprintln!("search_memory: arrivals: {}", super::writer::redacted(&e)))
+            .ok()
+    });
     let reads::Scoped {
         items: pool,
         from: hit_scope,
@@ -608,10 +632,14 @@ pub(super) async fn search(
             missing.join(", ")
         ));
     }
+    // What arrived, numbered first: its episodes are pointed at like a result's.
+    let arrived = arrived
+        .map(|(a, from)| out.arrived(&a, &from, &reads, ask.since, ask.until))
+        .unwrap_or_default();
     let mut body = String::new();
     let mut shown = 0;
-    // Room kept for the lines around the results: the head, the sources, the cursor.
-    let reserve = 400;
+    // Room kept for the lines around the results: the head, what arrived, the sources, the cursor.
+    let reserve = 400 + arrived.len();
     for (i, c) in window.iter().enumerate() {
         // Each result an equal share of what is left, less the sources it names, so one can't fill the answer.
         let left = ask
@@ -691,6 +719,10 @@ pub(super) async fn search(
     }
     lines.extend(head);
     let mut text = lines.join("\n");
+    if !arrived.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(arrived.trim_end());
+    }
     text.push_str("\n\n");
     text.push_str(&body);
     if !also.is_empty() {
@@ -1043,6 +1075,86 @@ impl<'a> Text<'a> {
             tail.push_str(&format!(" (feedback +{up} -{down})"));
         }
         tail
+    }
+
+    /// What arrived from `since` to `until`, in a few lines: each kind of source's count and latest time, then the
+    /// newest episodes not read for facts yet, each pointed at (`e1`) for get_episode.
+    fn arrived(
+        &mut self,
+        a: &crate::arrivals::Arrivals,
+        from: &HashMap<String, usize>,
+        reads: &Reads,
+        since: Option<i64>,
+        until: Option<i64>,
+    ) -> String {
+        const KINDS: usize = 8;
+        let window = match (since, until) {
+            (Some(f), Some(t)) => format!("from {} to {}", time(f), time(t)),
+            (Some(f), None) => format!("since {}", time(f)),
+            (None, Some(t)) => format!("up to {}", time(t)),
+            (None, None) => "at any time".into(),
+        };
+        // Said whatever the query's words: counted from the episodes' rows, not searched.
+        if a.episodes == 0 {
+            return format!("Arrived {window}, as ingested: nothing you may read.\n");
+        }
+        let mut kinds: Vec<String> = a
+            .kinds
+            .iter()
+            .take(KINDS)
+            .map(|k| {
+                let unread = match k.unread {
+                    0 => String::new(),
+                    n => format!(", {n} not read for facts"),
+                };
+                format!(
+                    "{} {} (latest {}{unread})",
+                    k.kind,
+                    k.episodes,
+                    time(k.latest)
+                )
+            })
+            .collect();
+        if a.kinds.len() > KINDS {
+            let rest: usize = a.kinds[KINDS..].iter().map(|k| k.episodes).sum();
+            kinds.push(format!("{rest} of {} other kinds", a.kinds.len() - KINDS));
+        }
+        let mut text = format!(
+            "Arrived {window}, as ingested (whatever the query's words): {} episode{}. {}.",
+            a.episodes,
+            if a.episodes == 1 { "" } else { "s" },
+            kinds.join(", ")
+        );
+        if a.unread == 0 {
+            text.push_str(" Every one has been read for facts.\n");
+            return text;
+        }
+        text.push_str(&format!(
+            " {} of them not read for facts yet, so a search finds {} only by {} words{}\n",
+            a.unread,
+            if a.unread == 1 { "it" } else { "them" },
+            if a.unread == 1 { "its" } else { "their" },
+            if a.listed.is_empty() {
+                "."
+            } else {
+                "; the newest:"
+            }
+        ));
+        for u in &a.listed {
+            let r = self.eref(&u.episode_id);
+            let mut line = format!("- {} · {}", time(u.occurred_at), clip(&u.source, 80));
+            if let Some(t) = u.title.as_deref().filter(|t| !t.is_empty()) {
+                line.push_str(&format!(" · \"{}\"", clip(t, 120)));
+            }
+            if let Some(&i) = from.get(&u.episode_id) {
+                line.push_str(&format!(" in {}", reads.scope_at(i)));
+            }
+            text.push_str(&format!("{line} [{r}]\n"));
+        }
+        if a.unread > a.listed.len() {
+            text.push_str(&format!("+{} more\n", a.unread - a.listed.len()));
+        }
+        text
     }
 
     /// A passage's episode, named, with its best-matching line.

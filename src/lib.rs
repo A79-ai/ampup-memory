@@ -44,6 +44,7 @@ pub mod advice_traces;
 pub mod agent;
 pub mod aggregate;
 pub mod alerts;
+pub mod arrivals;
 pub mod audit_sink;
 pub mod auto_review;
 pub mod brief;

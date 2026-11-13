@@ -1032,6 +1032,19 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
                     json!({"query": "owner", "k": 50, "format": "json"}),
                     mine_facts.clone(),
                 ),
+                // A dated search says what arrived in its window from the episodes' rows, whatever its words (these
+                // share none with any episode): every episode the caller may read there, and no other reader's.
+                (
+                    "search_memory",
+                    json!({"query": "zzunrelated", "start_date": "2000-01-01", "end_date": "2100-01-01"}),
+                    mine_memory.clone(),
+                ),
+                (
+                    "search_memory",
+                    json!({"query": "zzunrelated", "start_date": "2000-01-01", "end_date": "2100-01-01",
+                           "format": "json"}),
+                    mine_memory.clone(),
+                ),
                 (
                     "query_memory",
                     json!({"query": {"find": "facts", "time": "all", "limit": 500}}),
@@ -1680,6 +1693,18 @@ async fn cross_scope_reads(
                     json!({"query": "owner", "k": 50, "format": "json"}),
                     mine_facts.clone(),
                 ),
+                // What arrived, counted in every scope read: never another scope's, nor another person's own note.
+                (
+                    "search_memory",
+                    json!({"query": "zzunrelated", "start_date": "2000-01-01", "end_date": "2100-01-01"}),
+                    vec![],
+                ),
+                (
+                    "search_memory",
+                    json!({"query": "zzunrelated", "start_date": "2000-01-01", "end_date": "2100-01-01",
+                           "format": "json"}),
+                    vec![],
+                ),
             ];
             for e in entity_ids {
                 let tag = e.trim_start_matches("deal:").to_string();
@@ -1719,7 +1744,7 @@ async fn cross_scope_reads(
                         let (text, _) = tool_text(&raw);
                         assert_sees(&w, &text, &want);
                         // A result from a1 says so in acme's answer; no answer of a scope read alone names a scope.
-                        if tool == "search_memory" && args["format"].is_null() {
+                        if tool == "search_memory" && args["format"].is_null() && args["start_date"].is_null() {
                             assert_eq!(text.contains("in team:acme/a1"), fans, "{w}: {text}");
                         }
                     }

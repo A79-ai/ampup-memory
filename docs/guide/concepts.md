@@ -93,6 +93,12 @@ A fact is `(entity, predicate, value)` with a valid-time window, a verbatim quot
   `POST /query` with `{"find": "passages"}` searches them. Passage search works with no extraction model at all.
 - `search_memory`'s text answer groups facts by entity, cites each as `[e1 t3]` (episode 1, turn 3) and ends
   with the episode ids `get_episode` reads. It also shows matching source text no fact cites.
+- **Arrivals.** A search with `start_date` or `end_date` also says what arrived in that window, counted from the
+  episodes' own rows rather than searched: per kind of source (`linear`, `sentry`, `slack`: the source up to its
+  first `:`), how many episodes occurred in it and when the latest did, how many no extraction has read for facts
+  yet, and the newest five of those. Only episodes the caller may read count. An episode with no facts is found by
+  a search only through its words, so "what came in this hour?" is answered from what was ingested, not from
+  whether a search found it. The JSON format carries it as `arrived`.
 
 The index is derived. It lives at `AMPUP_MEMORY_INDEX_URI` and can be rebuilt from the tables at any time
 (`ampup-memory index rebuild`). See [schemas-and-queries.md](schemas-and-queries.md).
