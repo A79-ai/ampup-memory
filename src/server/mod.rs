@@ -799,10 +799,11 @@ pub async fn serve_with(
                     )
                     .await
                     {
-                        Ok(d) if d.ended + d.judged + d.graded > 0 => {
+                        Ok(d) if d.ended + d.judged + d.graded + d.unrewarded > 0 => {
                             eprintln!(
-                                "sessions {scope}: {} ended idle, {} judged, {} graded by request",
-                                d.ended, d.judged, d.graded
+                                "sessions {scope}: {} ended idle, {} judged, {} graded by request, \
+                                 {} judge's rewards dropped that their verdicts no longer gave",
+                                d.ended, d.judged, d.graded, d.unrewarded
                             )
                         }
                         Ok(_) => {}
@@ -11973,6 +11974,7 @@ fn session_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "context": {"type": "string", "description": "What the user asked, with what came with it"},
                 "harness": {"type": "string", "description": "The client: claude-ai, chatgpt, copilot, ..."},
+                "thread": {"type": "string", "description": "The client's own id for this conversation, if it has one: the sessions one conversation is split into share it, so they read as one"},
                 "keep": KEEP_ARG.clone(),
             }},
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false},

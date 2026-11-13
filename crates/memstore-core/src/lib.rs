@@ -7854,6 +7854,9 @@ fn qa_log_schema() -> Result<Schema> {
         // The pull requests it opened or pushed to, read from its transcript, each with what later came of it
         // (JSON: repo, number or branch, how it was linked, and its events: merged, closed, reverted, regression).
         ("prs", false, PrimitiveType::String),
+        // The harness's own id for the conversation it ran in: a conversation the harness split into several
+        // sessions (at a compaction, or after it went idle) has the same one on each, so they read as one.
+        ("thread", false, PrimitiveType::String),
     ])
 }
 

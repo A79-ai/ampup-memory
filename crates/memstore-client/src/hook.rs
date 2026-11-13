@@ -2058,14 +2058,13 @@ async fn open_session(
     if let Some(f) = marker("from", session_of(input)) {
         let _ = std::fs::write(f, transcript_entries(input, harness).len().to_string());
     }
-    let text = client
-        .tool(
-            "start_session",
-            kept_unless_off(
-                json!({"harness": harness.session_name(), "context": redact(context), "max_chars": MAX_ADVICE}),
-            ),
-        )
-        .await?;
+    let mut args = json!({"harness": harness.session_name(), "context": redact(context), "max_chars": MAX_ADVICE});
+    // The harness's own id for this conversation: each session it is split into (at a compaction, or once the
+    // last one went idle) carries it, so they read as one conversation.
+    if !session_of(input).is_empty() {
+        args["thread"] = json!(session_of(input));
+    }
+    let text = client.tool("start_session", kept_unless_off(args)).await?;
     let v: Value = serde_json::from_str(&text).context("start_session answered no JSON")?;
     let id = v["session_id"]
         .as_str()

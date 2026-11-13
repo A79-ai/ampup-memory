@@ -128,6 +128,10 @@ pub struct SessionPart {
     /// advice learns from before any model's reading.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prs: Vec<crate::session_prs::Pr>,
+    /// The harness's own id for the conversation it ran in (`start_session`'s `thread`): the sessions one
+    /// conversation was split into (at a compaction, or after it went idle) share it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
 }
 
 /// Records an answer, or (with `answer_id`) rates one `who` logged before. Returns its id.
@@ -691,6 +695,7 @@ pub async fn list(store: &Store, scope: &Scope, goal: Option<&str>) -> Result<Ve
         let (conversation, verdicts, acl) = (oo("conversation"), oo("verdicts"), oo("acl"));
         let (ended_by, fires, branch) = (oo("ended_by"), oo("fires"), oo("branch"));
         let (served_versions, lookups, prs) = (oo("served_versions"), oo("lookups"), oo("prs"));
+        let thread = oo("thread");
         let ended = if has("ended_at") {
             timestamps(b, "ended_at")
         } else {
@@ -780,6 +785,7 @@ pub async fn list(store: &Store, scope: &Scope, goal: Option<&str>) -> Result<Ve
                                 .as_deref()
                                 .and_then(|v| serde_json::from_str(v).ok())
                                 .unwrap_or_default(),
+                            thread: thread[i].clone(),
                         }),
                     },
                 ),
@@ -941,6 +947,7 @@ impl StoreQaLog for Store {
                         })
                     }),
                 ),
+                ("thread", opt(&|l| sp(l, &|s| s.thread.clone()))),
             ],
             OnConflict::Recommit,
         )

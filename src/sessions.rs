@@ -44,6 +44,8 @@ use sha2::Digest as _;
 pub const KIND: &str = "session";
 /// Longest opening context kept, in characters.
 const MAX_CONTEXT: usize = 4_000;
+/// The most of a harness's conversation id a session keeps (`start_session`'s `thread`).
+const MAX_THREAD: usize = 128;
 /// The end of a conversation or transcript kept, in characters.
 const MAX_TRANSCRIPT: usize = 20_000;
 /// Longest outcome kept, in characters.
@@ -395,6 +397,8 @@ pub async fn start(
         .collect();
     crate::phases::mark("sessions today");
     let harness = text(args, "harness").map(|h| head(h, 40));
+    // The harness's own id for its conversation: the sessions it splits one conversation into share it.
+    let thread = text(args, "thread").map(|t| head(t, MAX_THREAD));
     // The log is the catalog owner's to read: secret-looking words never reach it.
     // What a harness says in the user's place (an old client's `Tool loaded.`) is no task: the session takes its
     // first ask later instead.
@@ -420,6 +424,7 @@ pub async fn start(
             harness,
             arm: arm.into(),
             acl: acl.to_vec(),
+            thread,
             ..Default::default()
         }),
         ..Default::default()
@@ -1690,6 +1695,8 @@ fn reopen_idle(l: &mut Logged) -> bool {
     s.verdicts = None;
     l.episodes.clear();
     l.answer = None;
+    // The judge's reward went with its verdicts: the fuller end is judged afresh.
+    drop_stale_reward(l);
     true
 }
 
@@ -3100,29 +3107,71 @@ pub async fn judge(
     }
     fs.verdicts = Some(verdicts.to_string());
     // A session nobody rewarded teaches advice by how the judge found it turned out (an agent's own reward, given
-    // at its end, or later, stands: this runs only while there is none). `unclear` teaches nothing.
-    if fresh.reward.is_none() && fresh.rating.is_none() {
-        let reward = match verdicts["outcome"].as_str() {
-            Some("succeeded") => Some(1.0),
-            Some("failed") => Some(-1.0),
-            _ => None,
-        };
-        if reward.is_some() {
-            // A fixed reason: the judge's own sentence (in `verdicts`) is written from a transcript, which
-            // may hold instructions, and the reason is read by the model that learns advice.
-            fresh.reward = reward;
-            fresh.reward_reason = Some(format!(
-                "{}the judge's reading of the session's {}",
+    // at its end, or later, stands: this runs only while there is none, or while the one there is the judge's
+    // own from an earlier reading). `unclear` teaches nothing: a judge's earlier reward is dropped, not kept.
+    if (fresh.reward.is_none() || judge_rewarded(&fresh)) && fresh.rating.is_none() {
+        let reward = judged_reward(Some(&verdicts));
+        fresh.reward = reward;
+        // A fixed reason: the judge's own sentence (in `verdicts`) is written from a transcript, which may hold
+        // instructions, and the reason is read by the model that learns advice.
+        fresh.reward_reason = reward.map(|_| {
+            format!(
+                "{}{JUDGE_READ}{}",
                 crate::qa_log::JUDGED,
                 match kept {
                     Some(_) => "transcript",
                     None => "partial record and what came after it",
                 }
-            ));
-        }
+            )
+        });
     }
     put(store, scope, &fresh.asker.clone(), fresh.clone());
     Ok(fresh)
+}
+
+/// How the reason of a reward the session judge gave goes on after [`crate::qa_log::JUDGED`].
+const JUDGE_READ: &str = "the judge's reading of the session's ";
+
+/// Whether session `l`'s reward is one the session judge gave ([`judge`]): replaced when it is judged again, and
+/// dropped when its verdicts are.
+fn judge_rewarded(l: &Logged) -> bool {
+    l.reward.is_some()
+        && l.reward_reason.as_deref().is_some_and(|w| {
+            w.strip_prefix(crate::qa_log::JUDGED)
+                .is_some_and(|w| w.starts_with(JUDGE_READ))
+        })
+}
+
+/// The reward a session's verdicts give: 1 where the judge found it succeeded, -1 where it failed, none where it
+/// couldn't tell, left it unscored, or hasn't judged it.
+fn judged_reward(verdicts: Option<&Value>) -> Option<f64> {
+    match verdicts?["outcome"].as_str() {
+        Some("succeeded") => Some(1.0),
+        Some("failed") => Some(-1.0),
+        _ => None,
+    }
+}
+
+/// Drops a judge's reward that session `l`'s verdicts no longer give: one judged again since (as unclear, say),
+/// or reopened and not judged yet, from before this kept them in step. Whether it changed.
+fn drop_stale_reward(l: &mut Logged) -> bool {
+    if !judge_rewarded(l) {
+        return false;
+    }
+    let v = l
+        .session
+        .as_ref()
+        .and_then(|s| s.verdicts.as_deref())
+        .and_then(|v| serde_json::from_str::<Value>(v).ok());
+    let now = judged_reward(v.as_ref());
+    if now == l.reward {
+        return false;
+    }
+    l.reward = now;
+    if now.is_none() {
+        l.reward_reason = None;
+    }
+    true
 }
 
 /// The judge's reply, kept to the notes the session was served and to the shape asked for: each note's items to
@@ -3532,6 +3581,8 @@ pub struct Swept {
     pub judged: usize,
     /// Sessions graded request by request ([`grade_tasks`]).
     pub graded: usize,
+    /// Sessions whose judge's reward their verdicts no longer gave, dropped ([`drop_stale_reward`]).
+    pub unrewarded: usize,
 }
 
 /// Sessions a sweep tries to grade at most ([`grade_tasks`]): a scope's backlog is worked through a sweep at a time.
@@ -3571,6 +3622,24 @@ pub async fn sweep(
         .filter(|l| l.kind.as_deref() == Some(KIND))
         .collect();
     for l in sessions.iter().cloned() {
+        // A judge's reward its verdicts no longer give (judged again, or reopened, before the two were kept in
+        // step) is dropped, read fresh so a turn landing since isn't undone.
+        let mut fixed = l.clone();
+        let l = if drop_stale_reward(&mut fixed) {
+            let who = Principal::from_parts(l.asker.clone(), vec![]);
+            match Box::pin(find(store, scope, &who, &l.answer_id)).await {
+                Ok(mut f) => {
+                    if drop_stale_reward(&mut f) {
+                        put(store, scope, &f.asker.clone(), f.clone());
+                        done.unrewarded += 1;
+                    }
+                    f
+                }
+                Err(_) => l,
+            }
+        } else {
+            l
+        };
         let s = l.session.as_ref().expect("a session");
         let l = if s.ended_at.is_none() {
             if l.updated_at > before {

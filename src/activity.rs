@@ -271,8 +271,42 @@ pub(crate) fn entry(l: &Logged) -> Value {
                               "served_versions": s.served_versions, "withheld": s.withheld, "ended_at": s.ended_at, "ended_by": s.ended_by,
                               "fires": s.fires, "lookups": s.lookups, "prs": s.prs, "verdicts": s.verdicts.as_deref()
                                   .and_then(|v| serde_json::from_str::<Value>(v).ok())});
+        if let Some(t) = &s.thread {
+            v["session"]["thread"] = json!(t);
+        }
     }
     v
+}
+
+/// The sessions of `l`'s conversation, oldest first, `l` among them: its asker's sessions with the same
+/// [`crate::qa_log::SessionPart::thread`] (a harness splits one conversation into several at a compaction, or
+/// after it went idle). Empty for an entry with no thread.
+fn thread_sessions(log: &[Logged], l: &Logged) -> Vec<Value> {
+    let Some(thread) = l.session.as_ref().and_then(|s| s.thread.as_deref()) else {
+        return vec![];
+    };
+    let mut same: Vec<&Logged> = log
+        .iter()
+        .filter(|o| {
+            o.asker == l.asker
+                && o.session
+                    .as_ref()
+                    .is_some_and(|s| s.thread.as_deref() == Some(thread))
+        })
+        .collect();
+    same.sort_by_key(|o| (o.asked_at, o.answer_id.clone()));
+    same.iter()
+        .map(|o| {
+            let s = o.session.as_ref();
+            let outcome = s
+                .and_then(|s| s.verdicts.as_deref())
+                .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                .and_then(|v| v["outcome"].as_str().map(str::to_string));
+            json!({"id": o.answer_id, "asked_at": o.asked_at, "updated_at": o.updated_at,
+                   "question": o.question, "reward": o.reward, "outcome": outcome,
+                   "ended_by": s.and_then(|s| s.ended_by.clone())})
+        })
+        .collect()
 }
 
 /// The episode holding `l`'s conversation: an open session's conversation so far, else the transcript an ended
@@ -312,6 +346,10 @@ pub async fn transcript(
         return Ok(None);
     };
     let mut v = entry(l);
+    let thread = thread_sessions(log, l);
+    if !thread.is_empty() {
+        v["thread_sessions"] = json!(thread);
+    }
     let body = match transcript_of(l).filter(|_| kind_of(l) != "answer") {
         Some(e) => store
             .episode_bodies(scope, vec![e.to_string()])
