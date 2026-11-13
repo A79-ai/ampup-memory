@@ -8740,6 +8740,13 @@ async fn directory_change(
             let (st, org, user) = (Arc::clone(state), org.clone(), who.user().to_string());
             state.background(join::notify(st, org, user));
         }
+        // An unverified sign-in let in: the person is told they can sign in now.
+        if let Change::ApproveSignIn { org, user, .. } = &change
+            && !events.is_empty()
+        {
+            let (st, org, user) = (Arc::clone(state), org.clone(), user.clone());
+            state.background(signin::approved(st, org, user));
+        }
         if matches!(
             change,
             Change::SetSettings { .. } | Change::DeleteOrg { .. }

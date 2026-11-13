@@ -183,3 +183,51 @@ pub(super) async fn notify(state: Arc<State>, org: String, user: String) {
         }
     }
 }
+
+/// Tell `user` that an admin of `org` approved their sign-in, with the link to sign in. The console's
+/// waiting page signs them in by itself while it is open; this reaches them when it isn't.
+pub(super) async fn approved(_state: Arc<State>, org: String, user: String) {
+    let user = user_id(&user);
+    if !user.contains('@') {
+        return;
+    }
+    let Some(mailer) = mail::from_env() else {
+        eprintln!("signin approved: {user} in {org}: no mail is configured, so they weren't told");
+        return;
+    };
+    let link = std::env::var("AMPUP_MEMORY_CONSOLE_URL")
+        .ok()
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .map(|c| format!("{c}/login/{org}"));
+    let subject = format!("You're approved: sign in to {org} on AmpUp Memory");
+    let how = match &link {
+        Some(l) => format!("Sign in here, with the same email and password:\n{l}"),
+        None => "Sign in again with the same email and password.".to_string(),
+    };
+    let text = format!("An admin of {org} approved your sign-in to AmpUp Memory.\n\n{how}");
+    let e = mail::esc;
+    let p_style = "margin:0 0 14px;font:15px/1.5 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#18181b";
+    let mut body = format!(
+        "<h2 style=\"margin:0 0 14px;font:600 20px/1.3 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#18181b\">You're approved for {}</h2><p style=\"{p_style}\">An admin of {} approved your sign-in to AmpUp Memory. Sign in with the same email and password.</p>",
+        e(&org),
+        e(&org),
+    );
+    if let Some(l) = &link {
+        body.push_str(&format!(
+            "<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 0 14px\"><tr><td style=\"background:#18181b;border-radius:6px\"><a href=\"{}\" style=\"display:inline-block;padding:11px 20px;font:600 15px -apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#ffffff;text-decoration:none\">Sign in to {}</a></td></tr></table>",
+            e(l),
+            e(&org)
+        ));
+    }
+    let html = format!(
+        "<!doctype html><html><body style=\"margin:0;padding:24px;background:#ffffff\"><div style=\"max-width:640px\">{body}</div></body></html>"
+    );
+    match mailer.send(&user, &subject, &text, &html).await {
+        Ok(()) => eprintln!(
+            "signin approved: {user} in {org}; told them by {}",
+            mailer.provider()
+        ),
+        Err(e) => eprintln!("signin approved: {user} in {org}; mail to them failed: {e:#}"),
+    }
+}
