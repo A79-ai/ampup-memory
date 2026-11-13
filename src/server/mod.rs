@@ -219,6 +219,9 @@ struct KeyUse {
 /// this (exactly, when it asks the server that saw it).
 const KEY_USE_FLUSH: Duration = Duration::from_secs(3600);
 
+/// How long a server start waits out a throttled or failing catalog before it gives up.
+const STARTUP_CATALOG_WAIT: Duration = Duration::from_secs(300);
+
 impl KeyUse {
     fn due(&self) -> bool {
         match self.flushed {
@@ -444,9 +447,23 @@ pub async fn serve_with(
     }
     // A fresh install has no tables yet. A cell other than the served scope's (`serve org` on an org's own cell)
     // never opens it: that memory is the default cell's.
-    match memstore_core::cell::holds(&scope) {
-        true => store.ensure_scope(&scope).await?,
-        false => store.ensure_system().await?,
+    // A throttled or failing catalog waits here rather than exits: BigLake's read quota is per minute, and a
+    // rollout's pods crash-looping on it each spend more of it on every restart.
+    let started = Instant::now();
+    let mut wait = Duration::from_secs(1);
+    loop {
+        let opened = match memstore_core::cell::holds(&scope) {
+            true => store.ensure_scope(&scope).await,
+            false => store.ensure_system().await,
+        };
+        match opened {
+            Err(e) if crate::is_transient(&e) && started.elapsed() < STARTUP_CATALOG_WAIT => {
+                eprintln!("memstore: catalog unavailable at start, retrying in {wait:?}: {e:#}");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(30));
+            }
+            r => break r?,
+        }
     }
     let spec = options
         .identity
