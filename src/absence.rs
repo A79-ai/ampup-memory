@@ -27,7 +27,8 @@
 //!   once older than [`HOURS_ENV`] (24 hours unless set).
 //!
 //! The marks are [`crate::freshness::Mark`]s, given where freshness marks are and in every scope whatever its
-//! `freshness` setting: nothing is written, no model is asked and no job runs. Only the claims among the facts a
+//! `freshness` setting, and on the notes a session's start or its first ask for advice hands whole ([`handed`]):
+//! nothing is written, no model is asked and no job runs. Only the claims among the facts a
 //! read serves are checked, each set of kinds and start once per read ([`Checked`]), at most [`CHECKS`] of them.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -814,4 +815,58 @@ pub async fn marks(
         out.insert(f.fact_id.clone(), mark);
     }
     out
+}
+
+/// A note handed to an agent whole (what a session's start, or its first ask for advice, hands of what someone asked
+/// to be remembered): its words, when it was last said, and the notes (episodes) that say it.
+pub struct Note<'a> {
+    pub text: &'a str,
+    pub at: i64,
+    pub notes: &'a [String],
+}
+
+/// What each of `notes` is handed as, read in `session` as `who` may read it, as of `at`: what search serves of the
+/// same words as a fact. None where it is a claim of absence that what arrived since contradicts, which a read as of
+/// now leaves out ([`marks`]); else its words, with the mark search gives a claim of absence (that it holds so far,
+/// or `not checked since`, `stale:` once old) and, where only an agent wrote it, search's label for that (`an agent
+/// concluded, <day>`, [`crate::origin`]). Nothing is counted unless one of them reads as a claim of absence
+/// ([`candidate`]), so handing notes that hold none costs no arrivals query. `memo`: what this read counted already.
+pub async fn handed(
+    store: &Store,
+    session: &Session,
+    who: &Principal,
+    notes: &[Note<'_>],
+    at: i64,
+    memo: &Checked,
+) -> Vec<Option<String>> {
+    let facts: Vec<Fact> = notes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| Fact {
+            fact_id: format!("handed:{i}"),
+            value: n.text.to_string(),
+            valid_from: n.at,
+            source_episodes: n.notes.to_vec(),
+            ..Default::default()
+        })
+        .collect();
+    let refs: Vec<&Fact> = facts.iter().collect();
+    let marks = marks(store, &[session], who, &refs, at, memo).await;
+    facts
+        .iter()
+        .zip(notes)
+        .map(|(f, n)| {
+            let mut text = n.text.to_string();
+            match marks.get(&f.fact_id) {
+                Some(Mark::Contradicted { .. }) => return None,
+                Some(m) => text.push_str(&format!(" — {}", m.note(&f.predicate))),
+                None => {}
+            }
+            let origin = session.vis().fact_origin(f);
+            if let Some(o) = origin.and_then(|o| o.note(f.valid_from)) {
+                text.push_str(&format!(" — {o}"));
+            }
+            Some(text)
+        })
+        .collect()
 }

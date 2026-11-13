@@ -3229,7 +3229,9 @@ async fn an_approved_value_reaches_only_its_readers() {
 /// A claim that nothing arrived ("no new Linear tickets in the last hour") is checked against what arrived since, and
 /// the check counts only what its reader may read: a count with another reader's episodes, or another org's, would
 /// tell them those exist. Carol may read one new Linear ticket, Dave three others, and another org holds two more:
-/// each reads a count of their own, never one with what they can't read.
+/// each reads a count of their own, never one with what they can't read. So does a session's start, handing each the
+/// same claim in a note of their own written after Carol's ticket: Dave's tickets, which only he may read, leave out
+/// his and not hers.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_claim_of_absence_counts_only_what_its_reader_may_read() {
     let dir = tempfile::tempdir().unwrap();
@@ -3306,8 +3308,29 @@ async fn a_claim_of_absence_counts_only_what_its_reader_may_read() {
             &[acl],
         )
     };
+    store
+        .commit(&acme, "ingest", &[ticket(1, "user:carol@acme.com")], &[])
+        .await
+        .unwrap();
+    // Carol and Dave each remember the claim in a note of their own, after Carol's ticket and before Dave's.
+    let note = |user: &str| {
+        Episode::sourced(
+            &format!("mcp:remember_memory:{user}:hourly-check"),
+            format!("No new Linear tickets have reached memory since the last check ({user})")
+                .as_bytes(),
+            &[&format!("user:{user}")],
+        )
+    };
+    store
+        .commit(
+            &acme,
+            "remember",
+            &[note("carol@acme.com"), note("dave@acme.com")],
+            &[],
+        )
+        .await
+        .unwrap();
     let acme_tickets = vec![
-        ticket(1, "user:carol@acme.com"),
         ticket(2, "user:dave@acme.com"),
         ticket(3, "user:dave@acme.com"),
         ticket(4, "user:dave@acme.com"),
@@ -3380,4 +3403,39 @@ async fn a_claim_of_absence_counts_only_what_its_reader_may_read() {
             );
         }
     }
+    // What each one's session's start hands of their own notes: Carol's claim holds as far as she may read, so it is
+    // handed, marked so; Dave's tickets contradict his, so it is left out.
+    let handed = async |user: &str| -> Vec<String> {
+        let (status, raw) = mcp_call(
+            &url,
+            "?org=acme",
+            &id_token(&issuer, user),
+            "start_session",
+            json!({"context": "check that new linear tickets reach memory", "harness": "claude-code"}),
+        )
+        .await;
+        assert_eq!(status, 200, "{raw}");
+        let (text, err) = tool_text(&raw);
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        v["remembered_for_you"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect()
+    };
+    let carol = handed("carol@acme.com").await;
+    assert!(
+        carol.len() == 1
+            && carol[0].contains("(carol@acme.com)")
+            && carol[0].contains(" — a claim of absence; no linear item has arrived since "),
+        "carol's note, unchanged by tickets she can't read: {carol:?}"
+    );
+    let dave = handed("dave@acme.com").await;
+    assert!(
+        dave.iter().all(|n| !n.contains("Linear tickets")),
+        "dave's note, contradicted by his tickets: {dave:?}"
+    );
 }

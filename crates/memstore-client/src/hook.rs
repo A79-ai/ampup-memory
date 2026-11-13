@@ -1063,13 +1063,15 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             // last one, if there was one: then this one is the next session's alone.
             let cache = repo.as_deref().and_then(|r| marker("recall", r));
             let served = cache.as_ref().is_some_and(|c| c.exists());
+            // Without the claims of absence: the server checks one as of each read, so a copy handed later can't.
             if let (Some(c), Ok(found)) = (&cache, &recalled) {
-                let _ = match found {
+                let _ = match found.as_ref().and_then(|(_, kept)| kept.as_ref()) {
                     Some(text) => write_whole(c, text),
                     None => std::fs::remove_file(c).map_err(Into::into),
                 };
             }
-            let recalled = recalled.map(|r| r.filter(|_| !(detached && served)));
+            let recalled =
+                recalled.map(|r| r.map(|(now, _)| now).filter(|_| !(detached && served)));
             let opened = opened.unwrap_or_else(|e| {
                 warn(format!("no session: {e:#}"));
                 None
@@ -1117,7 +1119,7 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             // The first prompt's facts get what the advice and the notes left of the hook's (and the line between).
             let left = (BUDGET - START_FACTS)
                 .saturating_sub(advised.as_deref().map_or(0, |a| a.chars().count() + 1));
-            let recalled = recalled.map(|r| r.and_then(|t| within(&t, left)));
+            let recalled = recalled.map(|r| r.and_then(|(t, _)| within(&t, left)));
             say(
                 harness,
                 &input,
@@ -2836,8 +2838,15 @@ fn query_of(prompt: &str) -> String {
     shorten_to(&words.join(" "), QUERY_CHARS, QUERY_CHARS - QUERY_TAIL)
 }
 
-/// The results best matching `query`, as context, in at most `max` characters.
-async fn recall(client: &Client, query: &str, what: &str, max: usize) -> Result<Option<String>> {
+/// The results best matching `query`, as context, in at most `max` characters: each fact with what the server says
+/// beside it ([`beside`]); and the same without the claims of absence among them, for the repo's recall cache
+/// ([`absence_claim`]).
+async fn recall(
+    client: &Client,
+    query: &str,
+    what: &str,
+    max: usize,
+) -> Result<Option<(String, Option<String>)>> {
     // Facts as JSON, never the compact text: that quotes what others wrote, and a hook's context goes into
     // every prompt unasked. The facts alone, or {hits, passages, note}; a server that answers something else
     // (an error) adds nothing.
@@ -2858,40 +2867,76 @@ async fn recall(client: &Client, query: &str, what: &str, max: usize) -> Result<
     if facts.is_empty() && passages.is_empty() {
         return Ok(None);
     }
-    let mut context = format!(
-        "{RECALL_LEAD}, facts {what}. Each cites its source episodes; \
-         read one with the AmpUp Memory get_episode tool, search more with search_memory.\n"
-    );
-    for f in facts {
-        let s = |k: &str| f[k].as_str().unwrap_or_default().to_string();
-        context.push_str(&format!(
-            "- {} · {}: {}\n",
-            s("entity"),
-            s("predicate"),
-            s("value")
-        ));
-        // The facts a hit brings with it (its entity's others from the same source), under it.
-        for m in f["facts"].as_array().into_iter().flatten() {
-            let s = |k: &str| m[k].as_str().unwrap_or_default().to_string();
-            context.push_str(&format!("  - {}: {}\n", s("predicate"), s("value")));
-        }
-    }
-    // Raw text someone wrote (a Slack message, a call) never goes into every prompt unasked: only where it
-    // is, for the agent to read with get_episode when it wants it.
-    if !passages.is_empty() {
-        context.push_str(
-            "Episodes whose text matches though no fact above cites them (get_episode reads one):\n",
+    // The facts, with the claims of absence among them or without.
+    let render = |claims: bool| {
+        let mut context = format!(
+            "{RECALL_LEAD}, facts {what}. Each cites its source episodes; \
+             read one with the AmpUp Memory get_episode tool, search more with search_memory.\n"
         );
-    }
-    for p in passages {
-        let s = |k: &str| p[k].as_str().unwrap_or_default().to_string();
-        context.push_str(&format!(
-            "- {} {}\n",
-            s("episode_id"),
-            json!(one_line(&s("source"), 80))
-        ));
-    }
-    Ok(within(&context, max))
+        for f in facts.iter().filter(|f| claims || !absence_claim(f)) {
+            let s = |k: &str| f[k].as_str().unwrap_or_default().to_string();
+            context.push_str(&format!(
+                "- {} · {}: {}{}\n",
+                s("entity"),
+                s("predicate"),
+                s("value"),
+                beside(f)
+            ));
+            // The facts a hit brings with it (its entity's others from the same source), under it.
+            for m in f["facts"].as_array().into_iter().flatten() {
+                if !claims && absence_claim(m) {
+                    continue;
+                }
+                let s = |k: &str| m[k].as_str().unwrap_or_default().to_string();
+                context.push_str(&format!(
+                    "  - {}: {}{}\n",
+                    s("predicate"),
+                    s("value"),
+                    beside(m)
+                ));
+            }
+        }
+        // Raw text someone wrote (a Slack message, a call) never goes into every prompt unasked: only where it
+        // is, for the agent to read with get_episode when it wants it.
+        if !passages.is_empty() {
+            context.push_str(
+                "Episodes whose text matches though no fact above cites them (get_episode reads one):\n",
+            );
+        }
+        for p in &passages {
+            let s = |k: &str| p[k].as_str().unwrap_or_default().to_string();
+            context.push_str(&format!(
+                "- {} {}\n",
+                s("episode_id"),
+                json!(one_line(&s("source"), 80))
+            ));
+        }
+        within(&context, max)
+    };
+    Ok(render(true).map(|now| (now, render(false))))
+}
+
+/// What the server says beside a fact it answered with, as its text answer does: its freshness mark (`stale: ...`, a
+/// claim of absence's `a claim of absence; no linear item has arrived since ...`) and that only an agent wrote it
+/// (`an agent concluded, <day>`), each after ` — `.
+fn beside(f: &Value) -> String {
+    [&f["freshness"]["note"], &f["origin_note"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .map(|n| n.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|n| !n.is_empty())
+        .map(|n| format!(" — {n}"))
+        .collect()
+}
+
+/// Whether a fact the server answered with is a claim that something didn't happen (nothing arrived, a feed
+/// stopped), which it checks against what arrived as of each read: a copy of it handed later (the repo's recall
+/// cache, handed at the next session's start) could no longer say whether it holds.
+fn absence_claim(f: &Value) -> bool {
+    f["freshness"]["mark"] == "contradicted"
+        || f["freshness"]
+            .as_object()
+            .is_some_and(|o| o.contains_key("checked"))
 }
 
 /// `text` (recalled facts: a lead line, then one line a fact, the facts it brings indented under it) in at most

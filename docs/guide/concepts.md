@@ -113,7 +113,10 @@ A fact is `(entity, predicate, value)` with a valid-time window, a verbatim quot
   it reads `a claim of absence, as of
   <time>, not checked since`, and `stale:` after `AMPUP_MEMORY_ABSENCE_HOURS` (24). Claims are recognised by their
   words (a negation with a period, nothing arriving, a feed or job that stalled or stopped) or by the tag
-  `absence`, at read time: nothing is written and no model is asked.
+  `absence`, at read time: nothing is written and no model is asked. The notes a session's start or its first
+  `get_advice` hands whole (what the user and their team asked to be remembered) are checked the same way: a
+  contradicted one isn't handed, another carries the same mark, and one only an agent wrote says `an agent
+  concluded, <day>`, as search says it.
 
 The index is derived. It lives at `AMPUP_MEMORY_INDEX_URI` and can be rebuilt from the tables at any time
 (`ampup-memory index rebuild`). See [schemas-and-queries.md](schemas-and-queries.md).

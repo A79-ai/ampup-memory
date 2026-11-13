@@ -961,8 +961,8 @@ pub async fn for_session(
             .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_default()
     };
-    // Newest first, each with the day it was said: where two disagree (a prefix changed), the agent can tell which
-    // stands. One a newer note says the same as ([`says_same`]) is left out, so a preference said in many sessions,
+    // Newest first: where two disagree (a prefix changed), the agent can tell which stands by the day each is handed
+    // with. One a newer note says the same as ([`says_same`]) is left out, so a preference said in many sessions,
     // or said again in other words, is one line: the newest. A team sentence that says nothing is left out too.
     let texts = |ids: &[(String, i64)], team: bool| {
         // The ones handed: a note left out is one a handed note says.
@@ -982,7 +982,11 @@ pub async fn for_session(
             if kept.iter().any(|k| k.says(&read)) {
                 continue;
             }
-            out.push(format!("({}) {t}", day(*at)));
+            out.push(Handed {
+                at: *at,
+                text: t,
+                notes: vec![id.clone()],
+            });
             kept.push(read);
             if out.len() == HANDED {
                 break;
@@ -1029,28 +1033,47 @@ pub async fn for_session(
                 .await?
         }
     };
-    let mut mine: Vec<String> = entries
-        .into_iter()
-        .take(HANDED)
-        .map(|h| format!("({}) {}", day(h.at), h.text))
-        .collect();
+    // Each as search serves the same words (`crate::absence::handed`): a claim that nothing arrived, or that
+    // ingestion stalled, is checked against what the user may read that arrived since, and isn't handed where that
+    // contradicts it, else carries search's mark; one only an agent wrote says so. An hourly agent's wrong "ingestion
+    // stalled" note was handed to every later session's start as is, and each said so again.
+    let memo = &crate::absence::Checked::default();
+    let now = crate::now_micros();
+    let checked = |hs: Vec<Handed>| async move {
+        let notes: Vec<crate::absence::Note> = hs
+            .iter()
+            .map(|h| crate::absence::Note {
+                text: &h.text,
+                at: h.at,
+                notes: &h.notes,
+            })
+            .collect();
+        let handed = crate::absence::handed(store, session, who, &notes, now, memo).await;
+        hs.iter()
+            .zip(handed)
+            .filter_map(|(h, t)| Some((Said::of(&h.text), format!("({}) {}", day(h.at), t?))))
+            .take(HANDED)
+            .collect::<Vec<_>>()
+    };
+    let (noted, mut mine): (Vec<Said>, Vec<String>) = checked(entries).await.into_iter().unzip();
     // The preferences their own advice learned from how they reacted to the work, where no note says them already.
-    let noted: Vec<Said> = mine.iter().map(|m| Said::of(undated(m))).collect();
+    let mut learned: Vec<Said> = vec![];
     for p in crate::advice::own_preferences(session, store, who).await? {
         let read = Said::of(&p);
         if !noted.iter().any(|n| n.says(&read) || read.says(n)) {
             mine.push(format!("(learned) {p}"));
+            learned.push(read);
         }
     }
     // What the user's own notes say already (theirs may be one the team's sentence was made from) isn't handed again.
-    let own: Vec<Said> = mine.iter().map(|m| Said::of(undated(m))).collect();
-    let team = texts(&team, true)
+    let team: Vec<Handed> = texts(&team, true)
         .into_iter()
-        .filter(|t| {
-            let read = Said::of(undated(t));
-            !own.iter().any(|m| m.says(&read))
+        .filter(|h| {
+            let read = Said::of(&h.text);
+            !noted.iter().chain(&learned).any(|m| m.says(&read))
         })
         .collect();
+    let team = checked(team).await.into_iter().map(|(_, t)| t).collect();
     Ok((mine, team))
 }
 
