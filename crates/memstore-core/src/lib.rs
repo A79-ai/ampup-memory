@@ -32,6 +32,7 @@ pub mod pins;
 pub mod platform;
 pub mod query;
 pub mod retention;
+pub mod retry;
 pub mod search;
 pub mod usage;
 pub mod workspace;
@@ -306,6 +307,8 @@ impl std::fmt::Display for Scope {
 }
 
 pub use memstore_client::{check_name, naming};
+pub use retry::is_transient;
+pub(crate) use retry::with_retries;
 
 /// Who is reading. Groups come from the customer's IdP (SCIM); the engine defines none. They are the
 /// caller's closure: every team, role, account and channel they hold, already flattened.
@@ -2150,6 +2153,9 @@ struct DirState {
     /// The fold, when it was loaded, and the directory table snapshot it was folded from (none: not
     /// known). Held across a load, so concurrent loads are one load.
     folded: tokio::sync::Mutex<Option<HeldFold>>,
+    /// The last load's transient failure, when, and how long until the catalog is read again
+    /// ([`retry::cooldown`]): meanwhile a load returns it at once rather than each request spending the quota.
+    failed: std::sync::Mutex<Option<(Instant, Duration, String)>>,
     /// One directory write at a time from this server; other servers are raced with a
     /// compare-and-set on the table's snapshot ([`Store::append_directory_with`]).
     writes: tokio::sync::Mutex<()>,
@@ -2502,9 +2508,14 @@ impl Store {
                 // One load of a table at a time: a reader that finds the cache past the hard limit meanwhile
                 // waits for this one rather than reading the whole table again beside it.
                 let loading = cache.loading(&format!("{ns}.{name}"));
-                let _turn = loading.lock().await;
-                if let Err(e) = refresh(&*catalog, &cache, &ns, &name).await {
+                let turn = loading.lock().await;
+                let refreshed = refresh(&*catalog, &cache, &ns, &name).await;
+                drop(turn);
+                if let Err(e) = refreshed {
                     eprintln!("memstore: background refresh of {ns}.{name} failed: {e:#}");
+                    // Readers keep the cached rows meanwhile: a refresh started by each of them would spend a
+                    // throttled catalog's quota faster than retries ever did.
+                    tokio::time::sleep(retry::cooldown(&e)).await;
                 }
                 cache
                     .refreshing
@@ -4927,8 +4938,29 @@ impl Store {
         {
             return Ok(f.clone());
         }
+        if let Some((at, wait, e)) = &*self.dir.failed.lock().unwrap()
+            && at.elapsed() < *wait
+        {
+            anyhow::bail!(
+                "{e} (the directory is read again in {:?})",
+                *wait - at.elapsed()
+            );
+        }
         let t0 = Instant::now();
-        let (table, f) = self.fold_directory(held.as_ref()).await?;
+        let (table, f) = match self.fold_directory(held.as_ref()).await {
+            Ok(v) => {
+                *self.dir.failed.lock().unwrap() = None;
+                v
+            }
+            Err(e) => {
+                if retry::is_transient(&e) {
+                    let wait = retry::cooldown(&e);
+                    *self.dir.failed.lock().unwrap() =
+                        Some((Instant::now(), wait, format!("{e:#}")));
+                }
+                return Err(e);
+            }
+        };
         self.dir
             .metrics
             .refresh_seconds
@@ -6015,7 +6047,10 @@ impl Store {
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                eprintln!("memstore: background plan refresh of {ns} failed: {e:#}")
+                                eprintln!(
+                                    "memstore: background plan refresh of {ns} failed: {e:#}"
+                                );
+                                tokio::time::sleep(retry::cooldown(&e)).await;
                             }
                         }
                         cache
@@ -8997,51 +9032,6 @@ async fn read_task(table: &Table, task: FileScanTask) -> Result<Vec<RecordBatch>
         Ok(stream.try_collect().await?)
     })
     .await
-}
-
-/// Object stores and catalogs answer some requests with transient 5xx / throttling errors and
-/// expect a retry. Anything else (not found, denied, a commit conflict) is returned at once.
-pub fn is_transient(e: &anyhow::Error) -> bool {
-    let text = format!("{e:#}");
-    [
-        "status: 500",
-        "status: 502",
-        "status: 503",
-        "status: 504",
-        // Rate limited (BigLake's catalog API answers a burst of calls with it): backed off and tried again.
-        "status: 429",
-        "Too Many Requests",
-        "InternalError",
-        "SlowDown",
-        "ServiceUnavailable",
-        "Connection reset",
-        "connection error",
-    ]
-    .iter()
-    .any(|m| text.contains(m))
-}
-
-pub(crate) async fn with_retries<T, F, Fut>(op: F) -> Result<T>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    let mut delay = Duration::from_millis(50);
-    for attempt in 0.. {
-        match op().await {
-            Err(e) if attempt < 6 && is_transient(&e) => {
-                // Jittered (half to all of the step): callers throttled together, a scope's tables or pods
-                // restarting at once, don't all come back in the same instant.
-                let step = delay.as_millis() as u64;
-                let ms =
-                    step / 2 + (uuid::Uuid::new_v4().as_u128() % (step / 2 + 1) as u128) as u64;
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-                delay *= 2;
-            }
-            r => return r,
-        }
-    }
-    unreachable!()
 }
 
 /// Decoded batches per data file of the table's current snapshot, reusing `cached` for files

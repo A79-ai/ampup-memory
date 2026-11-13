@@ -448,21 +448,27 @@ pub async fn serve_with(
     // A fresh install has no tables yet. A cell other than the served scope's (`serve org` on an org's own cell)
     // never opens it: that memory is the default cell's.
     // A throttled or failing catalog waits here rather than exits: BigLake's read quota is per minute, and a
-    // rollout's pods crash-looping on it each spend more of it on every restart.
+    // rollout's pods crash-looping on it each spend more of it on every restart. This loop is the one layer
+    // that retries (the calls inside try once), with the same jittered backoff as every other retry.
     let started = Instant::now();
-    let mut wait = Duration::from_secs(1);
-    loop {
-        let opened = match memstore_core::cell::holds(&scope) {
-            true => store.ensure_scope(&scope).await,
-            false => store.ensure_system().await,
-        };
+    for retry in 0u32.. {
+        let opened = crate::retry::without_retries(async {
+            match memstore_core::cell::holds(&scope) {
+                true => store.ensure_scope(&scope).await,
+                false => store.ensure_system().await,
+            }
+        })
+        .await;
         match opened {
             Err(e) if crate::is_transient(&e) && started.elapsed() < STARTUP_CATALOG_WAIT => {
+                let wait = crate::retry::backoff(&e, retry);
                 eprintln!("memstore: catalog unavailable at start, retrying in {wait:?}: {e:#}");
                 tokio::time::sleep(wait).await;
-                wait = (wait * 2).min(Duration::from_secs(30));
             }
-            r => break r?,
+            r => {
+                r?;
+                break;
+            }
         }
     }
     let spec = options
