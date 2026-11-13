@@ -99,6 +99,21 @@ A fact is `(entity, predicate, value)` with a valid-time window, a verbatim quot
   yet, and the newest five of those. Only episodes the caller may read count. An episode with no facts is found by
   a search only through its words, so "what came in this hour?" is answered from what was ingested, not from
   whether a search found it. The JSON format carries it as `arrived`.
+- **Claims of absence.** A fact that says something did not happen over a period ("no new Linear tickets since
+  nine", "the Sentry feed stalled", "nothing reached memory today") is never superseded by news: a new ticket gives
+  facts about that ticket, not "tickets arrive". So every read checks such a claim against what the store received
+  since its period began (the episodes' recorded time, only those the reader may read, the claim's own aside; the
+  period begins when the claim was stated, or earlier where it says so: `since 22:15`, `in the last 3 hours`, `for
+  the fifth hour in a row`, at most 30 days earlier): when
+  episodes of the kinds of source it names (or of any kind, for memory or its ingestion as a whole) arrived, it reads
+  `contradicted: 14 linear items arrived since <time>` and a search as of now leaves it out (`as_of` and history
+  reads keep it, marked; JSON says how many as `left_out_contradicted`). When none did it says so; when it is about
+  nothing the store receives ("the customer hasn't replied since Monday"), or narrows a kind of source to one
+  customer, deal or project ("no new tickets from Acme"), or names only kinds of source the reader never received,
+  it reads `a claim of absence, as of
+  <time>, not checked since`, and `stale:` after `AMPUP_MEMORY_ABSENCE_HOURS` (24). Claims are recognised by their
+  words (a negation with a period, nothing arriving, a feed or job that stalled or stopped) or by the tag
+  `absence`, at read time: nothing is written and no model is asked.
 
 The index is derived. It lives at `AMPUP_MEMORY_INDEX_URI` and can be rebuilt from the tables at any time
 (`ampup-memory index rebuild`). See [schemas-and-queries.md](schemas-and-queries.md).

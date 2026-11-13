@@ -31,6 +31,7 @@ macro_rules! eprintln {
     };
 }
 
+pub mod absence;
 pub mod activity;
 pub mod advice;
 pub mod advice_curate;

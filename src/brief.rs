@@ -112,12 +112,12 @@ pub async fn brief(
     let schemas: Vec<&crate::query::schema::Schema> = schema.as_deref().into_iter().collect();
     let marking =
         crate::freshness::any(&schemas) && crate::freshness::on(store, session.scope()).await;
-    let marks = match marking {
+    let current: Vec<&Fact> = facts
+        .iter()
+        .filter(|f| f.valid_to.is_none_or(|t| t > now))
+        .collect();
+    let mut marks = match marking {
         true => {
-            let current: Vec<&Fact> = facts
-                .iter()
-                .filter(|f| f.valid_to.is_none_or(|t| t > now))
-                .collect();
             let said = crate::corroboration::Said {
                 vis: vec![session.vis()],
                 who,
@@ -126,6 +126,9 @@ pub async fn brief(
         }
         false => HashMap::new(),
     };
+    // And what the claims of absence among them come to, whatever the scope's setting (`crate::absence`).
+    let checked = crate::absence::Checked::default();
+    marks.extend(crate::absence::marks(store, &[session], who, &current, now, &checked).await);
     // And what another fact says against one now, where the scope keeps conflicts (`crate::conflicts`).
     let disputed = match crate::conflicts::on(store, session.scope()).await {
         true => {

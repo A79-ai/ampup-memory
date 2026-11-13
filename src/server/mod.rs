@@ -419,6 +419,7 @@ pub async fn serve_with(
     options: Options,
 ) -> Result<()> {
     cell::check();
+    crate::absence::register();
     let role = role().map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         !(role == Role::Serve
@@ -9442,7 +9443,7 @@ async fn search_rows(
             // optional: which page, as an offset or the cursor a previous page returned; the answer is then
             // {"hits", "cursor"} (the cursor of the next page, or null)
             let page = &r[arg + 4];
-            let (hits, next) = facts(
+            let (hits, next, _) = facts(
                 reads,
                 &store,
                 who,
@@ -9832,7 +9833,7 @@ async fn facts(
     explain: bool,
     tags: &[String],
     filter: Option<&search::Filter>,
-) -> Result<(Vec<Value>, Option<String>)> {
+) -> Result<(Vec<Value>, Option<String>, Vec<(String, Vec<String>)>)> {
     // A page: an offset, or a cursor (`<offset>.<fingerprint>.<pins>`) that reads what its first page read.
     let fingerprint = {
         use sha2::Digest;
@@ -9945,6 +9946,19 @@ async fn facts(
     let marks = reads.marks(store, who, &shown, valid_at, false).await?;
     // And what another fact says against one, where the scope keeps conflicts (`crate::conflicts`).
     let conflicts = reads.conflicts(store, who, &shown, valid_at).await?;
+    // A claim of absence what arrived since contradicts is left out of a read as of now (`crate::absence`): its id
+    // and episodes are returned, so its episodes' text is left out with it.
+    let (found, gone): (Vec<_>, Vec<_>) = found.into_iter().partition(|h| {
+        valid_at != Some(i64::MAX)
+            || !matches!(
+                marks.get(&h.fact.fact_id),
+                Some(crate::freshness::Mark::Contradicted { .. })
+            )
+    });
+    let gone: Vec<(String, Vec<String>)> = gone
+        .into_iter()
+        .map(|h| (h.fact.fact_id, h.fact.source_episodes))
+        .collect();
     for h in &found {
         let mut v = json!({
             "entity": h.fact.entity, "predicate": h.fact.predicate, "value": h.fact.value,
@@ -10038,7 +10052,7 @@ async fn facts(
         }
         hits.push(v);
     }
-    Ok((hits, next))
+    Ok((hits, next, gone))
 }
 
 /// A fact's origin in a JSON answer ([`crate::origin`]): `origin`, and for an agent's the `origin_note` a text answer
@@ -10501,6 +10515,7 @@ async fn mcp(
                                     kinds: &[],
                                     types: &kinds,
                                     list: ARRIVALS_LISTED,
+                                    ..Default::default()
                                 };
                                 Some(reads.arrivals(&store, who, &a).await)
                             }
@@ -10539,7 +10554,8 @@ async fn mcp(
                         }
                     };
                     match searched {
-                        Ok((hits, next)) => {
+                        Ok((hits, next, gone)) => {
+                            let contradicted = gone.len();
                             // A name the search asks about that nothing in memory mentions: say so, so the
                             // reader stops looking rather than reading the nearest matches as an answer.
                             // And the source text that matches from episodes no hit cites: what was said that
@@ -10550,7 +10566,14 @@ async fn mcp(
                                     pool,
                                 ) {
                                     (Ok(m), Ok(p)) => {
-                                        Ok((m, uncited_passages(reads, query, p, &hits, &kinds)))
+                                        // A left-out claim's episodes count as cited: their text is left out too.
+                                        let left: Vec<Value> = gone
+                                            .iter()
+                                            .map(|(_, e)| json!({"source_episodes": e}))
+                                            .collect();
+                                        let cited: Vec<Value> =
+                                            hits.iter().cloned().chain(left).collect();
+                                        Ok((m, uncited_passages(reads, query, p, &cited, &kinds)))
                                     }
                                     (Err(e), _) | (_, Err(e)) => Err(e),
                                 },
@@ -10558,11 +10581,17 @@ async fn mcp(
                             };
                             crate::phases::mark("unmentioned + uncited");
                             found.map(|(missing, passages)| {
-                            let plain = missing.is_empty() && passages.is_empty() && arrived.is_none();
+                            let plain = missing.is_empty()
+                                && passages.is_empty()
+                                && arrived.is_none()
+                                && contradicted == 0;
                             let v = match (first, plain) {
                                 (true, true) => json!(hits),
                                 (true, false) => {
                                     let mut v = json!({"hits": hits});
+                                    if contradicted > 0 {
+                                        v["left_out_contradicted"] = json!(contradicted);
+                                    }
                                     if let Some(a) = arrived {
                                         v["arrived"] = a;
                                     }
@@ -10577,7 +10606,13 @@ async fn mcp(
                                     }
                                     v
                                 }
-                                _ => json!({"hits": hits, "cursor": next}),
+                                _ => {
+                                    let mut v = json!({"hits": hits, "cursor": next});
+                                    if contradicted > 0 {
+                                        v["left_out_contradicted"] = json!(contradicted);
+                                    }
+                                    v
+                                }
                             };
                             serde_json::to_string_pretty(&v).unwrap_or_default()
                             })
@@ -11204,7 +11239,10 @@ fn tools(schema: Option<&crate::query::schema::Schema>) -> Value {
                     period, pass start_date and end_date: the answer then also says what arrived in the period, \
                     counted from what was ingested whatever the query's words (per kind of source, how many and \
                     the latest), and lists the newest items no fact has been extracted from yet, which a search \
-                    finds only by their words. Facts that share no word with the query are left out \
+                    finds only by their words. A fact claiming something didn't happen (no new tickets since \
+                    nine, a feed stalled) is checked against what memory received since: contradicted, it is \
+                    left out and the answer says how many (as_of shows it, marked); else it says so, and one \
+                    nothing can check goes stale within a day. Facts that share no word with the query are left out \
                     when others do, and the answer says how many; when none does, it says the results are only \
                     nearest in meaning. Source text that matches in episodes no result cites follows the \
                     results; then the full ids of the episodes cited (get_episode reads one), and a cursor when \
@@ -11213,7 +11251,8 @@ fn tools(schema: Option<&crate::query::schema::Schema>) -> Value {
                     it. format \"json\" returns the matching facts one by one instead, with fact ids, scores and \
                     full citations (and {hits, note} when the query names something nothing mentions; each fact names its \
                     episode_type, and the first page adds `passages`: matching source text from episodes no hit cites, \
-                    and with dates `arrived`: {from, to, episodes, by_kind, unread, unread_episodes}). \
+                    and with dates `arrived`: {from, to, episodes, by_kind, unread, unread_episodes}; \
+                    `left_out_contradicted` counts claims of absence left out). \
                     Every fact comes from an episode of a type (sales_call, slack_thread, email, crm_update, doc): \
                     episode_type narrows the search to one or more, and start_session says how many of each this \
                     memory holds (memory_holds).",
@@ -14275,7 +14314,7 @@ async fn ask(session: &Session, store: &Store, who: &Principal, args: &Value) ->
         return Err(ToolError("question is required".into()).into());
     }
     // ask_memory answers from the caller's own scope.
-    let (hits, _) = facts(
+    let (hits, _, _) = facts(
         &Reads::alone(session.clone()),
         store,
         who,

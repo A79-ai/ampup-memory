@@ -87,6 +87,7 @@ Requests carry `X-Title: ampup-memory`, so their spend shows apart on a shared k
 | `AMPUP_MEMORY_CHUNK_BYTES` (1500), `AMPUP_MEMORY_CHUNK_OVERLAP` (150) | Passage chunking. |
 | `AMPUP_MEMORY_VIEW_FACTS` (200000) | Values and entities typed queries keep in memory; 0 keeps none. |
 | `AMPUP_MEMORY_FRESHNESS=1`, `AMPUP_MEMORY_FRESHNESS_MARKS` | Mark stale and restated values at read time. |
+| `AMPUP_MEMORY_ABSENCE_HOURS` (24) | How long a claim that something didn't happen, which nothing the store receives can check, reads as current; `0` or `off` turns the check of claims of absence off ([concepts.md](concepts.md#search)). |
 
 ## Compiling
 

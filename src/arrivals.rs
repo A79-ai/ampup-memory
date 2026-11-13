@@ -9,11 +9,11 @@
 //! or notes the server kept, which extraction never reads ([`crate::extract::typed`]).
 //!
 //! Cost: no body is read to count. The episodes' rows are already held in memory (the passage search reads them on
-//! every search), and one pass over their `occurred_at` column picks the window. Whether an episode was read for
-//! facts is the extractions table's: each read an extraction commits names its episode. Those rows are indexed by
-//! episode once per version of the table and kept, so a call looks up only the episodes in its window. Only the
-//! listed episodes (at most [`Ask::list`]) are read, for their titles, once per server: an episode's id is its
-//! text's hash.
+//! every search), and one pass over their `occurred_at` column (or `recorded_at`, [`Clock`]) picks the window.
+//! Whether an episode was read for facts is the extractions table's: each read an extraction commits names its
+//! episode. Those rows are indexed by episode once per version of the table and kept, so a call looks up only the
+//! episodes in its window. Only the listed episodes (at most [`Ask::list`]) are read, for their titles, once per
+//! server: an episode's id is its text's hash.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -25,9 +25,11 @@ use arrow_array::{Array, RecordBatch};
 
 use crate::{EPISODES, EXTRACTIONS, Episode, FAILED_TRY, Principal, Session, Store};
 
-/// What to count: the episodes that occurred from `from` to `to` (microseconds since the epoch, both included; None:
-/// no bound), of these kinds of source ([`kind_of`]) and episode types (`slack_thread`; empty: any), and how many
-/// of those not read for facts to name.
+/// What to count: the episodes that occurred (or, on the [`Clock::Received`] clock, reached the store) from `from`
+/// to `to` (microseconds since the epoch, both included; None: no bound), of these kinds of source ([`kind_of`])
+/// and episode types (`slack_thread`; empty: any), but none of `except`, and how many of those not read for facts
+/// to name. `records`: a note counts only where the source it names is a record (`linear:ENG-12`), not a label
+/// of its author's own (`hourly-check`), which says what someone wrote, not what arrived.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Ask<'a> {
     pub from: Option<i64>,
@@ -35,6 +37,20 @@ pub struct Ask<'a> {
     pub kinds: &'a [&'a str],
     pub types: &'a [&'a str],
     pub list: usize,
+    pub clock: Clock,
+    pub except: &'a [&'a str],
+    pub records: bool,
+}
+
+/// Which time an episode's window is read on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Clock {
+    /// When it happened at its source (`occurred_at`): what a search for a period means.
+    #[default]
+    Occurred,
+    /// When the store first recorded it (`recorded_at`): whether anything arrived, whatever its date says. An
+    /// episode recorded again (its ACL changed) arrived when it was first recorded.
+    Received,
 }
 
 /// One kind of source's arrivals: how many, the latest one's time, and how many no extraction has read yet.
@@ -116,8 +132,10 @@ pub fn kind_of(source: &str) -> String {
 
 /// Whether an episode from `source` is source data that arrived: one extraction reads for facts, and not a note
 /// of a run, a session or the server's own.
-fn arrival(session: &Session, source: &str) -> bool {
-    if crate::profile::author_of(source).is_some_and(|(_, rest)| !crate::profile::is_note(rest)) {
+fn arrival(session: &Session, source: &str, records: bool) -> bool {
+    if crate::profile::author_of(source)
+        .is_some_and(|(_, rest)| !crate::profile::is_note(rest) || (records && !rest.contains(':')))
+    {
         return false;
     }
     let ep = Episode {
@@ -146,12 +164,16 @@ pub async fn of(
     let vis = session.vis();
     let ns = session.scope().namespace();
     let rows = store.rows(&ns, EPISODES).await?.rows;
-    // (id, source, occurred_at) of each episode in the window the reader may read, once.
+    let clock = match ask.clock {
+        Clock::Occurred => "occurred_at",
+        Clock::Received => "recorded_at",
+    };
+    // (id, source, time) of each episode in the window the reader may read, once.
     let mut found: Vec<(&str, &str, i64)> = vec![];
     let mut once: HashSet<&str> = HashSet::new();
     for b in rows.iter() {
         let (Some(at), Some(id), Some(source)) = (
-            b.column_by_name("occurred_at"),
+            b.column_by_name(clock),
             b.column_by_name("episode_id"),
             b.column_by_name("source"),
         ) else {
@@ -168,11 +190,33 @@ pub async fn of(
                 continue;
             }
             let (e, s) = (id.value(i), source.value(i));
-            if !vis.can_see_episode(e, who) || !once.insert(e) {
+            if ask.except.contains(&e) || !vis.can_see_episode(e, who) || !once.insert(e) {
                 continue;
             }
             found.push((e, s, t));
         }
+    }
+    // Received: an episode recorded again in the window that was first recorded before it arrived before it.
+    if let (Clock::Received, Some(f)) = (ask.clock, ask.from)
+        && !found.is_empty()
+    {
+        let mut earlier: HashSet<&str> = HashSet::new();
+        for b in rows.iter() {
+            let (Some(at), Some(id)) = (b.column_by_name(clock), b.column_by_name("episode_id"))
+            else {
+                continue;
+            };
+            let (at, id) = (
+                at.as_primitive::<TimestampMicrosecondType>(),
+                id.as_string::<i32>(),
+            );
+            for i in 0..b.num_rows() {
+                if !at.is_null(i) && at.value(i) < f && once.contains(id.value(i)) {
+                    earlier.insert(id.value(i));
+                }
+            }
+        }
+        found.retain(|(e, _, _)| !earlier.contains(e));
     }
     let read = read_for_facts(store, &ns).await?;
     let mut kinds: BTreeMap<String, Kind> = BTreeMap::new();
@@ -185,7 +229,7 @@ pub async fn of(
         }
         let kind = kind_of(source);
         if (!ask.kinds.is_empty() && !ask.kinds.contains(&kind.as_str()))
-            || !arrival(session, source)
+            || !arrival(session, source, ask.records)
         {
             continue;
         }

@@ -1694,15 +1694,20 @@ impl Exec<'_> {
             Time::AsOf(t) => t,
             _ => return Ok(HashMap::new()),
         };
-        let Some(schema) = self.schema.as_deref() else {
-            return Ok(HashMap::new());
+        // Claims of absence are checked whatever the scope's `freshness` setting, as search checks them.
+        let absent = match freshness::ABSENCE.get() {
+            Some(check) if !facts.is_empty() => {
+                let shown: Vec<&Fact> = facts.iter().collect();
+                check(self.store, self.session, self.who, &shown, at).await
+            }
+            _ => HashMap::new(),
         };
-        let schemas = [schema];
+        let schemas: Vec<&schema::Schema> = self.schema.as_deref().into_iter().collect();
         if facts.is_empty()
             || !freshness::any(&schemas)
             || !freshness::on(self.store, self.session.scope()).await
         {
-            return Ok(HashMap::new());
+            return Ok(absent);
         }
         let mut all: Vec<&Fact> = facts.iter().collect();
         let mut beside = vec![];
@@ -1719,7 +1724,9 @@ impl Exec<'_> {
             vis: vec![self.session.vis()],
             who: self.who,
         };
-        Ok(freshness::marks(&schemas, &all, at, &said))
+        let mut marks = freshness::marks(&schemas, &all, at, &said);
+        marks.extend(absent);
+        Ok(marks)
     }
 
     /// What another fact says against each of `facts` (`crate::conflicts`), under `now` or `as_of` and where the

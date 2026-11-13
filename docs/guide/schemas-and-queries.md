@@ -160,6 +160,10 @@ Queries are JSON, the same over `POST /query`, MCP `query_memory` and `ampup-mem
   (`later on <date>: "…"`) and a plan whose date passed while still pending. `AMPUP_MEMORY_FRESHNESS_MARKS` (`later`,
   `overdue`, `stale`) picks the kinds. Marks are derived at read time; nothing is written. Off by default.
 
+  Claims of absence ("no new tickets since nine") are marked in the same place whatever the setting:
+  `contradicted` when the store received episodes of what they name since, `absence` when it didn't, `stale` once
+  one nothing can check is older than `AMPUP_MEMORY_ABSENCE_HOURS` ([concepts.md](concepts.md#search)).
+
 ## Aggregation and briefs
 
 `extract.aggregates` summarises extracted facts per subject: each element scored (none, identified, partial,

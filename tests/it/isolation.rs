@@ -3225,3 +3225,159 @@ async fn an_approved_value_reaches_only_its_readers() {
         "an ended approval hides nothing"
     );
 }
+
+/// A claim that nothing arrived ("no new Linear tickets in the last hour") is checked against what arrived since, and
+/// the check counts only what its reader may read: a count with another reader's episodes, or another org's, would
+/// tell them those exist. Carol may read one new Linear ticket, Dave three others, and another org holds two more:
+/// each reads a count of their own, never one with what they can't read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_of_absence_counts_only_what_its_reader_may_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = platform::local_dir(dir.path()).await.unwrap();
+    let store =
+        Store::new(catalog.clone()).with_index_base(dir.path().join("index").display().to_string());
+    store.ensure_scope(&Scope::Org).await.unwrap();
+    let issuer = start_idp().await;
+    let keys = json!([{"id":"platform","sha256":auth::hex(&sha2::Sha256::digest(ADMIN_KEY.as_bytes())),"user":"svc:platform","admin":true}]);
+    let tauth = TokenAuth::new(Some(&keys.to_string()), None)
+        .unwrap()
+        .allow_local_issuers()
+        .with_oidc(
+            OidcConfig::discover(&issuer, vec![CLIENT_ID.into()])
+                .await
+                .unwrap(),
+        );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(serve_with(
+        port,
+        Scope::Org,
+        vec![],
+        Options {
+            listener: Some(listener),
+            catalog: Some(catalog),
+            index_base: Some(store.index_base().to_string()),
+            token_auth: Some(tauth),
+            ..Default::default()
+        },
+    ));
+    let url = format!("http://127.0.0.1:{port}");
+    for change in [
+        json!({"op":"create_org","org":"acme","admin":"alice@acme.com"}),
+        json!({"op":"invite","org":"acme","members":[{"user":"carol@acme.com"},{"user":"dave@acme.com"}]}),
+        json!({"op":"create_org","org":"globex","admin":"gary@globex.com"}),
+    ] {
+        admin(&url, change).await;
+    }
+    let (acme, globex) = (Scope::org("acme").unwrap(), Scope::org("globex").unwrap());
+    // The claims, an hour old, everyone in acme may read: one about Linear, one about memory as a whole.
+    let said = Episode::sourced(
+        "slack:C0OPS:#ops:1762900000.000100",
+        b"health-bot: No new Linear tickets have reached memory in the last hour. Nothing has reached memory.",
+        &["group:acme.all"],
+    );
+    let hour = 3_600_000_000;
+    let claims: Vec<Fact> = [
+        (
+            "linear tickets",
+            "No new Linear tickets have reached memory in the last hour",
+        ),
+        (
+            "ingestion",
+            "Nothing has reached memory since it was last checked",
+        ),
+    ]
+    .into_iter()
+    .map(|(entity, value)| {
+        let mut f = Fact::new(entity, "issue", value).from_episodes(&[&said]);
+        f.valid_from = memstore::now_micros() - hour;
+        f
+    })
+    .collect();
+    store
+        .commit(&acme, "extract", std::slice::from_ref(&said), &claims)
+        .await
+        .unwrap();
+    // Then tickets arrive: one Carol may read, three only Dave may, and two in another org.
+    let ticket = |n: u32, acl: &str| {
+        Episode::sourced(
+            &format!("linear:acme/OPS-{n}"),
+            format!("# OPS-{n} Something broke").as_bytes(),
+            &[acl],
+        )
+    };
+    let acme_tickets = vec![
+        ticket(1, "user:carol@acme.com"),
+        ticket(2, "user:dave@acme.com"),
+        ticket(3, "user:dave@acme.com"),
+        ticket(4, "user:dave@acme.com"),
+    ];
+    store
+        .commit(&acme, "ingest", &acme_tickets, &[])
+        .await
+        .unwrap();
+    store.ensure_scope(&globex).await.unwrap();
+    store
+        .commit(
+            &globex,
+            "ingest",
+            &[ticket(5, "group:globex.all"), ticket(6, "group:globex.all")],
+            &[],
+        )
+        .await
+        .unwrap();
+    // What a reader is told of each claim, read as of tomorrow so a contradicted one is kept and marked.
+    let tomorrow = chrono::Utc::now()
+        .checked_add_days(chrono::Days::new(1))
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    let notes = async |user: &str| -> BTreeMap<String, String> {
+        let token = id_token(&issuer, user);
+        let (status, raw) = mcp_call(
+            &url,
+            "?org=acme",
+            &token,
+            "search_memory",
+            json!({"query": "linear tickets memory ingestion", "format": "json", "as_of": tomorrow}),
+        )
+        .await;
+        assert_eq!(status, 200, "{raw}");
+        let (text, err) = tool_text(&raw);
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let hits = v.get("hits").cloned().unwrap_or(v);
+        hits.as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|h| std::iter::once(h).chain(h["facts"].as_array().into_iter().flatten()))
+            .filter(|h| h["predicate"] == "issue")
+            .map(|h| {
+                (
+                    h["entity"].as_str().unwrap_or_default().to_string(),
+                    h["freshness"]["note"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    };
+    let start = Instant::now();
+    while notes("dave@acme.com").await.len() < 2 && start.elapsed() < Duration::from_secs(30) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let (carol, dave) = (notes("carol@acme.com").await, notes("dave@acme.com").await);
+    for (who, seen, want) in [
+        ("carol", &carol, "1 linear item"),
+        ("dave", &dave, "3 linear items"),
+    ] {
+        assert_eq!(seen.len(), 2, "{who} reads both claims: {seen:?}");
+        for (entity, note) in seen {
+            assert!(
+                note.starts_with(&format!("contradicted: {want} arrived since")),
+                "{who}'s {entity}: {note:?}, not counted as {who} may read"
+            );
+        }
+    }
+}

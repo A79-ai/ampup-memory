@@ -315,6 +315,7 @@ pub(super) async fn search(
                     kinds: &[],
                     types: ask.kinds,
                     list: super::ARRIVALS_LISTED,
+                    ..Default::default()
                 };
                 Some(reads.arrivals(store, who, &a).await)
             }
@@ -356,6 +357,31 @@ pub(super) async fn search(
         false => pool,
     };
     let left_out = total - pool.len();
+
+    // Claims of absence ("no new tickets since nine") that what the store received since contradicts: left out of a
+    // read as of now, said how many, and their episodes' text with them (`crate::absence`). A read as of a date or
+    // over history keeps them, marked.
+    let mut pool = pool;
+    let mut gone: HashSet<String> = HashSet::new();
+    let contradicted = match ask.valid_at {
+        Some(i64::MAX) => {
+            let facts: Vec<&crate::Fact> = pool.iter().map(|h| &h.fact).collect();
+            let marks = reads.absence(store, who, &facts, ask.valid_at).await;
+            let before = pool.len();
+            pool.retain(|h| {
+                let out = matches!(
+                    marks.get(&h.fact.fact_id),
+                    Some(crate::freshness::Mark::Contradicted { .. })
+                );
+                if out {
+                    gone.extend(h.fact.source_episodes.iter().cloned());
+                }
+                !out
+            });
+            before - pool.len()
+        }
+        _ => 0,
+    };
 
     // Items join the entity their episode is the record of.
     let mut sources: HashMap<String, Source> = HashMap::new();
@@ -492,6 +518,7 @@ pub(super) async fn search(
         .iter()
         .flat_map(|c| c.hits.iter())
         .flat_map(|h| h.fact.source_episodes.iter().map(String::as_str))
+        .chain(gone.iter().map(String::as_str))
         .collect();
     let mut passages: Vec<search::passages::PassageHit> = vec![];
     if let Some(found) = found {
@@ -728,6 +755,15 @@ pub(super) async fn search(
             out.words.shown.join(", ")
         ));
     }
+    if contradicted > 0 {
+        lines.push(format!(
+            "Left out {contradicted} claim{} that something didn't happen (nothing arrived, a feed stopped): what \
+             the store received since contradicts {}. A search as_of a date shows {}, marked.",
+            if contradicted == 1 { "" } else { "s" },
+            if contradicted == 1 { "it" } else { "them" },
+            if contradicted == 1 { "it" } else { "them" },
+        ));
+    }
     if !shared && !cards.is_empty() && !words.shown.is_empty() {
         lines.push(format!(
             "No fact has the words {}: these are only the nearest in meaning.",
@@ -940,9 +976,16 @@ impl<'a> Text<'a> {
                 continue;
             }
             let episode = f.source_episodes.first().cloned().unwrap_or_default();
-            // A stale fact's note says when it was stated, so its line doesn't again.
+            // A stale fact's note, or a claim of absence's, says when it was stated, so its line doesn't again.
             let mark = self.marks.get(&f.fact_id);
-            let stale = matches!(mark, Some(crate::freshness::Mark::Stale { .. }));
+            let stale = matches!(
+                mark,
+                Some(
+                    crate::freshness::Mark::Stale { .. }
+                        | crate::freshness::Mark::Absent { .. }
+                        | crate::freshness::Mark::Contradicted { .. }
+                )
+            );
             let tail = self.tail(&[f], if stale { f.valid_from } else { when });
             let mut mark = mark.map_or(String::new(), |m| format!(" — {}", m.note(&f.predicate)));
             if let Some(c) = self.conflicts.get(&f.fact_id) {

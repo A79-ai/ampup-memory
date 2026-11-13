@@ -15,6 +15,9 @@
 //! - **overdue**: a plan date that has passed while nothing says its entity is settled (no status, or a status
 //!   still at a `pending` value), and that pending status. The note says what is known, not what to conclude:
 //!   "passed; nothing since says it happened or was dropped". A settled status (`done`, `won`) marks nothing.
+//! - **contradicted** and **absence**: a claim that something didn't happen ("no new tickets since nine") checked
+//!   against what the store received since. The server checks them ([`ABSENCE`]), in every scope whatever its
+//!   setting: a claim of absence is never superseded by news, so nothing else would end it.
 //!
 //! A fact both later and stale is later. Nothing is written, no model is asked and no job runs: the marks come from
 //! the facts' own times and words (and the restatements reconcile recorded, [`crate::corroboration`]) on every read,
@@ -56,6 +59,22 @@ pub enum Mark {
     /// Its entity's plan `plan` (a predicate such as `due`) passed at `since` while nothing says the entity is
     /// settled: the plan fact itself, or a status still pending.
     Overdue { since: i64, plan: String },
+    /// A claim that something didn't happen over a period (nothing arrived, a feed stopped, no new tickets since a
+    /// time) that what the store received since contradicts: per kind of source, how many episodes the reader may
+    /// read arrived from `since` to the time read. A claim of absence is never superseded by news, since a new
+    /// ticket says something about that ticket, never that tickets arrive, so it is checked on each read instead.
+    Contradicted {
+        since: i64,
+        arrived: Vec<(String, usize)>,
+    },
+    /// A claim that something didn't happen, as of `since`, that nothing contradicts. `checked`: the kinds of
+    /// source it is about, of which nothing has arrived since (checked on this read; empty: any kind). None when
+    /// it is about nothing the store receives, or wasn't checked: it is `stale` once older than such claims last.
+    Absent {
+        since: i64,
+        checked: Option<Vec<String>>,
+        stale: bool,
+    },
 }
 
 impl Mark {
@@ -64,12 +83,17 @@ impl Mark {
             Mark::Later { .. } => "later",
             Mark::Stale { .. } => "stale",
             Mark::Overdue { .. } => "overdue",
+            Mark::Contradicted { .. } => "contradicted",
+            Mark::Absent { stale: true, .. } => "stale",
+            Mark::Absent { .. } => "absence",
         }
     }
 
     /// What a reader is told after a value of `predicate`: `later on 2026-05-30: "two free nights"`,
     /// `stale: as of 2026-04-02, not confirmed since`, `passed; nothing since says it happened or was dropped` (the
-    /// plan itself), `its due date, 2026-04-15, passed; nothing since says it happened or was dropped` (its status).
+    /// plan itself), `its due date, 2026-04-15, passed; nothing since says it happened or was dropped` (its status),
+    /// `contradicted: 14 linear items arrived since 2026-11-10 09:00 UTC`, `a claim of absence, as of 2026-11-10
+    /// 09:00 UTC, not checked since`.
     pub fn note(&self, predicate: &str) -> String {
         const UNSETTLED: &str = "nothing since says it happened or was dropped";
         match self {
@@ -85,6 +109,45 @@ impl Mark {
             Mark::Overdue { since, plan } => {
                 format!("its {plan} date, {}, passed; {UNSETTLED}", day(*since))
             }
+            Mark::Contradicted { since, arrived } => {
+                const KINDS: usize = 4;
+                let all: usize = arrived.iter().map(|(_, n)| n).sum();
+                let mut each: Vec<String> = arrived
+                    .iter()
+                    .take(KINDS)
+                    .map(|(k, n)| format!("{n} {k}"))
+                    .collect();
+                if arrived.len() > KINDS {
+                    let rest: usize = arrived[KINDS..].iter().map(|(_, n)| n).sum();
+                    each.push(format!("{rest} other"));
+                }
+                format!(
+                    "contradicted: {} item{} arrived since {}",
+                    each.join(", "),
+                    if all == 1 { "" } else { "s" },
+                    minute(*since)
+                )
+            }
+            Mark::Absent {
+                since,
+                checked: Some(kinds),
+                ..
+            } => match kinds.is_empty() {
+                true => format!(
+                    "a claim of absence; nothing has arrived since {}",
+                    minute(*since)
+                ),
+                false => format!(
+                    "a claim of absence; no {} item has arrived since {}",
+                    kinds.join(" or "),
+                    minute(*since)
+                ),
+            },
+            Mark::Absent { since, stale, .. } => format!(
+                "{}a claim of absence, as of {}, not checked since",
+                if *stale { "stale: " } else { "" },
+                minute(*since)
+            ),
         }
     }
 
@@ -102,6 +165,23 @@ impl Mark {
             Mark::Overdue { since, plan } => {
                 v["since"] = json!(day(*since));
                 v["plan"] = json!(plan);
+            }
+            Mark::Contradicted { since, arrived } => {
+                v["since"] = json!(minute(*since));
+                v["arrived"] = arrived
+                    .iter()
+                    .map(|(k, n)| (k.clone(), json!(n)))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into();
+            }
+            Mark::Absent {
+                since,
+                checked,
+                stale,
+            } => {
+                v["since"] = json!(minute(*since));
+                v["checked"] = json!(checked);
+                v["stale"] = json!(stale);
             }
         }
         v
@@ -124,6 +204,27 @@ fn kinds() -> BTreeSet<String> {
 pub fn day(us: i64) -> String {
     chrono::DateTime::from_timestamp_micros(us)
         .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| us.to_string())
+}
+
+/// The check of claims of absence the server adds to reads ([`Mark::Contradicted`], [`Mark::Absent`]): marks on
+/// `facts`, as `who` reads them in a session, as of a time. Set once by the server, which counts what arrived; a
+/// store without it marks none.
+pub type AbsenceCheck = for<'a> fn(
+    &'a crate::Store,
+    &'a crate::Session,
+    &'a crate::Principal,
+    &'a [&'a Fact],
+    i64,
+) -> futures::future::BoxFuture<'a, HashMap<String, Mark>>;
+
+/// The server's [`AbsenceCheck`], once it has set it.
+pub static ABSENCE: std::sync::OnceLock<AbsenceCheck> = std::sync::OnceLock::new();
+
+/// `2026-04-15 09:30 UTC`: when a claim of absence's period starts, which an hour can matter to.
+pub fn minute(us: i64) -> String {
+    chrono::DateTime::from_timestamp_micros(us)
+        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| us.to_string())
 }
 

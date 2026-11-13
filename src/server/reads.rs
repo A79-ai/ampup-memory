@@ -29,6 +29,8 @@ pub(super) struct Reads {
     also: Vec<Session>,
     /// What these reads returned, for the audit's `read` row ([`Reads::took`]). Shared by clones.
     seen: std::sync::Arc<std::sync::Mutex<Seen>>,
+    /// What checks of claims of absence counted ([`crate::absence`]), once per read. Shared by clones.
+    absent: crate::absence::Checked,
 }
 
 /// Items and source episodes a request's reads returned.
@@ -59,6 +61,7 @@ impl Reads {
             own,
             also: vec![],
             seen: Default::default(),
+            absent: Default::default(),
         }
     }
 
@@ -104,6 +107,7 @@ impl Reads {
             own,
             also,
             seen: Default::default(),
+            absent: Default::default(),
         }
     }
 
@@ -185,6 +189,7 @@ impl Reads {
             own,
             also,
             seen: self.seen.clone(),
+            absent: self.absent.clone(),
         })
     }
 
@@ -518,12 +523,44 @@ impl Reads {
         Ok(out)
     }
 
-    /// What has gone stale or overdue among `facts` (`crate::freshness`), by fact id: a read's current facts as of
-    /// `valid_at` (`i64::MAX`: now). A read over history (None) marks nothing, and nor does a scope whose own
-    /// setting (or the server's) leaves marks off: each fact is marked as the scope read that holds it says, not
-    /// the caller's scope. The schemas of every scope read say what to mark. `whole`: the facts hold their
-    /// entities' plans and statuses; else those are read beside them, so a status can read overdue.
+    /// What has gone stale or overdue among `facts` (`crate::freshness`), and what the claims of absence among
+    /// them come to (`crate::absence`), by fact id: a read's current facts as of `valid_at` (`i64::MAX`: now).
+    /// Claims of absence are checked in every read, one over history (None) as of now; freshness marks nothing
+    /// there, and nor does a scope whose own setting (or the server's) leaves them off: each fact is marked as the
+    /// scope read that holds it says, not the caller's scope. The schemas of every scope read say what to mark.
+    /// `whole`: the facts hold their entities' plans and statuses; else those are read beside them, so a status
+    /// can read overdue.
     pub async fn marks(
+        &self,
+        store: &Store,
+        who: &Principal,
+        facts: &[&Fact],
+        valid_at: Option<i64>,
+        whole: bool,
+    ) -> Result<HashMap<String, freshness::Mark>> {
+        let mut marks = self.fresh(store, who, facts, valid_at, whole).await?;
+        marks.extend(self.absence(store, who, facts, valid_at).await);
+        Ok(marks)
+    }
+
+    /// The claims of absence among `facts` ([`crate::absence`]) as of `valid_at` (`i64::MAX` or None: now),
+    /// counted across the scopes read as the caller may read them, by fact id.
+    pub async fn absence(
+        &self,
+        store: &Store,
+        who: &Principal,
+        facts: &[&Fact],
+        valid_at: Option<i64>,
+    ) -> HashMap<String, freshness::Mark> {
+        let at = valid_at
+            .filter(|&t| t < i64::MAX)
+            .unwrap_or_else(|| self.now());
+        let sessions: Vec<&Session> = self.sessions().collect();
+        crate::absence::marks(store, &sessions, who, facts, at, &self.absent).await
+    }
+
+    /// [`Reads::marks`]' freshness marks.
+    async fn fresh(
         &self,
         store: &Store,
         who: &Principal,
