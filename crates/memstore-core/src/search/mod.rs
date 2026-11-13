@@ -63,6 +63,11 @@ pub const RECENCY_FLOOR: f32 = 0.75;
 /// A passage page spreads over kinds of source: each hit from a kind already on the page scores
 /// this much less than it would (see [`Rank::diverse`]).
 pub const DIVERSITY_DECAY: f32 = 0.9;
+/// A fact only an agent wrote ([`crate::origin`]) scores this much of what its match gives it
+/// (`AMPUP_MEMORY_RANK_AGENT`), so it ranks below an observed or stated fact that matches about as well: scores
+/// are a convex blend of normalized matches, so it outranks one only by matching at least a quarter better (1 /
+/// 0.8). Modest on purpose, as recency's floor is: it orders near-ties and leaves a clearly better match on top.
+pub const AGENT_SCALE: f32 = 0.8;
 
 /// How hits are ordered beyond how well they match.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2936,6 +2941,8 @@ pub struct Hit {
     pub in_window: bool,
     /// With [`Rank::group`], the facts that came with this one (see `group_hits`), best first.
     pub group: Vec<Fact>,
+    /// Where the fact's words came from, as the episodes it cites say ([`crate::Vis::fact_origin`]).
+    pub origin: Option<crate::origin::Origin>,
 }
 
 /// Facts a grouped hit brings at most (see [`Rank::group`]); `AMPUP_MEMORY_RANK_GROUP` overrides.
@@ -3503,6 +3510,7 @@ async fn ranked(
             signals: [0.0; 3],
             in_window: false,
             group: vec![],
+            origin: None,
         });
         if let Some((i, b)) = kw {
             h.signals[i] = h.signals[i].max(b);
@@ -3905,6 +3913,15 @@ async fn ranked(
         out.sort_by(|a, b| sem(b).total_cmp(&sem(a)).then(tiebreak(a, b)));
         for (r, h) in out.iter_mut().filter(|h| h.distance.is_some()).enumerate() {
             h.score += 1.0 / (RRF_K + r as f32);
+        }
+    }
+    // What only an agent wrote ranks below what was observed or stated about as well matched (`AGENT_SCALE`). The
+    // classic ranking is the ranking as it was, so it is left alone.
+    let agent = knob("AGENT", AGENT_SCALE);
+    for h in out.iter_mut() {
+        h.origin = vis.fact_origin(&h.fact);
+        if h.origin == Some(crate::origin::Origin::Agent) && !rank.classic {
+            h.score *= agent;
         }
     }
     // The time the query names: a fact stated in it, or whose value names one of its years, is in time; one

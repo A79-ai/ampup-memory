@@ -66,7 +66,14 @@ pub(super) async fn of_facts(
     let (mut facts, head, is_fact) =
         match reads.read_in(store, who, Col::FactId, &one, None).await? {
             f if !f.is_empty() => {
-                let head = format!("Fact {id} ({} · {})", f[0].entity, f[0].predicate);
+                let mut head = format!("Fact {id} ({} · {})", f[0].entity, f[0].predicate);
+                // Only an agent wrote it (`crate::origin`): said, as a search says it.
+                if let Some(n) = reads
+                    .fact_origin(&f[0])
+                    .and_then(|o| o.note(f[0].valid_from))
+                {
+                    head.push_str(&format!(" — {n} —"));
+                }
                 (f, head, true)
             }
             _ if id.contains(':') => (
@@ -118,7 +125,12 @@ pub(super) async fn of_facts(
             0 => String::new(),
             i => format!(", in {}", reads.scope_at(*i)),
         };
-        parts.push(format!("--- episode {e} ({day}{scope})\n{text}"));
+        // Written by an agent (`crate::origin`): said, so its words aren't read as a record's or a person's.
+        let by = match crate::origin::Origin::of_episode(ep) {
+            crate::origin::Origin::Agent => ", written by an agent",
+            _ => "",
+        };
+        parts.push(format!("--- episode {e} ({day}{scope}{by})\n{text}"));
         shown.push(e.as_str());
     }
     let others: Vec<&str> = cited
@@ -232,7 +244,7 @@ pub(super) async fn page(
     let to = from + lines.len() - 1;
     let mut v = json!({
         "episode_id": eid, "source": source, "type": kind, "units": n, "from": from, "to": to,
-        "text": lines.join("\n"),
+        "origin": crate::origin::Origin::of_episode(&ep).name(), "text": lines.join("\n"),
     });
     if !cut.is_empty() {
         v["cut"] = json!(cut);

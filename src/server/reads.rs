@@ -467,6 +467,14 @@ impl Reads {
         self.sessions().find_map(|s| s.vis().episode_type(episode))
     }
 
+    /// Where a fact's words came from ([`crate::origin`]): the strongest origin of the episodes it cites, each as the
+    /// first scope read that holds it says.
+    pub fn fact_origin(&self, f: &crate::Fact) -> Option<crate::origin::Origin> {
+        crate::origin::of_fact(f, |e| {
+            self.sessions().find_map(|s| s.vis().episode_origin(e))
+        })
+    }
+
     /// The episodes of type `kind` the caller may read, in every scope read.
     pub fn episodes_of_type(&self, kind: &str, who: &Principal) -> BTreeSet<String> {
         self.sessions()

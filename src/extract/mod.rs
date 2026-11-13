@@ -27,6 +27,8 @@
 //! facts that disagree apart ([`crate::conflicts`]), it may also label one `conflicts` (another source's account of
 //! the same thing, an estimate beside a reported figure): both are kept, with a record that they disagree. A known
 //! fact from the episode's own source is never in conflict with it: that source saying otherwise corrects itself.
+//! A fact from a text only an agent wrote ([`crate::origin`]) never ends one something observed or stated: the
+//! model's `supersedes` is kept as `conflicts` where the scope keeps them, else as `new`. It may end another agent's.
 //!
 //! An episode the model refuses (a 4xx other than 401 to 404, 408 and 429, a reply with no JSON text), or whose
 //! body can't be read, is tried [`crate::EXTRACT_TRIES`] times across runs and then given up on. An API that is
@@ -1798,7 +1800,9 @@ impl Extractor {
         let reply = self.complete(&prompt).await?;
         let verdicts = verdicts(&reply);
         // A value a person's live decision approved is theirs to change: a new text that says otherwise is in
-        // conflict with it where the scope keeps conflicts, and else kept beside it, never ending it.
+        // conflict with it where the scope keeps conflicts, and else kept beside it, never ending it. So is a fact
+        // something observed or stated, to a new fact only an agent wrote ([`crate::origin::may_end`]): an agent's
+        // conclusion is no evidence that what was recorded stopped being true.
         let main = store.visibility(scope, MAIN).await?;
         enum Verdict<'a> {
             Same(&'a Fact),
@@ -1833,11 +1837,17 @@ impl Extractor {
                 }
                 _ => Verdict::New,
             };
+            let by = crate::origin::Origin::of_cited(ep, f.cite.as_deref());
             let verdict = match verdict {
-                Verdict::Ends(old) if main.approved_at(old, i64::MAX) => match conflicts {
-                    true => Verdict::Disputes(old),
-                    false => Verdict::New,
-                },
+                Verdict::Ends(old)
+                    if main.approved_at(old, i64::MAX)
+                        || !crate::origin::may_end(by, main.fact_origin(old)) =>
+                {
+                    match conflicts {
+                        true => Verdict::Disputes(old),
+                        false => Verdict::New,
+                    }
+                }
                 v => v,
             };
             match verdict {

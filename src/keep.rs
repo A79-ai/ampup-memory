@@ -50,7 +50,7 @@ pub const SHARED_AT: usize = 3;
 
 /// What follows a person's signature in the source of a note the server kept for them: `keep`, then its category
 /// and topic (`keep:<category>:<topic>`; a note kept before the map is `keep` alone).
-pub const SOURCE: &str = "keep";
+pub const SOURCE: &str = crate::origin::KEPT;
 
 /// Whether `rest`, what follows a person's signature in a source, is a note the server kept ([`SOURCE`]).
 pub fn is_kept(rest: &str) -> bool {
@@ -595,7 +595,7 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
     use crate::aggregate::StoreAggregates;
     let view = store.aggregation_view(scope).await?;
     let prefix = format!("{}:", crate::REMEMBER_SOURCE);
-    let shared_source = format!("{prefix}{SHARER}:shared");
+    let shared_source = format!("{prefix}{}", crate::origin::SHARED);
     let mut notes: Vec<(String, String)> = vec![];
     let mut shared_ids = vec![];
     for e in &view.episodes {

@@ -55,11 +55,14 @@ pub enum Cite {
         at_ms: Option<u64>,
         speaker: String,
     },
-    /// A chat message: its timestamp id, author and link.
+    /// A chat message: its timestamp id, author and link, and whether a bot or an app posted it, as the message
+    /// says ([`crate::origin`] reads a fact citing such a message as an agent's).
     Message {
         ts: String,
         author: String,
         permalink: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        bot: bool,
     },
     /// A paragraph of an email.
     Email {

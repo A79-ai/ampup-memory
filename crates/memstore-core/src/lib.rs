@@ -25,6 +25,7 @@ pub mod governance;
 pub mod log_org;
 pub mod metrics;
 pub mod offboard;
+pub mod origin;
 pub mod people;
 pub mod pins;
 pub mod platform;
@@ -808,8 +809,9 @@ pub struct Vis {
     conflicts: HashMap<String, Vec<String>>,
     /// Which committed episodes are versions of a document.
     documents: Documents,
-    /// Each committed episode's type (`sales_call`, `slack_thread`, …), as its source names it.
-    kinds: HashMap<String, &'static str>,
+    /// Each committed episode's type (`sales_call`, `slack_thread`, …) and origin ([`origin::Origin::of_source`]), as
+    /// its source names them.
+    kinds: HashMap<String, (&'static str, origin::Origin)>,
     /// Committed retracted episodes: deleted, superseded and not written since, or aged out. They are left out
     /// of `acls` and `index`, so no reader sees them.
     retracted: HashSet<String>,
@@ -1122,14 +1124,26 @@ impl Vis {
     /// Whether the reader may see a committed episode.
     /// An episode's type (`sales_call`, `slack_thread`, …), if this state holds it.
     pub fn episode_type(&self, episode: &str) -> Option<&'static str> {
-        self.kinds.get(episode).copied()
+        self.kinds.get(episode).map(|(t, _)| *t)
+    }
+
+    /// Where an episode's words came from, as its source says ([`origin::Origin::of_source`]); None for one this
+    /// state doesn't hold, or one of the engine's own documents. A bot's message only its body marks
+    /// ([`origin::Origin::of_episode`]) reads here as its source's.
+    pub fn episode_origin(&self, episode: &str) -> Option<origin::Origin> {
+        self.kinds.get(episode).map(|(_, o)| *o)
+    }
+
+    /// Where a fact's words came from: the strongest origin of the episodes it cites ([`origin::of_fact`]).
+    pub fn fact_origin(&self, f: &Fact) -> Option<origin::Origin> {
+        origin::of_fact(f, |e| self.episode_origin(e))
     }
 
     /// The episodes of type `kind` that `who` may read.
     pub fn episodes_of_type(&self, kind: &str, who: &Principal) -> BTreeSet<String> {
         self.kinds
             .iter()
-            .filter(|(e, t)| **t == kind && self.can_see_episode(e, who))
+            .filter(|(e, (t, _))| *t == kind && self.can_see_episode(e, who))
             .map(|(e, _)| e.clone())
             .collect()
     }
@@ -1137,7 +1151,7 @@ impl Vis {
     /// How many episodes of each type `who` may read.
     pub fn episode_type_counts(&self, who: &Principal) -> BTreeMap<&'static str, usize> {
         let mut n = BTreeMap::new();
-        for (e, t) in &self.kinds {
+        for (e, (t, _)) in &self.kinds {
             if self.can_see_episode(e, who) {
                 *n.entry(*t).or_default() += 1;
             }
@@ -5753,7 +5767,7 @@ impl Store {
                         continue;
                     }
                     if let Some(t) = episode_types::name_of_source(&source[i]) {
-                        kinds.insert(id[i].clone(), t);
+                        kinds.insert(id[i].clone(), (t, origin::Origin::of_source(&source[i])));
                     }
                     if source[i].starts_with(MERGE_SOURCE) {
                         merges.insert(id[i].clone());

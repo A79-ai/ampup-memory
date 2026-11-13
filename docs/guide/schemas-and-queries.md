@@ -69,6 +69,13 @@ New facts are reconciled with what is known before they are committed. The model
 the new episode may already read. A repeat is dropped; a fact that supersedes an old one ends it with a closure
 citing the new episode. Nothing is deleted.
 
+Every fact has an origin, read from the episodes it cites: `observed` (a record a connector or system delivered, a
+document loaded), `stated` (a person's words: a call, an email, a chat message) or `agent` (an agent's
+`remember_memory` note, a message a bot or an app posted). A fact only an agent wrote never ends one that was
+observed or stated, only another agent's: the model's `supersedes` is kept as `conflicts` where the scope keeps
+them, else as new. Search ranks it a little below what was observed or stated and says so beside it ("an agent
+concluded, 2026-11-12"; `origin` in JSON).
+
 An episode the model refuses is tried three times, then given up on. While the API is down or refuses the key,
 nothing is given up on and the worker backs off. Refused facts are counted on `/metrics`
 (`memstore_extraction_refused_facts_total{reason}`) and in `GET /doctor`.

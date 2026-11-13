@@ -1,5 +1,6 @@
 //! A Slack thread. The body is its messages, as JSON (`messages` with `ts`, `user` or `author`, `text`, and
-//! optionally `permalink`) or as `author: text` lines. Facts cite a message. Follow-ups to a call land here
+//! optionally `permalink`, and Slack's `bot_id`, `bot_profile`, `app_id` or `subtype` where a bot or an app posted
+//! it) or as `author: text` lines. Facts cite a message. Follow-ups to a call land here
 //! (the deck was sent, the demo is booked): they are stated as actions taken, and aggregation decides what
 //! they complete.
 
@@ -25,6 +26,30 @@ struct Message {
     text: String,
     #[serde(default)]
     permalink: Option<String>,
+    #[serde(default)]
+    bot_id: Option<serde_json::Value>,
+    #[serde(default)]
+    bot_profile: Option<serde_json::Value>,
+    #[serde(default)]
+    app_id: Option<serde_json::Value>,
+    #[serde(default)]
+    subtype: Option<String>,
+}
+
+impl Message {
+    /// Whether a bot or an app posted it: Slack names its bot or app (`bot_id`, `bot_profile`, `app_id`), or its
+    /// subtype is `bot_message`.
+    fn by_bot(&self) -> bool {
+        let named = |v: &Option<serde_json::Value>| match v {
+            Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+            Some(serde_json::Value::Object(o)) => !o.is_empty(),
+            _ => false,
+        };
+        named(&self.bot_id)
+            || named(&self.bot_profile)
+            || named(&self.app_id)
+            || self.subtype.as_deref() == Some("bot_message")
+    }
 }
 
 impl EpisodeType for SlackThread {
@@ -59,12 +84,13 @@ impl EpisodeType for SlackThread {
                 .map(|(i, m)| Unit {
                     index: i,
                     speaker: Some(m.author.clone()),
-                    text: m.text,
                     cite: Cite::Message {
+                        bot: m.by_bot(),
                         ts: m.ts,
                         author: m.author,
                         permalink: m.permalink,
                     },
+                    text: m.text,
                 })
                 .collect());
         }
@@ -81,6 +107,7 @@ impl EpisodeType for SlackThread {
                         ts: i.to_string(),
                         author,
                         permalink: None,
+                        bot: false,
                     },
                 }
             })

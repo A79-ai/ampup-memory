@@ -9963,6 +9963,7 @@ async fn facts(
         if let Some(c) = conflicts.get(&h.fact.fact_id) {
             v["conflict"] = c.to_json();
         }
+        origin_json(&mut v, h.origin, h.fact.valid_from);
         for (k, x) in [("unit", &h.fact.unit), ("time_basis", &h.fact.time_basis)] {
             if let Some(x) = x {
                 v[k] = json!(x);
@@ -10004,6 +10005,7 @@ async fn facts(
                         if let Some(c) = conflicts.get(&f.fact_id) {
                             g["conflict"] = c.to_json();
                         }
+                        origin_json(&mut g, reads.fact_origin(f), f.valid_from);
                         g
                     })
                     .collect::<Vec<_>>()
@@ -10026,6 +10028,17 @@ async fn facts(
         hits.push(v);
     }
     Ok((hits, next))
+}
+
+/// A fact's origin in a JSON answer ([`crate::origin`]): `origin`, and for an agent's the `origin_note` a text answer
+/// shows beside it.
+fn origin_json(v: &mut Value, origin: Option<crate::origin::Origin>, valid_from: i64) {
+    if let Some(o) = origin {
+        v["origin"] = json!(o.name());
+        if let Some(n) = o.note(valid_from) {
+            v["origin_note"] = json!(n);
+        }
+    }
 }
 
 /// The `n`-char window of `body` holding the most of the query's informative terms (half-window steps).

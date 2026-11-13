@@ -257,6 +257,9 @@ pub async fn facts(
             let mut v = fact_json(f);
             v["entity_type"] = json!(type_of(f));
             v["tags"] = json!(f.tags);
+            if let Some(o) = session.vis().fact_origin(f) {
+                v["origin"] = json!(o.name());
+            }
             v["sources"] = json!(
                 f.source_episodes
                     .iter()

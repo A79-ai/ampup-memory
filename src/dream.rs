@@ -1625,10 +1625,16 @@ impl Audience<'_> {
     /// true by the pass (the closure is dated at it, so never in the future), another value (not one restating the
     /// other, every word of the shorter in the longer: that is the same thing said twice), values of one kind where
     /// the schema types both, neither a value kept with others at once (a reference, a predicate named for people in
-    /// a role, or one the schema marks a list), and an older fact that isn't a record of something that happened.
+    /// a role, or one the schema marks a list), an older fact that isn't a record of something that happened, and
+    /// not an agent's fact ending one something observed or stated.
     fn may_end(&self, old: &Fact, by: &Fact) -> bool {
-        // A value a person's live decision approved is theirs to change: only another approved one ends it.
-        (!self.v.vis.approved_at(old, self.now) || self.v.vis.approved_at(by, self.now))
+        let vis = &self.v.vis;
+        // A value a person's live decision approved is theirs to change: only another approved one ends it. And a
+        // fact only an agent wrote ends only another agent's ([`crate::origin::may_end`]).
+        (!vis.approved_at(old, self.now) || vis.approved_at(by, self.now))
+            && vis
+                .fact_origin(by)
+                .is_none_or(|o| crate::origin::may_end(o, vis.fact_origin(old)))
             && self.settles(old, by)
             && by.valid_from > old.valid_from
             && by.valid_from <= self.now
