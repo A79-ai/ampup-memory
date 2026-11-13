@@ -562,7 +562,9 @@ pub async fn from_user(
         ));
     }
     if !eps.is_empty() {
-        store.commit(scope, asker, &eps, &[]).await?;
+        // Each a fact too, theirs alone as the note is (`crate::note_facts`).
+        let facts = crate::note_facts::facts_of(&eps);
+        store.commit(scope, asker, &eps, &facts).await?;
     }
     // Counts only, never what was said or who said it.
     eprintln!(
@@ -766,7 +768,8 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
             continue;
         }
         let ep = crate::Episode::sourced(&shared_source, text.as_bytes(), &["*"]);
-        store.commit(scope, SHARER, &[ep], &[]).await?;
+        let facts = crate::note_facts::facts_of(std::slice::from_ref(&ep));
+        store.commit(scope, SHARER, &[ep], &facts).await?;
         eprintln!(
             "keep: shared with {scope} what {} people said: {text}",
             who.len()

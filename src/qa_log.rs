@@ -91,6 +91,15 @@ pub struct Logged {
     pub updated_at: i64,
 }
 
+/// Whether `l` is the engine's own record rather than something a person asked or ran: a dream job
+/// ([`crate::dream_jobs`]) or a digest's send or subscription ([`crate::digest`]). Neither is anyone's activity.
+pub fn internal(l: &Logged) -> bool {
+    matches!(
+        l.kind.as_deref(),
+        Some(crate::dream_jobs::KIND | crate::digest::KIND)
+    )
+}
+
 /// A session's own part of its entry.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SessionPart {
@@ -161,11 +170,11 @@ pub async fn log(store: &Store, scope: &Scope, who: &Principal, args: &Value) ->
         let Some(rating) = rating else {
             return Err(refuse("rating an answer needs rating".into()));
         };
-        let Some(was) = list(store, scope, None).await?.into_iter().find(|l| {
-            l.answer_id == id
-                && l.asker == who.user()
-                && l.kind.as_deref() != Some(crate::dream_jobs::KIND)
-        }) else {
+        let Some(was) = list(store, scope, None)
+            .await?
+            .into_iter()
+            .find(|l| l.answer_id == id && l.asker == who.user() && !internal(l))
+        else {
             return Err(refuse(format!("no answer {id} that you logged")));
         };
         store
@@ -479,20 +488,25 @@ pub async fn reward(
     reward: f64,
     reason: Option<&str>,
 ) -> Result<()> {
-    reward_all(store, scope, who, &[(id, reward, reason)], None).await
+    reward_all(store, scope, who, &[(id, reward, reason, false)], None).await
 }
 
-/// Attaches rewards, as [`reward`] attaches one, in one commit: `(run or session id, reward, reason)` each, in
-/// order (a run rewarded twice keeps the later). A refusal names its item ([`of_item`]); nothing is written then.
+/// Attaches rewards, as [`reward`] attaches one, in one commit: `(run or session id, reward, reason, person)` each,
+/// in order (a run rewarded twice keeps the later). `person`: the reward is the person's own verdict on their
+/// run or session, given by them at the keyboard (the hooks' `+` / `-` and outcome command), not a program's or
+/// an agent's: it is also their rating (`helpful` above 0, `not_helpful` below), which advice learns from as the
+/// person's word and the session judge leaves standing. A session's reward is held with its row
+/// ([`crate::sessions::rated`]), so one still open keeps it through its later steps and its end, and one ended a
+/// moment ago takes it before its row is written. A refusal names its item ([`of_item`]); nothing is written then.
 pub async fn reward_all(
     store: &Store,
     scope: &Scope,
     who: &Principal,
-    rewards: &[(&str, f64, Option<&str>)],
+    rewards: &[(&str, f64, Option<&str>, bool)],
     label: Option<&str>,
 ) -> Result<()> {
     let refuse = |m: String| -> anyhow::Error { Refused(m).into() };
-    for (i, (_, r, _)) in rewards.iter().enumerate() {
+    for (i, (_, r, _, person)) in rewards.iter().enumerate() {
         if !(-1.0..=1.0).contains(r) {
             return Err(of_item(
                 label,
@@ -500,16 +514,24 @@ pub async fn reward_all(
                 refuse(format!("reward is from -1 to 1, not {r}")),
             ));
         }
+        if *person && *r == 0.0 {
+            return Err(of_item(
+                label,
+                i,
+                refuse("a person's rating is above 0 (it went well) or below (it didn't)".into()),
+            ));
+        }
     }
     entries_cap(store, scope, who, rewards.len()).await?;
-    let mine: BTreeMap<String, Logged> = list(store, scope, None)
+    // With the session rows this server still holds: a session open (or ended a moment ago) isn't in the log yet.
+    let mine: BTreeMap<String, Logged> = crate::sessions::list(store, scope)
         .await?
         .into_iter()
         .filter(|l| l.asker == who.user() && matches!(l.kind.as_deref(), Some("run" | "session")))
         .map(|l| (l.answer_id.clone(), l))
         .collect();
-    let mut rows = Vec::with_capacity(rewards.len());
-    for (i, (id, r, reason)) in rewards.iter().enumerate() {
+    let (mut rows, mut sessions) = (vec![], vec![]);
+    for (i, (id, r, reason, person)) in rewards.iter().enumerate() {
         let Some(was) = mine.get(*id) else {
             return Err(of_item(
                 label,
@@ -517,13 +539,27 @@ pub async fn reward_all(
                 refuse(format!("no run or session {id} that you recorded")),
             ));
         };
-        rows.push(Logged {
+        let rating = match (*person, *r > 0.0) {
+            (false, _) => was.rating.clone(),
+            (true, true) => Some("helpful".to_string()),
+            (true, false) => Some("not_helpful".to_string()),
+        };
+        let row = Logged {
             reward: Some(*r),
             reward_reason: reason.map(String::from),
+            rating,
             ..was.clone()
-        });
+        };
+        match was.kind.as_deref() == Some(crate::sessions::KIND) {
+            true => sessions.push(row),
+            false => rows.push(row),
+        }
     }
-    store.write_qa_rows(scope, who.user(), &rows).await
+    if !rows.is_empty() {
+        store.write_qa_rows(scope, who.user(), &rows).await?;
+    }
+    crate::sessions::rated(store, scope, who.user(), sessions);
+    Ok(())
 }
 
 /// How a reviewer's reward's reason starts ([`review`]): a person who read the trace graded it, neither its

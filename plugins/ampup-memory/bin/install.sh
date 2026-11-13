@@ -1,9 +1,9 @@
 #!/bin/sh
 # Installs ampup-memory-client, what the AmpUp Memory plugins run (the sign-in, the hooks and the MCP bridge, a few
-# MB), from the public GitHub releases of A79-ai/ampup-memory, for this machine: Apple Silicon macOS, or Linux on
-# arm64 or x86_64. Client releases are the tags client-v* (the server's are v*); with no version named, it installs
-# the newest client release that has a build for this machine (pre-releases only when named). Releases from before
-# the rename name their archive memstore-client-<target>.tar.gz, and it takes those too.
+# MB), from the public GitHub releases of A79-ai/ampup-memory, for this machine: macOS on Apple Silicon or Intel, or
+# Linux on arm64 or x86_64. Client releases are the tags client-v* (the server's are v*); with no version named, it
+# installs the newest client release that has a build for this machine (pre-releases only when named). Releases from
+# before the rename name their archive memstore-client-<target>.tar.gz, and it takes those too.
 #
 #   curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/plugins/ampup-memory/bin/install.sh | sh
 #   sh install.sh --latest   prints the newest client release's tag (client-v0.1.0) and installs nothing
@@ -36,14 +36,10 @@ case "$(uname -m)" in
   x86_64 | amd64) arch=x86_64 ;;
   *) echo "ampup-memory-client builds for arm64 and x86_64 only, not $(uname -m)" >&2; exit 1 ;;
 esac
-if [ "$os" = apple-darwin ] && [ "$arch" = x86_64 ]; then
-  # A shell under Rosetta reports x86_64 on Apple Silicon; the arm64 build runs there natively.
-  if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then
-    arch=aarch64
-  else
-    echo "ampup-memory-client builds for Apple Silicon Macs only" >&2
-    exit 1
-  fi
+# A shell under Rosetta reports x86_64 on Apple Silicon, where the arm64 build runs natively; an Intel Mac gets the
+# x86_64 build.
+if [ "$os" = apple-darwin ] && [ "$arch" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then
+  arch=aarch64
 fi
 target=$arch-$os
 # The archive's name, and the binary's in it: ampup-memory-client from the rename on, memstore-client before.

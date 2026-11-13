@@ -5,11 +5,10 @@
 //! - `skills/<slug>`: the skills compiled from the scope's documents (`crate::compile`), there only when the
 //!   caller may read one on the branch read. The folder lists the routing index and each skill with when it
 //!   applies; a skill reads as its markdown with its AIP step graph.
-//! - `notes/…`: each person's notes under their name, `notes/<user>/…`: the preferences AmpUp Memory kept from
-//!   what they typed, by `<category>/<topic>` (`crate::keep`), `unfiled` what it kept before it filed notes,
-//!   `remembered` what they asked to be remembered; and `notes/team` what it shared with everyone once enough
-//!   people said the same. A member finds only their own name there; an org's admins (see [`Reader`]) find
-//!   everyone's, and open any of them.
+//! - `notes`: the notes the caller may read, newest first, as their facts (`crate::note_facts`): what they asked
+//!   to be remembered, what AmpUp Memory kept from what they typed (`crate::keep`), and what it shared with
+//!   everyone once enough people said the same. A note's fact is read by who may read the note, no one else: a
+//!   person's notes are theirs alone, an org's admins included.
 //! - `advice/<team|mine>/<category>/<situation>`: the advice the caller may read (`crate::listing::advice`), each a
 //!   note to read in full.
 //! - `sessions/…`: the caller's own sessions: `ended/<day>` their records (what facts are extracted from) and
@@ -25,14 +24,15 @@
 //! `after` the last name of the previous page) or, at `entities/<type>/<key>`, the entity's facts;
 //! `{"op": "episode", "id": "..."}` reads one episode with the facts that cite it; `{"op": "branches"}` names
 //! the scope's branches, each with how many compiled skills the caller may read there; `{"op": "schema"}` reads
-//! the scope's schema on the branch read, with every version committed there.
+//! the scope's schema on the branch read, with every version committed there; `{"op": "lessons", …}` what it
+//! learned, lesson by lesson, with each one's trail (`crate::lessons`, also `POST /lessons`).
 
 use std::collections::BTreeMap;
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::search::{Col, Filter};
+use crate::search::{Col, Filter, Lit};
 use crate::{Fact, Principal, Scope, Session, Store};
 
 /// Children per page unless the request asks for fewer or more (at most [`MAX_LIMIT`]).
@@ -81,12 +81,13 @@ impl Ep {
     }
 }
 
-/// Who is browsing: the caller, and whether they read every person's notes, not only their own (an org's admins
-/// and the operator, on the org's own memory, where the org shows its people's activity: the server decides).
+/// Who is browsing: the caller, and whether they read every person's sessions the advice page lists, not only
+/// their own (an org's admins and the operator, on the org's own memory, where the org shows its people's
+/// activity: the server decides). Notes are read by their ACL alone, whoever browses.
 #[derive(Clone, Copy)]
 pub struct Reader<'a> {
     pub who: &'a Principal,
-    pub every_note: bool,
+    pub every_session: bool,
 }
 
 /// Answers one `/browse` request as `reader`.
@@ -101,6 +102,22 @@ pub async fn run(
         // The filterable lists (`crate::listing`): `/facts/list` and `/advice/list` are these ops.
         "facts" => crate::listing::facts(store, session, who, req).await,
         "advice" => crate::listing::advice(store, session, who, req).await,
+        // The advice page: each team note's use, outcomes and sessions, everyone's sessions for those who read
+        // everyone's notes (an org's admins, where it shows people's activity), else the reader's own.
+        "advice_usage" => {
+            let days = match &req["days"] {
+                Value::Null => None,
+                v => Some(
+                    v.as_u64()
+                        .filter(|d| (1..=3650).contains(d))
+                        .ok_or_else(|| bad("days is a whole number of days, 1 to 3650"))?,
+                ),
+            };
+            let since = days.map_or(0, |d| crate::now_micros() - d as i64 * 86_400_000_000);
+            crate::advice::usage(store, session.scope(), who, reader.every_session, since).await
+        }
+        // What it learned, lesson by lesson, with where each came from and where it was served (`/lessons`).
+        "lessons" => crate::lessons::run(store, session, reader, req).await,
         "ls" => {
             let path: Vec<String> = match &req["path"] {
                 Value::Null => vec![],
@@ -123,7 +140,7 @@ pub async fn run(
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| bad("episode needs an id"))?;
-            episode(store, session, reader, id).await
+            episode(store, session, who, id).await
         }
         "branches" => branches(store, session.scope(), who).await,
         // The schema the memory is typed with on the branch read, and every version committed there (oldest
@@ -134,7 +151,7 @@ pub async fn run(
             Ok(json!({"schema": session.schema().as_deref(), "history": history}))
         }
         op => Err(bad(format!(
-            "unknown op {op:?}: ls, episode, branches, schema, facts or advice"
+            "unknown op {op:?}: ls, episode, branches, schema, facts, advice, advice_usage or lessons"
         ))),
     }
 }
@@ -174,17 +191,12 @@ async fn ls(
     };
     match path.first().map(String::as_str) {
         None => {
-            let (eps, notes, facts) = tokio::try_join!(
-                episodes(store, session, who),
-                note_episodes(store, session, reader),
-                facts(store, session, who)
-            )?;
+            let (eps, facts) =
+                tokio::try_join!(episodes(store, session, who), facts(store, session, who))?;
+            let notes = notes(store, session, who, &eps).await?;
             let entities = by_entity(&facts).len();
             let skills = skill_keys(session, who).len();
-            let (notes, sessions) = (
-                filed(&notes, reader, Tree::Notes).len(),
-                filed(&eps, reader, Tree::Sessions).len(),
-            );
+            let (notes, sessions) = (notes.len(), filed(&eps, who).len());
             let advice = advice(store, session, who).await?.len();
             let mut children = vec![
                 json!({"name": "advice", "kind": "folder", "path": ["advice"], "count": advice}),
@@ -199,19 +211,27 @@ async fn ls(
             Ok(page(children))
         }
         Some("skills") => skills(store, session, who, path, page).await,
-        Some(root @ ("notes" | "sessions")) => {
-            let tree = if root == "notes" {
-                Tree::Notes
-            } else {
-                Tree::Sessions
-            };
-            let eps = match tree {
-                Tree::Notes => note_episodes(store, session, reader).await?,
-                Tree::Sessions => episodes(store, session, who).await?,
-            };
-            let leaves = filed(&eps, reader, tree);
+        // The notes: no folders, each one its fact.
+        Some("notes") if path.len() == 1 => {
+            let eps = episodes(store, session, who).await?;
+            let children = notes(store, session, who, &eps)
+                .await?
+                .iter()
+                .map(|f| {
+                    let id = f.source_episodes.first().map_or("", String::as_str);
+                    let name = format!("{}-{}", day(f.valid_from), &id[..id.len().min(8)]);
+                    json!({"name": name, "kind": "episode", "path": path, "episode_id": id,
+                           "fact_id": f.fact_id, "occurred_at": f.valid_from, "title": title(&f.value),
+                           "team": f.tags.iter().any(|t| t == "team")})
+                })
+                .collect();
+            Ok(page(children))
+        }
+        Some("sessions") => {
+            let eps = episodes(store, session, who).await?;
+            let leaves = filed(&eps, who);
             let children = folder(path, &leaves)?;
-            titled(store, session.scope(), tree, page(children)).await
+            titled(store, session.scope(), page(children)).await
         }
         Some("advice") => {
             let advice = advice(store, session, who).await?;
@@ -373,38 +393,25 @@ async fn ls(
     }
 }
 
-async fn episode(store: &Store, session: &Session, reader: Reader<'_>, id: &str) -> Result<Value> {
-    let who = reader.who;
+async fn episode(store: &Store, session: &Session, who: &Principal, id: &str) -> Result<Value> {
     // The facts citing it: those whose sources name it (a scan of that one column), then exactly.
     let cites_it = Filter::Contains(Col::Sources, id.to_string());
     let citing = session.read_where(store, who, &cites_it, None);
-    let (eps, facts) = tokio::try_join!(note_episodes(store, session, reader), citing)?;
+    let (eps, facts) = tokio::try_join!(episodes(store, session, who), citing)?;
     let facts = once_each(facts);
     let Some(e) = eps.iter().find(|e| e.id == id) else {
         return Err(NotFound.into());
     };
-    // Read with the caller's own access, again: an ACL change since the listing hides it. Another person's note
-    // an admin opens is theirs to read whatever its ACL ([`Reader`]), and nothing else is.
-    let body = if session.vis().can_see_episode(id, who) {
-        session.episode_body(store, who, id).await?
-    } else if reader.every_note && person_note(&e.source) && !session.vis().is_gone(id) {
-        store
-            .episode_bodies(session.scope(), vec![id.to_string()])
-            .await?
-            .remove(id)
-    } else {
-        None
-    };
-    let Some(body) = body else {
+    // Read with the caller's own access, again: an ACL change since the listing hides it.
+    let Some(body) = session.episode_body(store, who, id).await? else {
         return Err(NotFound.into());
     };
     let truncated = body.len() > BODY_BYTES;
     let text = String::from_utf8_lossy(&body[..body.len().min(BODY_BYTES)]).into_owned();
-    // Where the Explorer lists it: a note in its writer's folder under `notes/` (where an admin reading someone
-    // else's finds it too), anything else under `sources/`.
-    let path = match filed(std::slice::from_ref(e), reader, Tree::Notes).pop() {
-        Some((at, _)) => std::iter::once("notes".to_string()).chain(at).collect(),
-        None => std::iter::once("sources")
+    // Where the Explorer lists it: a note (one its fact cites) under `notes`, anything else under `sources/`.
+    let path = match crate::note_facts::is_note(&e.source) {
+        true => vec!["notes".to_string()],
+        false => std::iter::once("sources")
             .chain(e.segments())
             .map(String::from)
             .collect::<Vec<_>>(),
@@ -566,8 +573,11 @@ fn by_entity(facts: &[Fact]) -> BTreeMap<(&str, &str), Vec<&Fact>> {
 
 /// Every fact the caller may read, over all valid time (history included), once each: a corpus loaded
 /// twice into one catalog commits each fact twice, under the same id.
+/// The facts `entities/` files: every one the caller may read but the notes', which `notes` lists.
 async fn facts(store: &Store, session: &Session, who: &Principal) -> Result<Vec<Fact>> {
-    Ok(once_each(session.read(store, who, None).await?))
+    let mut facts = once_each(session.read(store, who, None).await?);
+    facts.retain(|f| !crate::is_note_fact(f));
+    Ok(facts)
 }
 
 /// Each fact once, by id.
@@ -597,77 +607,72 @@ fn advice_status(a: &Value) -> &'static str {
     }
 }
 
-/// The derived trees of episodes: what a caller's own notes and sessions are filed as.
-#[derive(Clone, Copy, PartialEq)]
-enum Tree {
-    Notes,
-    Sessions,
+/// The notes the caller may read, as their facts ([`crate::note_facts`]), newest first: each read with the caller's
+/// own access as every fact is, so a person's note is theirs alone and a shared one everyone's in the scope. Only
+/// a fact citing a note (among `eps`, the episodes the caller reads) is one.
+async fn notes(store: &Store, session: &Session, who: &Principal, eps: &[Ep]) -> Result<Vec<Fact>> {
+    let note = Filter::Eq(Col::Predicate, Lit::Str(crate::NOTE.to_string()));
+    let notes_at: std::collections::BTreeSet<&str> = eps
+        .iter()
+        .filter(|e| crate::note_facts::is_note(&e.source))
+        .map(|e| e.id.as_str())
+        .collect();
+    let mut notes: Vec<Fact> = once_each(
+        session
+            .read_where(store, who, &note, Some(i64::MAX))
+            .await?,
+    )
+    .into_iter()
+    .filter(crate::is_note_fact)
+    .filter(|f| notes_at.contains(f.source_episodes[0].as_str()))
+    .collect();
+    notes.sort_by_key(|f| std::cmp::Reverse(f.valid_from));
+    Ok(notes)
 }
 
-/// Whether `source` is a person's note: what an admin may open of someone else's. Only what the server kept from
-/// what they typed, and what they asked to be remembered under a plain source (a hook's session note, its
-/// transcript, a session's record or a run's trace each name more than one segment); never the team's shared
-/// notes, which everyone reads anyway.
-fn person_note(source: &str) -> bool {
-    crate::profile::author_of(source).is_some_and(|(author, rest)| {
-        author != crate::keep::SHARER
-            && (crate::keep::is_kept(rest)
-                || (!rest.contains(':') && crate::profile::is_note(rest)))
-    })
-}
-
-/// The episodes `notes/` is filed from: those the caller may read, and for a reader of every note
-/// ([`Reader::every_note`]) every person's notes too.
-async fn note_episodes(store: &Store, session: &Session, reader: Reader<'_>) -> Result<Vec<Ep>> {
-    let also = |source: &str| reader.every_note && person_note(source);
-    episodes_where(store, session, reader.who, also).await
-}
-
-/// The episodes in `tree` the reader is shown, each with the folders it is filed under (below the tree's root):
-/// their own sessions; their own notes under their name, or everyone's for a reader of every note.
-fn filed<'a>(eps: &'a [Ep], reader: Reader<'_>, tree: Tree) -> Vec<(Vec<String>, &'a Ep)> {
-    let me = reader.who.user();
+/// The caller's own sessions among `eps`, each with the folders it is filed under (below `sessions/`): `ended/<day>`
+/// a session's record, `<harness>/<repo>` what a coding session's hooks kept as it went.
+fn filed<'a>(eps: &'a [Ep], who: &Principal) -> Vec<(Vec<String>, &'a Ep)> {
+    let me = who.user();
     eps.iter()
         .filter_map(|e| {
             let (author, rest) = crate::profile::author_of(&e.source)?;
-            let shared = author == crate::keep::SHARER && rest == "shared";
-            let mine = author.eq_ignore_ascii_case(me);
-            let theirs = tree == Tree::Notes && reader.every_note && person_note(&e.source);
-            if !shared && !mine && !theirs {
+            if !author.eq_ignore_ascii_case(me) {
                 return None;
             }
-            // A person's notes are under their name, as they sign in (the same person in any case is one).
-            let name = || {
-                if mine {
-                    me.to_string()
-                } else {
-                    author.to_lowercase()
-                }
-            };
-            let at: Vec<String> = match tree {
-                Tree::Notes if shared => vec!["team".into()],
-                Tree::Notes if crate::keep::is_kept(rest) => {
-                    match rest.splitn(3, ':').collect::<Vec<_>>()[..] {
-                        [_, category, topic] => vec![name(), category.into(), topic.into()],
-                        _ => vec![name(), "unfiled".into()],
-                    }
-                }
-                Tree::Notes if crate::profile::is_note(rest) => vec![name(), "remembered".into()],
-                Tree::Sessions
-                    if crate::session_record_source(&e.source).is_some()
-                        || rest.starts_with("session:") =>
-                {
-                    vec!["ended".into(), day(e.occurred_at)]
-                }
-                Tree::Sessions if crate::keep::hook_session_note(&e.source) => {
-                    let parts: Vec<&str> = rest.split(':').collect();
-                    vec![parts[0].into(), parts[1].into()]
-                }
-                _ => return None,
+            let at: Vec<String> = if crate::session_record_source(&e.source).is_some()
+                || rest.starts_with("session:")
+            {
+                vec!["ended".into(), day(e.occurred_at)]
+            } else if crate::keep::hook_session_note(&e.source) {
+                let parts: Vec<&str> = rest.split(':').collect();
+                vec![parts[0].into(), parts[1].into()]
+            } else {
+                return None;
             };
             Some((at, e))
         })
         .collect()
+}
+
+/// A note's or a session's title: its first line that says something, at most 90 characters.
+fn title(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(|l| l.trim().trim_start_matches('#').trim())
+        .map(|l| {
+            l.strip_prefix("User:")
+                .or(l.strip_prefix("Task:"))
+                .unwrap_or(l)
+                .trim()
+        })
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    let mut title: String = line.chars().take(90).collect();
+    if line.chars().count() > 90 {
+        title.push('…');
+    }
+    title
 }
 
 /// A time's day, `YYYY-MM-DD` (UTC).
@@ -711,8 +716,8 @@ fn folder(path: &[String], leaves: &[(Vec<String>, &Ep)]) -> Result<Vec<Value>> 
     Ok(children)
 }
 
-/// Page `listed`, with each episode on it titled by its first line, or a session record by its first request.
-async fn titled(store: &Store, scope: &Scope, tree: Tree, mut listed: Value) -> Result<Value> {
+/// Page `listed`, with each session on it titled by its first request.
+async fn titled(store: &Store, scope: &Scope, mut listed: Value) -> Result<Value> {
     let ids: Vec<String> = listed["children"]
         .as_array()
         .into_iter()
@@ -727,41 +732,13 @@ async fn titled(store: &Store, scope: &Scope, tree: Tree, mut listed: Value) -> 
         let Some(b) = c["episode_id"].as_str().and_then(|id| bodies.get(id)) else {
             continue;
         };
-        let text = String::from_utf8_lossy(b);
-        let line = text
-            .lines()
-            .map(|l| l.trim().trim_start_matches('#').trim())
-            .map(|l| match tree {
-                Tree::Sessions => l
-                    .strip_prefix("User:")
-                    .or(l.strip_prefix("Task:"))
-                    .unwrap_or(l)
-                    .trim(),
-                Tree::Notes => l,
-            })
-            .find(|l| !l.is_empty())
-            .unwrap_or_default();
-        let mut title: String = line.chars().take(90).collect();
-        if line.chars().count() > 90 {
-            title.push('…');
-        }
-        c["title"] = json!(title);
+        c["title"] = json!(title(&String::from_utf8_lossy(b)));
     }
     Ok(listed)
 }
 
 /// Every committed episode the session sees that the caller may read, once each.
 pub(crate) async fn episodes(store: &Store, session: &Session, who: &Principal) -> Result<Vec<Ep>> {
-    episodes_where(store, session, who, |_| false).await
-}
-
-/// Every committed episode the session sees that the caller may read, or whose source `also` admits, once each.
-async fn episodes_where(
-    store: &Store,
-    session: &Session,
-    who: &Principal,
-    also: impl Fn(&str) -> bool,
-) -> Result<Vec<Ep>> {
     let vis = session.vis();
     let mut out: BTreeMap<String, Ep> = BTreeMap::new();
     for bs in store.episode_files(session.scope()).await?.values() {
@@ -774,11 +751,7 @@ async fn episodes_where(
             let at = crate::timestamps(b, "occurred_at");
             let about = crate::optional_strings(b, "about");
             for i in 0..b.num_rows() {
-                if !vis.committed.contains(&commit[i])
-                    // What `also` admits past its ACL, never once it is gone (forgotten only re-ACLs it).
-                    || !(vis.can_see_episode(&id[i], who)
-                        || (also(&source[i]) && !vis.is_gone(&id[i])))
-                {
+                if !vis.committed.contains(&commit[i]) || !vis.can_see_episode(&id[i], who) {
                     continue;
                 }
                 out.entry(id[i].clone()).or_insert_with(|| Ep {

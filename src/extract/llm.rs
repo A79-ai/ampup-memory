@@ -126,8 +126,114 @@ fn write(dir: &Path, llm: &Llm) -> Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
     let mut w = o.open(&f).with_context(|| format!("{}", f.display()))?;
+    // The mode above is only a new file's: one there already is made the owner's alone too.
+    #[cfg(unix)]
+    w.set_permissions(
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )?;
     std::io::Write::write_all(&mut w, serde_json::to_string_pretty(llm)?.as_bytes())?;
     Ok(())
+}
+
+/// What `dir/llm.json` holds, if anything (for `service status`: never show its key).
+pub fn saved(dir: &Path) -> Result<Option<Llm>> {
+    read(dir)
+}
+
+/// A vendor's own key variable, for the backends that have one.
+fn vendor_key(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openrouter" | "openrouter-batch" => Some("OPENROUTER_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        _ => None,
+    }
+}
+
+/// For a server that runs without this environment (`ampup-memory service install`): keeps the model this
+/// environment names in `dir/llm.json`, where that server reads it, key included (the file is the owner's
+/// alone). `AMPUP_MEMORY_LLM` (or `_URL`) wins, with `_MODEL` and `_KEY` (else the vendor's key variable);
+/// else a vendor's key (`OPENROUTER_API_KEY`, then `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`) is kept where
+/// nothing is saved, no model was chosen, or the same vendor was (its key refreshed). A different backend chosen
+/// before (a local Ollama) is kept: `AMPUP_MEMORY_LLM` switches it. Says what it did, never the key; None where
+/// the environment names no model.
+pub fn adopt_env(dir: &Path) -> Result<Option<String>> {
+    let saved = read(dir)?;
+    let provider =
+        var("AMPUP_MEMORY_LLM").or_else(|| var("AMPUP_MEMORY_LLM_URL").map(|_| "openai".into()));
+    let want = match provider {
+        Some(p) => {
+            let p = p.to_ascii_lowercase();
+            let key = var("AMPUP_MEMORY_LLM_KEY").or_else(|| vendor_key(&p).and_then(var));
+            Llm {
+                url: var("AMPUP_MEMORY_LLM_URL"),
+                model: var("AMPUP_MEMORY_LLM_MODEL"),
+                key: if p == "off" { None } else { key },
+                provider: p,
+            }
+        }
+        None => {
+            let vendors = ["openrouter", "anthropic", "openai"];
+            let has = |p: &str| vendor_key(p).and_then(var);
+            let chosen = saved.as_ref().map(|s| s.provider.as_str());
+            match chosen {
+                // The vendor chosen before: its key refreshed, its model and URL kept.
+                Some(p) if vendors.contains(&p) && has(p).is_some() => Llm {
+                    key: has(p),
+                    ..saved.clone().unwrap_or_default()
+                },
+                None | Some("off") => match vendors.iter().find(|p| has(p).is_some()) {
+                    Some(p) => Llm {
+                        provider: p.to_string(),
+                        key: has(p),
+                        model: var("AMPUP_MEMORY_LLM_MODEL"),
+                        url: None,
+                    },
+                    None => return Ok(None),
+                },
+                Some(p) => {
+                    return Ok(vendors.iter().find(|v| has(v).is_some()).map(|v| {
+                        format!(
+                            "model: keeping {p}, chosen before ({}), not {} from {}: set AMPUP_MEMORY_LLM={v} to switch",
+                            file(dir).display(),
+                            v,
+                            vendor_key(v).unwrap_or_default()
+                        )
+                    }));
+                }
+            }
+        }
+    };
+    let what = describe(&want);
+    if saved.as_ref() == Some(&want) {
+        return Ok(Some(format!(
+            "model: {what}, as saved in {}",
+            file(dir).display()
+        )));
+    }
+    write(dir, &want)?;
+    Ok(Some(format!(
+        "model: {what}, saved in {} (readable by you alone)",
+        file(dir).display()
+    )))
+}
+
+/// A saved choice in words, without its key.
+pub fn describe(l: &Llm) -> String {
+    if l.provider == "off" {
+        return "none (memory is kept and searched, nothing is extracted)".into();
+    }
+    let mut s = l.provider.clone();
+    if let Some(m) = &l.model {
+        s += &format!(" {m}");
+    }
+    if let Some(u) = &l.url {
+        s += &format!(" at {u}");
+    }
+    if l.key.is_some() {
+        s += " with a key";
+    }
+    s
 }
 
 /// The models a local Ollama has pulled, or None where it doesn't answer at `base`.
@@ -157,7 +263,8 @@ async fn ollama_models(base: &str) -> Option<Vec<String>> {
 /// How to turn learning on, for a server that has no model and asks no one.
 pub const HOW: &str = "to learn from what it keeps, set OPENROUTER_API_KEY (or AMPUP_MEMORY_LLM=openai with \
 OPENAI_API_KEY, or anthropic with ANTHROPIC_API_KEY), or run Ollama and set AMPUP_MEMORY_LLM=ollama (model \
-qwen2.5:3b unless AMPUP_MEMORY_LLM_MODEL names another); or run `ampup-memory serve --local` in a terminal to choose";
+qwen2.5:3b unless AMPUP_MEMORY_LLM_MODEL names another); or run `ampup-memory serve --local` (or, for the background \
+service, `ampup-memory service install`) in a terminal to choose";
 
 /// `serve --local`'s first run: reads the choice `dir/llm.json` keeps, and where there is none and nothing else
 /// names a model, asks at the terminal: a key to paste, the local Ollama, or no learning. The answer is kept in

@@ -119,7 +119,7 @@ pub const REFRESH_GAP: i64 = 5 * 60_000_000;
 pub(crate) struct Ep {
     pub(crate) id: String,
     pub(crate) source: String,
-    occurred_at: i64,
+    pub(crate) occurred_at: i64,
     pub(crate) about: Vec<String>,
     /// Who may read it.
     pub(crate) acl: Vec<String>,

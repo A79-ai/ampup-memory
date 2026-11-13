@@ -14,10 +14,23 @@ import { baseUrl, forget, validNamespace } from "./gke";
 // Each setting is AMPUP_MEMORY_*, still read under its old name (MEMSTORE_*) when the new one isn't set.
 const HOSTED = (process.env.AMPUP_MEMORY_URL ?? process.env.MEMSTORE_URL)?.replace(/\/$/, "");
 
+/** `AMPUP_MEMORY_URL` naming this machine's own server (`ampup-memory serve --local`, which nobody signs in to)
+ * with no Google sign-in configured: read as that server's one local caller, with no token. */
+const LOCAL =
+  !!HOSTED &&
+  !process.env.AUTH_GOOGLE_ID &&
+  !viaGateway() &&
+  /^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(HOSTED);
+
 /** How this UI reaches memstore, as the page needs to know it. */
-export function mode(): { hosted: boolean; label: string } {
-  if (HOSTED) return { hosted: true, label: process.env.AMPUP_MEMORY_LABEL ?? process.env.MEMSTORE_LABEL ?? new URL(HOSTED).host };
-  return { hosted: viaGateway(), label: "Kubernetes" };
+export function mode(): { hosted: boolean; local: boolean; label: string } {
+  if (HOSTED)
+    return {
+      hosted: true,
+      local: LOCAL,
+      label: process.env.AMPUP_MEMORY_LABEL ?? process.env.MEMSTORE_LABEL ?? new URL(HOSTED).host,
+    };
+  return { hosted: viaGateway(), local: false, label: "Kubernetes" };
 }
 
 /** The namespace value that names `AMPUP_MEMORY_URL`'s memstore, beside the gateway's memstore-* ones. */
@@ -47,6 +60,11 @@ export async function memstore(
   path: string,
   init: { body?: unknown; sel?: Selection; method?: "GET" | "POST" },
 ): Promise<Response> {
+  if (LOCAL) {
+    const r = await call(`${HOSTED}${path}${query(init.sel)}`, init, path, HOSTED!);
+    if (r.status === 599) return Response.json({ error: `${HOSTED} isn't answering` }, { status: 502 });
+    return r;
+  }
   if (HOSTED || viaGateway()) {
     const token = await idToken(req).catch(() => null);
     if (!token) return Response.json({ error: "sign in", signIn: true }, { status: 401 });

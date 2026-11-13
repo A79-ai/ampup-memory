@@ -37,6 +37,7 @@ body:
       label: Platform
       options:
         - macOS (Apple Silicon)
+        - macOS (Intel)
         - Linux x86_64
         - Linux arm64
         - Other

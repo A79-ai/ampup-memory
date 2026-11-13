@@ -307,7 +307,7 @@ async fn serve(
 }
 
 /// A page: the server's own, plain, with no script.
-fn page(title: &str, body: &str) -> String {
+pub(super) fn page(title: &str, body: &str) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>body{{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem;color:#111}}button{{font:inherit;padding:.5rem 1rem;border-radius:.4rem;border:1px solid #333;background:#fff;cursor:pointer}}code{{background:#f3f3f3;padding:.1rem .3rem}}</style></head><body>{}</body></html>",
         mail::esc(title),
@@ -321,7 +321,7 @@ pub(super) struct Shown {
     pub(super) html: String,
 }
 
-fn shown(status: u16, title: &str, body: &str) -> Shown {
+pub(super) fn shown(status: u16, title: &str, body: &str) -> Shown {
     Shown {
         status,
         html: page(title, body),

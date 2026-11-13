@@ -344,6 +344,10 @@ pub async fn advice(
         if l.held {
             v["held"] = json!(true);
         }
+        // An admin ratified it: served to everyone whatever its evidence.
+        if l.approved {
+            v["approved"] = json!(true);
+        }
         if let Some(why) = &l.needs_backing {
             v["needs_backing"] = json!(why);
         }
@@ -375,7 +379,7 @@ pub async fn advice(
         for l in crate::advice::listed(session, store, who, &crate::advice::Space::team()).await? {
             let tally = tallies.get(&l.key).cloned().unwrap_or_default();
             // Everyone reads what the team serves, and it serves every note: the bar is reported only.
-            let past = tally.ratified(bar);
+            let past = tally.ratified(bar) || l.approved;
             add("team", l, Some(&tally), past);
         }
     }

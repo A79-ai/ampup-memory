@@ -134,4 +134,84 @@ export type Focus =
   | { kind: "skill"; path: string[] }
   | { kind: "episode"; id: string }
   | { kind: "search"; query: string }
-  | { kind: "tools"; tool?: string };
+  | { kind: "tools"; tool?: string }
+  /** What it learned: every lesson the reader may read, `show` narrowing them (`team`, `mine` or a person). */
+  | { kind: "lessons"; show?: string; key?: string };
+
+/** How a run or a session went, and who said so (`/lessons`). */
+export type Outcome = "right" | "wrong" | "good" | "bad" | "unclear" | "open";
+export type SaidBy = "person" | "pr" | "reward" | "judge" | "none" | "unknown";
+
+/** A run or session a lesson was learned from. */
+export type LearnedFrom = {
+  id: string;
+  kind: "run" | "session";
+  user: string;
+  question: string;
+  at: number;
+  runs: number;
+  right: number;
+  wrong: number;
+  outcome: Outcome;
+  by: SaidBy;
+};
+
+/** A session a lesson was served in. */
+export type ServedIn = {
+  id: string;
+  user: string;
+  question: string;
+  at: number;
+  moment: string | null;
+  harness: string | null;
+  applied: boolean | null;
+  helped: boolean | null;
+  outcome: Outcome;
+  by: SaidBy;
+  reward: number | null;
+  prs: { repo: string; number: number | null; state: string }[];
+  ended_at: number | null;
+};
+
+/** One learned advice note with its trail (`/lessons`). */
+export type Lesson = {
+  key: string;
+  space: "mine" | "team";
+  owner: string | null;
+  category: string;
+  situation: string;
+  when: string;
+  title: string;
+  lesson: string;
+  note_id: string;
+  learned_at: number;
+  status: string;
+  status_reason?: string;
+  learned_from: {
+    runs: number;
+    right: number;
+    wrong: number;
+    people: number;
+    trail: LearnedFrom[];
+    more: number;
+    hidden: number;
+  };
+  served_in: {
+    sessions: number;
+    people: number;
+    helped: number;
+    good: number;
+    bad: number;
+    trail: ServedIn[];
+    more: number;
+    hidden: number;
+  };
+  evidence?: { served: number; helped: number; ratified: boolean };
+};
+
+export type Lessons = {
+  reader: { user: string; everyone: boolean };
+  people: string[];
+  count: number;
+  lessons: Lesson[];
+};

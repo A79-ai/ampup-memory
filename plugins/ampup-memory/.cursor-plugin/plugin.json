@@ -1,6 +1,6 @@
 {
   "name": "ampup-memory",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "AmpUp Memory, team memory for Cursor: what the org's memory knows recalled at a session's start, each session recorded as a run to learn from, and skills to search the memory, follow its advice, see where things stand and remember what lasts.",
   "author": { "name": "AmpUp" },
   "repository": "https://github.com/A79-ai/ampup-memory",

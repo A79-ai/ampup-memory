@@ -4,6 +4,7 @@ import { signIn, signOut, useSession } from "next-auth/react";
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { browse, me as loadMe, namespaces as loadNamespaces } from "./api";
 import { Inspector } from "./inspector";
+import { Lessons } from "./lessons";
 import { Schema } from "./schema";
 import { Tools } from "./tools";
 import { Tree } from "./tree";
@@ -15,6 +16,7 @@ import type { Branch, Focus, Me, Namespace, Selection } from "./types";
 //   #/s/skills/<slug>       a compiled skill (or the index)
 //   #/t/<tool>              the Tools tab, a tool picked
 //   #/c                     the Schema tab
+//   #/l/<show>/<key>        the Learned tab: every lesson, or `team`, `mine` or one person's; a lesson in focus
 // Each segment is URI-encoded, so one may hold `/`. `?ns=` picks the memstore (a `memstore-*` namespace on
 // Kubernetes), `?org=&team=` (or `?scope=`) the memory within it and `?branch=` the branch read (main by default).
 function toHash(f: Focus | null): string {
@@ -35,11 +37,13 @@ function toHash(f: Focus | null): string {
       return `#/t/${encodeURIComponent(f.tool ?? "")}`;
     case "schema":
       return "#/c/";
+    case "lessons":
+      return `#/l/${encodeURIComponent(f.show ?? "")}${f.key ? `/${encodeURIComponent(f.key)}` : ""}`;
   }
 }
 
 function fromHash(h: string): Focus | null {
-  const m = /^#\/([fesxqtc])\/(.*)$/.exec(h);
+  const m = /^#\/([fesxqtcl])\/(.*)$/.exec(h);
   if (!m) return null;
   const segs = m[2] ? m[2].split("/").map(decodeURIComponent) : [];
   switch (m[1]) {
@@ -55,6 +59,15 @@ function fromHash(h: string): Focus | null {
       return { kind: "tools", tool: decodeURIComponent(m[2]) || undefined };
     case "c":
       return { kind: "schema" };
+    case "l": {
+      // The key holds a `/` (`<category>/<situation>`): everything after the first segment.
+      const [show, ...key] = m[2].split("/");
+      return {
+        kind: "lessons",
+        show: decodeURIComponent(show) || undefined,
+        key: key.length ? decodeURIComponent(key.join("/")) : undefined,
+      };
+    }
     default:
       return { kind: "search", query: decodeURIComponent(m[2]) };
   }
@@ -93,10 +106,12 @@ export function Browser() {
   }, [search]);
   const [scopes, setScopes] = useState<{ ns: string; list: string[] } | null>(null);
   const [who, setWho] = useState<{ sel: string; me?: Me; error?: string } | null>(null);
-  const [nss, setNss] = useState<{ list?: Namespace[]; hosted?: boolean; error?: string } | null>(null);
+  const [nss, setNss] = useState<{ list?: Namespace[]; hosted?: boolean; local?: boolean; error?: string } | null>(
+    null,
+  );
   const { data: session, status: signedIn } = useSession();
-  // Hosted, nothing is read until someone signs in.
-  const waiting = !!nss?.hosted && signedIn !== "authenticated";
+  // Hosted, nothing is read until someone signs in (but this machine's own server has no sign-in).
+  const waiting = !!nss?.hosted && !nss.local && signedIn !== "authenticated";
   const [query, setQuery] = useState("");
   // The scope's branches with their skills (null: a memstore that can't name them), for the memory selected.
   const [branches, setBranches] = useState<{ key: string; list: Branch[] | null } | null>(null);
@@ -104,9 +119,9 @@ export function Browser() {
 
   // The memstore- namespaces on Kubernetes; with none picked, the first one serving.
   useEffect(() => {
-    loadNamespaces<{ namespaces: Namespace[]; hosted: boolean; error?: string }>().then(
+    loadNamespaces<{ namespaces: Namespace[]; hosted: boolean; local?: boolean; error?: string }>().then(
       (r) => {
-        setNss({ list: r.namespaces, hosted: r.hosted, error: r.error });
+        setNss({ list: r.namespaces, hosted: r.hosted, local: r.local, error: r.error });
         const first = r.namespaces.find((n) => n.serving);
         if (!new URLSearchParams(window.location.search).get("ns") && first) {
           navigate(`${window.location.pathname}?ns=${first.namespace}`);
@@ -288,7 +303,15 @@ export function Browser() {
         )}
         <nav className="tabs" aria-label="View">
           <button
-            className={focus?.kind !== "tools" && focus?.kind !== "schema" ? "tab tab-on" : "tab"}
+            className={focus?.kind === "lessons" ? "tab tab-on" : "tab"}
+            onClick={() => go({ kind: "lessons" })}
+          >
+            Learned
+          </button>
+          <button
+            className={
+              focus?.kind !== "tools" && focus?.kind !== "schema" && focus?.kind !== "lessons" ? "tab tab-on" : "tab"
+            }
             onClick={() => go({ kind: "folder", path: [] })}
           >
             Browse
@@ -348,6 +371,8 @@ export function Browser() {
         <Namespaces list={nss?.list} onPick={(ns) => choose({ ns })} />
       ) : focus?.kind === "schema" ? (
         <Schema key={search} sel={sel} />
+      ) : focus?.kind === "lessons" ? (
+        <Lessons key={search} sel={sel} show={focus.show} focusKey={focus.key} onFocus={go} />
       ) : focus?.kind === "tools" ? (
         <main className="split">
           <Tools key={search} sel={sel} tool={focus.tool} onFocus={go} />

@@ -19675,7 +19675,9 @@ The Apache Software Foundation (http://www.apache.org/).
 ================================================================================
 
 memstore statically links ONNX Runtime 1.28.0 (Copyright (c) Microsoft Corporation, MIT License), the build
-the ort crate downloads for each release platform. Source: https://github.com/microsoft/onnxruntime/tree/v1.28.0
+the ort crate downloads for each release platform (for Intel macOS, which it has none for, built from the same
+source by .github/scripts/onnxruntime-x86_64-apple-darwin.sh).
+Source: https://github.com/microsoft/onnxruntime/tree/v1.28.0
 Its license, then its own third-party notices (the libraries compiled into it), follow.
 
 --------------------------------------------------------------------------------

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The third-party notices of the release binaries (memstore and memstore-client): every crate they link on the
 # release platforms with its license text (cargo-about, about.toml and about.hbs), the NOTICE files those crates ship,
-# and the texts in licenses/: ONNX Runtime, which ort links into memstore, and the default embedding model.
+# and the texts in licenses/: ONNX Runtime, which ort links into memstore (on Intel macOS, built from the same source
+# by onnxruntime-x86_64-apple-darwin.sh), and the default embedding model.
 #
 #   .github/scripts/third-party-notices.sh <out-file>
 #
@@ -138,7 +139,9 @@ ort = read("licenses/onnxruntime/VERSION").strip()
 text += section(
     "5. ONNX RUNTIME",
     f"memstore statically links ONNX Runtime {ort} (Copyright (c) Microsoft Corporation, MIT License), the build\n"
-    f"the ort crate downloads for each release platform. Source: https://github.com/microsoft/onnxruntime/tree/v{ort}\n"
+    "the ort crate downloads for each release platform (for Intel macOS, which it has none for, built from the same\n"
+    "source by .github/scripts/onnxruntime-x86_64-apple-darwin.sh).\n"
+    f"Source: https://github.com/microsoft/onnxruntime/tree/v{ort}\n"
     "Its license, then its own third-party notices (the libraries compiled into it), follow.\n\n"
     f"{'-' * 80}\nONNX Runtime LICENSE\n{'-' * 80}\n\n{read('licenses/onnxruntime/LICENSE').rstrip()}\n\n"
     f"{'-' * 80}\nONNX Runtime ThirdPartyNotices.txt\n{'-' * 80}\n\n{read('licenses/onnxruntime/ThirdPartyNotices.txt').rstrip()}",

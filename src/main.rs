@@ -193,7 +193,17 @@ enum Cmd {
         /// AMPUP_MEMORY_SERVE_WORKSPACES=1)
         #[arg(long)]
         workspaces: bool,
+        /// With --local: start it detached (output to DIR/logs/serve.log) and return once it is ready; nothing to do
+        /// where an AmpUp Memory server already answers on the port
+        #[arg(long, requires = "local")]
+        background: bool,
     },
+    /// Keep `serve --local` running in the background, started at login and again if it stops: a LaunchAgent on
+    /// macOS, a systemd user unit on Linux, logging to DIR/logs/serve.log. `install [DIR] [--port p]` (again: rewrites
+    /// it for this binary and restarts it), `uninstall` (stops it; the data stays), `status`, `restart`,
+    /// `logs [-f] [-n lines]`
+    #[command(subcommand)]
+    Service(ServiceCmd),
     /// Expire all but the last `keep` Iceberg snapshots of the system tables and a scope's tables, and delete the
     /// metadata only they named (every commit does this as it goes, and serve on a timer)
     Maintain {
@@ -403,6 +413,10 @@ enum Cmd {
     /// Runs for advice to learn from: `runs load` records a file of them, scored or not, in one batch
     #[command(subcommand)]
     Runs(RunsCmd),
+    /// The weekly digest each active person is mailed: `preview` renders one without sending it, `send` sends a
+    /// week's now (each person's once, as `serve` does from Monday on)
+    #[command(subcommand)]
+    Digest(DigestCmd),
     /// The training log (`AMPUP_MEMORY_TRAIN_LOG`): every model call kept whole, so a smaller model can be trained on
     /// it. `sweep` removes what the memory has since forgotten; `export` writes training examples
     #[command(subcommand)]
@@ -609,6 +623,48 @@ enum SchemaCmd {
     },
     /// Check a schema (a built-in name or a JSON file) without a catalog; prints its summary
     Check { schema: String },
+}
+
+/// `ampup-memory service`: the local server kept running in the background.
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Install the service and start it (again: rewrite it for this binary and restart it). The model it learns
+    /// with is this environment's key (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY or AMPUP_MEMORY_LLM*),
+    /// kept in DIR/llm.json, readable by you alone, never in the service's file; at a terminal with none set and
+    /// none chosen before, it asks
+    Install {
+        /// Where the memory lives
+        #[arg(value_name = "DIR", default_value = "~/.ampup-memory")]
+        dir: String,
+        /// The port it serves on, on 127.0.0.1 (the hooks call 8080 unless AMPUP_MEMORY_URL says otherwise)
+        #[arg(long, default_value_t = memstore::service::PORT)]
+        port: u16,
+    },
+    /// Save the model this environment names in DIR/llm.json, as `install` does, without installing the service:
+    /// a key (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY) or AMPUP_MEMORY_LLM*. `serve --local`, the
+    /// service and the server a coding agent's session starts all learn with it. Prints what it saved (never the
+    /// key); nothing where the environment names no model
+    SaveModel {
+        /// Where the memory lives
+        #[arg(value_name = "DIR", default_value = "~/.ampup-memory")]
+        dir: String,
+    },
+    /// Stop the service and remove it. The data stays
+    Uninstall,
+    /// Whether it is installed and running: its pid, port, data, log, and whether it answers. Exits non-zero
+    /// when it isn't installed or doesn't answer
+    Status,
+    /// Restart it (after changing DIR/llm.json, say)
+    Restart,
+    /// Its log (DIR/logs/serve.log)
+    Logs {
+        /// Keep printing what it writes
+        #[arg(short, long)]
+        follow: bool,
+        /// How many lines to print first
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -822,6 +878,166 @@ enum IndexCmd {
     List { scope: String },
     /// Delete an index of another configuration (a directory `index list` shows)
     Drop { scope: String, dir: String },
+}
+
+#[derive(Clone, Subcommand)]
+enum DigestCmd {
+    /// Print a person's digest of a week (its subject and text), sending nothing; `--html` writes the HTML part
+    Preview {
+        /// The person, by email
+        #[arg(long)]
+        person: String,
+        /// The org (from the directory); without it, a `serve --local` store's own scope
+        #[arg(long)]
+        org: Option<String>,
+        /// `last`, `this`, an ISO week (2026-W46) or any day in it (2026-11-12)
+        #[arg(long, default_value = "last")]
+        week: String,
+        /// Without --org, the groups the person reads as (a `serve --local` caller's: local)
+        #[arg(long, value_delimiter = ',', default_value = "local")]
+        groups: Vec<String>,
+        /// Write the HTML part to this file
+        #[arg(long)]
+        html: Option<PathBuf>,
+        /// Print what the digest holds as JSON instead
+        #[arg(long)]
+        json: bool,
+        /// Ask this running server (its `/digest/preview`; `AMPUP_MEMORY_TOKEN` as the bearer, if set): a
+        /// `serve --local` one previews anyone's, another the caller's own or, for an org admin, a member's
+        #[arg(long, conflicts_with = "local")]
+        server: Option<String>,
+        /// A `serve --local` directory (stopped), instead of the catalog the environment names
+        #[arg(long)]
+        local: Option<PathBuf>,
+    },
+    /// Send a week's digests now through the mail the environment configures: each active, subscribed person's,
+    /// once (a digest already sent isn't sent again)
+    Send {
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long, default_value = "last")]
+        week: String,
+        /// Only this person's
+        #[arg(long)]
+        person: Option<String>,
+        #[arg(long, value_delimiter = ',', default_value = "local")]
+        groups: Vec<String>,
+        /// A `serve --local` directory (stop the server first)
+        #[arg(long)]
+        local: Option<PathBuf>,
+    },
+}
+
+impl DigestCmd {
+    fn local(&self) -> Option<&PathBuf> {
+        match self {
+            DigestCmd::Preview { local, .. } | DigestCmd::Send { local, .. } => local.as_ref(),
+        }
+    }
+}
+
+/// A digest preview as `/digest/preview` answers it, printed (or its JSON), its HTML written to `html`.
+fn show_digest(
+    v: &serde_json::Value,
+    week: memstore::digest::Week,
+    json: bool,
+    html: Option<&std::path::Path>,
+) -> Result<()> {
+    let (d, r, unsubscribed, sent) = memstore::digest::Preview::from_json(v)?;
+    let person = d["person"].as_str().unwrap_or_default();
+    let active = d["sessions"].as_u64().unwrap_or(0) + d["runs"].as_u64().unwrap_or(0) > 0;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&d)?);
+    } else if !active {
+        println!(
+            "No digest: {person} had no sessions or runs in {} ({}), so none is sent.",
+            week.label(),
+            week.span()
+        );
+    } else {
+        if unsubscribed {
+            println!("({person} unsubscribed: none is sent.)\n");
+        }
+        if let Some(s) = &sent {
+            println!("(This week's digest: {s}.)\n");
+        }
+        println!("Subject: {}\n\n{}", r.subject, r.text);
+    }
+    if let Some(f) = html {
+        std::fs::write(f, &r.html)?;
+        eprintln!("HTML part written to {}", f.display());
+    }
+    Ok(())
+}
+
+/// `memstore digest preview --server`: the preview a running server renders.
+async fn digest_from_server(c: &DigestCmd) -> Result<()> {
+    let DigestCmd::Preview {
+        person,
+        org,
+        week,
+        html,
+        json,
+        server: Some(server),
+        ..
+    } = c
+    else {
+        anyhow::bail!("not a server preview");
+    };
+    let w = memstore::digest::Week::parse(week, memstore::now_micros())?;
+    let mut req = reqwest::Client::new()
+        .post(format!("{}/digest/preview", server.trim_end_matches('/')))
+        .json(&serde_json::json!({"person": person, "week": week}));
+    if let Ok(t) = std::env::var("AMPUP_MEMORY_TOKEN")
+        && !t.trim().is_empty()
+    {
+        req = req.bearer_auth(t.trim());
+    }
+    if let Some(o) = org {
+        req = req.header("x-memstore-org", o);
+    }
+    let r = req.send().await?;
+    let status = r.status();
+    let v: serde_json::Value = r.json().await?;
+    anyhow::ensure!(
+        status.is_success(),
+        "{server} answered {status}: {}",
+        v["error"].as_str().unwrap_or_default()
+    );
+    show_digest(&v, w, *json, html.as_deref())
+}
+
+/// `memstore digest`.
+async fn digest(store: &Store, c: &DigestCmd) -> Result<()> {
+    use memstore::digest::{self, Week};
+    match c {
+        DigestCmd::Preview {
+            person,
+            org,
+            week,
+            groups,
+            html,
+            json,
+            ..
+        } => {
+            let week = Week::parse(week, memstore::now_micros())?;
+            let p = digest::preview(store, org.as_deref(), person, week, groups).await?;
+            show_digest(&p.json(), week, *json, html.as_deref())?;
+        }
+        DigestCmd::Send {
+            org,
+            week,
+            person,
+            groups,
+            ..
+        } => {
+            let week = Week::parse(week, memstore::now_micros())?;
+            let r =
+                digest::send_now(store, org.as_deref(), week, groups, person.as_deref()).await?;
+            println!("{}", serde_json::to_string(&r)?);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Subcommand)]
@@ -1043,6 +1259,9 @@ fn jemalloc_stats() -> String {
 }
 
 fn main() -> Result<()> {
+    // Under the background service (or `serve --local --background`): this process writes its own log, capped.
+    // SAFETY: first in main: no other thread runs yet.
+    unsafe { memstore::service::own_log_from_env() };
     // The old names (MEMSTORE_*, ~/.memstore) read as the new ones, before anything reads them.
     // SAFETY: first in main: no other thread runs yet.
     unsafe { memstore::naming::startup() };
@@ -1182,32 +1401,35 @@ async fn compile(
         Some(s) => memstore::compile::parse_sources(s),
         None => memstore::compile::sources_for(dir.as_ref(), &scope_),
     };
-    // The scope's batch size and what its sources are, as its settings say, as `serve` compiles it.
-    let opts = memstore::compile::options_for(dir.as_ref(), &scope_);
     anyhow::ensure!(
         !sources.is_empty(),
         "{scope} has no compile sources: pass --sources kb:,file: (or * for every source), or set the org's \
          compile_sources"
     );
-    let r =
-        memstore::compile::run_with(store, &scope_, branch, &sources, &cx, &opts, limit).await?;
-    println!(
-        "{scope} on {branch}: {} with {}: {} sources compiled ({} not compile sources), {} skills and {} AIP graphs written, {} dropped, {} failed ({} with the API down); {}",
-        sources.join(","),
-        cx.model(),
-        r.episodes,
-        r.skipped,
-        r.skills,
-        r.aip,
-        r.dropped,
-        r.failed,
-        r.unavailable,
-        cx.calls()
-    );
+    // The scope's batch size and what its sources are, as its settings say, as `serve` compiles it: a group of
+    // sources per prompt.
+    let mut down = 0;
+    for (sources, opts) in memstore::compile::plan(dir.as_ref(), &scope_, &sources) {
+        let r = memstore::compile::run_with(store, &scope_, branch, &sources, &cx, &opts, limit)
+            .await?;
+        println!(
+            "{scope} on {branch}: {} with {}: {} sources compiled ({} not compile sources), {} skills and {} AIP graphs written, {} dropped, {} failed ({} with the API down); {}",
+            sources.join(","),
+            cx.model(),
+            r.episodes,
+            r.skipped,
+            r.skills,
+            r.aip,
+            r.dropped,
+            r.failed,
+            r.unavailable,
+            cx.calls()
+        );
+        down += r.unavailable;
+    }
     anyhow::ensure!(
-        r.unavailable == 0,
-        "the compile API was down for {} sources; run again",
-        r.unavailable
+        down == 0,
+        "the compile API was down for {down} sources; run again"
     );
     Ok(())
 }
@@ -1770,10 +1992,32 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             port,
             groups,
             local: Some(dir),
+            background: true,
+            ..
+        } => {
+            Scope::parse(scope)?;
+            let dir = memstore::service::data_dir(dir)?;
+            return memstore::service::background(&dir, scope, *port, groups.as_deref()).await;
+        }
+        Cmd::Serve {
+            scope,
+            port,
+            groups,
+            local: Some(dir),
             ..
         } => {
             let groups = groups.as_deref().map_or(vec![], memstore::split_list);
             return serve_local(dir, *port, Scope::parse(scope)?, groups).await;
+        }
+        Cmd::Service(c) => {
+            return match c {
+                ServiceCmd::Install { dir, port } => memstore::service::install(dir, *port).await,
+                ServiceCmd::SaveModel { dir } => memstore::service::save_model(dir),
+                ServiceCmd::Uninstall => memstore::service::uninstall().await,
+                ServiceCmd::Status => memstore::service::status().await,
+                ServiceCmd::Restart => memstore::service::restart().await,
+                ServiceCmd::Logs { follow, lines } => memstore::service::logs(*follow, *lines),
+            };
         }
         Cmd::Index(IndexArgs {
             cmd: None,
@@ -1925,6 +2169,15 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
         ) => {
             let store = local_store(dir).await?;
             return train_log(&store, c.clone()).await;
+        }
+        Cmd::Digest(
+            c @ DigestCmd::Preview {
+                server: Some(_), ..
+            },
+        ) => return digest_from_server(c).await,
+        Cmd::Digest(c) if c.local().is_some() => {
+            let store = local_store(c.local().expect("local")).await?;
+            return digest(&store, c).await;
         }
         Cmd::QaLog {
             scope,
@@ -2531,6 +2784,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::QaLog { scope, .. } => qa_log(&store, &scope).await?,
+        Cmd::Digest(c) => digest(&store, &c).await?,
         Cmd::Runs(r) => runs(&store, r).await?,
         Cmd::TrainLog(c) => train_log(&store, c).await?,
         Cmd::Compile {
@@ -2624,6 +2878,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             groups,
             local,
             workspaces,
+            ..
         } => {
             let groups = groups.map_or(vec![], |g| memstore::split_list(&g));
             anyhow::ensure!(
@@ -2751,6 +3006,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
         | Cmd::Preflight(_)
         | Cmd::SupportBundle { .. }
         | Cmd::Hooks { .. }
+        | Cmd::Service(_)
         | Cmd::Gen { .. }
         | Cmd::Embed { .. }
         | Cmd::Dataset(_)
@@ -3299,12 +3555,10 @@ fn on_local(dir: &std::path::Path, catalog: std::sync::Arc<dyn iceberg::Catalog>
 /// `memstore serve --local [DIR]`: everything under one directory on this machine. The one caller reads as
 /// the groups given, else `local`; memories shared with `group:local` (or `*`) are theirs.
 async fn serve_local(dir: &str, port: u16, scope: Scope, groups: Vec<String>) -> Result<()> {
-    let dir = match dir.strip_prefix("~/") {
-        // The default: the state directory, still ~/.memstore where moving it failed (memstore::naming).
-        Some(memstore::naming::STATE_DIR) => memstore::naming::current_state_dir(),
-        Some(rest) => std::path::PathBuf::from(std::env::var("HOME")?).join(rest),
-        None => std::path::PathBuf::from(dir),
-    };
+    // The default: the state directory, still ~/.memstore where moving it failed (memstore::naming).
+    let dir = memstore::service::data_dir(dir)?;
+    // A port already served (the background service, most likely) is said so, not a bind error after the start.
+    memstore::service::refuse_if_taken(port, &dir).await?;
     // Every request reads as the one local caller, with no sign-in: never reachable from another machine.
     // The bind is fixed below whatever the environment says; a different one asked for is a mistake to report.
     if let Ok(bind) = std::env::var("AMPUP_MEMORY_SERVE_BIND") {

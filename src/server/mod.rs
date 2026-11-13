@@ -45,6 +45,7 @@ mod reads;
 mod reports;
 mod routing;
 mod signin;
+mod unsubscribe;
 pub mod writer;
 
 /// Rebuild the catalog this often (`AMPUP_MEMORY_CATALOG_REFRESH_SECS`, default 300): inside SPCS its session
@@ -124,9 +125,10 @@ struct State {
     directory_only: bool,
     /// Scopes callers have selected, kept indexed alongside `scope`.
     served: std::sync::Mutex<std::collections::BTreeSet<Scope>>,
-    /// Scopes the start's warm-up loaded, which [`keep_warm`] keeps loaded: a new server's first caller finds them
-    /// as warm as the last one found the old server's.
-    warmed: std::sync::Mutex<std::collections::BTreeSet<Scope>>,
+    /// When each scope was last selected by a request (or loaded by the start's warm-up), so [`keep_warm`] keeps
+    /// loaded only the scopes someone reads: a new server's first caller finds them as warm as the last one found
+    /// the old server's, and a scope nobody has read for [`keep_warm_idle`] is left to its next reader.
+    read_at: std::sync::Mutex<HashMap<Scope, Instant>>,
     /// Orgs' identity providers and service keys as last read from the directory, and when.
     providers: std::sync::Mutex<Option<(std::time::Instant, DirectoryAuth)>>,
     /// Seals orgs' provider client secrets for the directory, and opens them (`AMPUP_MEMORY_SECRET_KEY`).
@@ -185,6 +187,14 @@ struct State {
 }
 
 impl State {
+    /// Note that a request read `scope` just now, which keeps it warm for a while ([`keep_warm`]).
+    fn read(&self, scope: &Scope) {
+        self.read_at
+            .lock()
+            .unwrap()
+            .insert(scope.clone(), Instant::now());
+    }
+
     /// The store background work writes through: fenced by the writer lease, so a commit is refused once
     /// this server no longer holds it, however far into a round it is.
     fn writing_store(&self) -> Arc<Store> {
@@ -604,7 +614,7 @@ pub async fn serve_with(
         directory_only: options.directory_only
             || std::env::var("AMPUP_MEMORY_DIRECTORY").is_ok_and(|v| v == "required"),
         served: Default::default(),
-        warmed: Default::default(),
+        read_at: Default::default(),
         providers: Default::default(),
         secret_key,
         secret_env: options.secret_env,
@@ -750,6 +760,30 @@ pub async fn serve_with(
             }
         });
     }
+    // Each note is a fact too (`crate::note_facts`): the notes written before, or by a path that didn't write their
+    // fact, get it here, each scope checked once every few hours.
+    {
+        let st = state.clone();
+        let bg = st.clone();
+        bg.background(async move {
+            let mut walk = ScopeWalk::default();
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if !st.writer.holds() {
+                    continue;
+                }
+                let store = st.writing_store();
+                for scope in walk.next(&st, &store).await {
+                    if !st.writer.holds() {
+                        break;
+                    }
+                    if let Err(e) = crate::note_facts::backfill(&store, &scope).await {
+                        eprintln!("notes: {scope}: their facts not written yet: {e:#}");
+                    }
+                }
+            }
+        });
+    }
     // Sessions left open end once idle, and ended sessions that were routed advice are judged by the judge model
     // (`crate::sessions`; a small one, `AMPUP_MEMORY_JUDGE_MODEL`), every `AMPUP_MEMORY_SESSION_SWEEP_SECS` (default 60).
     {
@@ -841,6 +875,45 @@ pub async fn serve_with(
                 }
             }
         });
+    }
+    // The weekly digest (`crate::digest`): last week's, from Monday at `AMPUP_MEMORY_DIGEST_HOUR` (UTC), sent by the
+    // writer lease's holder alone and recorded per person, so each goes once. Checked every
+    // `AMPUP_MEMORY_DIGEST_CHECK_SECS` (900).
+    match crate::digest::Sender::from_env() {
+        Err(why) => eprintln!("weekly digest is off: {why}"),
+        Ok(sender) => {
+            let every = std::env::var("AMPUP_MEMORY_DIGEST_CHECK_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map_or(Duration::from_secs(900), |s: u64| {
+                    Duration::from_secs(s.max(5))
+                });
+            eprintln!(
+                "weekly digest: last week's from Mondays at {:02}:00 UTC, by {}",
+                crate::digest::hour(),
+                sender.mailer.provider()
+            );
+            let st = state.clone();
+            state.background(async move {
+                let mut walk = ScopeWalk::default();
+                let mut done = std::collections::BTreeSet::new();
+                loop {
+                    tokio::time::sleep(every).await;
+                    if !st.writer.holds() {
+                        continue;
+                    }
+                    let Some(week) = crate::digest::due(crate::now_micros()) else {
+                        continue;
+                    };
+                    let store = st.writing_store();
+                    if let Err(e) =
+                        digest_round(&st, &store, &sender, week, &mut walk, &mut done).await
+                    {
+                        eprintln!("digest {}: {e:#}", week.label());
+                    }
+                }
+            });
+        }
     }
     let bg = state.clone();
     // Index updates run in the background, the first one right away: after an index layout
@@ -1185,30 +1258,38 @@ pub async fn serve_with(
                     }
                     // The org's (or team's) models, where the operator chose them (`set_settings`).
                     let cx = scoped_models(&cx, dir.as_ref(), &scope);
-                    // Its batch size and what its sources are, where its admins said (`set_settings`).
-                    let opts = crate::compile::options_for(dir.as_ref(), &scope);
-                    match crate::compile::run_with(
-                        &store,
-                        &scope,
-                        crate::MAIN,
-                        &sources,
-                        &cx,
-                        &opts,
-                        100,
-                    )
-                    .await
-                    {
-                        Ok(r) => {
-                            if r.episodes + r.failed > 0 {
-                                eprintln!(
-                                    "compiled {scope}: {} sources, {} skills, {} AIP graphs ({} dropped), {} failed ({} with the API down)",
-                                    r.episodes, r.skills, r.aip, r.dropped, r.failed, r.unavailable
-                                );
+                    // Its batch size and what its sources are, where its admins said (`set_settings`): a group
+                    // of sources per prompt.
+                    for (sources, opts) in crate::compile::plan(dir.as_ref(), &scope, &sources) {
+                        match crate::compile::run_with(
+                            &store,
+                            &scope,
+                            crate::MAIN,
+                            &sources,
+                            &cx,
+                            &opts,
+                            100,
+                        )
+                        .await
+                        {
+                            Ok(r) => {
+                                if r.episodes + r.failed > 0 {
+                                    eprintln!(
+                                        "compiled {scope} ({}): {} sources, {} skills, {} AIP graphs ({} dropped), {} failed ({} with the API down)",
+                                        sources.join(","),
+                                        r.episodes,
+                                        r.skills,
+                                        r.aip,
+                                        r.dropped,
+                                        r.failed,
+                                        r.unavailable
+                                    );
+                                }
+                                read += r.episodes;
+                                down += r.unavailable;
                             }
-                            read += r.episodes;
-                            down += r.unavailable;
+                            Err(e) => eprintln!("compiling {scope} failed: {e:#}"),
                         }
-                        Err(e) => eprintln!("compiling {scope} failed: {e:#}"),
                     }
                 }
                 wait = if down > 0 && read == 0 {
@@ -1879,6 +1960,17 @@ async fn listen(
                                 {
                                     let query = req.uri().query().unwrap_or_default().to_string();
                                     Ok(join::route(state.clone(), req, query).await)
+                                }
+                                // The weekly digest's unsubscribe link (`unsubscribe`): its sealed token is the
+                                // credential, as an approval link's is.
+                                Err(req)
+                                    if !internal
+                                        && req.uri().path() == crate::digest::UNSUBSCRIBE_PATH
+                                        && (!state.loopback_only
+                                            || addressed_to_this_machine(req.headers())) =>
+                                {
+                                    let query = req.uri().query().unwrap_or_default().to_string();
+                                    Ok(unsubscribe::route(state.clone(), req, query).await)
                                 }
                                 Err(req) => handle(state.clone(), req, internal).await,
                             }
@@ -4039,7 +4131,7 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
     scopes.retain(|s| *s != st.scope && cell::mine(s));
     use futures::StreamExt;
     let store = &store;
-    let warmed = &st.warmed;
+    let read_at = &st.read_at;
     let since = chrono::Utc::now().timestamp_millis() - warm_days() * 86_400_000;
     futures::stream::iter(scopes)
         .for_each_concurrent(4, |scope| async move {
@@ -4057,7 +4149,10 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
                         crate::metrics::process_memory()
                     );
                     warm_advice(store, &scope).await;
-                    warmed.lock().unwrap().insert(scope.clone());
+                    read_at
+                        .lock()
+                        .unwrap()
+                        .insert(scope.clone(), Instant::now());
                 }
                 Err(e) => eprintln!(
                     "warming {scope} failed (reads load it): {}",
@@ -4073,14 +4168,25 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
 /// refreshed behind a read, but past `AMPUP_MEMORY_HARD_STALENESS_MS` (60 s) a read waits for them: on a busy org that
 /// is a catalog walk and the unindexed files read from object storage, 30 s on one production deployment. A scope read now and then
 /// went past 60 s between reads, so its next reader paid for it; touched every 20 s it never does. The scopes
-/// touched are the served one, those the start's warm-up loaded (so a new server, ready when it has warmed, is as
-/// warm for its first caller as the old one was for its last) and those a request has selected since, a few at a time.
+/// touched are the served one, and those a request selected (or the start's warm-up loaded, so a new server, ready
+/// when it has warmed, is as warm for its first caller as the old one was for its last) within [`keep_warm_idle`],
+/// a few at a time. Each touch reloads every table of the scope from the catalog (they are past
+/// `AMPUP_MEMORY_MAX_STALENESS_MS` by then): touching every scope ever selected spent a catalog's read quota on
+/// orgs nobody read (staging, Nov 2026: 2,800 table loads a minute against a 3,000 limit, its test orgs among them).
 fn keep_warm_every() -> Option<Duration> {
     let secs = std::env::var("AMPUP_MEMORY_KEEP_WARM_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(20);
     (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// How long after its last read a scope is still kept warm (`AMPUP_MEMORY_KEEP_WARM_IDLE_SECS`, default 1800).
+fn keep_warm_idle() -> Duration {
+    std::env::var("AMPUP_MEMORY_KEEP_WARM_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(Duration::from_secs(1800), Duration::from_secs)
 }
 
 async fn keep_warm(st: Arc<State>) {
@@ -4096,8 +4202,12 @@ async fn keep_warm(st: Arc<State>) {
         tokio::time::sleep(every).await;
         let store = st.store.read().unwrap().clone();
         let mut scopes: Vec<Scope> = vec![st.scope.clone()];
-        scopes.extend(st.warmed.lock().unwrap().iter().cloned());
-        scopes.extend(st.served.lock().unwrap().iter().cloned());
+        {
+            let idle = keep_warm_idle();
+            let mut read_at = st.read_at.lock().unwrap();
+            read_at.retain(|_, at| at.elapsed() < idle);
+            scopes.extend(read_at.keys().cloned());
+        }
         scopes.sort();
         scopes.dedup();
         scopes.retain(cell::mine);
@@ -4289,6 +4399,197 @@ impl ScopeWalk {
     }
 }
 
+/// `POST /digest/preview {person?, week?}`: a person's weekly digest as it would be mailed (`crate::digest`), sent to
+/// no one. A person previews their own; another's is the org's admins' (or the operator's) to read, since it names
+/// that person's sessions. On a server that identifies no one, its one caller (the operator) previews anyone's.
+async fn digest_preview(
+    state: &Arc<State>,
+    scope: &Scope,
+    who: &Principal,
+    via: &SignIn,
+    superuser: bool,
+    args: &Value,
+) -> Result<Value> {
+    use crate::digest::{self, Loaded, Week};
+    use crate::people::directory::{Directory, Refused};
+    let person = auth::norm_id(args["person"].as_str().unwrap_or(who.user()).trim());
+    let week = Week::parse(args["week"].as_str().unwrap_or("last"), crate::now_micros())?;
+    let store = state.store.read().unwrap().clone();
+    let (org, scopes, home, reader): (Option<String>, Vec<Loaded>, Scope, Principal) = if state
+        .fixed()
+    {
+        let loaded = Loaded::load(&store, &state.scope, None).await?;
+        (
+            None,
+            vec![loaded],
+            state.scope.clone(),
+            Principal::from_parts(person.clone(), state.groups.clone()),
+        )
+    } else {
+        let org = scope
+            .org_name()
+            .context("a digest is of an org: select one")?
+            .to_string();
+        let dir = Directory::load(&store).await?;
+        if person != auth::norm_id(who.user()) && !superuser && !dir.is_admin(who.user(), via, &org)
+        {
+            return Err(Refused(format!(
+                "{} may not read {person}'s digest (only they and {org}'s admins may)",
+                who.user()
+            ))
+            .into());
+        }
+        if !dir.holds_member(&person, &org, None) {
+            return Err(Refused(format!("{person} is not a member of {org}")).into());
+        }
+        let held = dir
+            .orgs
+            .get(&org)
+            .map(|o| o.teams.keys().cloned().collect::<Vec<_>>());
+        let mut loaded = vec![Loaded::load(&store, &Scope::org(&org)?, None).await?];
+        for t in held.unwrap_or_default() {
+            let s = Scope::team(&org, &t)?;
+            if dir.holds_member(&person, &org, Some(&t)) && store.has_episodes(&s).await? {
+                loaded.push(Loaded::load(&store, &s, Some(t)).await?);
+            }
+        }
+        let mut groups = state.closures.apply(&person, vec![]);
+        let all = auth::acl::org_wide(&org);
+        if !groups.contains(&all) {
+            groups.push(all);
+        }
+        let home = Scope::org(&org)?;
+        (
+            Some(org),
+            loaded,
+            home,
+            Principal::from_parts(person.clone(), groups),
+        )
+    };
+    let unsubscribe = match (
+        state.secret_key.as_ref(),
+        std::env::var("AMPUP_MEMORY_PUBLIC_URL"),
+    ) {
+        (Some(k), Ok(base)) if !base.trim().is_empty() => {
+            Some(digest::unsubscribe_link(k, &base, org.as_deref(), &person))
+        }
+        _ => None,
+    };
+    let p = digest::preview_in(
+        &store,
+        org.as_deref(),
+        &scopes,
+        &home,
+        &reader,
+        week,
+        unsubscribe,
+    )
+    .await?;
+    Ok(p.json())
+}
+
+/// One round of the weekly digest of `week`: every org this server serves (or its own scope, on a server that
+/// identifies no one), each org whose round completed already in this process skipped (`done`); what was sent is
+/// recorded in the store, so a restart or another holder sends nothing twice.
+async fn digest_round(
+    state: &Arc<State>,
+    store: &Store,
+    sender: &crate::digest::Sender,
+    week: crate::digest::Week,
+    walk: &mut ScopeWalk,
+    done: &mut std::collections::BTreeSet<(Option<String>, crate::digest::Week)>,
+) -> Result<()> {
+    use crate::digest::{self, Loaded};
+    let holds = || state.writer.holds();
+    let mut orgs: Vec<digest::Org> = vec![];
+    if state.fixed() {
+        if done.contains(&(None, week)) {
+            return Ok(());
+        }
+        let loaded = Loaded::load(store, &state.scope, None).await?;
+        let people = digest::askers(loaded.log(), week)
+            .into_iter()
+            .map(|p| (p, vec![0]))
+            .collect();
+        orgs.push(digest::Org {
+            org: None,
+            home: state.scope.clone(),
+            scopes: vec![loaded],
+            people,
+        });
+    } else {
+        let dir = crate::people::directory::Directory::load(store).await?;
+        let mut by_org: std::collections::BTreeMap<String, Vec<Scope>> = Default::default();
+        for s in walk.next(state, store).await {
+            if let Some(o) = s.org_name() {
+                by_org.entry(o.to_string()).or_default().push(s.clone());
+            }
+        }
+        for (org, scopes) in by_org {
+            if !dir.orgs.contains_key(&org)
+                || !dir.digest(&org)
+                || done.contains(&(Some(org.clone()), week))
+            {
+                continue;
+            }
+            let mut loaded = vec![];
+            for s in &scopes {
+                loaded.push(Loaded::load(store, s, digest::team_of(s)).await?);
+            }
+            let people = digest::members(&dir, &org)
+                .into_iter()
+                .map(|p| {
+                    let r = digest::readable(&dir, &org, &p, &loaded);
+                    (p, r)
+                })
+                .filter(|(_, r)| !r.is_empty())
+                .collect();
+            orgs.push(digest::Org {
+                org: Some(org.clone()),
+                home: Scope::org(&org)?,
+                scopes: loaded,
+                people,
+            });
+        }
+    }
+    for org in orgs {
+        let name = org.org.clone();
+        let reader = |person: &str| {
+            let person = auth::norm_id(person);
+            let groups = match &name {
+                Some(o) => {
+                    let mut g = state.closures.apply(&person, vec![]);
+                    let all = auth::acl::org_wide(o);
+                    if !g.contains(&all) {
+                        g.push(all);
+                    }
+                    g
+                }
+                None => state.groups.clone(),
+            };
+            Principal::from_parts(person, groups)
+        };
+        let r = digest::send_org(store, sender, &org, week, &reader, &holds).await?;
+        if r.sent + r.failed + r.given_up > 0 {
+            eprintln!(
+                "digest {} {}: {} sent, {} failed, {} given up, {} already sent, {} inactive, {} unsubscribed",
+                org.home,
+                week.label(),
+                r.sent,
+                r.failed,
+                r.given_up,
+                r.already,
+                r.inactive,
+                r.unsubscribed
+            );
+        }
+        if r.failed == 0 {
+            done.insert((name, week));
+        }
+    }
+    Ok(())
+}
+
 /// The scope the operator's admin key ingests into: the org (or its team) it selects, if the directory
 /// holds it (and, for a workspace, while it lives); else the served scope.
 async fn operator_ingest_scope(
@@ -4323,6 +4624,7 @@ async fn operator_ingest_scope(
         store.ensure_scope(&scope).await?;
         state.served.lock().unwrap().insert(scope.clone());
     }
+    state.read(&scope);
     Ok(scope)
 }
 
@@ -4940,6 +5242,7 @@ async fn handle(
     let list_op = match path.as_str() {
         "/facts/list" => Some("facts"),
         "/advice/list" => Some("advice"),
+        "/lessons" => Some("lessons"),
         _ => None,
     };
     let browse = !internal && (path == "/browse" || list_op.is_some());
@@ -4953,7 +5256,7 @@ async fn handle(
     if browse && req.method() != hyper::Method::POST {
         return Ok(reply(
             StatusCode::METHOD_NOT_ALLOWED,
-            json!({"error": "POST {op, path} to /browse, or {filters} to /facts/list or /advice/list"}),
+            json!({"error": "POST {op, path} to /browse, or {filters} to /facts/list, /advice/list or /lessons"}),
         ));
     }
     let retract_route = !internal && path == "/retract";
@@ -5004,6 +5307,13 @@ async fn handle(
             json!({"error": "POST {session_id, file, lines, calls} (or {check: true}) to /advice-traces"}),
         ));
     }
+    let seed_route = !internal && path == "/advice/seed";
+    if seed_route && req.method() != hyper::Method::POST {
+        return Ok(reply(
+            StatusCode::METHOD_NOT_ALLOWED,
+            json!({"error": "POST {repo, sources: [{name, text}]} (or {check: true}) to /advice/seed"}),
+        ));
+    }
     let transcripts_route = !internal && path == "/transcripts";
     if transcripts_route && req.method() != hyper::Method::POST {
         return Ok(reply(
@@ -5017,6 +5327,13 @@ async fn handle(
         return Ok(reply(
             StatusCode::METHOD_NOT_ALLOWED,
             json!({"error": "POST {harness?, context?} to /sessions, {session_id, transcript?, outcome?, reward?, reason?} to /sessions/end, {repo, number, branch?, event, at?, by?} to /sessions/prs"}),
+        ));
+    }
+    let digest_route = !internal && path == "/digest/preview";
+    if digest_route && req.method() != hyper::Method::POST {
+        return Ok(reply(
+            StatusCode::METHOD_NOT_ALLOWED,
+            json!({"error": "POST {person?, week?} to /digest/preview"}),
         ));
     }
     let feedback_route = !internal && path == "/feedback";
@@ -5089,7 +5406,9 @@ async fn handle(
         && !runs_route
         && !traces_route
         && !transcripts_route
+        && !seed_route
         && !sessions_route
+        && !digest_route
     {
         return Ok(reply(StatusCode::OK, json!({"ok": true})));
     }
@@ -5104,7 +5423,7 @@ async fn handle(
     // The app the call came from, for the advice log (`advice_calls`).
     let app = advice_calls::app_of(req.headers());
     // `/remember` carries a hook's whole session, `/transcripts` a part of one's transcript.
-    let max_body = if ingest || remember_route || transcripts_route {
+    let max_body = if ingest || remember_route || transcripts_route || seed_route {
         MAX_INGEST_BODY
     } else if runs_route || traces_route {
         MAX_RUNS_BODY
@@ -6395,6 +6714,103 @@ async fn handle(
             },
         });
     }
+    if digest_route {
+        let who = who.expect("public port");
+        let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        return Ok(
+            match digest_preview(&state, &scope, &who, &via, superuser, &args).await {
+                Ok(v) => reply(StatusCode::OK, v),
+                Err(e) => match e.downcast_ref::<crate::people::directory::Refused>() {
+                    Some(r) => reply(StatusCode::FORBIDDEN, json!({"error": r.0.clone()})),
+                    None => reply(StatusCode::BAD_REQUEST, json!({"error": format!("{e:#}")})),
+                },
+            },
+        );
+    }
+    if seed_route {
+        let who = who.expect("public port");
+        let writes = writes_for(
+            &state,
+            &via,
+            &scope,
+            sel_org.as_deref(),
+            sel_team.as_deref(),
+        );
+        if !via.may_write() || writes != Writes::Scope || !view.is_main() {
+            return Ok(reply(
+                StatusCode::FORBIDDEN,
+                json!({"error": format!("a repository's material isn't kept on {scope} here: keep it where its memory is written, on main")}),
+            ));
+        }
+        let store = state.store.read().unwrap().clone();
+        let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        // Where no notes can be written or served, nothing is kept: it would serve no advice. Said to whoever asks,
+        // first.
+        if let Some(why) = crate::repo_advice::why_not() {
+            return Ok(reply(StatusCode::OK, json!({"advises": false, "why": why})));
+        }
+        if args["check"].as_bool() == Some(true) {
+            return Ok(reply(StatusCode::OK, json!({"advises": true})));
+        }
+        let acl = match own_acl(&state, &who, &via, "repository's material") {
+            Ok(acl) => acl,
+            Err(e) => {
+                return Ok(reply(
+                    StatusCode::FORBIDDEN,
+                    json!({"error": e.to_string()}),
+                ));
+            }
+        };
+        let done =
+            crate::repo_advice::keep(&store, &scope, &who, &acl, &provenance(&who, ""), &args)
+                .await;
+        return Ok(match done {
+            Ok(kept) => {
+                // Written again only when a doc changed or several pull requests are new, or where the repository has
+                // no notes yet (an earlier write failed); in the background, after the answer: a learning model's call takes a minute or more.
+                let space = crate::repo_advice::space_for(&who);
+                let has = crate::advice::seeded_repos(&store, &scope, &space, &acl)
+                    .await
+                    .map(|r| r.contains(&kept.repo))
+                    .unwrap_or(false);
+                let writing = match crate::extract::Extractor::advice_from_env() {
+                    Ok(Some(cx)) if !kept.sources.is_empty() && (kept.rewrite || !has) => {
+                        state.background(crate::repo_advice::write_notes(
+                            store.clone(),
+                            scope.clone(),
+                            who.clone(),
+                            acl,
+                            kept.repo.clone(),
+                            kept.sources.clone(),
+                            cx,
+                        ));
+                        true
+                    }
+                    _ => false,
+                };
+                reply(StatusCode::OK, crate::repo_advice::answer(&kept, writing))
+            }
+            Err(e) if e.downcast_ref::<crate::repo_advice::Limited>().is_some() => reply(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"error": e.to_string()}),
+            ),
+            Err(e) => match (
+                e.downcast_ref::<crate::repo_advice::Refused>(),
+                e.downcast_ref::<crate::runs::Refused>(),
+            ) {
+                (Some(r), _) => reply(StatusCode::BAD_REQUEST, json!({"error": r.to_string()})),
+                (_, Some(r)) => reply(StatusCode::FORBIDDEN, json!({"error": r.to_string()})),
+                _ => {
+                    eprintln!("repository advice failed: {e:#}");
+                    crate::report::failure("repo_advice", &e);
+                    reply(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": "repository advice failed"}),
+                    )
+                }
+            },
+        });
+    }
     if transcripts_route {
         let who = who.expect("public port");
         let store = state.store.read().unwrap().clone();
@@ -6877,10 +7293,10 @@ async fn handle(
                 json!({"scopes": scopes, "scope": scope.to_string()}),
             ));
         }
-        // Every person's notes, not only the caller's own: an org's admins (and the operator) on the org's own
-        // memory, never a service key or in a team's (isolated from its org's admins), and only where the org shows
-        // its people's activity, as Studio's activity does.
-        let every_note = via.key.is_none()
+        // Every person's sessions on the advice page, not only the caller's own: an org's admins (and the operator)
+        // on the org's own memory, never a service key or in a team's (isolated from its org's admins), and only
+        // where the org shows its people's activity, as Studio's activity does. Notes are read by their ACL alone.
+        let every_session = via.key.is_none()
             && matches!(scope, Scope::Org | Scope::NamedOrg(_))
             && match scope.org_name() {
                 Some(org) => Box::pin(crate::people::directory::Directory::load(&store))
@@ -6892,7 +7308,7 @@ async fn handle(
             };
         let reader = crate::browse::Reader {
             who: &who,
-            every_note,
+            every_session,
         };
         // Boxed: browse's future is large, and inline it would grow the handler's for every request.
         return Ok(
@@ -7059,6 +7475,7 @@ async fn mine_scope(state: &State, who: &Principal, via: &SignIn) -> Result<Scop
         store.ensure_scope(&scope).await?;
         state.served.lock().unwrap().insert(scope.clone());
     }
+    state.read(&scope);
     Ok(scope)
 }
 
@@ -7305,6 +7722,8 @@ const PERSONAL_KEY_ROUTES: &[&str] = &[
     "/browse",
     "/facts/list",
     "/advice/list",
+    "/lessons",
+    "/advice/seed",
     "/brief",
     "/remember",
     "/forget",
@@ -7403,6 +7822,7 @@ async fn select_scope(
         store.ensure_scope(&scope).await?;
         state.served.lock().unwrap().insert(scope.clone());
     }
+    state.read(&scope);
     Ok(scope)
 }
 
@@ -7666,6 +8086,7 @@ async fn served_workspace(
         store.ensure_scope(&scope).await?;
         state.served.lock().unwrap().insert(scope.clone());
     }
+    state.read(&scope);
     Ok(scope)
 }
 
@@ -8056,6 +8477,42 @@ async fn directory_change(
         v["scope"] = json!(scope.to_string());
         return Ok(v);
     }
+    if req["op"] == "conversation" && !superuser && via.key.is_none() {
+        // A person reads the transcript of a session of their own (the advice page links each one), as its admins
+        // read anyone's: signed in, never a service key, whatever the org's activity setting.
+        let org = req["org"].as_str().unwrap_or_default();
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
+        let dir = Directory::load(&store).await?;
+        if !(dir.is_admin(who.user(), via, org) && dir.shows_activity(org)) {
+            let team = req["team"].as_str().filter(|t| !t.is_empty());
+            let scope = dir
+                .resolve(who.user(), via, Some(org), team)
+                .map_err(|e| Refused(format!("{e:#}")))?;
+            let id = req["id"].as_str().unwrap_or_default();
+            let log = crate::qa_log::list(&store, &scope, None).await?;
+            let theirs = log
+                .iter()
+                .any(|l| l.answer_id == id && l.asker == who.user());
+            let found = match theirs {
+                true => crate::activity::transcript(&store, &scope, &log, id).await?,
+                false => None,
+            };
+            let Some(mut v) = found else {
+                return Err(Refused(format!(
+                    "{} may read only their own sessions in org {org} (its admins read everyone's)",
+                    who.user()
+                ))
+                .into());
+            };
+            eprintln!(
+                "conversation: {} read their own {id} in {scope}",
+                who.user()
+            );
+            v["org"] = json!(org);
+            v["scope"] = json!(scope.to_string());
+            return Ok(v);
+        }
+    }
     if req["op"] == "activity" || req["op"] == "conversation" || req["op"] == "user_facts" {
         // Each person's activity in the org's memory (or a team's), every word of it, one entry's transcript
         // (`conversation`, by `id`), and the facts from what one person wrote or said (`user_facts`, those the
@@ -8361,16 +8818,19 @@ async fn directory_change(
                          "sessions": total, "by_user": counts}),
         );
     }
-    if req["op"] == "hold_advice" {
-        // Team notes held back from everyone (`hold: true`, the default) or served again (`crate::advice::hold`):
-        // the org's admins (or the operator). It writes the advice map, as a learn does: the writer lease's holder,
+    if req["op"] == "hold_advice" || req["op"] == "ratify_advice" {
+        // Team notes held back from everyone (`hold_advice`, `hold: true` the default) or served again
+        // (`crate::advice::hold`), or ratified for everyone (`ratify_advice`, `ratify: true` the default) or no
+        // longer (`crate::advice::ratify`): the org's admins (or the operator). It writes the advice map, as a learn does: the writer lease's holder,
         // while no learn runs in the scope.
         let org = req["org"].as_str().unwrap_or_default();
         crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
         let dir = Directory::load(&store).await?;
+        let ratifying = req["op"] == "ratify_advice";
+        let verb = if ratifying { "ratify" } else { "hold" };
         if !superuser && !dir.is_admin(who.user(), via, org) {
             return Err(Refused(format!(
-                "{} may not hold advice in org {org} (only its admins may)",
+                "{} may not {verb} advice in org {org} (only its admins may)",
                 who.user()
             ))
             .into());
@@ -8392,9 +8852,10 @@ async fn directory_change(
                 .map_err(|_| Invalid("acl is a list of ACL entries, such as group:sales".into()))?,
         };
         let hold = req["hold"].as_bool() != Some(false);
+        let ratify = req["ratify"].as_bool() != Some(false);
         if !cell::mine(&scope) {
             return Err(Refused(format!(
-                "{org} is served by its own cell: select it (?org={org} or x-memstore-org) to hold its advice"
+                "{org} is served by its own cell: select it (?org={org} or x-memstore-org) to {verb} its advice"
             ))
             .into());
         }
@@ -8408,27 +8869,35 @@ async fn directory_change(
                     None => e,
                 })?;
             let r = crate::advice_requests::Request {
-                op: "hold".into(),
+                op: verb.into(),
                 by: who.user().to_string(),
                 at: crate::now_micros(),
                 acl: acl.clone(),
                 keys: keys.clone(),
                 hold,
+                ratify,
                 min_wrong: 0,
                 resort: false,
                 rewrite: Default::default(),
                 force: false,
             };
             let id = crate::advice_requests::queue(&store, &scope, &r).await?;
+            let doing = match (ratifying, if ratifying { ratify } else { hold }) {
+                (false, true) => "holding",
+                (false, false) => "releasing",
+                (true, true) => "ratifying",
+                (true, false) => "withdrawing the ratification of",
+            };
             eprintln!(
-                "hold_advice: {} queued {} {keys:?} in {scope} for the writer ({id})",
+                "{}: {} queued {doing} {keys:?} in {scope} for the writer ({id})",
+                req["op"].as_str().unwrap_or_default(),
                 who.user(),
-                if hold { "holding" } else { "releasing" }
             );
-            return Ok(
-                json!({"org": org, "scope": scope.to_string(), "queued": id, "keys": keys,
-                             "hold": hold, "applies": QUEUED_FOR_WRITER}),
-            );
+            let mut v = json!({"org": org, "scope": scope.to_string(), "queued": id, "keys": keys,
+                               "applies": QUEUED_FOR_WRITER});
+            v[if ratifying { "ratify" } else { "hold" }] =
+                json!(if ratifying { ratify } else { hold });
+            return Ok(v);
         }
         let Some(_claim) = crate::advice_loop::claim(&scope) else {
             return Err(Refused(format!(
@@ -8436,12 +8905,29 @@ async fn directory_change(
             ))
             .into());
         };
+        let refused = |e: anyhow::Error| match e.downcast_ref::<crate::extract::Refused>() {
+            Some(r) => Refused(r.to_string()).into(),
+            None => e,
+        };
+        if ratifying {
+            let ratified =
+                crate::advice::ratify(&state.writing_store(), &scope, &acl, &keys, ratify)
+                    .await
+                    .map_err(refused)?;
+            eprintln!(
+                "ratify_advice: {} {} {keys:?} in {scope}",
+                who.user(),
+                if ratify {
+                    "ratified"
+                } else {
+                    "withdrew the ratification of"
+                }
+            );
+            return Ok(json!({"org": org, "scope": scope.to_string(), "ratified": ratified}));
+        }
         let held = crate::advice::hold(&state.writing_store(), &scope, &acl, &keys, hold)
             .await
-            .map_err(|e| match e.downcast_ref::<crate::extract::Refused>() {
-                Some(r) => Refused(r.to_string()).into(),
-                None => e,
-            })?;
+            .map_err(refused)?;
         eprintln!(
             "hold_advice: {} {} {keys:?} in {scope}",
             who.user(),
@@ -8516,6 +9002,7 @@ async fn directory_change(
                 acl,
                 keys: Default::default(),
                 hold: false,
+                ratify: false,
                 min_wrong,
                 resort,
                 rewrite,
@@ -10751,7 +11238,12 @@ async fn mcp(
                         .map_err(runs_error)
                 }
                 "reward_run" if writes == Writes::Scope => {
-                    crate::runs::reward(&store, scope, who, args)
+                    // A model chooses a tool's arguments: only the route says the person rated it themselves.
+                    let mut args = args.clone();
+                    if let Some(o) = args.as_object_mut() {
+                        o.remove("by");
+                    }
+                    crate::runs::reward(&store, scope, who, &args)
                         .await
                         .map(|id| format!("reward recorded on run {id}"))
                         .map_err(runs_error)
@@ -12183,6 +12675,15 @@ async fn apply_advice_requests(st: &State, store: &Store, scope: &Scope) -> bool
                     format!(
                         "{} {:?}; held now {held:?}",
                         if r.hold { "held" } else { "released" },
+                        r.keys
+                    )
+                }),
+            "ratify" => crate::advice::ratify(store, scope, &r.acl, &r.keys, r.ratify)
+                .await
+                .map(|ratified| {
+                    format!(
+                        "{} {:?}; ratified now {ratified:?}",
+                        if r.ratify { "ratified" } else { "withdrew" },
                         r.keys
                     )
                 }),
@@ -13874,6 +14375,13 @@ async fn post_facts(
             ))
             .into());
         }
+        // A note's own fact is written with the note (`crate::note_facts`), never posted: none passes as one.
+        if predicate == crate::NOTE && entity.starts_with("note:") {
+            return Err(ToolError(format!(
+                "fact {i}: note:<id> note is a note's own fact, written with the note; remember_memory writes one"
+            ))
+            .into());
+        }
         let cited: Vec<String> = r["source_episodes"]
             .as_array()
             .into_iter()
@@ -14244,15 +14752,17 @@ async fn commit_remembered(
         Some(sid) => crate::sessions::branch_of(store, scope, who, sid, true).await?,
         None => None,
     };
+    // A note is a fact too, citing it alone: read by who reads the note (`crate::note_facts`).
+    let facts = crate::note_facts::facts_of(&eps[..1]);
     let readers = match &branch {
         Some(b) => {
-            store.commit_on(scope, b, who.user(), &eps, &[]).await?;
+            store.commit_on(scope, b, who.user(), &eps, &facts).await?;
             format!(
                 "{readers}, on this session's branch {b} (it merges into main once the session ends)"
             )
         }
         None => {
-            store.commit(scope, who.user(), &eps, &[]).await?;
+            store.commit(scope, who.user(), &eps, &facts).await?;
             readers
         }
     };

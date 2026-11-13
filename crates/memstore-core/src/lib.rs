@@ -416,6 +416,51 @@ fn not_held(branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// A note as a fact: the type of the entity every note's fact is about (`note:<id>`), and its one predicate. A
+/// note (what someone asked to be remembered, what the server kept for them, what the team shares) is an episode
+/// with its ACL, and its fact cites it alone: who reads the fact is who reads the note, and a forget, an
+/// offboarding or a retention rule that takes the note takes the fact with it. Engine-written, it fits every
+/// schema ([`query::schema::Schema::normalize`]).
+pub const NOTE: &str = "note";
+
+/// The fact of note `episode` (its text, from when it was said), about an entity of its own: one note's fact is
+/// never another's value for the same key.
+pub fn note_fact(episode_id: &str, text: &str, said_at: i64, tags: Vec<String>) -> Fact {
+    Fact {
+        fact_id: format!("{NOTE}:{episode_id}"),
+        entity: format!("{NOTE}:{}", &episode_id[..episode_id.len().min(16)]),
+        predicate: NOTE.to_string(),
+        value: text.to_string(),
+        valid_from: said_at,
+        valid_to: None,
+        source_episodes: vec![episode_id.to_string()],
+        quote: None,
+        entity_type: Some(NOTE.to_string()),
+        value_type: Some("text".to_string()),
+        time_basis: Some("as_of_source".to_string()),
+        tags,
+        ..Default::default()
+    }
+}
+
+/// Whether `f` is a note's fact ([`note_fact`]): exactly its shape, the one note it cites naming its id and entity.
+/// Nothing else may write it ([`validate_write`]): no writer's fact is listed as a note, or passes a schema as one.
+pub fn is_note_fact(f: &Fact) -> bool {
+    match f.source_episodes.as_slice() {
+        [ep] => {
+            f.predicate == NOTE
+                && f.fact_id == format!("{NOTE}:{ep}")
+                && f.entity == format!("{NOTE}:{}", &ep[..ep.len().min(16)])
+        }
+        _ => false,
+    }
+}
+
+/// Whether `f` claims a note's shape: its predicate on a note's entity.
+fn claims_note(f: &Fact) -> bool {
+    f.predicate == NOTE && f.entity.starts_with("note:")
+}
+
 /// The ACL of a forgotten episode ([`Store::forget`]): an entry no one holds (`.invalid` is a reserved
 /// domain), so no one reads it.
 pub const FORGOTTEN: &str = "user:forgotten@memstore.invalid";
@@ -9427,6 +9472,11 @@ fn validate_write(episodes: &[Episode], facts: &[Fact]) -> Result<()> {
                 TIME_BASES.join(", ")
             );
         }
+        anyhow::ensure!(
+            !claims_note(f) || is_note_fact(f),
+            "fact {}: {NOTE}:<id> {NOTE} is a note's own fact, written with the note",
+            f.fact_id
+        );
         anyhow::ensure!(
             f.tags.len() <= MAX_TAGS && f.tags.iter().all(|t| valid_tag(t)),
             "fact {}: at most {MAX_TAGS} tags, each lower-case letters, digits, _ and - (at most 32)",

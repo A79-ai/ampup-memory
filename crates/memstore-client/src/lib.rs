@@ -6,6 +6,7 @@ use anyhow::Result;
 
 pub mod client;
 pub mod hook;
+pub mod local;
 pub mod naming;
 pub mod update;
 

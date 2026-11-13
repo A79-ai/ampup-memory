@@ -92,7 +92,8 @@ impl Reads {
         for (scope, p) in scopes.into_iter().zip(pinned) {
             match p {
                 Ok(s) => {
-                    // Kept warm with the scopes the server serves (`keep_warm`).
+                    // Kept warm while it is read (`keep_warm`).
+                    state.read(&scope);
                     state.served.lock().unwrap().insert(scope);
                     also.push(s);
                 }

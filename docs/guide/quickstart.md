@@ -6,12 +6,23 @@ one machine with no cloud account.
 ## 1. Install
 
 ```bash
+uv tool install ampup-memory-cli      # or: pipx install ampup-memory-cli, or pip install ampup-memory-cli
+```
+
+That installs `ampup-memory` (server and CLI) and `ampup-memory-client` on your `PATH` from
+[`ampup-memory-cli`](https://pypi.org/project/ampup-memory-cli/) on PyPI, a wheel per platform holding the two
+binaries (no Python code runs). `uv tool upgrade ampup-memory-cli` updates them. To try it without installing
+anything, `uvx --from ampup-memory-cli ampup-memory serve --local` runs step 2.
+
+### Or with the installer
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/install.sh | sh
 ```
 
-That installs `ampup-memory` (server and CLI) and `ampup-memory-client` into `~/.local/bin` from the newest
-[release](https://github.com/A79-ai/ampup-memory/releases), with only `curl` (or `wget`) and `tar`. Set
-`AMPUP_MEMORY_INSTALL_DIR` for another directory, or `AMPUP_MEMORY_VERSION` for a given release.
+That installs the same two into `~/.local/bin` from the newest
+[release](https://github.com/A79-ai/ampup-memory/releases) (PyPI gets one a week), with only `curl` (or `wget`) and
+`tar`. Set `AMPUP_MEMORY_INSTALL_DIR` for another directory, or `AMPUP_MEMORY_VERSION` for a given release.
 
 ### Or build from source
 
@@ -21,8 +32,8 @@ You need:
   first `cargo` command.
 - `protoc` (the Protocol Buffers compiler) on your `PATH`, as the CI builds install it
   (`brew install protobuf`, `apt install protobuf-compiler`).
-- macOS on Apple Silicon or Linux on arm64 or x86_64. The ONNX Runtime behind local embeddings is downloaded
-  prebuilt during the build; there is none for Intel macOS.
+- macOS (Apple Silicon or Intel) or Linux on arm64 or x86_64. The ONNX Runtime behind local embeddings is
+  downloaded prebuilt during the build; there is none for Intel macOS, where CONTRIBUTING.md builds it first.
 
 ```bash
 cargo install --locked --path .                                    # ampup-memory: server and CLI
@@ -38,6 +49,21 @@ ampup-memory serve --local
 
 Everything lives under `~/.ampup-memory` (pass a directory to `--local` for another). Nobody signs in; the server binds
 to 127.0.0.1 only. `curl localhost:8080/ready` answers `{"ready":true,…}` once it has warmed up.
+
+To keep the server always on without a terminal open, install it as a background service instead:
+
+```bash
+ampup-memory service install    # starts now, at login, and again if it stops
+ampup-memory service status     # running, pid, port, data, log, and whether it answers
+```
+
+`ampup-memory service uninstall` stops it; the memory stays. See [cli.md](cli.md#the-background-service).
+
+With a coding agent's hooks (the Claude Code plugin, or `ampup-memory hooks install`) you needn't do either: where no
+team server is named, a session's start runs `ampup-memory serve --local --background` when nothing answers on
+port 8080 ([coding-agents.md](coding-agents.md#claude-code); `AMPUP_MEMORY_AUTOSTART=0` turns it off). Where no
+model is saved yet, that first start saves the one the agent's environment names in `~/.ampup-memory/llm.json`, as
+`service install` does.
 
 With no model key, the server stores and searches but extracts, compiles and learns nothing. To turn the model work
 on, start it with a key:
@@ -130,7 +156,11 @@ curl -s localhost:8080/sessions/end -d '{"session_id": "6512edd0-…",
 # {"ended":true,"served":[],"session_id":"6512edd0-…"}
 ```
 
-A new memory has nothing to serve yet: `situation` is null. Advice appears from one of two sources.
+A new memory has nothing to serve yet: `situation` is null. With the Claude Code plugin (or the hooks
+`ampup-memory hooks install` writes), a session's start in a git repository sends its docs and recent pull requests
+once a day, and the server writes notes for the usual coding tasks from them, so the first session there is
+advised already ([advice.md](advice.md#advice-from-a-repository-from-the-first-session)). Otherwise advice appears
+from one of two sources.
 
 **Procedures compiled from your documents.** Name the sources to compile, and `get_advice` serves the matching
 procedure before any runs exist. Notes sent to `/remember` are stored under the source

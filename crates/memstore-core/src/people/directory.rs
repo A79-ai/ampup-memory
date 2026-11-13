@@ -969,6 +969,14 @@ pub struct Settings {
     /// so the compiler's id: the scope's history compiles again. `""` unsets it, back to the org's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compile_kind: Option<String>,
+    /// The compile sources `compile_kind` is about (source prefixes, such as `sentry:`), where a scope compiles
+    /// sources of more than one kind: those under them compile with the kind's prompt, the others with the one
+    /// prompt every scope uses, each under a compiler id of its own (`crate::compile::plan`). So a team that
+    /// compiles its error reports adds its tickets and pull requests without its error reports compiling again.
+    /// Unset, the kind is about every compile source, as before it existed. An empty list unsets it, back to the
+    /// org's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_kind_sources: Option<Vec<String>>,
     /// Whether the engine learns advice from the scope's rewarded runs and sessions on its own, and judges those
     /// nobody rewarded (`crate::advice_loop`): model calls over every recorder's traces. On unless set false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1158,6 +1166,11 @@ pub struct Settings {
     /// unless set true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pii: Option<bool>,
+    /// Whether the org's people are mailed a weekly digest of what their memory learned and how their sessions
+    /// went (`memstore::digest`), where the server sends mail. An org setting (a team's is refused); on unless set
+    /// false. Each person can still unsubscribe themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<bool>,
 }
 
 impl Settings {
@@ -1166,6 +1179,7 @@ impl Settings {
             && self.compile_sources.is_none()
             && self.compile_batch.is_none()
             && self.compile_kind.is_none()
+            && self.compile_kind_sources.is_none()
             && self.advice.is_none()
             && self.advice_procedures.is_none()
             && self.advice_evidence.is_none()
@@ -1193,6 +1207,7 @@ impl Settings {
             && self.session_branches.is_none()
             && self.auto_review.is_none()
             && self.pii.is_none()
+            && self.digest.is_none()
             && !self.sets_models()
     }
     /// Whether it names a model (the operator's to set).
@@ -1213,6 +1228,9 @@ impl Settings {
         if other.compile_kind.is_some() {
             self.compile_kind = other.compile_kind;
         }
+        if other.compile_kind_sources.is_some() {
+            self.compile_kind_sources = other.compile_kind_sources;
+        }
         if other.advice.is_some() {
             self.advice = other.advice;
         }
@@ -1227,6 +1245,9 @@ impl Settings {
         }
         if other.pii.is_some() {
             self.pii = other.pii;
+        }
+        if other.digest.is_some() {
+            self.digest = other.digest;
         }
         if other.advice_procedures.is_some() {
             self.advice_procedures = other.advice_procedures;
@@ -2257,6 +2278,15 @@ impl Directory {
         self.team_or_org(scope, |s| s.compile_kind.clone().filter(|k| !k.is_empty()))
     }
 
+    /// The compile sources `scope`'s `compile_kind` is about (`Settings::compile_kind_sources`): its team's, else
+    /// its org's; none (the kind is about every compile source) where neither sets a list, or in a scope the
+    /// directory doesn't hold.
+    pub fn compile_kind_sources(&self, scope: &crate::Scope) -> Option<Vec<String>> {
+        self.team_or_org(scope, |s| {
+            s.compile_kind_sources.clone().filter(|v| !v.is_empty())
+        })
+    }
+
     /// A setting of `scope`'s team where it sets one, else of its org; none in a scope the directory doesn't hold.
     fn team_or_org<T>(
         &self,
@@ -2315,6 +2345,14 @@ impl Directory {
             .get(org)
             .and_then(|o| o.settings.session_branches)
             .unwrap_or(false)
+    }
+
+    /// Whether `org`'s people are mailed the weekly digest (its `digest` setting): on unless the org set it false.
+    pub fn digest(&self, org: &str) -> bool {
+        self.orgs
+            .get(org)
+            .and_then(|o| o.settings.digest)
+            .unwrap_or(true)
     }
 
     /// Whether `org`'s owner reviews are decided by a decisions model (its `auto_review` setting): on unless the org
@@ -2782,9 +2820,10 @@ pub struct SyncMember {
     pub teams: Vec<String>,
 }
 
-/// A change someone asks for.
+/// A change someone asks for. One is made per request, so `SetSettings`' size beside the others costs nothing.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Change {
     CreateOrg {
         org: String,
@@ -3054,6 +3093,7 @@ impl Change {
                     && settings.session_branches.is_none()
                     && settings.auto_review.is_none()
                     && settings.pii.is_none()
+                    && settings.digest.is_none()
             }
             Change::CreateKey { role, .. } => *role == KeyRole::Ingest,
             Change::RevokeKey { org, name } | Change::SetKeySources { org, name, .. } => dir
@@ -3738,9 +3778,12 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             if team.is_some() && settings.auto_review.is_some() {
                 invalid!("auto_review is the org's setting, not a team's: set it without a team");
             }
+            if team.is_some() && settings.digest.is_some() {
+                invalid!("digest is the org's setting, not a team's: set it without a team");
+            }
             if settings.is_empty() {
                 invalid!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"compile_kind_sources\": [\"<source prefix>\"], \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"digest\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             if let Some(sources) = &settings.compile_sources {
@@ -3751,6 +3794,18 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                     if p.trim().is_empty() || p.trim() != p || p.len() > 200 {
                         invalid!(
                             "invalid compile source {p:?}: a source prefix (kb:, github:acme/) or * for every source"
+                        );
+                    }
+                }
+            }
+            if let Some(sources) = &settings.compile_kind_sources {
+                if sources.len() > 50 {
+                    invalid!("compile_kind_sources names at most 50 source prefixes");
+                }
+                for p in sources {
+                    if p.trim().is_empty() || p.trim() != p || p.len() > 200 || p == "*" {
+                        invalid!(
+                            "invalid compile_kind_sources entry {p:?}: a source prefix (sentry:) that compile_kind is about; [] unsets it"
                         );
                     }
                 }

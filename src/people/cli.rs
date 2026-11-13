@@ -260,6 +260,10 @@ pub enum OrgCmd {
         /// message) ("" unsets it)
         #[arg(long)]
         compile_kind: Option<String>,
+        /// The compile sources compile_kind is about (sentry:); the others compile with the usual prompt, under
+        /// a compiler id of their own ("" unsets it: the kind is about every compile source)
+        #[arg(long)]
+        compile_kind_sources: Option<String>,
         /// Learn advice from rewarded runs and judged sessions on its own (default true; false turns it off)
         #[arg(long)]
         advice: Option<bool>,
@@ -380,6 +384,10 @@ pub enum OrgCmd {
         /// written from now on with [card], [ssn], [iban] and [phone] before it is stored (default false)
         #[arg(long)]
         pii: Option<bool>,
+        /// Whether the org's people are mailed a weekly digest of what their memory learned and how their sessions
+        /// went, where the server sends mail (default true; each person can still unsubscribe)
+        #[arg(long)]
+        digest: Option<bool>,
     },
     /// Bind the org to an Auth0 Organization (the operator only): a sign-in through the platform's Auth0
     /// tenant counts in the org only from that Organization (for example, the host application's org id)
@@ -1145,6 +1153,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             compile_sources,
             compile_batch,
             compile_kind,
+            compile_kind_sources,
             advice,
             advice_procedures,
             advice_evidence,
@@ -1175,6 +1184,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             session_branches,
             auto_review,
             pii,
+            digest,
         }) => {
             let settings = directory::Settings {
                 compile: *compile,
@@ -1183,6 +1193,9 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                     .map(crate::compile::parse_sources),
                 compile_batch: *compile_batch,
                 compile_kind: compile_kind.clone(),
+                compile_kind_sources: compile_kind_sources
+                    .as_deref()
+                    .map(crate::compile::parse_sources),
                 advice: *advice,
                 advice_procedures: *advice_procedures,
                 advice_evidence: *advice_evidence,
@@ -1225,6 +1238,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 session_branches: *session_branches,
                 auto_review: *auto_review,
                 pii: *pii,
+                digest: *digest,
             };
             if settings.is_empty() {
                 let view = to.view(Some(org)).await?;

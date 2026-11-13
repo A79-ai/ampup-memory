@@ -13,6 +13,9 @@ own route handlers, so the browser never talks to AmpUp Memory directly. Pick a 
   branch of its own (`ampup-memory compile --branch`), so the picker counts each branch's skills, and on a branch
   with none the page says which have them. A server whose `/browse` predates `skills/` (one pinned to an
   older build) shows them from its MCP `skills` tool instead; it can't list its branches, so the branch is typed.
+- **Learned**: what the memory learned, lesson by lesson (its `/lessons`): each lesson's text, the runs and
+  sessions it was learned from and the sessions it was served in since, each marked by how it went and who said so.
+  Your own lessons and the team's; an org's admin sees everyone's, and picks a person.
 - **Schema**: the memory's schema as cards: the source prefixes its `extract` section reads, the versions
   committed on the branch (with the prefixes each added or dropped), every type with its predicates, the guidance,
   and the raw JSON. It reads `/browse`'s `schema` op.
@@ -59,6 +62,9 @@ the UI's OAuth client.
 | `NEXTAUTH_SECRET` | encrypts the session cookie |
 | `AUTH_ALLOWED_DOMAINS` | optional: only these email domains may sign in |
 
+With `AMPUP_MEMORY_URL` naming this machine's own server (`http://127.0.0.1:8080`, an `ampup-memory serve --local`)
+and no `AUTH_GOOGLE_ID` set, nobody signs in: the UI reads it as that server's one local caller.
+
 A hosted UI can also list a cluster's namespaces through a gateway: this same app run inside the cluster
 (`Dockerfile`), where `kubectl` uses the pod's service account. Set `GATEWAY_AUDIENCE` (the UI's OAuth client ID)
 and `AUTH_ALLOWED_DOMAINS` on the gateway, and `AMPUP_MEMORY_GATEWAY_URL` (the gateway's URL) on the hosted UI
@@ -68,4 +74,5 @@ and `AUTH_ALLOWED_DOMAINS` on the gateway, and `AMPUP_MEMORY_GATEWAY_URL` (the g
 
 `?ns=<namespace>&scope=<scope>&branch=<branch>`, then `#/f/<path>` a folder, `#/e/entities/<type>/<key>`
 an entity, `#/s/skills/<slug>` a compiled skill (`…/index` the routing index), `#/x/<episode id>`
-an episode, `#/q/<text>` a search, `#/t/<tool>` the Tools tab, `#/c` the Schema tab.
+an episode, `#/q/<text>` a search, `#/t/<tool>` the Tools tab, `#/c` the Schema tab, `#/l/` the Learned tab
+(`#/l/team`, `#/l/mine` or `#/l/<person>` to narrow it, `#/l/<show>/<lesson key>` to a lesson).

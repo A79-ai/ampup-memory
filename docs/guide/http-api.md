@@ -19,6 +19,7 @@ Examples below run against `ampup-memory serve --local` on `localhost:8080`.
 | `POST /runs` | `{task, trace, used?, outcome?, advice?}` or `{runs: [...]}` | `{run_id}` or `{run_ids}` |
 | `POST /runs/reward` | `{run_id, reward, reason?}` or `{rewards: [...]}` | `{run_id}` or `{run_ids}` |
 | `POST /sessions/prs` | `{repo, number, branch?, event, at?, by?}` | how many sessions it reached |
+| `POST /advice/seed` | `{repo, sources: [{name, text}]}` or `{check: true}` | `{advises, sent, written, retired, writing_notes}`, or `{advises: false, why}` with no model |
 
 ```bash
 curl -s localhost:8080/remember -d '{"source": "note:deploy", "body": "Deploy billing with ./deploy.sh billing. Never from a laptop on Fridays."}'
@@ -35,6 +36,8 @@ curl -s localhost:8080/sessions/end -d '{"session_id": "6512edd0-…", "transcri
   scope; `"mine": true` makes it the caller's alone (refused for a caller with no `user:` entry). The episode's
   source records its author as `mcp:remember_memory:<caller>:<source>`. `document` (a key under `starter/`)
   writes a new version of that document.
+- `/advice/seed`: a repository's docs and pull requests, kept as the caller's own episodes; the server writes
+  notes for coding tasks from them in the background ([advice.md](advice.md#advice-from-a-repository-from-the-first-session)).
 - `/sessions/end` and `/advice` in a session: only the person who started the session may use it; anyone else
   gets 404.
 - `/sessions/prs` reports what became of a pull request a session opened or pushed to (`merged`, `closed`,
@@ -54,6 +57,7 @@ Details of advice, runs and sessions: [advice.md](advice.md).
 | `POST /browse` | `{op, path?, …}` | Memory as file trees: `sources/`, `entities/`, `skills/` |
 | `POST /facts/list` | `{entity?, entity_type?, predicate?, source?, tags?, status?, text?, limit?, cursor?}` | Facts the caller may read, newest first |
 | `POST /advice/list` | `{space?, category?, situation?, text?, …}` | Situations whose advice the caller may read, with evidence tallies |
+| `POST /lessons` | `{space?, person?, key?, since?, limit?}` | What it learned: each lesson with the runs it came from and the sessions it was served in, and how each went |
 | `POST /brief` | `{subject, refresh?}` | Where a subject stands (needs `extract.aggregates`) |
 | `POST /pin` | `{ttl_secs?}`, `{renew}`, `{release}` | A leased pin; read through it with `x-memstore-at: pin_…` or `?at=` |
 | `GET /me` | | The caller, their groups, selected scope, memberships, the org's memory profile |
@@ -79,6 +83,48 @@ citing it), `branches`, `schema`, `facts`, `advice`, `scopes`. A path is a JSON 
 curl -s localhost:8080/browse -d '{"op": "ls", "path": ["sources"]}'
 curl -s localhost:8080/browse -d '{"op": "ls", "path": ["entities", "deal", "42"]}'
 ```
+
+### What it learned: `/lessons`
+
+`POST /lessons` (also `/browse {"op": "lessons"}`) answers each learned lesson (an advice note: the caller's own,
+`space: "mine"`, or the team's) with its trail, newest first. The Explorer's Learned tab reads it, and anything that
+reports what the memory learned (a weekly digest) can read the same:
+
+```bash
+curl -s localhost:8080/lessons -d '{"since": "2026-11-06"}'
+```
+
+```json
+{"reader": {"user": "amy@example.com", "everyone": false}, "people": ["amy@example.com"], "count": 1,
+ "lessons": [{
+   "key": "service-deployment/deploy-a-service-change-to-production", "space": "team", "owner": null,
+   "category": "Service deployment", "situation": "Deploy a service change to production",
+   "title": "Deploy a service change to production", "when": "…", "lesson": "## When\n…\n## Steps\n1. [how-to] …",
+   "learned_at": 1794610311969569, "note_id": "16a4…", "status": "served", "evidence": {"served": 3, "helped": 2, "ratified": false, …},
+   "learned_from": {"runs": 11, "right": 6, "wrong": 5, "people": 4, "more": 0, "hidden": 6,
+     "trail": [{"id": "…", "kind": "run", "user": "amy@example.com", "question": "Deploy the search service",
+                "at": 1794610300000000, "runs": 1, "right": 1, "wrong": 0, "outcome": "right", "by": "reward"}]},
+   "served_in": {"sessions": 3, "people": 1, "helped": 2, "good": 2, "bad": 1, "more": 0, "hidden": 0,
+     "trail": [{"id": "…", "user": "amy@example.com", "question": "Ship the payments hotfix", "at": 1794610400000000,
+                "moment": "start", "harness": "claude-code", "applied": true, "helped": true, "outcome": "good",
+                "by": "reward", "reward": 1, "prs": [], "ended_at": 1794610410000000}]}
+ }]}
+```
+
+- `lesson` is the note as agents are served it (no item ids, no Evidence or Freshness), markdown; `title` is its
+  heading. `status`: `served`, `held`, `needs backing`, `withheld` or `not served`.
+- `learned_from`: the runs and sessions its situation was learned from (a session's graded requests count as runs of
+  it). `served_in`: the sessions it was handed in since, `moment` where (`start`, `prompt`, `agent`, `next`, `fork`,
+  `stuck`, `done`), and `helped` the judge's reading.
+- `outcome`: `right`/`wrong` for a run, `good`/`bad`/`unclear`/`open` for a session. `by` says who said so, surest
+  first: `pr` (what came of its pull requests), `person` (their rating, or their next message grading the request),
+  `reward` (a reward given), `judge` (a model's reading).
+- Each trail lists the caller's own runs and sessions, newest first, `limit` (12, at most 200) a side, `more` the rest;
+  other people's are counted in the totals and `hidden`, never listed. An org's admins, reading the org's own memory
+  where the org shows its people's activity (as `notes/` in `/browse`), read every person's own lessons and every
+  entry in full; `person` narrows to one person's own (a member may name only themselves, else 400).
+- `since` (µs, an RFC 3339 time or a date) keeps the lessons written at or after it; `key` reads one (404 if the
+  caller may read no such lesson).
 
 Every read is filtered by what the caller may see. A path or id that holds nothing the caller may see answers 404,
 as if it didn't exist.
@@ -112,6 +158,8 @@ as if it didn't exist.
 | `POST /closure` | Push a user's group changes or disable them (admin key) |
 | `POST /team`, `DELETE /team` | Replace or clear a team csv on every server (admin key) |
 | `POST /installations` | Register which org owns a connector installation (admin key) |
+| `POST /digest/preview` | A person's weekly digest, sending nothing: `{person?, week?}` (`last` by default); the caller's own, or an org admin's for a member |
+| `GET /digest/unsubscribe?t=…`, `POST /digest/unsubscribe` | A digest's unsubscribe link: the page asks; a POST (`t=…`, `subscribe=on` to subscribe again) changes it, one-click (RFC 8058) too |
 | `GET /metrics` | Prometheus text; the admin key only on the public port, or anyone on `AMPUP_MEMORY_METRICS_PORT` |
 | `GET /.well-known/oauth-protected-resource` | The identity provider and CLI client id, for OAuth sign-in (RFC 9728) |
 

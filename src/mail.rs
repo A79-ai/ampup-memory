@@ -1,4 +1,5 @@
-//! Mail the server sends: an org's admins are told when someone asks to join ([`crate::server::join`]).
+//! Mail the server sends: an org's admins are told when someone asks to join ([`crate::server::join`]), and people
+//! get a weekly digest ([`crate::digest`]).
 //!
 //! Through Resend (`RESEND_API_KEY`) or MailerSend (`MAILERSEND_API_KEY`), from `AMPUP_MEMORY_MAIL_FROM`. With
 //! neither key, or no sender, nothing is sent: what would have been mailed is logged, and the request stays
@@ -47,11 +48,34 @@ impl Mailer {
 
     /// Send one message. The body is never logged: a link in it is the secret.
     pub async fn send(&self, to: &str, subject: &str, text: &str, html: &str) -> Result<()> {
+        self.send_with(to, subject, text, html, &Extra::default())
+            .await
+    }
+
+    /// [`Mailer::send`], with an idempotency key and headers where the provider takes them (Resend takes both;
+    /// MailerSend neither, so they are left out there).
+    pub async fn send_with(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        html: &str,
+        extra: &Extra,
+    ) -> Result<()> {
         let (url, body) = match self.provider {
-            Provider::Resend => (
-                "https://api.resend.com/emails",
-                json!({"from": self.from, "to": [to], "subject": subject, "text": text, "html": html}),
-            ),
+            Provider::Resend => {
+                let mut body = json!({"from": self.from, "to": [to], "subject": subject, "text": text, "html": html});
+                if !extra.headers.is_empty() {
+                    body["headers"] = json!(
+                        extra
+                            .headers
+                            .iter()
+                            .cloned()
+                            .collect::<serde_json::Map<String, serde_json::Value>>()
+                    );
+                }
+                ("https://api.resend.com/emails", body)
+            }
             Provider::MailerSend => (
                 "https://api.mailersend.com/v1/email",
                 json!({"from": {"email": self.from}, "to": [{"email": to}], "subject": subject,
@@ -62,10 +86,14 @@ impl Mailer {
             .ok()
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| url.to_string());
-        let r = crate::deployment::client()
+        let mut req = crate::deployment::client()
             .post(&url)
             .bearer_auth(&self.key)
-            .json(&body)
+            .json(&body);
+        if let (Provider::Resend, Some(k)) = (self.provider, &extra.idempotency_key) {
+            req = req.header("Idempotency-Key", k);
+        }
+        let r = req
             .send()
             .await
             .with_context(|| format!("{} didn't answer", self.provider()))?;
@@ -73,6 +101,15 @@ impl Mailer {
         anyhow::ensure!(status.is_success(), "{} answered {status}", self.provider());
         Ok(())
     }
+}
+
+/// What a message may carry besides its parts.
+#[derive(Clone, Debug, Default)]
+pub struct Extra {
+    /// The same key sent twice is one message (Resend keeps a key for 24 hours).
+    pub idempotency_key: Option<String>,
+    /// Extra headers, such as `List-Unsubscribe`, as (name, value).
+    pub headers: Vec<(String, serde_json::Value)>,
 }
 
 /// Text as HTML shows it.

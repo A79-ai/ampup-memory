@@ -5,6 +5,8 @@ name: Release
 # - `v*` (the server): the ampup-memory CLI as a GitHub release of this repository, per platform a tarball of
 #   ampup-memory and ampup-memory-client with its checksum, and install.sh, which anyone can run with no sign-in:
 #     curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/install.sh | sh
+#   and on PyPI as `ampup-memory-cli`, a wheel per platform with both binaries (the pypi job at the end):
+#     uv tool install ampup-memory-cli    (or pipx install, pip install; uvx --from ampup-memory-cli ampup-memory ...)
 # - `client-v*` (the client): ampup-memory-client alone (what the Claude Code, Cursor and Codex plugins run, a few
 #   MB), per platform, installed with AMPUP_MEMORY_INSTALL=client.
 #
@@ -23,8 +25,10 @@ name: Release
 # Every archive carries LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt: the licenses of every crate linked into the
 # binaries, ONNX Runtime's and the embedding model's, kept current by .github/scripts/third-party-notices.sh.
 #
-# Platforms: Linux x86_64 and arm64 (glibc 2.39 or newer: built on Ubuntu 24.04) and Apple Silicon macOS. No Intel
-# macOS: onnxruntime (ort) ships no prebuilt library for it.
+# Platforms: Linux x86_64 and arm64 (glibc 2.39 or newer: built on Ubuntu 24.04), Apple Silicon macOS and Intel
+# macOS (13.4 or newer). The Intel build is cross-compiled on the Apple Silicon runner, its ONNX Runtime built from
+# source (.github/scripts/onnxruntime-x86_64-apple-darwin.sh, cached), as ort ships no prebuilt library for Intel
+# Macs; it is checked there under Rosetta, and installed on an Intel runner.
 #
 # macOS builds are signed with a Developer ID and notarized when the signing secrets are set
 # (.github/scripts/macos-sign.sh names them); without them they're unsigned, and install.sh clears the quarantine
@@ -60,6 +64,7 @@ jobs:
           - { target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
           - { target: aarch64-apple-darwin, runner: macos-15 }
+          - { target: x86_64-apple-darwin, runner: macos-15 }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: What this release is
@@ -72,13 +77,42 @@ jobs:
       - uses: ./.github/actions/rust
         with:
           target: release
+      # Intel macOS, cross-compiled: ONNX Runtime built from source (~35 CPU-minutes, so 15 or so on this runner;
+      # cached, though a tag's cache serves only that tag's reruns), and Rosetta to run the build's checks.
+      - name: Cache ONNX Runtime for Intel macOS
+        if: matrix.target == 'x86_64-apple-darwin'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/onnxruntime
+          key: onnxruntime-x86_64-apple-darwin-${{ hashFiles('licenses/onnxruntime/VERSION', '.github/scripts/onnxruntime-x86_64-apple-darwin.sh') }}
+      - name: ONNX Runtime for Intel macOS
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          rustup target add x86_64-apple-darwin
+          arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+          .github/scripts/onnxruntime-x86_64-apple-darwin.sh "$RUNNER_TEMP/onnxruntime"
+          echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime" >> "$GITHUB_ENV"
       # Both, for either kind: the check runs ampup-memory-client against ampup-memory. Only this release's kind is
       # packaged.
       - name: Build
         # --version names the release, which the plugin compares with the latest to keep the client current.
+        # .cargo/release.toml: fat LTO, and the dependencies that do no numeric work optimized for size: the server is
+        # half the size it is with the release profile alone, and its final link runs on one core for many minutes.
         env:
           AMPUP_MEMORY_RELEASE: ${{ steps.kind.outputs.version }}
-        run: cargo build --release --locked --bin ampup-memory --bin ampup-memory-client
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [ "$TARGET" = x86_64-apple-darwin ]; then
+            # The oldest macOS it runs on, as its ONNX Runtime is built for (the script's deploy_target).
+            export MACOSX_DEPLOYMENT_TARGET=13.4
+            cargo build --release --config .cargo/release.toml --locked --target "$TARGET" --bin ampup-memory --bin ampup-memory-client
+            # Where every other platform's build is, for the steps below.
+            mkdir -p target/release
+            cp "target/$TARGET/release/ampup-memory" "target/$TARGET/release/ampup-memory-client" target/release/
+            file target/release/ampup-memory target/release/ampup-memory-client
+          else
+            cargo build --release --config .cargo/release.toml --locked --bin ampup-memory --bin ampup-memory-client
+          fi
       # Stripped before signing (stripping a signed binary breaks its signature), and both checked as they ship.
       - name: Strip
         run: strip target/release/ampup-memory target/release/ampup-memory-client
@@ -150,6 +184,55 @@ jobs:
             ampup-memory-*${{ matrix.target }}.tar.gz*
             memstore-client-${{ matrix.target }}.tar.gz*
           retention-days: 1 # only carries the build to this run's publish job; the release keeps the files
+      # A server release as a Python package too: ampup-memory-cli, a wheel per platform with both binaries in it
+      # (and ampup-memory-client again as memstore-client, its old name, as the client's wheel had it), installed in
+      # a fresh venv and checked as the build was, before the pypi job below may upload it (PyPI never takes a
+      # version twice).
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        if: steps.kind.outputs.kind == 'server'
+        with:
+          python-version: "3.12"
+      - name: Wheel
+        if: steps.kind.outputs.kind == 'server'
+        env:
+          VERSION: ${{ steps.kind.outputs.version }}
+        run: |
+          # The platform tag, from the binary itself: Linux's glibc floor (above), macOS's oldest version the binary
+          # says it runs on (11 and later as <major>_0, as pip looks for them) and its architecture (an Intel build
+          # is made on Apple Silicon).
+          bin=target/release/ampup-memory
+          case "$RUNNER_OS" in
+            Linux) platform=manylinux_2_39_$(uname -m) ;;
+            macOS)
+              minos=$(vtool -show-build "$bin" | awk '$1 == "minos" { print $2; exit }')
+              major=${minos%%.*} minor=${minos#*.}; minor=${minor%%.*}
+              [ "$major" -ge 11 ] && minor=0
+              platform=macosx_${major}_${minor}_$(lipo -archs "$bin")
+              ;;
+          esac
+          wheel=$(python3 harness/wheel.py target/release/ampup-memory-client ampup-memory-cli "$GITHUB_REF_NAME" \
+            "$platform" wheels --with="$bin" --alias=memstore-client LICENSE NOTICE THIRD-PARTY-NOTICES.txt)
+          ls -l "$wheel"
+          # Into a fresh venv; a build for another architecture than the runner's (the Intel Mac's) into a directory,
+          # as pip won't install it as such, its binaries then run under Rosetta.
+          if [ "${platform##*_}" = "$(uname -m)" ]; then
+            python3 -m venv "$RUNNER_TEMP/venv"
+            "$RUNNER_TEMP/venv/bin/pip" install -q "$wheel"
+            installed=$RUNNER_TEMP/venv/bin
+          else
+            python3 -m pip install -q --only-binary=:all: --platform "$platform" --target "$RUNNER_TEMP/wheel" "$wheel"
+            installed=$RUNNER_TEMP/wheel/bin
+          fi
+          for b in ampup-memory ampup-memory-client memstore-client; do
+            test "$("$installed/$b" --version 2>/dev/null | cut -d' ' -f2)" = "$VERSION"
+          done
+          .github/scripts/release-check.sh "$installed/ampup-memory" "$installed/ampup-memory-client"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.kind.outputs.kind == 'server'
+        with:
+          name: wheel-${{ matrix.target }}
+          path: wheels/*.whl
+          retention-days: 1 # only carries the build to this run's pypi job
 
   publish:
     name: Publish the release
@@ -187,7 +270,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
     # As a stranger installs it: install.sh from this tag, downloading from this repository's public releases with
     # no token.
     env:
@@ -223,3 +306,40 @@ jobs:
           test -L "$client/memstore-client"
           .github/scripts/release-check.sh "$server" "$client/ampup-memory-client"
           .github/scripts/release-check.sh "$server" "$client/memstore-client"
+
+  # A server release's wheels to PyPI as ampup-memory-cli (`uv tool install ampup-memory-cli`), once every platform
+  # built and the release installed everywhere. Through trusted publishing: PyPI trusts this repository's
+  # release.yml (a publisher on pypi.org for ampup-memory-cli: owner A79-ai, repository ampup-memory, workflow
+  # release.yml, no environment), so there is no token. .github/scripts/pypi-publishable.py decides whether a release
+  # goes, with the settings below; a skip is no failure.
+  pypi:
+    name: Publish ampup-memory-cli to PyPI
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    env:
+      # 0.1.x on PyPI is the client alone, numbered by the client's releases: the server's start at 0.2.0.
+      PYPI_FROM: "0.2.0"
+      # At most a release a week: each is ~65 MiB a platform, and PyPI caps the project's total (10 GiB unless it
+      # raises it). The GitHub release and install.sh have every one.
+      PYPI_MIN_DAYS: "7"
+      # PyPI's per-file limit for the project: raise it here when PyPI raises it.
+      PYPI_FILE_LIMIT_MIB: "100"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: wheel-*
+          merge-multiple: true
+      - name: Whether it goes
+        id: gate
+        run: |
+          ls -l dist
+          python3 -I .github/scripts/pypi-publishable.py ampup-memory-cli "$GITHUB_REF_NAME" dist/*.whl >> "$GITHUB_OUTPUT"
+      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        if: steps.gate.outputs.publish == 'true'
+        with:
+          skip-existing: true

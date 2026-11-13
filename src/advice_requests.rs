@@ -1,5 +1,5 @@
-//! Advice's admin ops that only the server doing the background writing runs (`hold_advice` and `learn_advice`:
-//! both write the advice map, which a learn rewrites from what it read, so they run where learning does, under its
+//! Advice's admin ops that only the server doing the background writing runs (`hold_advice`, `ratify_advice` and
+//! `learn_advice`: each writes the advice map, which a learn rewrites from what it read, so they run where learning does, under its
 //! claim), asked of a server that doesn't. That is every serving pod of a deployment that splits serving from
 //! writing (`AMPUP_MEMORY_ROLE=serve`, a cell's pods among them, whose worker holds the cell's lease), and any server while
 //! the lease is elsewhere. An admin reaches only the serving pods, so the request is queued for the writer instead of
@@ -34,7 +34,7 @@ const SOURCE: &str = "advice:request:";
 /// One queued op, as the admin asked it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
-    /// `hold` (or release, `hold: false`) or `learn`.
+    /// `hold` (or release, `hold: false`), `ratify` (or withdraw, `ratify: false`) or `learn`.
     pub op: String,
     /// Who asked.
     pub by: String,
@@ -47,6 +47,9 @@ pub struct Request {
     pub keys: BTreeSet<String>,
     #[serde(default)]
     pub hold: bool,
+    /// `ratify`: the notes, and whether to ratify them or withdraw it.
+    #[serde(default)]
+    pub ratify: bool,
     /// `learn`: as the admin op takes them.
     #[serde(default)]
     pub min_wrong: usize,

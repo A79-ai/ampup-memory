@@ -3,7 +3,8 @@ import { memstore, selection } from "@/lib/memstore";
 import { withSkills } from "@/lib/skills";
 
 // POST {ns, op, path?, id?, limit?, after?, sel?}: memstore's /browse for the selected org or team, on the
-// selected branch; `skills/` read through the `skills` tool where that memstore's /browse predates it.
+// selected branch; `skills/` read through the `skills` tool where that memstore's /browse predates it. The `lessons`
+// op (what it learned) takes {space?, person?, key?, since?, limit?} instead.
 export async function POST(req: Request) {
   const refused = await guard(req);
   if (refused) return refused;
@@ -16,6 +17,10 @@ export async function POST(req: Request) {
       body: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "skills", arguments: args } },
       sel,
     });
+  if (op === "lessons") {
+    const { space, person, key, since } = b ?? {};
+    return browse({ op, space, person, key, since, limit });
+  }
   const r = await browse({ op, path, id, limit, after });
   if (op === "scopes") return r;
   return withSkills(r, { op, path, limit, after }, String(b?.ns ?? ""), { browse, skills });

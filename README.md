@@ -19,13 +19,24 @@ AmpUp also runs it for you: [hosted AmpUp Memory](https://www.ampup.ai/ampup-mem
 plugin. To run it yourself:
 
 ```bash
+uv tool install ampup-memory-cli      # or: pipx install ampup-memory-cli, or pip install ampup-memory-cli
+ampup-memory serve --local
+```
+
+That puts `ampup-memory` (server and CLI) and `ampup-memory-client` (hooks for coding agents) on your `PATH`, from
+[`ampup-memory-cli`](https://pypi.org/project/ampup-memory-cli/) on PyPI: a wheel per platform holding the two
+binaries, for macOS on Apple Silicon or Intel (13.4 or newer) or Linux on arm64/x86_64 (glibc 2.39 or newer). To run
+it without installing: `uvx --from ampup-memory-cli ampup-memory serve --local`.
+
+Or with the installer, which needs only `curl` (or `wget`) and `tar`, puts both in `~/.local/bin` from the newest
+[release](https://github.com/A79-ai/ampup-memory/releases) (PyPI gets one a week), and with
+`AMPUP_MEMORY_INSTALL=client` installs the client alone:
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/install.sh | sh
 ```
 
-That puts `ampup-memory` (server and CLI) and `ampup-memory-client` (hooks for coding agents) in `~/.local/bin`, from
-the newest [release](https://github.com/A79-ai/ampup-memory/releases), for macOS on Apple Silicon or Linux on
-arm64/x86_64. It needs only `curl` (or `wget`) and `tar`; `AMPUP_MEMORY_INSTALL=client` installs the client alone.
-The command was `memstore` before the rename, and `memstore` still works as a link to it.
+The command was `memstore` before the rename; the installer leaves `memstore` as a link to it.
 
 To build from source instead, you need `rustup` (the toolchain is pinned in `rust-toolchain.toml`) and `protoc` on
 your `PATH`:
@@ -43,6 +54,11 @@ releases if none is installed ([coding agents](https://docs.ampup.ai/ampup-memor
 /plugin install ampup-memory@ampup-memory
 ```
 
+With no team server named, the plugin's memory is the local server, and a session's start runs it
+(`ampup-memory serve --local --background`) when nothing answers on port 8080, so install `ampup-memory` as above
+first (`AMPUP_MEMORY_AUTOSTART=0` turns this off). Where no model is saved yet, the first start saves the one
+Claude Code's environment names in `~/.ampup-memory/llm.json`, as `service install` does.
+
 ## Run it locally
 
 ```bash
@@ -53,6 +69,14 @@ claude mcp add --transport http ampup-memory http://localhost:8080/mcp
 `--local` needs no Docker, catalog service or sign-in, and binds to 127.0.0.1. Without a model key it stores and
 searches but learns nothing; any OpenAI-compatible, Anthropic, Bedrock or Vertex AI endpoint, or a local Ollama,
 works instead of OpenRouter ([configuration](https://docs.ampup.ai/ampup-memory/configuration#models)).
+
+To keep it always on, with no terminal open, install it as a background service (a LaunchAgent on macOS, a systemd
+user unit on Linux). The key is kept in `~/.ampup-memory/llm.json`, readable by you alone:
+
+```bash
+OPENROUTER_API_KEY=... ampup-memory service install   # starts now, at login, and again if it stops
+ampup-memory service status                           # or: logs, restart, uninstall (the data stays)
+```
 
 ### Offline, on your laptop
 

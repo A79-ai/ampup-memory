@@ -981,10 +981,12 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
             );
         }
     }
-    // Her admin reads the entry whole.
-    let (status, body) = admin_as(s, &alice, conversation.clone()).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("xqcarolasked"), "{body}");
+    // Her admin reads the entry whole, and so does she: it is hers (the advice page links each of her sessions).
+    for who in [&alice, &carol] {
+        let (status, body) = admin_as(s, who, conversation.clone()).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("xqcarolasked"), "{body}");
+    }
     // And the facts from what she wrote (Studio's "by person" filter): those citing her note, no one else's.
     let user_facts = json!({"op": "user_facts", "org": "acme", "user": "Carol@acme.com"});
     let (status, body) = admin_as(s, &alice, user_facts.clone()).await;
@@ -1014,6 +1016,19 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         ),
         (&bob, json!({"op": "advice_trail", "org": "acme"})),
         (&gary, json!({"op": "advice_trail", "org": "acme"})),
+        // Ratifying a note serves it to everyone: the org's admins only, never a key.
+        (
+            &bob,
+            json!({"op": "ratify_advice", "org": "acme", "keys": ["work/do-it"]}),
+        ),
+        (
+            &gary,
+            json!({"op": "ratify_advice", "org": "acme", "keys": ["work/do-it"]}),
+        ),
+        (
+            &ALICE_FILE_KEY.to_string(),
+            json!({"op": "ratify_advice", "org": "acme", "keys": ["work/do-it"]}),
+        ),
         // A team is isolated from the rest of its org, its admins included: Alice isn't in a1.
         (
             &alice,
@@ -1076,6 +1091,10 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
             "{body}"
         );
     }
+    // Her own session stays hers to read with the setting off.
+    let (status, body) = admin_as(s, &carol, conversation.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("xqcarolasked"), "{body}");
     let on = json!({"op": "set_settings", "org": "acme", "settings": {"activity": true}});
     let (status, body) = admin_as(s, &alice, on).await;
     assert_eq!(status, 200, "{body}");
@@ -1505,7 +1524,8 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     // Her four notes, both parts of her advice trace, her session transcript's three versions of two parts (the
     // two she forgot too) and her session's conversation so far.
     assert_eq!(done["forgotten"]["acme"]["episodes"], 10, "{body}");
-    assert_eq!(done["forgotten"]["acme"]["facts"], 3, "{body}");
+    // Her facts: three extracted, and her four notes' own (each note is a fact citing it alone).
+    assert_eq!(done["forgotten"]["acme"]["facts"], 7, "{body}");
     // Her ownership, her decision and the proposal built on her note are in no file; the entity is unowned, the
     // inbox doesn't list the proposal, and a change to the entity publishes without review.
     for t in [

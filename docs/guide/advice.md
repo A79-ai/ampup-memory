@@ -32,8 +32,23 @@ A session is one conversation, start to end.
 
 When a session that was served advice ends, a judge model reads its notes and transcript (fenced as data) and says,
 per note, whether the agent applied it and whether it helped, and whether the session succeeded, failed or is
-unclear. A session's judged outcome is its reward when the agent gave none. Each note keeps a tally (served,
+unclear. A session's judged outcome is its reward when nobody gave one. Each note keeps a tally (served,
 applied, helped, not helped), counting each person's latest judged session only.
+
+### The person's rating
+
+The person whose session it was can rate it: in Claude Code or Codex, `+` or `-` typed alone as a prompt (the hooks
+record it and keep it from the agent; see [coding agents](coding-agents.md)), or `/ampup-memory:good|bad [why]`.
+The hooks send `POST /runs/reward {run_id: <session id>, reward: 1 or -1, reason?, by: "person"}`. With `by:
+"person"` the reward is also the session's rating (`helpful` or `not_helpful`), and:
+
+- learning reads it as the person's response, above the judge's reading and a reward the agent gave itself (only
+  what became of the session's PRs and a reviewer's grade rank higher), with their words as the reason;
+- the judge still reads the session, but never replaces its reward;
+- it counts in each note's tally of outcomes people gave (`checked` in the advice trail).
+
+A session open or ended a moment ago takes the rating at once (it is held with the session's row), and a newer one
+replaces it. `by` is taken on the route alone: the `reward_run` MCP tool, whose arguments a model chooses, ignores it.
 
 ### Holdout arm
 
@@ -61,7 +76,8 @@ curl -s localhost:8080/runs/reward -d '{"run_id": "…", "reward": 1, "reason": 
 - `POST /runs {task, trace, used?, outcome?, advice?}`. `trace` is at most 20,000 characters and is the caller's
   own episode. `advice` is the situation key `get_advice` named, so a run says what it was served (several keys
   separated by `; `).
-- `POST /runs/reward {run_id, reward: -1..1, reason?}`. Only the recorder rewards its own run.
+- `POST /runs/reward {run_id, reward: -1..1, reason?, by?}`. Only the recorder rewards its own run or session.
+  `by: "person"` marks it the person's own rating ([above](#the-persons-rating)).
 - **Batches.** `POST /runs {"runs": [...]}` takes up to 1,000 runs and 16 MiB, each with an inline `reward` and
   `reason`. Every run is checked before any is written; one bad run refuses the batch. Batch run ids are derived
   from the runs' content, so loading the same runs into a fresh store gives the same ids.
@@ -159,6 +175,43 @@ message, shared frames and files, fused with BM25. No model is called. Answers c
 (catalog version `2026-11-08`) when a decisions model (`AMPUP_MEMORY_DECIDE`) is configured and is at least 0.9
 confident. Send `available_capabilities` to suppress what the agent already has. `public_capabilities: false` per
 call, or `AMPUP_MEMORY_PUBLIC_CAPABILITIES=off`, turns them off. They are suggestions, not installs.
+
+## Advice from a repository, from the first session
+
+A new person's memory has no notes: they are learned from rewarded sessions. So that a coding agent is advised in
+its first session in a repository, the hooks send what the repository already says about how its work is done, and
+the server writes it into notes for the kinds of task coding sessions are routed to.
+
+- **When.** In the background copy of a session's start (never in the hook the session waits on), at most once a
+  day per repository and memory, with a lock so sessions starting together send it once. The first time, the
+  session is told what was read; later days send it again quietly, and the server keeps only what changed. The
+  notes are written again only when a doc changed or five pull requests are new: each write is one call of the
+  learning model over the whole material.
+- **What is read.** Only files git tracks (so `.gitignore` holds), never code: the agent instructions (`CLAUDE.md`,
+  `AGENTS.md`, `GEMINI.md`, `.claude/rules`, `.cursor/rules`), the guides at the top or under `.github/`
+  (`CONTRIBUTING`, `README`, `DEVELOPMENT`, `ARCHITECTURE`, `TESTING`, style and release guides, the pull request
+  template), up to 15 Markdown files under `docs/`, your own Claude Code memory files for the repository, and the
+  last 25 merged pull requests (title, description, changed files, reviews and review comments, bots left out)
+  through `gh` where it is signed in, else the default branch's last 60 commit messages and the files they changed.
+  At most 30 KB a file and 500 KB in all; links out of the repository aren't followed; secret-looking words are
+  redacted.
+- **What it becomes.** One call of the learning model writes a note for each of seven kinds of task the material
+  says something specific about: implement a requested behavior change, investigate a bug, error or failing test,
+  review a pull request, open a pull request, plan how to build a feature or fix, explain how something works in
+  the code, run, build or test the project locally. These are the situations advice routing matches most coding
+  requests to, so the router and the fit check read them as they read learned notes; narrow compiled procedures
+  rarely pass the fit check. Each note has the usual sections, every item tagged with its kind and resting on the
+  sources it cites (an item citing none is dropped), within the note budget. They go under a category named for the
+  repository (`<repo>-repository/<situation>`).
+- **Whose.** The material is your own episodes (`mcp:remember_memory:<you>:memstore:repo:<repo>/<name>`), and the
+  notes your own advice (`advice-mine/`), readable by you alone; nothing reaches a teammate. On `serve --local`,
+  whose one caller is everyone, they go to the scope's advice. Once runs of one of these kinds of task are learned
+  from, learning writes that note from them instead; until then learning keeps the seeded notes.
+- **Without a model** (none configured, or `AMPUP_MEMORY_ADVICE=off`), nothing is read or kept: the session is told
+  why once, and the next day's start asks again.
+- `AMPUP_MEMORY_REPO_ADVICE=off` (or `AMPUP_MEMORY_CAPTURE=off`) on the client sends nothing. The route is
+  `POST /advice/seed` ([http-api.md](http-api.md#the-learning-loop)): at most 80 sources and 600 KB a call, and 20
+  calls that keep something new per person a day on one server.
 
 ## Procedures: AIP skills and step graphs
 

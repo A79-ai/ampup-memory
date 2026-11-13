@@ -28,6 +28,7 @@ On BigQuery or Snowflake, the same tables are readable by their own engines.
 ```bash
 ampup-memory serve --local                 # ~/.ampup-memory, http://127.0.0.1:8080
 ampup-memory serve --local ./store org 8090   # another directory, scope and port
+ampup-memory service install                 # or keep it running in the background (cli.md)
 ```
 
 - `DIR/warehouse` holds the tables, `DIR/index` the search index, `DIR/embeddings` the embedding cache, and

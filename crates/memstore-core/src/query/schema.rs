@@ -695,6 +695,12 @@ impl Schema {
     /// Check a fact against the schema and fill its typed columns. Values are canonicalised
     /// (`2026-10-12`, `50000`, `true`) so equal values compare equal.
     pub fn normalize(&self, f: &mut Fact) -> Result<()> {
+        // A note's fact is the engine's, in every scope whatever its schema names ([`crate::note_fact`]).
+        if crate::is_note_fact(f) {
+            f.entity_type = Some(crate::NOTE.to_string());
+            f.value_type = Some("text".to_string());
+            return Ok(());
+        }
         let ty = self
             .entity_type(&f.entity)
             .with_context(|| {

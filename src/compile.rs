@@ -33,7 +33,10 @@
 //! skills, so sources that are each a situation of their own want 8 or fewer), and what its sources are
 //! (`compile_kind`: `errors` has each skill's `when` name the exception and its message as reported). A kind
 //! changes the prompt and so the compiler's id; the batch size doesn't, and a scope that sets neither compiles
-//! with the same prompt, under the same id, as before either existed.
+//! with the same prompt, under the same id, as before either existed. A scope whose sources are of more than one
+//! kind names those its kind is about (`compile_kind_sources`, [`plan`]): they compile with the kind's prompt, the
+//! others with the one prompt, each group under a compiler id of its own, so adding sources of another kind
+//! compiles none of the kind's again.
 //!
 //! **Audiences.** Sources whose ACLs differ never share a batch. A skill, its graph and its index are
 //! readable by exactly the ACL of the sources they were compiled from, so a skill never shows a reader what
@@ -123,6 +126,34 @@ pub fn options_for(dir: Option<&crate::people::directory::Directory>, scope: &Sc
         batch: d.compile_batch(scope),
         kind: d.compile_kind(scope).as_deref().and_then(Kind::parse),
     }
+}
+
+/// How `scope` compiles `sources`: one group per prompt, each with its options and so its own compiler id. Where
+/// the scope's kind is about only some of its sources (`compile_kind_sources`), the sources under those prefixes
+/// compile with the kind and the others without it; else all of them compile as [`options_for`] says, in one
+/// group, as before groups existed. `*` can't be split: with it the kind is about every source.
+pub fn plan(
+    dir: Option<&crate::people::directory::Directory>,
+    scope: &Scope,
+    sources: &[String],
+) -> Vec<(Vec<String>, Options)> {
+    let opts = options_for(dir, scope);
+    let about = match (opts.kind, dir.and_then(|d| d.compile_kind_sources(scope))) {
+        (Some(_), Some(about)) if !sources.iter().any(|s| s == "*") => about,
+        _ => return vec![(sources.to_vec(), opts)],
+    };
+    let (kind, rest): (Vec<String>, Vec<String>) = sources
+        .iter()
+        .cloned()
+        .partition(|s| about.iter().any(|p| s.starts_with(p.as_str())));
+    let plain = Options {
+        kind: None,
+        ..opts.clone()
+    };
+    [(kind, opts), (rest, plain)]
+        .into_iter()
+        .filter(|(s, _)| !s.is_empty())
+        .collect()
 }
 
 /// Compile sources from a comma-separated list: `kb:,file:`, or `*`.

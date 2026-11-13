@@ -28,13 +28,14 @@ over the server's variables where both exist; a team's setting wins over its org
 | `AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER` (64) | One caller's requests under way at once; past it 429. `off` lifts it. |
 | `AMPUP_MEMORY_HEADER_TIMEOUT_SECS` (660) | How long a connection may take to send a request's headers, idle keep-alive ones too. Keep it above the load balancer's idle timeout. |
 | `AMPUP_MEMORY_SERVE_WORKSPACES=1` | Serve every workspace side by side (as `serve --workspaces`). |
+| `AMPUP_MEMORY_LOG_FILE` | Write the process's output to this file instead, appended, moved aside past 20 MB with three older ones kept. `service install` and `serve --local --background` set it. |
 
 ## Models
 
 | Variable | What it does |
 |---|---|
 | `OPENROUTER_API_KEY` | The default backend's key. With no model key at all, nothing is extracted, compiled or learned. |
-| `AMPUP_MEMORY_LLM` | One backend for every role below whose own variable names none: `ollama`, any `AMPUP_MEMORY_EXTRACT` value, or `off`. `serve --local` keeps a choice made at its first run in `llm.json` in its directory, under the variables. |
+| `AMPUP_MEMORY_LLM` | One backend for every role below whose own variable names none: `ollama`, any `AMPUP_MEMORY_EXTRACT` value, or `off`. `serve --local` keeps a choice made at its first run in `llm.json` in its directory, under the variables. `service install` keeps the one in its environment there, key included, since the background service doesn't see your shell; so do `service save-model` and, where none is saved yet, a coding agent's session start that starts the local server. |
 | `AMPUP_MEMORY_LLM_MODEL`, `AMPUP_MEMORY_LLM_URL`, `AMPUP_MEMORY_LLM_KEY` | One model (the strong roles' too), base URL and key for it. `AMPUP_MEMORY_LLM_URL` alone means `openai` at that URL. |
 | `AMPUP_MEMORY_LLM_CONTEXT` (32768) | The context, in tokens, Ollama loads the model with. |
 | `AMPUP_MEMORY_EXTRACT` | The backend: `openrouter` (default with a key), `openrouter-batch`, `openai`, `anthropic`, `bedrock`, `vertex`, `cortex`, or `off`. |
@@ -118,6 +119,38 @@ Requests carry `X-Title: ampup-memory`, so their spend shows apart on a shared k
 | `AMPUP_MEMORY_SESSION_IDLE_SECS` (1800), `AMPUP_MEMORY_SESSION_SWEEP_SECS` (60) | Ending idle sessions; judging ended ones. |
 | `AMPUP_MEMORY_RUNS_PER_DAY` (100), `AMPUP_MEMORY_LOG_PER_DAY` (1000), `AMPUP_MEMORY_SESSIONS_PER_DAY` (1000) | Per-person daily caps. |
 
+## Mail and the weekly digest
+
+Every Monday the server mails each person who used AmpUp Memory the week before a short digest: what it learned
+(their new or changed lessons, and the team's, with the sessions and runs they came from), where advice was served
+and how those sessions went, their sessions and the share rewarded, and a team lesson or two, each linking into the
+Explorer. Only people with sessions or runs that week get one; it shows only what they may read. Each is sent once
+per person and week, by the replica holding the writer lease. A send that fails is retried for 22 hours with the
+same idempotency key, which Resend dedupes on; MailerSend takes none, so there a retry after a send whose answer was
+lost could mail it twice.
+
+It is off without mail, so `serve --local` sends none unless mail is configured. `ampup-memory digest preview
+--person <email> [--week last|this|2026-W46]` prints one without sending ([cli.md](cli.md)).
+
+| Variable | What it does |
+|---|---|
+| `AMPUP_MEMORY_MAIL_FROM` | The sender, like `AmpUp Memory <memory@example.com>`. Without it no mail is sent: join requests are logged instead, and there is no digest. |
+| `RESEND_API_KEY` or `MAILERSEND_API_KEY` | The mail provider. |
+| `AMPUP_MEMORY_MAIL_URL` | Send the provider's request here instead (a relay, or a sink when checking locally). |
+| `AMPUP_MEMORY_DIGEST=off` | No digest from this server. It also needs `AMPUP_MEMORY_PUBLIC_URL` (its unsubscribe links) and `AMPUP_MEMORY_SECRET_KEY` (to seal them); without either the server logs why there is none. |
+| `AMPUP_MEMORY_DIGEST_HOUR` (14) | The hour (UTC) on Mondays from which last week's digests go out. |
+| `AMPUP_MEMORY_DIGEST_CHECK_SECS` (900) | How often the server looks for digests due. |
+| `AMPUP_MEMORY_EXPLORER_URL` | The Explorer the digest links into, `{org}` standing for the org: `https://console.example.com/o/{org}/studio`. A lesson or session opens as `#/x/<episode id>`, a team's with `?team=<team>`. Without it the digest has no links but its unsubscribe one. |
+
+Opting out:
+
+- **A person**: every digest has an unsubscribe link (and the `List-Unsubscribe` headers that let a mail client do it
+  in one click). The link opens a page that asks before it changes anything; the same page subscribes them again.
+  It is recorded in the org's answer log as `digest:subscription:<person>`, and forgetting the person removes it.
+- **An org**: `ampup-memory org settings <org> --digest false` (or `/admin {"op": "set_settings", "settings":
+  {"digest": false}}`) sends its members none. It is on by default, and an org-wide setting only: a team can't set it.
+- **A server**: `AMPUP_MEMORY_DIGEST=off`.
+
 ## Memory of what users say
 
 | Variable | What it does |
@@ -168,6 +201,9 @@ Requests carry `X-Title: ampup-memory`, so their spend shows apart on a shared k
 |---|---|
 | `AMPUP_MEMORY_URL`, `AMPUP_MEMORY_ORG`, `AMPUP_MEMORY_TOKEN`, `AMPUP_MEMORY_SCOPE` | Where the hooks and `ampup-memory mcp` send, and as whom. |
 | `AMPUP_MEMORY_CAPTURE=off`, `AMPUP_MEMORY_RECALL=every`, `AMPUP_MEMORY_STARTER=off` | What the hooks send. |
+| `AMPUP_MEMORY_QUICK_RATE` (on) | A bare `+` or `-` typed as a prompt in Claude Code or Codex rates the session (never reaching the agent), and Stop tells the person so once a session, after a turn of five tool calls or more. `quiet`: no telling. `off`: neither; `+` and `-` go to the agent. The rating commands work either way. |
+| `AMPUP_MEMORY_REPO_ADVICE=off` | A session's start sends no repository's docs and pull requests. Otherwise, once a day per repository, it sends them to the person's own memory, where the server writes notes for coding tasks from them ([advice.md](advice.md#advice-from-a-repository-from-the-first-session)). |
+| `AMPUP_MEMORY_AUTOSTART=0` | Never start the local server. Otherwise, where nothing names a server (no `AMPUP_MEMORY_URL`, no sign-in), a session's start and `ampup-memory-client mcp` start `ampup-memory serve --local --background` when nothing answers on 127.0.0.1:8080. Where `~/.ampup-memory/llm.json` doesn't exist, the first start saves the model the agent's environment names there first (as `service save-model`); the server never gets the key in its environment. |
 | `AMPUP_MEMORY_CONFIG_DIR` | Where contexts and sign-ins are kept (`~/.ampup-memory`). |
 | `AMPUP_MEMORY_CONTEXT` | The context for one command (as `--context`). |
 | `AMPUP_MEMORY_LOGIN_PORT` | The loopback port for browser sign-in. |

@@ -11,7 +11,9 @@
 //!
 //! `reward_run {run_id, reward, reason?}` (`POST /runs/reward`) attaches the outcome later, from -1 to 1: only
 //! the person who recorded the run may. Only a person records runs: a service key has no ACL id of its own, so
-//! its trace couldn't be kept to itself.
+//! its trace couldn't be kept to itself. A session is rewarded the same way, by its id. `by: "person"` (the route
+//! only, never the MCP tool, whose arguments a model chooses) says the person rated it themselves, at the
+//! keyboard (the hooks' `+` and `-`): their rating, which advice weighs as the person's word, not a program's.
 //!
 //! **Many at once.** Loading runs whose outcomes are already known (historical or practice runs, for advice to
 //! learn from) is a batch: `POST /runs {runs: [{task, trace, used?, outcome?, advice?, reward?, reason?},
@@ -467,14 +469,23 @@ fn reward_of(reward: &Value, reason: &Value) -> Result<(f64, Option<String>)> {
     Ok((r, reason.map(String::from)))
 }
 
-/// A `reward_run` item: the run's id, its reward and reason.
-fn reward_item(args: &Value) -> Result<(String, f64, Option<String>)> {
+/// A `reward_run` item: the run's id, its reward and reason, and whether the person gave it (`by: "person"`).
+fn reward_item(args: &Value) -> Result<(String, f64, Option<String>, bool)> {
     let id = args["run_id"].as_str().unwrap_or_default().trim();
     if id.is_empty() {
         return Err(refuse("run_id is required".into()));
     }
     let (r, reason) = reward_of(&args["reward"], &args["reason"])?;
-    Ok((id.to_string(), r, reason))
+    let person = match &args["by"] {
+        Value::Null => false,
+        v if v.as_str() == Some("person") => true,
+        _ => {
+            return Err(refuse(
+                "by is \"person\" (the person rated it) or absent".into(),
+            ));
+        }
+    };
+    Ok((id.to_string(), r, reason, person))
 }
 
 /// Rewards a run the caller recorded.
@@ -507,14 +518,14 @@ async fn reward_items(
     items: &[Value],
     label: Option<&str>,
 ) -> Result<Vec<String>> {
-    let items: Vec<(String, f64, Option<String>)> = items
+    let items: Vec<(String, f64, Option<String>, bool)> = items
         .iter()
         .enumerate()
         .map(|(i, a)| reward_item(a).map_err(|e| of_item(label, i, e)))
         .collect::<Result<_>>()?;
-    let rewards: Vec<(&str, f64, Option<&str>)> = items
+    let rewards: Vec<(&str, f64, Option<&str>, bool)> = items
         .iter()
-        .map(|(id, r, reason)| (id.as_str(), *r, reason.as_deref()))
+        .map(|(id, r, reason, person)| (id.as_str(), *r, reason.as_deref(), *person))
         .collect();
     crate::qa_log::reward_all(store, scope, who, &rewards, label)
         .await

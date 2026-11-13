@@ -30,6 +30,11 @@
 //!   redacted, is kept as the caller's own episode for later passes to check notes against (`transcripts`,
 //!   `POST /transcripts`). The note and the trace above stay as they were.
 //! - `outcome` (`/ampup-memory:outcome good|bad [why]`, no stdin): rewards this session, which advice learns from.
+//! - A rating typed as a prompt (`prompt`, Claude Code and Codex): a bare `+` or `-`, or `/ampup-memory:good`,
+//!   `:bad` or `:outcome` typed with their words, rates the session as `outcome` does and never reaches the agent
+//!   (the hook blocks the prompt, and the person sees the line it answers with). After a turn of real work the
+//!   `stop` hook says once a session, to the person alone, that `+` or `-` rates it ([`rate_hint`]).
+//!   `AMPUP_MEMORY_QUICK_RATE`: `quiet` drops that line, `off` lets a bare `+` or `-` through as a prompt too.
 //! - `status`: where the memory is and whether it answers.
 //!
 //! A hook never gets in the session's way: whatever fails is said on stderr and the hook exits 0 with no
@@ -92,6 +97,8 @@ const DETACHED: &str = "AMPUP_MEMORY_HOOK_DETACHED";
 
 #[path = "advice_traces.rs"]
 mod advice_traces;
+#[path = "repo_advice.rs"]
+mod repo_advice;
 #[path = "transcripts.rs"]
 mod transcripts;
 pub use transcripts::without_memory;
@@ -111,6 +118,15 @@ fn now_secs() -> u64 {
 pub async fn bridge() -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let client = std::sync::Arc::new(Client::from_env(Duration::from_secs(120)));
+    // The agent may start its MCP server before its session's start hook runs: where the memory is the local server
+    // by default, the bridge starts it too, and its first answer (`initialize`) waits for a start under way, so the
+    // agent doesn't find the memory down for the whole session.
+    if client.local_by_default() {
+        if let Err(e) = crate::local::autostart() {
+            eprintln!("ampup-memory-client mcp: the local server wasn't started: {e:#}");
+        }
+        crate::local::wait_for_start(Duration::from_secs(20)).await;
+    }
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     // One answer written at a time, each whole on its line.
     let out = std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
@@ -187,6 +203,8 @@ pub struct Client {
     scope: Option<String>,
     /// Where `url` came from, for `status`: AMPUP_MEMORY_URL, or which context in which config directory.
     from: String,
+    /// Nothing named a server (no AMPUP_MEMORY_URL, no CLI context): `url` is the local server's default.
+    by_default: bool,
     /// Built on the first request: building one loads the system's root certificates (about 90 ms on macOS),
     /// which a hook with nothing to send (most tool calls, most Stops) never pays.
     http: std::sync::OnceLock<reqwest::Client>,
@@ -207,7 +225,7 @@ impl Client {
         let ctx_server = ctx_get("server").map(|s| s.trim_end_matches('/').to_string());
         let url = var("AMPUP_MEMORY_URL")
             .or_else(|| ctx_server.clone())
-            .unwrap_or_else(|| "http://127.0.0.1:8080".into())
+            .unwrap_or_else(|| crate::local::URL.into())
             .trim_end_matches('/')
             .to_string();
         // `AMPUP_MEMORY_ORG` (and `AMPUP_MEMORY_TEAM`) name them with `AMPUP_MEMORY_URL`; the context's select only on the
@@ -232,6 +250,7 @@ impl Client {
             ),
             None => "the default (no AMPUP_MEMORY_URL, no CLI context)".into(),
         };
+        let by_default = var("AMPUP_MEMORY_URL").is_none() && ctx_server.is_none();
         let given = var("AMPUP_MEMORY_TOKEN");
         if given.is_some() && var("AMPUP_MEMORY_URL").is_none() {
             eprintln!(
@@ -256,6 +275,7 @@ impl Client {
             team,
             scope: var("AMPUP_MEMORY_SCOPE"),
             from,
+            by_default,
             http: std::sync::OnceLock::new(),
             timeout,
         }
@@ -276,8 +296,19 @@ impl Client {
     /// Whether this calls a team's server with nobody signed in to it: every request would be refused, so the
     /// start says how to sign in rather than the memory going quiet. A server on this machine needs no sign-in.
     fn unsigned_remote(&self) -> bool {
+        matches!(self.auth, Auth::Fixed(None)) && !self.on_this_machine()
+    }
+
+    /// Whether the memory is the local server only because nothing named another: the one a session's start
+    /// starts where nothing answers ([`crate::local::autostart`]). A local URL someone set is theirs to run.
+    fn local_by_default(&self) -> bool {
+        self.by_default && self.url == crate::local::URL
+    }
+
+    /// Whether the server is on this machine (`serve --local`), which needs no sign-in.
+    fn on_this_machine(&self) -> bool {
         let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"];
-        matches!(self.auth, Auth::Fixed(None)) && !local.iter().any(|l| self.url.starts_with(l))
+        local.iter().any(|l| self.url.starts_with(l))
     }
 
     /// Who this client calls as, for `status`: the signed-in user, a given token, or nobody.
@@ -440,6 +471,7 @@ impl Client {
             team: field("team"),
             scope: field("scope"),
             from: "the outbox".into(),
+            by_default: false,
             http: std::sync::OnceLock::new(),
             timeout,
         }
@@ -898,6 +930,21 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
     // harness's budget, too), and a Stop's or a compaction's note and kept conversation, whose commits take
     // seconds. The person at the keyboard should never notice the memory.
     let detached = std::env::var_os(DETACHED).is_some();
+    // A rating the person typed is recorded here and goes no further: the agent never sees it.
+    if event == "prompt"
+        && !detached
+        && matches!(harness, Harness::ClaudeCode | Harness::Codex)
+        && let Some((reward, why)) = typed_rating(prompt_of(&input), quick_rate() != QuickRate::Off)
+    {
+        return rate_typed(&input, harness, reward, &why).await;
+    }
+    // Said to the person, once a session, after a turn of real work: how to rate it.
+    if event == "stop"
+        && !detached
+        && let Some(hint) = rate_hint(&input, harness)
+    {
+        println!("{}", json!({ "systemMessage": hint }));
+    }
     if ["end", "stop", "session-end"].contains(&event)
         && !detached
         && detach(&raw, event, harness).is_ok()
@@ -908,6 +955,9 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
     // once with what copies of it fetched since (the inbox), and its own calls run on in a copy, whose answer the
     // next hook hands on. A slow or down memory costs the person nothing; what a call finds reaches the agent one
     // hook later.
+    // Where the memory is the local server by default, the start starts it when nothing answers there, or says
+    // how to install it.
+    let mut local_note = None;
     if !detached && matches!(event, "session-start" | "prompt" | "pre-tool" | "post-tool") {
         // Nobody signed in to a team's server: every call would be refused, so the start says how to sign in.
         if event == "session-start" {
@@ -915,6 +965,9 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             if client.unsigned_remote() {
                 let hint = sign_in_hint(&client);
                 return say(harness, &input, harness.event(true), &[Some(hint)]);
+            }
+            if client.local_by_default() {
+                local_note = start_local();
             }
         }
         let session = session_of(&input);
@@ -933,7 +986,7 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             // What is on this machine already: a continued session's line and what the memory held about the repo
             // when last asked (a harness with no later hook gets nothing else), the open session's line and what its
             // user asked to be remembered, then the inbox, as much as the context takes.
-            let mut parts = vec![];
+            let mut parts = vec![local_note];
             if event == "session-start" {
                 parts.push(continued(&input));
                 parts.push(
@@ -979,7 +1032,7 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
                 warn(format!("the session's transcript wasn't kept: {e:#}"));
             }
             // The rest of its markers: they outlive a compaction, not the harness session.
-            for kind in ["recalled", "remembered"] {
+            for kind in ["recalled", "remembered", "rated", "ratehint"] {
                 if let Some(m) = marker(kind, session_of(&input)) {
                     let _ = std::fs::remove_file(m);
                 }
@@ -1042,6 +1095,10 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
         "session-start" => {
             if detached {
                 prune_markers();
+                // A server this start (or another session's) is starting: the session opens on it once ready.
+                if client.local_by_default() {
+                    crate::local::wait_for_start(Duration::from_secs(60)).await;
+                }
             }
             // What the memory holds about the repo; outside one, a directory's name finds nothing it's about.
             let repo = git_repo(&input);
@@ -1082,8 +1139,16 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
                 harness,
                 &input,
                 harness.event(true),
-                &[opened, recalled_or_none(recalled)],
-            )
+                &[local_note, opened, recalled_or_none(recalled)],
+            )?;
+            // In the copy, once a day a repository: what it says about its work, for advice from its first session.
+            if detached {
+                match repo_advice::seed(&client, &input).await {
+                    Ok(line) => say(harness, &input, harness.event(true), &[line])?,
+                    Err(e) => warn(format!("the repository's material wasn't sent: {e:#}")),
+                }
+            }
+            Ok(())
         }
         "prompt" => {
             // Masked before it leaves the machine (the server masks again): a key pasted as a prompt reached the
@@ -1291,6 +1356,18 @@ async fn report(client: &Client) -> Result<()> {
             println!("calling as {}", client.caller().await);
             if how != "down" {
                 println!("sign in again: {}", crate::client::sign_in_hint());
+            } else if client.on_this_machine() {
+                let auto = match client.local_by_default() {
+                    true => format!(
+                        "the next session's start starts it in the background (unless {}=0), or ",
+                        crate::local::AUTOSTART_VAR
+                    ),
+                    false => String::new(),
+                };
+                println!(
+                    "start it: {auto}`ampup-memory service install` keeps it running, at login too \
+                     (`ampup-memory service status` says how it is), or `ampup-memory serve --local` in a terminal"
+                );
             }
             return Err(e);
         }
@@ -1712,8 +1789,11 @@ fn marker(kind: &str, session: &str) -> Option<std::path::PathBuf> {
 /// Removes per-session markers a week old: those of harness sessions that never reached their end (killed, or a
 /// harness with no end hook), which would otherwise pile up.
 fn prune_markers() {
-    const KINDS: [&str; 18] = [
+    const KINDS: [&str; 21] = [
         "session",
+        "ended",
+        "rated",
+        "ratehint",
         "advised",
         "asked",
         "from",
@@ -1783,6 +1863,29 @@ fn sign_in_hint(client: &Client) -> String {
         client.url,
         crate::client::sign_in_hint()
     )
+}
+
+/// At a session's start where the memory is the local server by default ([`crate::local::autostart`]): the
+/// session's line where its binary isn't installed, or where it started one: the model it saved, or that it has
+/// none; else nothing. A start that failed is a warning, never in the session's way.
+fn start_local() -> Option<String> {
+    match crate::local::autostart() {
+        Ok(crate::local::Start::NotInstalled) => Some(crate::local::install_hint()),
+        Ok(crate::local::Start::Started(pid, model)) => {
+            eprintln!(
+                "ampup-memory-client: starting the local server on {} in the background (pid {pid}; \
+                 {}=0 turns this off)",
+                crate::local::URL,
+                crate::local::AUTOSTART_VAR
+            );
+            crate::local::started_line(&model)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            warn(format!("the local server wasn't started: {e:#}"));
+            None
+        }
+    }
 }
 
 /// Adds `parts` to the session's context, as the harness takes hook `event`'s output; nothing when all are empty.
@@ -2445,8 +2548,12 @@ async fn end_session(client: &Client, input: &Value, harness: Harness) -> Result
         ended,
     );
     // Gone whether or not the end landed: a session the server refuses to end (ended already) is no longer this
-    // harness session's, and a stale marker would hold up the next one's.
+    // harness session's, and a stale marker would hold up the next one's. Its id stays, for a rating typed after the
+    // conversation resumes ([`rated_session`]).
     forget_session(input);
+    if let Some(m) = marker("ended", session_of(input)) {
+        let _ = write_whole(&m, &id);
+    }
     ended.map(|_| ())
 }
 
@@ -2502,11 +2609,11 @@ fn detach(_: &str, _: &str, _: Harness) -> Result<()> {
 }
 
 /// `memstore hook outcome <good|bad> [why...]` (`/ampup-memory:outcome`): rewards this session's memstore session, +1 or
-/// -1 with the reason given; advice learns from it once the session ends. With no arguments, they are read from
-/// stdin: the command hands over what was typed in a quoted heredoc, since Claude Code puts it into the shell line
-/// as it stands and a quote in it would break the line. The command gets no hook input, so the session is the one
-/// named (Claude Code puts its id into the command), else `CLAUDE_CODE_SESSION_ID`, else the newest one the hooks
-/// opened.
+/// -1 with the reason given, as the person's own rating; advice learns from it once the session ends. With no
+/// arguments, they are read from stdin: the command hands over what was typed in a quoted heredoc, since Claude Code
+/// puts it into the shell line as it stands and a quote in it would break the line. The command gets no hook input,
+/// so the session is the one named (Claude Code puts its id into the command), else `CLAUDE_CODE_SESSION_ID`, else
+/// the newest one the hooks opened.
 pub async fn outcome(session: Option<&str>, args: &[String]) -> Result<()> {
     use std::io::IsTerminal;
     let usage = "ampup-memory-client hook outcome good|bad [why]";
@@ -2517,31 +2624,195 @@ pub async fn outcome(session: Option<&str>, args: &[String]) -> Result<()> {
         args = typed.split_whitespace().map(String::from).collect();
     }
     let (verdict, why) = args.split_first().context(usage)?;
-    let reward = match verdict.to_ascii_lowercase().as_str() {
-        "good" | "+1" | "1" => 1.0,
-        "bad" | "-1" => -1.0,
-        _ => bail!("{usage}, not {verdict:?}"),
+    let reward = verdict_reward(verdict).with_context(|| format!("{usage}, not {verdict:?}"))?;
+    let named = session
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("CLAUDE_CODE_SESSION_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
+    let id = session_here(named.as_deref())?;
+    let client = Client::from_env(Duration::from_secs(30));
+    let line = rate_session(&client, named.as_deref(), &id, reward, &why.join(" ")).await?;
+    println!("{line} ({id})");
+    Ok(())
+}
+
+/// A verdict as `outcome` takes it: good (`+`, `+1`, `1`) is 1, bad (`-`, `-1`) is -1.
+fn verdict_reward(verdict: &str) -> Option<f64> {
+    match verdict.to_ascii_lowercase().as_str() {
+        "good" | "+" | "+1" | "1" => Some(1.0),
+        "bad" | "-" | "-1" => Some(-1.0),
+        _ => None,
+    }
+}
+
+/// `AMPUP_MEMORY_QUICK_RATE`: whether a bare `+` or `-` typed as a prompt rates the session, and whether the person is
+/// told so after a turn of real work.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuickRate {
+    /// Both (the default).
+    On,
+    /// `+` and `-` rate it; nobody is told.
+    Quiet,
+    /// Neither: `+` and `-` go to the agent as any prompt does. The rating commands still rate it.
+    Off,
+}
+
+fn quick_rate() -> QuickRate {
+    match std::env::var("AMPUP_MEMORY_QUICK_RATE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" | "0" | "false" | "no" => QuickRate::Off,
+        "quiet" => QuickRate::Quiet,
+        _ => QuickRate::On,
+    }
+}
+
+/// A rating typed as a prompt, as its reward and the words given with it: a bare `+` or `-` (with `bare`), or one of
+/// the plugin's rating commands as the person typed it (the prompt hook sees a command's line before it expands):
+/// `/ampup-memory:good [why]`, `/ampup-memory:bad [why]` or `/ampup-memory:outcome good|bad [why]`. Anything else is
+/// a prompt. A `+` or `-` with words after it is a prompt too: `- fix the test` is a list of one.
+fn typed_rating(prompt: &str, bare: bool) -> Option<(f64, String)> {
+    let p = prompt.trim();
+    if bare && (p == "+" || p == "-") {
+        return Some((verdict_reward(p)?, String::new()));
+    }
+    let rest = p.strip_prefix("/ampup-memory:")?;
+    let (command, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let (verdict, why) = match command {
+        "good" | "bad" => (command, rest),
+        "outcome" => {
+            let rest = rest.trim();
+            rest.split_once(char::is_whitespace).unwrap_or((rest, ""))
+        }
+        _ => return None,
     };
-    let id = session_here(session)?;
-    let reason = clip(&redact(why.join(" ").trim()), 490);
-    let mut body = json!({"run_id": id, "reward": reward});
+    Some((verdict_reward(verdict)?, why.trim().to_string()))
+}
+
+/// Records a rating the person typed as a prompt ([`typed_rating`]) and blocks the prompt, so it never reaches the
+/// agent: the person sees the line this answers with in its place.
+async fn rate_typed(input: &Value, harness: Harness, reward: f64, why: &str) -> Result<()> {
+    let said = match rated_session(session_of(input)) {
+        None => "AmpUp Memory: no session is open here to rate (/ampup-memory:status says why). Not sent to the \
+                 agent."
+            .to_string(),
+        Some(id) => {
+            let client = Client::from_env(Duration::from_secs(3));
+            match rate_session(&client, Some(session_of(input)), &id, reward, why).await {
+                Ok(line) => format!("{line}. Not sent to the agent; + or - again changes it."),
+                Err(e) => format!("AmpUp Memory: the rating wasn't recorded: {e:#}"),
+            }
+        }
+    };
+    let mut out = json!({"decision": "block", "reason": said});
+    // The block's line, without the prompt it blocked under it (Claude Code adds it by default).
+    if harness == Harness::ClaudeCode {
+        out["hookSpecificOutput"] =
+            json!({"hookEventName": "UserPromptSubmit", "suppressOriginalPrompt": true});
+    }
+    println!("{out}");
+    Ok(())
+}
+
+/// The memstore session a rating in harness session `session` is about: the one open in it, unless nothing was asked
+/// in that one yet and an earlier one of the same conversation ended (`claude --resume`, or `-p` run again on it,
+/// opens a new one): a rating typed first thing after a resume is about the work it resumed.
+fn rated_session(session: &str) -> Option<String> {
+    let read = |kind: &str| {
+        marker(kind, session)
+            .and_then(|m| std::fs::read_to_string(m).ok())
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    };
+    let asked = marker("asked", session).is_some_and(|m| m.exists());
+    match (read("session"), read("ended")) {
+        (Some(open), _) if asked => Some(open),
+        (open, ended) => ended.or(open),
+    }
+}
+
+/// Rewards memstore session `id` with the person's own rating (`by: "person"`): `reward` with the words they gave,
+/// redacted. Marks harness session `session` rated, so it isn't told again how to rate it. A memory out of reach
+/// keeps it in the outbox for a later hook to send. The line that says so.
+async fn rate_session(
+    client: &Client,
+    session: Option<&str>,
+    id: &str,
+    reward: f64,
+    why: &str,
+) -> Result<String> {
+    let reason = clip(&redact(why.trim()), 490);
+    let mut body = json!({"run_id": id, "reward": reward, "by": "person"});
     if !reason.trim().is_empty() {
         body["reason"] = json!(reason.trim());
     }
-    Client::from_env(Duration::from_secs(30))
-        .post("/runs/reward", &body)
-        .await?;
+    let kept = match client.post("/runs/reward", &body).await {
+        Ok(_) => false,
+        Err(e) if worth_retrying(&e) => {
+            client.queue("rate", session.unwrap_or(id), "/runs/reward", body, None);
+            true
+        }
+        Err(e) => return Err(e),
+    };
+    if let Some(m) = session.and_then(|s| marker("rated", s)) {
+        let _ = std::fs::write(m, "");
+    }
+    let verdict = if reward > 0.0 { "good" } else { "bad" };
     let said = match reason.trim() {
         "" => String::new(),
         r => format!(": {r}"),
     };
-    let verdict = if reward > 0.0 { "good" } else { "bad" };
-    println!("AmpUp Memory: rated this session ({id}) {verdict}{said}");
-    Ok(())
+    Ok(match kept {
+        false => format!("AmpUp Memory: rated this session {verdict}{said}"),
+        true => format!(
+            "AmpUp Memory: rated this session {verdict}{said}, kept on this machine until the memory answers"
+        ),
+    })
 }
 
-/// The memstore session `outcome` is about: the named harness session's, else `CLAUDE_CODE_SESSION_ID`'s, else
-/// the one the hooks opened last.
+/// Tool calls a turn makes before the person is told how to rate the session ([`rate_hint`]): a task done, not a
+/// question answered.
+const HINT_CALLS: usize = 5;
+
+/// The line said to the person (not the agent) at a Stop, once a session: how to rate it. Only after a turn that
+/// made [`HINT_CALLS`] tool calls or more, in a session open to rate and not rated yet, where a person is at the
+/// keyboard (not `claude -p` or an SDK) and the harness takes a typed rating (Claude Code, Codex); never with
+/// `AMPUP_MEMORY_QUICK_RATE` `quiet` or `off`.
+fn rate_hint(input: &Value, harness: Harness) -> Option<String> {
+    if !matches!(harness, Harness::ClaudeCode | Harness::Codex)
+        || quick_rate() != QuickRate::On
+        || harness.session_name().ends_with(":sdk")
+        || input["stop_hook_active"].as_bool() == Some(true)
+    {
+        return None;
+    }
+    let session = session_of(input);
+    if marker("rated", session)?.exists() || marker("ratehint", session)?.exists() {
+        return None;
+    }
+    session_id(input)?;
+    if turn_calls(input, harness) < HINT_CALLS || !first("ratehint", session) {
+        return None;
+    }
+    let commands = match harness {
+        Harness::ClaudeCode => " (/ampup-memory:good or :bad to say why)",
+        _ => "",
+    };
+    Some(format!(
+        "AmpUp Memory: did that go well? Type + or - to rate this session{commands}; the team memory learns \
+         most from your rating. It isn't sent to the agent. AMPUP_MEMORY_QUICK_RATE=quiet hides this."
+    ))
+}
+
+/// The memstore session `outcome` is about: the named harness session's ([`rated_session`]), else
+/// `CLAUDE_CODE_SESSION_ID`'s, else the one the hooks opened last.
 fn session_here(named: Option<&str>) -> Result<String> {
     let named = named
         .map(str::to_string)
@@ -2558,8 +2829,8 @@ fn session_here(named: Option<&str>) -> Result<String> {
             .filter(|id| !id.is_empty())
     };
     if let Some(s) = named {
-        let m = marker("session", &s).with_context(|| format!("no session {s:?}"))?;
-        return read(&m).with_context(|| {
+        marker("session", &s).with_context(|| format!("no session {s:?}"))?;
+        return rated_session(&s).with_context(|| {
             format!("AmpUp Memory's hooks opened no session for {s}: is the plugin on in it?")
         });
     }

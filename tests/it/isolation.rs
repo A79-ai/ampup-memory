@@ -1657,13 +1657,23 @@ async fn cross_scope_reads(
                             .unwrap_or_default();
                     // Each hit names its scope when more than one is read, and only then: as before.
                     for h in &hits {
-                        let tag = h["value"].as_str().unwrap_or_default();
-                        let home = tags
+                        // A fact's value is its tag; a note's fact holds the note, its tag first.
+                        let tag = h["value"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or_default();
+                        let mut home = tags
                             .memory
                             .iter()
                             .filter(|(_, t)| t.iter().any(|t| t == tag))
                             .map(|(s, _)| s.clone())
                             .collect::<Vec<_>>();
+                        // Carol's own note, found by her alone (`assert_clean` above): where she wrote it.
+                        if tag == PRIVATE {
+                            home.push("team:acme/a1".to_string());
+                        }
                         match fans {
                             true => assert!(
                                 home.contains(&h["scope"].as_str().unwrap_or_default().to_string()),

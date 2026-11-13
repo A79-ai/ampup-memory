@@ -713,6 +713,16 @@ struct Map {
     /// they pass; every learn decides again, and the notes' documents stay.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     needs_backing: BTreeMap<String, String>,
+    /// Team notes an admin ratified ([`ratify`]): a note's key → the hash of what it was written from when they did
+    /// ([`Map::notes`]). Served to everyone though a learn holds it for backing, until an admin withdraws it. The
+    /// approval is of the note they read: once a learn writes it again from other runs, it is no longer ratified.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    ratified: BTreeMap<String, String>,
+    /// When an admin last changed the map ([`hold`], [`ratify`]), in µs: each change is a version of its own. A
+    /// version's id is its body's, so without it holding, releasing and holding again would write the first
+    /// hold's bytes, the same episode, and the release would stay the newest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    changed_at: Option<i64>,
     /// Situations merged into another as the same task ([`crate::advice_curate`]), by their key: a task sorted
     /// under one again lands in the one it went into, and its note's documents stay.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -720,6 +730,10 @@ struct Map {
     /// The hash of the situations last looked over for duplicates: looked over again only when they change.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     deduped: String,
+    /// Notes written from what a repository says rather than from runs ([`seed`]): a note's key → the repository.
+    /// Learning keeps them while no runs back their situation, and writes them anew from runs once some do.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    seeded: BTreeMap<String, String>,
 }
 
 /// What a note was last written from.
@@ -910,6 +924,32 @@ impl Map {
                     .filter(|(_, sit)| sit.conversation == Some(true))
                     .map(move |(s, _)| key(c, s))
             })
+            .collect()
+    }
+
+    /// The notes held until outcomes or people back them ([`Map::needs_backing`]) and not ratified by an admin
+    /// ([`ratify`]): served to no one.
+    fn unbacked(&self) -> impl Iterator<Item = String> + '_ {
+        self.needs_backing
+            .keys()
+            .filter(|k| !self.ratified.contains_key(*k))
+            .cloned()
+    }
+
+    /// The notes the index serves: none withheld by reward, held by an admin, waiting for backing (unless ratified)
+    /// or of the conversation itself.
+    fn served_notes(&self) -> BTreeSet<String> {
+        let conversation = self.conversation();
+        let unbacked: BTreeSet<String> = self.unbacked().collect();
+        self.notes
+            .keys()
+            .filter(|k| {
+                !self.withheld.contains_key(*k)
+                    && !self.held.contains(*k)
+                    && !unbacked.contains(*k)
+                    && !conversation.contains(*k)
+            })
+            .cloned()
             .collect()
     }
 }
@@ -1412,11 +1452,23 @@ async fn runs_and_overrides(
                 }
                 (_, Some(r), _) if reviewed => (r, Source::Person, l.reward_reason),
                 (Some("run"), Some(r), _) if !judged => (r, Source::Outcome, l.reward_reason),
-                (_, _, Some(rating)) => (
-                    if rating == "helpful" { 1.0 } else { -1.0 },
-                    Source::Person,
-                    Some(format!("the person rated it {}", rating.replace('_', " "))),
-                ),
+                (_, _, Some(rating)) => {
+                    // The words they rated it with (`reward_run` with `by: "person"`), where they gave some.
+                    let why = l
+                        .reward_reason
+                        .as_deref()
+                        .filter(|w| !judged && !w.starts_with(crate::qa_log::REVIEWED))
+                        .map(|w| format!(": {w}"))
+                        .unwrap_or_default();
+                    (
+                        if rating == "helpful" { 1.0 } else { -1.0 },
+                        Source::Person,
+                        Some(format!(
+                            "the person rated it {}{why}",
+                            rating.replace('_', " ")
+                        )),
+                    )
+                }
                 (_, Some(r), _) => (r, Source::Judge, l.reward_reason),
                 (_, None, None) => (-1.0, Source::Judge, l.reward_reason),
             };
@@ -1586,6 +1638,25 @@ async fn read_map(
         .and_then(|(_, _, b)| serde_json::from_slice(&b).ok()))
 }
 
+/// Where each run of `space`'s map was sorted, as `who` may read the map: run id → its situation's key (without the
+/// `mine:` tag). Empty when there is no map they may read.
+pub(crate) async fn assigned(
+    session: &Session,
+    store: &Store,
+    who: &Principal,
+    space: &Space,
+) -> Result<BTreeMap<String, String>> {
+    Ok(read_map(session, store, who, space)
+        .await?
+        .map(|m| {
+            m.assign
+                .into_iter()
+                .map(|(run, (c, s))| (run, key(&c, &s)))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// The notes of `map` served to no one now: those an admin held ([`hold`]), those of situations whose task is the
 /// conversation itself ([`Situation::conversation`]), and those withheld by reward ([`crate::advice_curate`]), which
 /// only while `scope` curates advice, so turning curation off serves them again.
@@ -1594,7 +1665,7 @@ async fn withheld(store: &Store, scope: &Scope, map: Option<&Map>) -> BTreeSet<S
         return BTreeSet::new();
     };
     let mut out = m.held.clone();
-    out.extend(m.needs_backing.keys().cloned());
+    out.extend(m.unbacked());
     out.extend(m.conversation());
     if !m.withheld.is_empty() && curate::on(store, scope).await {
         out.extend(m.withheld.keys().cloned());
@@ -1613,32 +1684,62 @@ pub async fn hold(
     keys: &BTreeSet<String>,
     hold: bool,
 ) -> Result<BTreeSet<String>> {
-    let space = Space::team();
     let mut map = map_to_hold(store, scope, acl, keys).await?;
     for k in keys {
         match hold {
             true => map.held.insert(k.clone()),
             false => map.held.remove(k),
         };
+        // Held from everyone is no longer ratified for everyone.
+        if hold {
+            map.ratified.remove(k);
+        }
     }
+    write_admin_map(store, scope, &mut map, "advice:hold").await?;
+    Ok(map.held)
+}
+
+/// Ratifies the team notes `keys` of `scope` (`ratify`), or withdraws it: an admin's word that a note is right for
+/// the team, so it is served to everyone though a learn holds it until outcomes or people back it
+/// ([`Map::needs_backing`]); a held note is released. As [`hold`] reads and writes it, under the scope's learn claim.
+/// The notes ratified after.
+pub async fn ratify(
+    store: &Store,
+    scope: &Scope,
+    acl: &[String],
+    keys: &BTreeSet<String>,
+    ratify: bool,
+) -> Result<BTreeSet<String>> {
+    let mut map = map_to_hold(store, scope, acl, keys).await?;
+    for k in keys {
+        if ratify {
+            if let Some(from) = map.notes.get(k) {
+                map.ratified.insert(k.clone(), from.clone());
+            }
+            map.held.remove(k);
+        } else {
+            map.ratified.remove(k);
+        }
+    }
+    write_admin_map(store, scope, &mut map, "advice:ratify").await?;
+    Ok(map.ratified.into_keys().collect())
+}
+
+/// Writes the team map an admin changed ([`hold`], [`ratify`]) and its index of the notes served now.
+async fn write_admin_map(store: &Store, scope: &Scope, map: &mut Map, actor: &str) -> Result<()> {
+    map.changed_at = Some(crate::now_micros());
+    let map = &*map;
+    let space = Space::team();
     let entries: Vec<&str> = map.acl.iter().map(String::as_str).collect();
-    let conversation = map.conversation();
-    let with_note: BTreeSet<String> = map
-        .notes
-        .keys()
-        .filter(|k| {
-            !map.withheld.contains_key(*k) && !map.held.contains(*k) && !conversation.contains(*k)
-        })
-        .cloned()
-        .collect();
+    let served = map.served_notes();
     let docs = vec![
-        Episode::sourced(&space.source, index(&map, &with_note).as_bytes(), &entries)
+        Episode::sourced(&space.source, index(map, &served).as_bytes(), &entries)
             .version_of(&space.index()),
-        Episode::sourced(&space.source, &serde_json::to_vec_pretty(&map)?, &entries)
+        Episode::sourced(&space.source, &serde_json::to_vec_pretty(map)?, &entries)
             .version_of(&space.map()),
     ];
-    store.commit(scope, "advice:hold", &docs, &[]).await?;
-    Ok(map.held)
+    store.commit(scope, actor, &docs, &[]).await?;
+    Ok(())
 }
 
 /// Refused unless `scope`'s team notes, as the audience `acl` reads them, hold a note for each of `keys`: what
@@ -1688,8 +1789,11 @@ pub(crate) struct Listed {
     pub withheld: Option<curate::Utility>,
     /// Whether an admin held its note back from everyone ([`hold`]).
     pub held: bool,
-    /// Why its note is served to no one until outcomes or people back it ([`backing`]), when it is.
+    /// Why its note is served to no one until outcomes or people back it ([`backing`]), when it is: none once an
+    /// admin ratified it.
     pub needs_backing: Option<String>,
+    /// Whether an admin ratified its note ([`ratify`]).
+    pub approved: bool,
     /// Whether its task is the conversation itself, so the team serves it no note ([`Situation::conversation`]).
     pub conversation: bool,
     /// The situation it was merged into as the same task, when it was ([`crate::advice_curate`]): listed for its
@@ -1900,8 +2004,15 @@ pub async fn trail(
             if m.held.contains(k) {
                 v["held"] = json!(true);
             }
-            if let Some(why) = m.needs_backing.get(k) {
+            if let Some(why) = m
+                .needs_backing
+                .get(k)
+                .filter(|_| !m.ratified.contains_key(k))
+            {
                 v["needs_backing"] = json!(why);
+            }
+            if m.ratified.contains_key(k) {
+                v["approved"] = json!(true);
             }
         }
     }
@@ -1915,7 +2026,7 @@ pub async fn trail(
             e["value"] = json!(t.value(bar));
             e["checked_value"] = json!(t.checked_value());
             e["proven"] = json!(t.proven());
-            e["ratified"] = json!(t.ratified(bar));
+            e["ratified"] = json!(t.ratified(bar) || m.ratified.contains_key(k));
             v["evidence"] = e;
         }
     }
@@ -1938,6 +2049,118 @@ pub async fn trail(
         json!({"notes": notes.into_values().collect::<Vec<_>>(), "map": true, "evidence_bar": bar,
               "proof_sessions": crate::sessions::proof_sessions()}),
     )
+}
+
+/// The most sessions [`usage`] lists for one note.
+const USAGE_SESSIONS: usize = 500;
+
+/// How a session went, as the advice page shows it: by what the person said (their rating, their next messages, what
+/// became of their PRs: [`crate::sessions::checked_outcome`]), else by the session judge, else unknown.
+fn session_outcome(l: &crate::qa_log::Logged) -> (Option<bool>, Option<&'static str>) {
+    if let Some(ok) = crate::sessions::checked_outcome(l) {
+        return (Some(ok), Some("person"));
+    }
+    let judged = l
+        .session
+        .as_ref()
+        .and_then(|s| s.verdicts.as_deref())
+        .and_then(|v| serde_json::from_str::<Value>(v).ok());
+    match judged.as_ref().and_then(|v| v["outcome"].as_str()) {
+        Some("succeeded") => (Some(true), Some("judge")),
+        Some("failed") => (Some(false), Some("judge")),
+        _ => (None, None),
+    }
+}
+
+/// The team's advice as the advice page reads it (`/browse {op: "advice_usage"}`): each note `who` may read, how many
+/// people's sessions since `since` (µs) it was served in across the scope, how many of them went well or wrong
+/// ([`session_outcome`]), whether it is ratified (by its evidence, or by an admin: [`ratify`]), and the sessions
+/// themselves: everyone's where `every` (the org's admins, where the org shows people's activity), else only
+/// `who`'s own. Counts are the scope's for everyone; no one else's session, question or name is in them. Programs'
+/// sessions ([`crate::sessions::automated`]) are left out.
+pub async fn usage(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    every: bool,
+    since: i64,
+) -> Result<Value> {
+    let session = store.pin(scope, crate::MAIN).await?;
+    let space = Space::team();
+    let Some(m) = read_map(&session, store, who, &space).await? else {
+        return Ok(json!({"advice": [], "every": every}));
+    };
+    let bar = crate::sessions::evidence_bar(store, scope).await?;
+    let tallies = crate::sessions::evidence(store, scope).await?;
+    let log = crate::qa_log::list(store, scope, None).await?;
+    let conversation = m.conversation();
+    let mut out = vec![];
+    for (c, cat) in &m.categories {
+        for (s, sit) in &cat.situations {
+            let k = key(c, s);
+            if !m.notes.contains_key(&k) || conversation.contains(&k) {
+                continue;
+            }
+            let Some((note_id, learned_at, body)) =
+                session.document(store, who, &space.note(&k), None).await?
+            else {
+                continue;
+            };
+            let (mut used, mut ok, mut bad, mut last) = (0usize, 0usize, 0usize, None::<i64>);
+            let mut people: BTreeSet<&str> = BTreeSet::new();
+            let mut sessions = vec![];
+            for l in &log {
+                let Some(part) = l.session.as_ref() else {
+                    continue;
+                };
+                if l.asked_at < since || crate::sessions::automated(l) || !part.served.contains(&k)
+                {
+                    continue;
+                }
+                let (went, by) = session_outcome(l);
+                used += 1;
+                people.insert(&l.asker);
+                // When others last used it is theirs: a member hears only when they did.
+                if every || l.asker == who.user() {
+                    last = last.max(Some(l.asked_at));
+                }
+                match went {
+                    Some(true) => ok += 1,
+                    Some(false) => bad += 1,
+                    None => {}
+                }
+                if (every || l.asker == who.user()) && sessions.len() < USAGE_SESSIONS {
+                    let mut e = json!({"id": l.answer_id, "question": l.question, "at": l.asked_at,
+                                       "went_well": went, "by": by});
+                    if every {
+                        e["user"] = json!(l.asker);
+                    }
+                    sessions.push(e);
+                }
+            }
+            sessions.sort_by_key(|e| std::cmp::Reverse(e["at"].as_i64()));
+            let approved = m.ratified.contains_key(&k);
+            let earned = tallies.get(&k).is_some_and(|t| t.ratified(bar));
+            let mut v = json!({"key": k, "category": c, "situation": s, "when": sit.when,
+                "note_id": note_id, "learned_at": learned_at, "text": String::from_utf8_lossy(&body),
+                "used": used, "people": people.len(), "went_well": ok, "went_wrong": bad,
+                "no_outcome": used - ok - bad, "last_used_at": last,
+                "ratified": earned || approved, "approved": approved, "sessions": sessions});
+            if m.held.contains(&k) {
+                v["held"] = json!(true);
+            } else if let Some(why) = m.needs_backing.get(&k).filter(|_| !approved) {
+                v["needs_backing"] = json!(why);
+            }
+            out.push(v);
+        }
+    }
+    out.sort_by(|a, b| {
+        b["used"]
+            .as_u64()
+            .cmp(&a["used"].as_u64())
+            .then_with(|| a["key"].as_str().cmp(&b["key"].as_str()))
+    });
+    Ok(json!({"advice": out, "every": every, "since": since}))
 }
 
 /// Every situation `space`'s map holds that `who` may read the map of, each with its note when `who` may read
@@ -1982,7 +2205,12 @@ pub(crate) async fn listed(
                     .then(|| map.withheld.get(&k).cloned())
                     .flatten(),
                 held: map.held.contains(&k),
-                needs_backing: map.needs_backing.get(&k).cloned(),
+                needs_backing: map
+                    .needs_backing
+                    .get(&k)
+                    .filter(|_| !map.ratified.contains_key(&k))
+                    .cloned(),
+                approved: map.ratified.contains_key(&k),
                 conversation: sit.conversation == Some(true),
                 merged_into: None,
             });
@@ -2005,11 +2233,27 @@ pub(crate) async fn listed(
             withheld: None,
             held: false,
             needs_backing: None,
+            approved: false,
             conversation: false,
             merged_into: Some(format!("{}{}", space.tag(), m.into)),
         });
     }
     Ok(out)
+}
+
+/// A note's items of its Steps, Pitfalls and Verification sections, in order: (section, the item's first line as an
+/// agent is served it).
+pub(crate) fn note_items(note: &str) -> Vec<(String, String)> {
+    let items = std::cell::RefCell::new(vec![]);
+    map_items(note, |section, item| {
+        let first = curate::without_ids(item.lines().next().unwrap_or_default());
+        let text = item_text(&first).unwrap_or(&first).trim().to_string();
+        if !text.is_empty() {
+            items.borrow_mut().push((section.to_string(), text));
+        }
+        Some(item.to_string())
+    });
+    items.into_inner()
 }
 
 /// One reader holding exactly an ACL's entries: it sees what that audience sees.
@@ -3613,6 +3857,137 @@ fn index(map: &Map, with_note: &BTreeSet<String>) -> String {
     out
 }
 
+/// The repositories whose notes `space` holds now ([`seed`]), as `acl` reads it.
+pub async fn seeded_repos(
+    store: &Store,
+    scope: &Scope,
+    space: &Space,
+    acl: &[String],
+) -> Result<BTreeSet<String>> {
+    let session = store.pin(scope, crate::MAIN).await?;
+    let own: Vec<String> = space.audience().into_iter().collect();
+    let asked = if own.is_empty() { acl } else { &own };
+    Ok(read_map(&session, store, &reader(asked), space)
+        .await?
+        .map(|m| {
+            m.seeded
+                .iter()
+                .filter(|(k, _)| m.notes.contains_key(*k))
+                .map(|(_, r)| r.clone())
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// A note written from what a repository says ([`crate::repo_advice`]), for one kind of task.
+pub struct Seeded {
+    pub category: String,
+    /// The category's description, where the map has none for it yet.
+    pub about: String,
+    pub situation: String,
+    pub when: String,
+    /// The note, in the sections a learned note has (`## When`, `## Steps`, `## Pitfalls`, …).
+    pub note: String,
+}
+
+/// Writes `notes`, written from what `repo` says, into `space` in `scope` for the audience `acl` (an existing
+/// map's own audience wins, so learning never clears them for another): each one's situation goes into the map
+/// (its `when` kept where the map has it already), and its note in as a new version, stamped and curbed as a
+/// learned note is, and marked seeded ([`Map::seeded`]). A situation whose note was learned from runs keeps that
+/// note; a note `repo` seeded before and doesn't now is taken out. Answers the notes written.
+pub async fn seed(
+    store: &Store,
+    scope: &Scope,
+    space: &Space,
+    acl: &[String],
+    repo: &str,
+    notes: &[Seeded],
+) -> Result<usize> {
+    let session = store.pin(scope, crate::MAIN).await?;
+    let own: Vec<String> = space.audience().into_iter().collect();
+    let asked = if own.is_empty() { acl } else { &own };
+    let mut map = read_map(&session, store, &reader(asked), space)
+        .await?
+        .unwrap_or_default();
+    if map.acl.is_empty() {
+        let mut a = asked.to_vec();
+        a.sort();
+        map.acl = a;
+    }
+    let acl = map.acl.clone();
+    let entries: Vec<&str> = acl.iter().map(String::as_str).collect();
+    let today = chrono::Utc::now().date_naive();
+    let mut docs = vec![];
+    let mut now = BTreeSet::new();
+    for n in notes {
+        let k = key(&n.category, &n.situation);
+        if slug(&n.category).is_empty() || slug(&n.situation).is_empty() {
+            continue;
+        }
+        if map.notes.contains_key(&k) && !map.seeded.contains_key(&k) {
+            continue;
+        }
+        let cat = map.categories.entry(n.category.clone()).or_default();
+        if cat.description.trim().is_empty() {
+            cat.description = n.about.clone();
+        }
+        let sit = cat.situations.entry(n.situation.clone()).or_default();
+        if sit.when.trim().is_empty() {
+            sit.when = n.when.clone();
+        }
+        let text = stamp_ids(&n.note, &k);
+        let (text, _) = curb(
+            &text,
+            &format!("{}{k}", space.tag()),
+            &BTreeMap::new(),
+            today,
+            true,
+        );
+        docs.push(
+            Episode::sourced(&space.source, text.as_bytes(), &entries).version_of(&space.note(&k)),
+        );
+        map.notes.insert(k.clone(), short_hash(&[&text]));
+        map.seeded.insert(k.clone(), repo.to_string());
+        now.insert(k);
+    }
+    // What this repository seeded before and doesn't now: its note goes, and its situation too unless runs are in it.
+    let gone: Vec<String> = map
+        .seeded
+        .iter()
+        .filter(|(k, r)| r.as_str() == repo && !now.contains(*k))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let assigned: BTreeSet<String> = map.assign.values().map(|(c, s)| key(c, s)).collect();
+    for k in &gone {
+        map.seeded.remove(k);
+        map.notes.remove(k);
+    }
+    for (c, cat) in map.categories.iter_mut() {
+        cat.situations.retain(|s, _| {
+            let k = key(c, s);
+            !gone.contains(&k) || assigned.contains(&k)
+        });
+    }
+    map.categories.retain(|_, cat| !cat.situations.is_empty());
+    let held = withheld(store, scope, Some(&map)).await;
+    let with_note: BTreeSet<String> = map
+        .notes
+        .keys()
+        .filter(|k| !held.contains(*k) && !map.needs_backing.contains_key(*k))
+        .cloned()
+        .collect();
+    docs.push(
+        Episode::sourced(&space.source, index(&map, &with_note).as_bytes(), &entries)
+            .version_of(&space.index()),
+    );
+    docs.push(
+        Episode::sourced(&space.source, &serde_json::to_vec_pretty(&map)?, &entries)
+            .version_of(&space.map()),
+    );
+    store.commit(scope, "advice:seed", &docs, &[]).await?;
+    Ok(now.len())
+}
+
 /// Learns the scope's advice from its rewarded runs, for the audience `acl`; a situation gets a note once at
 /// least `min_wrong` of its runs went wrong, or [`min_right`] went right.
 pub async fn learn(
@@ -3711,11 +4086,32 @@ async fn learn_space(
     if pass.resort {
         // What curation decided stays: a note withheld for scoring worse isn't served again for being re-sorted, and
         // a situation merged into another still lands there.
+        // So do the notes a repository seeded, with their situations: no run sorts them back.
+        let mut categories: BTreeMap<String, Category> = BTreeMap::new();
+        for (c, cat) in &map.categories {
+            for (s, sit) in &cat.situations {
+                if map.seeded.contains_key(&key(c, s)) {
+                    let to = categories.entry(c.clone()).or_default();
+                    to.description = cat.description.clone();
+                    to.situations.insert(s.clone(), sit.clone());
+                }
+            }
+        }
+        let notes = map
+            .notes
+            .iter()
+            .filter(|(k, _)| map.seeded.contains_key(*k))
+            .map(|(k, h)| (k.clone(), h.clone()))
+            .collect();
         map = Map {
             acl: map.acl,
             withheld: map.withheld,
             held: map.held,
+            ratified: map.ratified,
             merged: map.merged,
+            categories,
+            notes,
+            seeded: map.seeded,
             ..Map::default()
         };
     }
@@ -4002,11 +4398,17 @@ async fn learn_space(
     // A note kept only while its situation may hold one: a situation that lost its runs or its people
     // (forgotten, retracted), or has none left, is taken out of the map, so no note outlives what it was written from.
     // A note held for backing stays, served to no one ([`withheld`]), so it comes back once its runs are backed.
-    let keep = |k: &String| eligible.contains(k) || needs_backing.contains_key(k);
+    // A note a repository seeded stays while no runs back its situation ([`seed`]).
+    let seeded = map.seeded.clone();
+    let keep = |k: &String| {
+        eligible.contains(k) || needs_backing.contains_key(k) || seeded.contains_key(k)
+    };
     map.notes.retain(|k, _| keep(k));
     map.written.retain(|k, _| keep(k));
     map.withheld.retain(|k, _| keep(k));
     map.needs_backing = needs_backing;
+    let notes = &map.notes;
+    map.ratified.retain(|k, from| notes.get(k) == Some(from));
     // The futures are made here, not in a stream's closure: a closure over borrowed runs would keep the
     // server's spawned learning from being `Send`. Each counts its own call's tokens, apart from the others'.
     // Long runs are read whole by the router's model, a chat model, before a note is written from them ([`reflect`]).
@@ -4226,19 +4628,11 @@ async fn learn_space(
             );
         }
     }
+    // A seeded note learning wrote again from runs is theirs now: a repository's next seed leaves it be.
+    map.seeded.retain(|k, _| !stamped.contains(k));
     // Notes of situations the map no longer has, withheld or held ones and the conversation's, are left out of the
     // index (their documents stay, unread).
-    let with_note: BTreeSet<String> = map
-        .notes
-        .keys()
-        .filter(|k| {
-            !map.withheld.contains_key(*k)
-                && !map.held.contains(*k)
-                && !map.needs_backing.contains_key(*k)
-                && !conversation.contains(*k)
-        })
-        .cloned()
-        .collect();
+    let with_note = map.served_notes();
     docs.push(
         Episode::sourced(&space.source, index(&map, &with_note).as_bytes(), &entries)
             .version_of(&space.index()),
@@ -5343,10 +5737,14 @@ fn learned_skill(
     let w = map.written.get(key);
     Some(Skill {
         key: key.to_string(),
-        origin: Origin::Runs {
-            runs: w.map(|w| w.runs),
-            right: w.map(|w| w.runs.saturating_sub(w.wrong)),
-            wrong: w.map(|w| w.wrong),
+        // A note a repository seeded ([`seed`]) was written from its documents, not from runs.
+        origin: match map.seeded.contains_key(key) {
+            true => Origin::Documents,
+            false => Origin::Runs {
+                runs: w.map(|w| w.runs),
+                right: w.map(|w| w.runs.saturating_sub(w.wrong)),
+                wrong: w.map(|w| w.wrong),
+            },
         },
         version,
         written_at: crate::audit::rfc3339(at),

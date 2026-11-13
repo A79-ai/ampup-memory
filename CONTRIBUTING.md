@@ -39,8 +39,14 @@ work is yours to license.
 
 ## What you need
 
-- **macOS on Apple Silicon, or Linux on x86_64 or arm64.** Intel Macs and Windows aren't supported: the ONNX
-  Runtime library the local embedding model runs on (the `ort` crate) has no prebuilt build for them.
+- **macOS (Apple Silicon or Intel), or Linux on x86_64 or arm64.** Windows isn't supported. On an Intel Mac, the
+  ONNX Runtime library the local embedding model runs on has no prebuilt build for the `ort` crate to download:
+  build it first (a few minutes, once) and point the build at it:
+
+  ```bash
+  .github/scripts/onnxruntime-x86_64-apple-darwin.sh ~/.cache/onnxruntime-x86_64
+  export ORT_LIB_LOCATION=~/.cache/onnxruntime-x86_64 MACOSX_DEPLOYMENT_TARGET=13.4
+  ```
 - **Rust through [rustup](https://rustup.rs).** `rust-toolchain.toml` pins the toolchain (with rustfmt and
   clippy), and rustup installs it on the first `cargo` command.
 - **protoc**, the Protocol Buffers compiler (`brew install protobuf`, `apt install protobuf-compiler`).
@@ -175,5 +181,5 @@ is carried over by hand, so it may land as a slightly different change; the main
 ## Releases
 
 Maintainers release by pushing a tag: `v*` for the server and CLI, `client-v*` for ampup-memory-client alone. The
-release workflow (`.github/workflows/release.yml`) builds Linux x86_64, Linux arm64 and Apple Silicon macOS
+release workflow (`.github/workflows/release.yml`) builds Linux x86_64, Linux arm64, Apple Silicon and Intel macOS
 binaries, publishes them to this repository's GitHub Releases, and installs them with `install.sh` to check them.

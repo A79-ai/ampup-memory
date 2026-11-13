@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
-# Installs AmpUp Memory's CLI (`ampup-memory`) from A79-ai/ampup-memory's GitHub releases, for this machine (Apple
-# Silicon macOS, or Linux on arm64 or x86_64). The repository is public: no GitHub account, CLI or sign-in is needed,
-# only curl (or wget) and tar.
+# Installs AmpUp Memory's CLI (`ampup-memory`) from A79-ai/ampup-memory's GitHub releases, for this machine (macOS
+# on Apple Silicon or Intel, or Linux on arm64 or x86_64). The repository is public: no GitHub account, CLI or sign-in
+# is needed, only curl (or wget) and tar.
 #
 #   curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/install.sh | sh
 #
@@ -37,14 +37,10 @@ case "$(uname -m)" in
   x86_64 | amd64) arch=x86_64 ;;
   *) echo "ampup-memory builds for arm64 and x86_64 only, not $(uname -m)" >&2; exit 1 ;;
 esac
-if [ "$os" = apple-darwin ] && [ "$arch" = x86_64 ]; then
-  # A shell under Rosetta reports x86_64 on Apple Silicon; the arm64 build runs there natively.
-  if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then
-    arch=aarch64
-  else
-    echo "ampup-memory builds for Apple Silicon Macs only: onnxruntime, which it embeds with, has no prebuilt Intel macOS library" >&2
-    exit 1
-  fi
+# A shell under Rosetta reports x86_64 on Apple Silicon, where the arm64 build runs natively; an Intel Mac gets the
+# x86_64 build.
+if [ "$os" = apple-darwin ] && [ "$arch" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then
+  arch=aarch64
 fi
 # The archive by its name since the rename, and by the one a release before it gave it.
 case "$kind" in

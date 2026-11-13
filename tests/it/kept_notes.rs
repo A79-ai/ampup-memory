@@ -874,7 +874,7 @@ async fn preferences_are_kept_from_what_people_type() {
         }
     }
 
-    // Her Explorer files her notes under her name, by category and topic, titled, and her sessions by day.
+    // Her Explorer lists her notes as their facts, titled, no folders; her sessions by day.
     let names = |v: &Value| -> Vec<String> {
         v["children"]
             .as_array()
@@ -884,24 +884,24 @@ async fn preferences_are_kept_from_what_people_type() {
             .collect()
     };
     let notes = rig.browse(&carol, json!(["notes"])).await;
-    assert_eq!(names(&notes), ["carol@acme.com"], "{notes}");
-    let mine = rig.browse(&carol, json!(["notes", "carol@acme.com"])).await;
-    let mine = names(&mine);
-    assert!(
-        mine.iter().any(|n| n == "tooling") && mine.iter().any(|n| n == "version-control"),
-        "{mine:?}"
-    );
-    let at = json!(["notes", "carol@acme.com", "tooling", "versions"]);
-    let leaf = rig.browse(&carol, at.clone()).await;
-    assert_eq!(
-        leaf["children"][0]["title"], "Pin exact dependency versions, never caret ranges.",
-        "{leaf}"
-    );
-    // Clicking it opens the note.
-    let note = leaf["children"][0]["episode_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let pinned = notes["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|c| c["title"] == "Pin exact dependency versions, never caret ranges.")
+        .unwrap_or_else(|| panic!("her kept note isn't listed: {notes}"))
+        .clone();
+    assert!(pinned["fact_id"].is_string(), "{pinned}");
+    let (status, _) = post(
+        &format!("{}/browse", rig.s),
+        &carol,
+        &[("x-memstore-org", "acme")],
+        &json!({"op": "ls", "path": ["notes", "carol@acme.com"]}),
+    )
+    .await;
+    assert_eq!(status, 404, "notes are filed under a person's name again");
+    // Clicking it opens the note, under `notes`, with its fact.
+    let note = pinned["episode_id"].as_str().unwrap().to_string();
     let (status, read) = rig.read(&carol, &note).await;
     assert_eq!(status, 200, "{read}");
     assert!(
@@ -910,28 +910,42 @@ async fn preferences_are_kept_from_what_people_type() {
             .is_some_and(|b| b.contains("Pin exact")),
         "{read}"
     );
+    assert_eq!(read["path"], json!(["notes"]), "{read}");
+    assert!(
+        read["facts"]
+            .as_array()
+            .is_some_and(|f| f.iter().any(|f| f["predicate"] == "note")),
+        "{read}"
+    );
     let ended = rig.browse(&carol, json!(["sessions", "ended"])).await;
     assert!(
         ended["children"].as_array().is_some_and(|d| !d.is_empty()),
         "{ended}"
     );
 
-    // Alice, the org's admin, finds carol's notes under carol's name and opens them; never her sessions.
+    // Her notes are hers alone: Alice, the org's admin, with the org showing its people's activity, finds none
+    // of them, can't open one, and finds none of their facts; nor her sessions.
     let alice = rig.token("alice@acme.com");
+    rig.admin(json!({"op": "set_settings", "org": "acme", "settings": {"activity": true}}))
+        .await;
     let theirs = rig.browse(&alice, json!(["notes"])).await;
     assert!(
-        names(&theirs).contains(&"carol@acme.com".to_string()),
-        "{theirs}"
+        !names(&theirs).contains(&pinned["name"].as_str().unwrap().to_string()),
+        "alice lists carol's note: {theirs}"
     );
-    let leaf = rig.browse(&alice, at.clone()).await;
-    assert_eq!(leaf["children"][0]["episode_id"], note.as_str(), "{leaf}");
     let (status, read) = rig.read(&alice, &note).await;
-    assert_eq!(status, 200, "{read}");
+    assert_eq!(status, 404, "alice opens carol's note: {read}");
+    let (status, facts) = post(
+        &format!("{}/browse", rig.s),
+        &alice,
+        &[("x-memstore-org", "acme")],
+        &json!({"op": "facts", "limit": 500}),
+    )
+    .await;
+    assert_eq!(status, 200, "{facts}");
     assert!(
-        read["body"]
-            .as_str()
-            .is_some_and(|b| b.contains("Pin exact")),
-        "{read}"
+        !facts.to_string().contains("Pin exact"),
+        "alice reads carol's note's fact: {facts}"
     );
     let sessions = rig.browse(&alice, json!(["sessions"])).await;
     assert!(
@@ -939,15 +953,17 @@ async fn preferences_are_kept_from_what_people_type() {
         "alice reads carol's sessions: {sessions}"
     );
 
-    // Dave, a member who isn't an admin, finds none of carol's notes and can't open one.
+    // Nor Dave, a member who isn't an admin, nor a service key.
     rig.admin(json!({"op": "invite", "org": "acme", "members": [{"user": "dave@acme.com"}]}))
         .await;
     let dave = rig.token("dave@acme.com");
     let his = rig.browse(&dave, json!(["notes"])).await;
-    assert!(names(&his).is_empty(), "dave reads carol's notes: {his}");
+    assert!(
+        !names(&his).contains(&pinned["name"].as_str().unwrap().to_string()),
+        "dave reads carol's notes: {his}"
+    );
     let (status, read) = rig.read(&dave, &note).await;
     assert_eq!(status, 404, "dave opens carol's note: {read}");
-    // Nor does a service key.
     let (status, read) = post(
         &format!("{}/browse", rig.s),
         &rig.writer,
@@ -957,34 +973,18 @@ async fn preferences_are_kept_from_what_people_type() {
     .await;
     assert_ne!(status, 200, "a writer key opens carol's note: {read}");
 
-    // A note carol forgets is gone for alice too.
+    // A note carol forgets is gone from her notes, its fact with it.
     let (said, failed) = rig
         .tool(&carol, None, "forget_memory", json!({"episode_id": note}))
         .await;
     assert!(!failed, "{said}");
-    let leaf = rig
-        .browse(&alice, json!(["notes", "carol@acme.com", "tooling"]))
-        .await;
+    let mine = rig.browse(&carol, json!(["notes"])).await;
     assert!(
-        !names(&leaf).contains(&"versions".to_string()),
-        "alice lists carol's forgotten note: {leaf}"
+        !names(&mine).contains(&pinned["name"].as_str().unwrap().to_string()),
+        "carol lists her forgotten note: {mine}"
     );
-    let (status, read) = rig.read(&alice, &note).await;
-    assert_eq!(status, 404, "alice opens carol's forgotten note: {read}");
-
-    // An org that keeps each person's activity to themselves keeps their notes from its admins too.
-    rig.admin(json!({"op": "set_settings", "org": "acme", "settings": {"activity": false}}))
-        .await;
-    let theirs = rig.browse(&alice, json!(["notes"])).await;
-    assert!(
-        !names(&theirs).contains(&"carol@acme.com".to_string()),
-        "{theirs}"
-    );
-    let (status, read) = rig.read(&alice, &note).await;
-    assert_eq!(
-        status, 404,
-        "alice opens carol's note with activity off: {read}"
-    );
+    let (status, read) = rig.read(&carol, &note).await;
+    assert_eq!(status, 404, "carol opens her forgotten note: {read}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1077,6 +1077,47 @@ async fn advice_learns_from_each_graded_request_and_hands_its_preferences() {
         !text.contains(LEARNED),
         "carol's advice handed to alice: {text}"
     );
+
+    // What it learned (`/lessons`): carol reads her own lesson with the session it came from; alice, the org's
+    // admin, reads it too; dave, a member, neither finds it nor may ask for it.
+    let lessons = |bearer: String, req: Value| {
+        let url = format!("{}/lessons", rig.s);
+        async move { post(&url, &bearer, &[("x-memstore-org", "acme")], &req).await }
+    };
+    let from_her_session = |v: &Value| {
+        v["lessons"].as_array().into_iter().flatten().any(|l| {
+            l["owner"] == "carol@acme.com"
+                && l["learned_from"]["trail"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|e| e["id"] == id.as_str() && e["question"].as_str().is_some())
+        })
+    };
+    let (status, hers) = lessons(carol.clone(), json!({})).await;
+    assert_eq!(status, 200, "{hers}");
+    assert!(from_her_session(&hers), "carol's own lesson: {hers}");
+    let (status, admin) = lessons(rig.token("alice@acme.com"), json!({})).await;
+    assert_eq!(status, 200, "{admin}");
+    assert!(
+        from_her_session(&admin),
+        "alice reads carol's lesson: {admin}"
+    );
+    rig.admin(json!({"op": "invite", "org": "acme", "members": [{"user": "dave@acme.com"}]}))
+        .await;
+    let dave = rig.token("dave@acme.com");
+    let (status, his) = lessons(dave.clone(), json!({})).await;
+    assert_eq!(status, 200, "{his}");
+    assert!(
+        !his["lessons"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|l| l["owner"] == "carol@acme.com"),
+        "dave reads carol's lesson: {his}"
+    );
+    let (status, his) = lessons(dave, json!({"person": "carol@acme.com"})).await;
+    assert_eq!(status, 400, "dave asks for carol's lessons: {his}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

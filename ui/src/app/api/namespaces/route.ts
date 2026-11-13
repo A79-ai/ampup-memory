@@ -22,7 +22,7 @@ export async function GET(req: Request) {
       if (r.ok) list.push(...(v.namespaces as Namespace[]));
       else error = `Kubernetes namespaces: ${v.error ?? r.status}`;
     }
-    return Response.json({ hosted: true, namespaces: list, error });
+    return Response.json({ hosted: true, local: m.local, namespaces: list, error });
   }
   try {
     return Response.json({ hosted: false, namespaces: await namespaces() });

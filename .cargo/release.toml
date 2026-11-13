@@ -1,0 +1,88 @@
+# How a release is built: what .github/workflows/release.yml adds to the release profile, so the ampup-memory
+# binary fits a PyPI wheel (PyPI takes no file over 100 MiB).
+#
+#   cargo build --release --config .cargo/release.toml --bin ampup-memory
+#
+# Not in Cargo.toml's release profile, because staging deploys, the Docker image and Tilt build that profile too, and
+# they rebuild often: with fat LTO every change relinks the whole server on one core, for many minutes.
+#
+# What each setting does to the aarch64-apple-darwin server (stripped; tar.gz):
+#   release profile alone                       282 MB; 107 MB
+#   + fat LTO, one codegen unit                 177 MB;  75 MB  each generic function once, not once per crate
+#   + dependencies at opt-level "s", but the    144 MB;  62 MB  (every dependency at "s": 118 MB; 51 MB, and vector
+#     ones below at 3                                            math 5x slower)
+# ONNX Runtime, linked statically by ort, is 18 MB of it (7 MB compressed).
+#
+# opt-level "s" turns off LLVM's loop vectorizer, and the vector math is written for it: Lance's L2 distance over
+# 100,000 vectors of 384 dimensions takes 16 ms at "s" against 3 ms at 3. So the code that does numeric work per row
+# stays at 3: this workspace's own crates (and with them the LTO pass, which runs at the binary crate's level), Lance's
+# and Arrow's kernels and encodings, the local embedder's tokenizer and arrays, compression and the allocator. The rest
+# (DataFusion's SQL front end, the cloud SDKs and object stores, Iceberg, HTTP, TLS, serde) is glue, where size wins.
+#
+# Panics stay unwinding (no panic = "abort", which would drop __eh_frame and __gcc_except_tab): each connection is a
+# task of its own (src/server/mod.rs), and a request that panics must end that connection, not the server.
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[profile.release.package."*"]
+opt-level = "s"
+
+# Vector distances (flat search over unindexed rows, k-means) and the vector index.
+[profile.release.package.lance-linalg]
+opt-level = 3
+[profile.release.package.lance-index]
+opt-level = 3
+# Lance's columnar encodings, read on every scan.
+[profile.release.package.lance-arrow]
+opt-level = 3
+[profile.release.package.lance-bitpacking]
+opt-level = 3
+[profile.release.package.lance-encoding]
+opt-level = 3
+[profile.release.package.lance-file]
+opt-level = 3
+[profile.release.package.lance-core]
+opt-level = 3
+[profile.release.package.fsst]
+opt-level = 3
+# Arrow's arrays and compute kernels (filters, comparisons, casts, sorts) under every query.
+[profile.release.package.arrow-array]
+opt-level = 3
+[profile.release.package.arrow-buffer]
+opt-level = 3
+[profile.release.package.arrow-data]
+opt-level = 3
+[profile.release.package.arrow-arith]
+opt-level = 3
+[profile.release.package.arrow-ord]
+opt-level = 3
+[profile.release.package.arrow-select]
+opt-level = 3
+[profile.release.package.arrow-cast]
+opt-level = 3
+[profile.release.package.arrow-string]
+opt-level = 3
+[profile.release.package.arrow-row]
+opt-level = 3
+# The local embedder around ONNX Runtime (which is prebuilt, so none of this touches it): tokenizing and pooling.
+[profile.release.package.fastembed]
+opt-level = 3
+[profile.release.package.tokenizers]
+opt-level = 3
+[profile.release.package.ndarray]
+opt-level = 3
+[profile.release.package.half]
+opt-level = 3
+[profile.release.package.roaring]
+opt-level = 3
+# C built by build scripts at the package's level: compression and the allocator.
+[profile.release.package.zstd-sys]
+opt-level = 3
+[profile.release.package.lz4-sys]
+opt-level = 3
+[profile.release.package.lz4_flex]
+opt-level = 3
+[profile.release.package.tikv-jemalloc-sys]
+opt-level = 3

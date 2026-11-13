@@ -628,6 +628,21 @@ fn put(store: &Store, scope: &Scope, actor: &str, l: Logged) {
     hold(&mut buffer, store, scope, actor, l);
 }
 
+/// Holds the rewards `rows` carry (each a session's row with its new reward, reason and rating,
+/// [`crate::qa_log::reward_all`]) on their sessions as they stand now: a step held since the rows were read keeps
+/// its own row and takes the reward onto it, so neither undoes the other. Ended or open, a session takes it.
+pub(crate) fn rated(store: &Store, scope: &Scope, actor: &str, rows: Vec<Logged>) {
+    let mut buffer = BUFFER.lock().unwrap();
+    for r in rows {
+        let mut l = match buffer.get(&key(store, scope, &r.answer_id)) {
+            Some(h) if !(ended_final(&r) && !ended_final(&h.l)) => h.l.clone(),
+            _ => r.clone(),
+        };
+        (l.reward, l.reward_reason, l.rating) = (r.reward, r.reward_reason, r.rating);
+        hold(&mut buffer, store, scope, actor, l);
+    }
+}
+
 /// Names session `l`'s task `question`, its first ask, if it has none: a session a harness's start hook opened
 /// before anything was asked, most of which are left open and end idle, with no end to name it.
 pub fn name_task(store: &Store, scope: &Scope, who: &Principal, l: &mut Logged, question: &str) {
