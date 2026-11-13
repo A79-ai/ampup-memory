@@ -6870,9 +6870,26 @@ async fn handle(
                 json!({"scopes": scopes, "scope": scope.to_string()}),
             ));
         }
+        // Every person's notes, not only the caller's own: an org's admins (and the operator) on the org's own
+        // memory, never a service key or in a team's (isolated from its org's admins), and only where the org shows
+        // its people's activity, as Studio's activity does.
+        let every_note = via.key.is_none()
+            && matches!(scope, Scope::Org | Scope::NamedOrg(_))
+            && match scope.org_name() {
+                Some(org) => Box::pin(crate::people::directory::Directory::load(&store))
+                    .await
+                    .is_ok_and(|d| {
+                        d.shows_activity(org) && (superuser || d.is_admin(who.user(), &via, org))
+                    }),
+                None => false,
+            };
+        let reader = crate::browse::Reader {
+            who: &who,
+            every_note,
+        };
         // Boxed: browse's future is large, and inline it would grow the handler's for every request.
         return Ok(
-            match Box::pin(crate::browse::run(&store, &session, &who, &req)).await {
+            match Box::pin(crate::browse::run(&store, &session, reader, &req)).await {
                 Ok(v) => {
                     crate::usage::METER.op(crate::usage::Op::Read, who.user());
                     reply(StatusCode::OK, v)

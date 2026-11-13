@@ -5,9 +5,11 @@
 //! - `skills/<slug>`: the skills compiled from the scope's documents (`crate::compile`), there only when the
 //!   caller may read one on the branch read. The folder lists the routing index and each skill with when it
 //!   applies; a skill reads as its markdown with its AIP step graph.
-//! - `notes/…`: the caller's own notes: the preferences AmpUp Memory kept from what they typed, by
-//!   `<category>/<topic>` (`crate::keep`), `unfiled` what it kept before it filed notes, `remembered` what they
-//!   asked to be remembered, and `team` what it shared with everyone once enough people said the same.
+//! - `notes/…`: each person's notes under their name, `notes/<user>/…`: the preferences AmpUp Memory kept from
+//!   what they typed, by `<category>/<topic>` (`crate::keep`), `unfiled` what it kept before it filed notes,
+//!   `remembered` what they asked to be remembered; and `notes/team` what it shared with everyone once enough
+//!   people said the same. A member finds only their own name there; an org's admins (see [`Reader`]) find
+//!   everyone's, and open any of them.
 //! - `advice/<team|mine>/<category>/<situation>`: the advice the caller may read (`crate::listing::advice`), each a
 //!   note to read in full.
 //! - `sessions/…`: the caller's own sessions: `ended/<day>` their records (what facts are extracted from) and
@@ -79,8 +81,22 @@ impl Ep {
     }
 }
 
-/// Answers one `/browse` request as `who`.
-pub async fn run(store: &Store, session: &Session, who: &Principal, req: &Value) -> Result<Value> {
+/// Who is browsing: the caller, and whether they read every person's notes, not only their own (an org's admins
+/// and the operator, on the org's own memory, where the org shows its people's activity: the server decides).
+#[derive(Clone, Copy)]
+pub struct Reader<'a> {
+    pub who: &'a Principal,
+    pub every_note: bool,
+}
+
+/// Answers one `/browse` request as `reader`.
+pub async fn run(
+    store: &Store,
+    session: &Session,
+    reader: Reader<'_>,
+    req: &Value,
+) -> Result<Value> {
+    let who = reader.who;
     match req["op"].as_str().unwrap_or("ls") {
         // The filterable lists (`crate::listing`): `/facts/list` and `/advice/list` are these ops.
         "facts" => crate::listing::facts(store, session, who, req).await,
@@ -100,14 +116,14 @@ pub async fn run(store: &Store, session: &Session, who: &Principal, req: &Value)
                 .map_or(LIMIT, |n| n as usize)
                 .clamp(1, MAX_LIMIT);
             let after = req["after"].as_str();
-            ls(store, session, who, &path, limit, after).await
+            ls(store, session, reader, &path, limit, after).await
         }
         "episode" => {
             let id = req["id"]
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| bad("episode needs an id"))?;
-            episode(store, session, who, id).await
+            episode(store, session, reader, id).await
         }
         "branches" => branches(store, session.scope(), who).await,
         // The schema the memory is typed with on the branch read, and every version committed there (oldest
@@ -143,11 +159,12 @@ async fn branches(store: &Store, scope: &Scope, who: &Principal) -> Result<Value
 async fn ls(
     store: &Store,
     session: &Session,
-    who: &Principal,
+    reader: Reader<'_>,
     path: &[String],
     limit: usize,
     after: Option<&str>,
 ) -> Result<Value> {
+    let who = reader.who;
     let page = |mut children: Vec<Value>| {
         children.retain(|c| after.is_none_or(|a| c["name"].as_str().unwrap_or_default() > a));
         let more = children.len() > limit;
@@ -157,13 +174,16 @@ async fn ls(
     };
     match path.first().map(String::as_str) {
         None => {
-            let (eps, facts) =
-                tokio::try_join!(episodes(store, session, who), facts(store, session, who))?;
+            let (eps, notes, facts) = tokio::try_join!(
+                episodes(store, session, who),
+                note_episodes(store, session, reader),
+                facts(store, session, who)
+            )?;
             let entities = by_entity(&facts).len();
             let skills = skill_keys(session, who).len();
             let (notes, sessions) = (
-                filed(&eps, who, Tree::Notes).len(),
-                filed(&eps, who, Tree::Sessions).len(),
+                filed(&notes, reader, Tree::Notes).len(),
+                filed(&eps, reader, Tree::Sessions).len(),
             );
             let advice = advice(store, session, who).await?.len();
             let mut children = vec![
@@ -185,8 +205,11 @@ async fn ls(
             } else {
                 Tree::Sessions
             };
-            let eps = episodes(store, session, who).await?;
-            let leaves = filed(&eps, who, tree);
+            let eps = match tree {
+                Tree::Notes => note_episodes(store, session, reader).await?,
+                Tree::Sessions => episodes(store, session, who).await?,
+            };
+            let leaves = filed(&eps, reader, tree);
             let children = folder(path, &leaves)?;
             titled(store, session.scope(), tree, page(children)).await
         }
@@ -350,23 +373,42 @@ async fn ls(
     }
 }
 
-async fn episode(store: &Store, session: &Session, who: &Principal, id: &str) -> Result<Value> {
+async fn episode(store: &Store, session: &Session, reader: Reader<'_>, id: &str) -> Result<Value> {
+    let who = reader.who;
     // The facts citing it: those whose sources name it (a scan of that one column), then exactly.
     let cites_it = Filter::Contains(Col::Sources, id.to_string());
     let citing = session.read_where(store, who, &cites_it, None);
-    let (eps, facts) = tokio::try_join!(episodes(store, session, who), citing)?;
+    let (eps, facts) = tokio::try_join!(note_episodes(store, session, reader), citing)?;
     let facts = once_each(facts);
     let Some(e) = eps.iter().find(|e| e.id == id) else {
         return Err(NotFound.into());
     };
-    // Read with the caller's own access, again: an ACL change since the listing hides it.
-    let Some(body) = session.episode_body(store, who, id).await? else {
+    // Read with the caller's own access, again: an ACL change since the listing hides it. Another person's note
+    // an admin opens is theirs to read whatever its ACL ([`Reader`]), and nothing else is.
+    let body = if session.vis().can_see_episode(id, who) {
+        session.episode_body(store, who, id).await?
+    } else if reader.every_note && person_note(&e.source) && !session.vis().is_gone(id) {
+        store
+            .episode_bodies(session.scope(), vec![id.to_string()])
+            .await?
+            .remove(id)
+    } else {
+        None
+    };
+    let Some(body) = body else {
         return Err(NotFound.into());
     };
     let truncated = body.len() > BODY_BYTES;
     let text = String::from_utf8_lossy(&body[..body.len().min(BODY_BYTES)]).into_owned();
-    let mut path = vec!["sources".to_string()];
-    path.extend(e.segments().into_iter().map(String::from));
+    // Where the Explorer lists it: a note in its writer's folder under `notes/` (where an admin reading someone
+    // else's finds it too), anything else under `sources/`.
+    let path = match filed(std::slice::from_ref(e), reader, Tree::Notes).pop() {
+        Some((at, _)) => std::iter::once("notes".to_string()).chain(at).collect(),
+        None => std::iter::once("sources")
+            .chain(e.segments())
+            .map(String::from)
+            .collect::<Vec<_>>(),
+    };
     let cites: Vec<Value> = facts
         .iter()
         .filter(|f| f.source_episodes.iter().any(|s| s == id))
@@ -562,25 +604,55 @@ enum Tree {
     Sessions,
 }
 
-/// The caller's own episodes in `tree`, each with the folders it is filed under (below the tree's root).
-fn filed<'a>(eps: &'a [Ep], who: &Principal, tree: Tree) -> Vec<(Vec<String>, &'a Ep)> {
-    let me = who.user();
+/// Whether `source` is a person's note: what an admin may open of someone else's. Only what the server kept from
+/// what they typed, and what they asked to be remembered under a plain source (a hook's session note, its
+/// transcript, a session's record or a run's trace each name more than one segment); never the team's shared
+/// notes, which everyone reads anyway.
+fn person_note(source: &str) -> bool {
+    crate::profile::author_of(source).is_some_and(|(author, rest)| {
+        author != crate::keep::SHARER
+            && (crate::keep::is_kept(rest)
+                || (!rest.contains(':') && crate::profile::is_note(rest)))
+    })
+}
+
+/// The episodes `notes/` is filed from: those the caller may read, and for a reader of every note
+/// ([`Reader::every_note`]) every person's notes too.
+async fn note_episodes(store: &Store, session: &Session, reader: Reader<'_>) -> Result<Vec<Ep>> {
+    let also = |source: &str| reader.every_note && person_note(source);
+    episodes_where(store, session, reader.who, also).await
+}
+
+/// The episodes in `tree` the reader is shown, each with the folders it is filed under (below the tree's root):
+/// their own sessions; their own notes under their name, or everyone's for a reader of every note.
+fn filed<'a>(eps: &'a [Ep], reader: Reader<'_>, tree: Tree) -> Vec<(Vec<String>, &'a Ep)> {
+    let me = reader.who.user();
     eps.iter()
         .filter_map(|e| {
             let (author, rest) = crate::profile::author_of(&e.source)?;
             let shared = author == crate::keep::SHARER && rest == "shared";
-            if !shared && !author.eq_ignore_ascii_case(me) {
+            let mine = author.eq_ignore_ascii_case(me);
+            let theirs = tree == Tree::Notes && reader.every_note && person_note(&e.source);
+            if !shared && !mine && !theirs {
                 return None;
             }
+            // A person's notes are under their name, as they sign in (the same person in any case is one).
+            let name = || {
+                if mine {
+                    me.to_string()
+                } else {
+                    author.to_lowercase()
+                }
+            };
             let at: Vec<String> = match tree {
                 Tree::Notes if shared => vec!["team".into()],
                 Tree::Notes if crate::keep::is_kept(rest) => {
                     match rest.splitn(3, ':').collect::<Vec<_>>()[..] {
-                        [_, category, topic] => vec![category.into(), topic.into()],
-                        _ => vec!["unfiled".into()],
+                        [_, category, topic] => vec![name(), category.into(), topic.into()],
+                        _ => vec![name(), "unfiled".into()],
                     }
                 }
-                Tree::Notes if crate::profile::is_note(rest) => vec!["remembered".into()],
+                Tree::Notes if crate::profile::is_note(rest) => vec![name(), "remembered".into()],
                 Tree::Sessions
                     if crate::session_record_source(&e.source).is_some()
                         || rest.starts_with("session:") =>
@@ -680,6 +752,16 @@ async fn titled(store: &Store, scope: &Scope, tree: Tree, mut listed: Value) -> 
 
 /// Every committed episode the session sees that the caller may read, once each.
 pub(crate) async fn episodes(store: &Store, session: &Session, who: &Principal) -> Result<Vec<Ep>> {
+    episodes_where(store, session, who, |_| false).await
+}
+
+/// Every committed episode the session sees that the caller may read, or whose source `also` admits, once each.
+async fn episodes_where(
+    store: &Store,
+    session: &Session,
+    who: &Principal,
+    also: impl Fn(&str) -> bool,
+) -> Result<Vec<Ep>> {
     let vis = session.vis();
     let mut out: BTreeMap<String, Ep> = BTreeMap::new();
     for bs in store.episode_files(session.scope()).await?.values() {
@@ -692,7 +774,11 @@ pub(crate) async fn episodes(store: &Store, session: &Session, who: &Principal) 
             let at = crate::timestamps(b, "occurred_at");
             let about = crate::optional_strings(b, "about");
             for i in 0..b.num_rows() {
-                if !vis.committed.contains(&commit[i]) || !vis.can_see_episode(&id[i], who) {
+                if !vis.committed.contains(&commit[i])
+                    // What `also` admits past its ACL, never once it is gone (forgotten only re-ACLs it).
+                    || !(vis.can_see_episode(&id[i], who)
+                        || (also(&source[i]) && !vis.is_gone(&id[i])))
+                {
                     continue;
                 }
                 out.entry(id[i].clone()).or_insert_with(|| Ep {
