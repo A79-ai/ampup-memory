@@ -185,10 +185,28 @@ fn negations(w: &[String]) -> Vec<usize> {
     (0..w.len())
         .filter(|&i| {
             let t = w[i].as_str();
-            (NONE.contains(&t) && !(t == "no" && w.get(i + 1).is_some_and(|n| n == "longer")))
-                || (t == "not" && i > 0 && NOT_AFTER.contains(&w[i - 1].as_str()))
+            ((NONE.contains(&t) && !(t == "no" && w.get(i + 1).is_some_and(|n| n == "longer")))
+                || (t == "not" && i > 0 && NOT_AFTER.contains(&w[i - 1].as_str())))
+                // `was not stalled`, `never stopped`: a negated stall says things kept arriving.
+                && !w[i + 1..].iter().take(2).any(|n| STALL.contains(&n.as_str()))
         })
         .collect()
+}
+
+/// Words that say something stalled or stopped, which a negation just before turns into its opposite.
+const STALL: [&str; 4] = ["stalled", "stalling", "halted", "stopped"];
+/// Words just before a stall that negate it (`was not stalled`, `never stopped`, `isn't stalling`).
+const UNSAID: [&str; 12] = [
+    "not", "never", "isn't", "wasn't", "weren't", "aren't", "hasn't", "haven't", "hadn't",
+    "didn't", "hardly", "barely",
+];
+
+/// Whether the stall word at `i` is negated: one of [`UNSAID`] in the two words before it, or `no longer` just
+/// before it (`ingestion was not stalled`, `never actually stopped`, `is no longer stalled`).
+fn unsaid(w: &[String], i: usize) -> bool {
+    let before = &w[i.saturating_sub(2)..i];
+    before.iter().any(|b| UNSAID.contains(&b.as_str()))
+        || (i >= 2 && w[i - 2] == "no" && w[i - 1] == "longer")
 }
 
 /// Whether `w` names a period (`since`, `anymore`, `in the last 3 hours`).
@@ -218,10 +236,14 @@ fn none_arrived(w: &[String], negs: &[usize]) -> bool {
     })
 }
 
-/// Whether `w` says something stalled or stopped (`stalled`, `stopped arriving`, `went quiet`).
+/// Whether `w` says something stalled or stopped (`stalled`, `stopped arriving`, `went quiet`), not negated
+/// ([`unsaid`]: `was not stalled` says things kept arriving).
 fn stalled(w: &[String]) -> bool {
     w.iter().enumerate().any(|(i, t)| {
         let next = w.get(i + 1).map(String::as_str);
+        if unsaid(w, i) {
+            return false;
+        }
         match t.as_str() {
             "stalled" | "stalling" | "halted" => true,
             "stopped" => next.is_none_or(|n| STOPPED.contains(&n) || n == "since"),
