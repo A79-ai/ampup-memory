@@ -95,7 +95,7 @@ def main() -> None:
             # A regular file's type bits too: pip marks a script executable only when they say it is one.
             info.external_attr = (0o100000 | mode) << 16
             info.compress_type = zipfile.ZIP_DEFLATED
-            # The most deflate gives: the server's wheel is ~85 MiB, against PyPI's 100 MiB file limit.
+            # The most deflate gives: the server's wheel is ~65 MiB, against PyPI's 100 MiB file limit.
             z.writestr(info, data, compresslevel=9)
     print(path)
 

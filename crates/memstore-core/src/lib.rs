@@ -307,8 +307,8 @@ impl std::fmt::Display for Scope {
 }
 
 pub use memstore_client::{check_name, naming};
+pub use retry::is_transient;
 pub(crate) use retry::with_retries;
-pub use retry::{is_transient, wait_hint};
 
 /// Who is reading. Groups come from the customer's IdP (SCIM); the engine defines none. They are the
 /// caller's closure: every team, role, account and channel they hold, already flattened.

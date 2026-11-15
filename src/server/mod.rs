@@ -5833,30 +5833,13 @@ async fn handle(
                         ),
                         // A request no one could make as it is (a value out of range, a name that can't be
                         // one): the caller fixes the request, so it says what is wrong, and refuses no one.
-                        // Before the busy check, which reads the error's text, and this echoes the request.
-                        None if let Some(bad) =
-                            e.downcast_ref::<crate::people::directory::Invalid>() =>
-                        {
-                            reply(StatusCode::BAD_REQUEST, json!({"error": bad.0}))
-                        }
-                        // The catalog or the object store refused for load (BigLake's 429, a 503): refused no
-                        // one, so not audited as a refusal, and asked again after the wait the upstream named.
-                        None if memstore_core::is_transient(&e) => {
-                            let message = match e.downcast_ref::<crate::people::directory::Busy>() {
-                                Some(b) => b.0.clone(),
-                                None => "the catalog is busy: try again shortly".into(),
-                            };
-                            let mut r =
-                                reply(StatusCode::SERVICE_UNAVAILABLE, json!({"error": message}));
-                            let wait = memstore_core::wait_hint(&e).as_secs().max(1);
-                            r.headers_mut()
-                                .insert(hyper::header::RETRY_AFTER, wait.into());
-                            r
-                        }
-                        None => reply(
-                            StatusCode::BAD_REQUEST,
-                            json!({"error": "bad request or change failed"}),
-                        ),
+                        None => match e.downcast_ref::<crate::people::directory::Invalid>() {
+                            Some(bad) => reply(StatusCode::BAD_REQUEST, json!({"error": bad.0})),
+                            None => reply(
+                                StatusCode::BAD_REQUEST,
+                                json!({"error": "bad request or change failed"}),
+                            ),
+                        },
                     }
                 }
             },
