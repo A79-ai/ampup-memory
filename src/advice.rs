@@ -30,13 +30,14 @@
 //!
 //! **What backs a team note.** A reward is only as sure as where it came from ([`Source`]): what happened (a
 //! recorder's own reward: a PR's fate, a verifier), then the person (their rating, or their next message, which
-//! accepted the work or corrected it), then a model's reading of the transcript (the judge's), which is context and
-//! never evidence. A situation gets a team note only once outcomes or people back it ([`backing`]): a failure they
-//! showed, against a success they showed, or successes they showed from two people; and its backed runs come from
-//! the people bar's worth of people. A note that falls short is held, served to no one, and written again once it
-//! passes. Each lesson must cite backed runs of enough people, and a pitfall a backed failure ([`backed_only`]). On
-//! one production org, 192 of the 436 runs behind its 31 notes were the judge's alone, which said 4% of sessions
-//! failed where people corrected the agent in twice as many; 16 notes had never seen a failure.
+//! accepted the work or corrected it), then a model's reading of the transcript (the judge's). A situation gets a
+//! team note once its runs come from the people bar's worth of people, whatever rewarded them, and the note is
+//! served; each lesson must cite runs of that many people, and a pitfall a run that went wrong ([`gated`]). Outcomes
+//! and people decide only whether the note is **ratified** ([`backing`]): a failure they showed, against a success
+//! they showed, or successes they showed from two people, from the people bar's worth of people, and a step of the
+//! note resting on such runs. Until then it is listed as not ratified, with why ([`Map::needs_backing`]), and
+//! served all the same. Holding such notes back left most kinds of task with no team note: on one production org
+//! the judge alone rewarded most runs, and the note most used there went dark once a rewrite kept no backed step.
 //!
 //! **No goal is read.** What success means comes from the runs' rewards and their reasons, never from a goal's
 //! statement: no prompt here (sorting, linking, writing a note) is shown the scope's goals. On τ²-bench banking,
@@ -708,14 +709,15 @@ struct Map {
     /// learn and resort keeps the hold, and the notes' documents stay.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     held: BTreeSet<String>,
-    /// Team notes held until outcomes or people back them ([`backing`]): a note's key → why. Their runs still meet
-    /// the people bar, but too few rest on more than a model's reading. Served to no one, and written again only once
-    /// they pass; every learn decides again, and the notes' documents stay.
+    /// Team notes not ratified for want of backing ([`backing`]): a note's key → why. Their runs meet the people bar,
+    /// but too few rest on more than a model's reading, or the note's last rewrite kept no step that does
+    /// ([`REWRITE_UNBACKED`]). Served as every note is: backing marks a note ratified, it never holds one back. Every
+    /// learn decides again. (The field's name is from when it held a note back.)
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     needs_backing: BTreeMap<String, String>,
     /// Team notes an admin ratified ([`ratify`]): a note's key → the hash of what it was written from when they did
-    /// ([`Map::notes`]). Served to everyone though a learn holds it for backing, until an admin withdraws it. The
-    /// approval is of the note they read: once a learn writes it again from other runs, it is no longer ratified.
+    /// ([`Map::notes`]). Ratified whatever its backing and evidence, until an admin withdraws it. The approval is of
+    /// the note they read: once a learn writes it again from other runs, it is no longer ratified.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     ratified: BTreeMap<String, String>,
     /// When an admin last changed the map ([`hold`], [`ratify`]), in µs: each change is a version of its own. A
@@ -927,26 +929,30 @@ impl Map {
             .collect()
     }
 
-    /// The notes held until outcomes or people back them ([`Map::needs_backing`]) and not ratified by an admin
-    /// ([`ratify`]): served to no one.
-    fn unbacked(&self) -> impl Iterator<Item = String> + '_ {
+    /// Why team note `k` isn't ratified for want of backing ([`Map::needs_backing`]), when it isn't and no admin
+    /// ratified it ([`ratify`]). Reported only: the note is served either way.
+    fn unbacked(&self, k: &str) -> Option<String> {
+        if self.ratified.contains_key(k) {
+            return None;
+        }
+        // A reason kept before backing stopped holding notes back said the note "isn't served": said as it is now.
         self.needs_backing
-            .keys()
-            .filter(|k| !self.ratified.contains_key(*k))
-            .cloned()
+            .get(k)
+            .map(|why| match rewrite_unbacked(why) {
+                true => REWRITE_UNBACKED.to_string(),
+                false => why.clone(),
+            })
     }
 
-    /// The notes the index serves: none withheld by reward, held by an admin, waiting for backing (unless ratified)
-    /// or of the conversation itself.
+    /// The notes the index serves: none withheld by reward, held by an admin or of the conversation itself. A note
+    /// whose runs aren't backed is served too ([`Map::needs_backing`]: it isn't ratified).
     fn served_notes(&self) -> BTreeSet<String> {
         let conversation = self.conversation();
-        let unbacked: BTreeSet<String> = self.unbacked().collect();
         self.notes
             .keys()
             .filter(|k| {
                 !self.withheld.contains_key(*k)
                     && !self.held.contains(*k)
-                    && !unbacked.contains(*k)
                     && !conversation.contains(*k)
             })
             .cloned()
@@ -1070,14 +1076,17 @@ pub struct Learned {
     /// A note written here is curbed as it is written (to [`NOTE_BUDGET`] too), and counted in `notes`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub curbed: usize,
-    /// Situations whose note, written again, held no lesson resting on enough people: they have none now.
+    /// Situations whose note, written again, held no lesson resting on enough people: a new one has none, and one
+    /// that had a note keeps serving it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unbacked: usize,
-    /// Situations whose runs back a note: by an outcome or a person, not a model's reading alone ([`backing`]).
+    /// Situations whose runs, from enough people, may hold a note, whatever rewarded them.
     pub eligible: usize,
-    /// Team notes held until outcomes or people back them: kept, served to no one ([`Map::needs_backing`]).
+    /// Team notes that outcomes or people don't back yet, so they aren't ratified ([`Map::needs_backing`]); served
+    /// all the same.
     pub needs_backing: usize,
-    /// Runs read whose reward rests only on a model's reading (the judge's): context for a note, never its evidence.
+    /// Runs read whose reward rests only on a model's reading (the judge's): they count toward a note and its people,
+    /// never toward its ratification.
     pub judge_only: usize,
     /// Sessions whose person's next moves overruled the judge's reading of them.
     pub overridden: usize,
@@ -1665,7 +1674,6 @@ async fn withheld(store: &Store, scope: &Scope, map: Option<&Map>) -> BTreeSet<S
         return BTreeSet::new();
     };
     let mut out = m.held.clone();
-    out.extend(m.unbacked());
     out.extend(m.conversation());
     if !m.withheld.is_empty() && curate::on(store, scope).await {
         out.extend(m.withheld.keys().cloned());
@@ -1700,9 +1708,9 @@ pub async fn hold(
 }
 
 /// Ratifies the team notes `keys` of `scope` (`ratify`), or withdraws it: an admin's word that a note is right for
-/// the team, so it is served to everyone though a learn holds it until outcomes or people back it
-/// ([`Map::needs_backing`]); a held note is released. As [`hold`] reads and writes it, under the scope's learn claim.
-/// The notes ratified after.
+/// the team, so it is reported ratified though outcomes or people don't back it yet ([`Map::needs_backing`]) or its
+/// evidence is short of the bar ([`team_ratified`]); a held note is released. As [`hold`] reads and writes it, under
+/// the scope's learn claim. The notes ratified after.
 pub async fn ratify(
     store: &Store,
     scope: &Scope,
@@ -1771,6 +1779,13 @@ async fn map_to_hold(
     Ok(map)
 }
 
+/// Whether a team note is ratified: an admin ratified it ([`ratify`]), or outcomes or people back its runs (it isn't
+/// `unbacked`: [`Map::needs_backing`]) and its judged sessions pass the scope's evidence bar (`earned`:
+/// [`crate::sessions::Tally::ratified`]). Reported only: every note is served, ratified or not.
+pub(crate) fn team_ratified(approved: bool, unbacked: bool, earned: bool) -> bool {
+    approved || (!unbacked && earned)
+}
+
 /// One situation of a space's map, as a listing shows it.
 pub(crate) struct Listed {
     /// As a session is served it: `<category>/<situation>`, `mine:`-prefixed in a person's own space.
@@ -1789,8 +1804,8 @@ pub(crate) struct Listed {
     pub withheld: Option<curate::Utility>,
     /// Whether an admin held its note back from everyone ([`hold`]).
     pub held: bool,
-    /// Why its note is served to no one until outcomes or people back it ([`backing`]), when it is: none once an
-    /// admin ratified it.
+    /// Why its note isn't ratified for want of backing ([`backing`]), when it isn't: none once an admin ratified it.
+    /// The note is served either way.
     pub needs_backing: Option<String>,
     /// Whether an admin ratified its note ([`ratify`]).
     pub approved: bool,
@@ -2004,11 +2019,7 @@ pub async fn trail(
             if m.held.contains(k) {
                 v["held"] = json!(true);
             }
-            if let Some(why) = m
-                .needs_backing
-                .get(k)
-                .filter(|_| !m.ratified.contains_key(k))
-            {
+            if let Some(why) = m.unbacked(k) {
                 v["needs_backing"] = json!(why);
             }
             if m.ratified.contains_key(k) {
@@ -2026,7 +2037,11 @@ pub async fn trail(
             e["value"] = json!(t.value(bar));
             e["checked_value"] = json!(t.checked_value());
             e["proven"] = json!(t.proven());
-            e["ratified"] = json!(t.ratified(bar) || m.ratified.contains_key(k));
+            e["ratified"] = json!(team_ratified(
+                m.ratified.contains_key(k),
+                m.unbacked(k).is_some(),
+                t.ratified(bar)
+            ));
             v["evidence"] = e;
         }
     }
@@ -2140,15 +2155,19 @@ pub async fn usage(
             }
             sessions.sort_by_key(|e| std::cmp::Reverse(e["at"].as_i64()));
             let approved = m.ratified.contains_key(&k);
-            let earned = tallies.get(&k).is_some_and(|t| t.ratified(bar));
+            // A note no judged session used yet has an empty tally: past a bar of 0, as `list_advice` reads it.
+            let earned = tallies.get(&k).cloned().unwrap_or_default().ratified(bar);
+            let unbacked = m.unbacked(&k);
             let mut v = json!({"key": k, "category": c, "situation": s, "when": sit.when,
                 "note_id": note_id, "learned_at": learned_at, "text": String::from_utf8_lossy(&body),
                 "used": used, "people": people.len(), "went_well": ok, "went_wrong": bad,
                 "no_outcome": used - ok - bad, "last_used_at": last,
-                "ratified": earned || approved, "approved": approved, "sessions": sessions});
+                "ratified": team_ratified(approved, unbacked.is_some(), earned), "approved": approved,
+                "sessions": sessions});
             if m.held.contains(&k) {
                 v["held"] = json!(true);
-            } else if let Some(why) = m.needs_backing.get(&k).filter(|_| !approved) {
+            }
+            if let Some(why) = unbacked {
                 v["needs_backing"] = json!(why);
             }
             out.push(v);
@@ -2205,11 +2224,7 @@ pub(crate) async fn listed(
                     .then(|| map.withheld.get(&k).cloned())
                     .flatten(),
                 held: map.held.contains(&k),
-                needs_backing: map
-                    .needs_backing
-                    .get(&k)
-                    .filter(|_| !map.ratified.contains_key(&k))
-                    .cloned(),
+                needs_backing: map.unbacked(&k),
                 approved: map.ratified.contains_key(&k),
                 conversation: sit.conversation == Some(true),
                 merged_into: None,
@@ -2712,7 +2727,7 @@ fn note_runs<'a>(runs: &[&'a Run]) -> Vec<&'a Run> {
     let mut shown: Vec<&Run> = wrong.into_iter().take(take_wrong).collect();
     shown.extend(right.into_iter().take(take_right));
     // Everyone who asked is shown at least once (their newest run), in place of the oldest shown run of whoever is
-    // shown most: a lesson rests on several people only where the writer sees their runs ([`backed_only`]).
+    // shown most: a lesson rests on several people only where the writer sees their runs ([`gated`]).
     let mut unseen: Vec<&Run> = vec![];
     for r in runs.iter().rev() {
         if !shown.iter().chain(&unseen).any(|s| s.asker == r.asker) {
@@ -2889,7 +2904,7 @@ fn seen_before(r: &Run, seen: Option<&BTreeSet<String>>) -> bool {
 
 /// [`runs_text`]; with `brief`, a run the note took in already ([`seen_before`]) is shown by its task and how it went
 /// alone, not what it did: the editor changes the note for what is new, and needs the runs it has read only to
-/// count who did what (an item rests on enough people: [`backed_only`]) and what went right and wrong.
+/// count who did what (an item rests on enough people: [`gated`]) and what went right and wrong.
 fn runs_text_as(
     this: &str,
     shown: &[&Run],
@@ -2911,13 +2926,11 @@ fn runs_text_as(
         .map(|(i, r)| {
             let new = seen.is_some_and(|s| !s.is_empty()) && !seen_before(r, seen);
             let person = people.iter().position(|p| *p == r.asker).unwrap_or(0) + 1;
-            // Only an outcome or the person says how a run went; a model's reading is shown as unverified, so no
-            // lesson (and no pitfall) is drawn from it ([`backed_only`]).
+            // An outcome or the person says how a run went; a model's reading is shown as unverified. A lesson may rest
+            // on either ([`gated`]); only the first back it.
             let went = match (r.source, r.right) {
-                (Source::Judge, true) => "a model read it as right, unverified: context only",
-                (Source::Judge, false) => {
-                    "a model read it as wrong, unverified: context only, no pitfall rests on it"
-                }
+                (Source::Judge, true) => "a model read it as right, unverified",
+                (Source::Judge, false) => "a model read it as wrong, unverified",
                 (_, true) => "went right",
                 (_, false) => "went wrong",
             };
@@ -2978,7 +2991,8 @@ fn runs_text_as(
 }
 
 /// A situation's note, from its runs, or none when the advisor's answer isn't one; empty when every item it wrote
-/// rests on fewer than `min_people` people ([`backed_only`]).
+/// rests on fewer than `min_people` people ([`gated`]). With it, whether a step of it is backed by outcomes or
+/// people's responses ([`gated`]).
 #[allow(clippy::too_many_arguments)]
 async fn note(
     cx: &Extractor,
@@ -2992,7 +3006,7 @@ async fn note(
     avoid: &[String],
     reflector: Option<&Extractor>,
     store: &Store,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, bool)>> {
     let this = key(category, situation);
     let shown = note_runs(runs);
     let reflected = reflect(reflector, store, scope, &shown).await;
@@ -3039,11 +3053,13 @@ async fn note(
         .run(cx.complete_if(&prompt, 16_000, |r| as_note(r).is_some()))
         .await?;
     let today = chrono::Utc::now().date_naive();
-    let backed = as_note(&reply).map(|n| backed_only(n, &shown, min_people, had_procedures));
+    let backed = as_note(&reply).map(|n| gated(n, &shown, min_people, had_procedures));
+    let backed_step = backed.as_ref().is_some_and(|(_, _, b)| *b > 0);
+    let backed = backed.map(|(n, d, _)| (n, d));
     let kept = backed.as_ref().map(|(n, _)| kinds_only(n, today));
     // Nothing the note says rests on enough people: an empty note, apart from an answer that isn't one. Nor does a
-    // note whose every step was dropped for resting on too few backed runs: it would be refused for its form and
-    // leave the note before it serving, which rested on runs only a model read.
+    // note whose every step was dropped for resting on too few people: it would be refused for its form, and the
+    // note before it is kept as it was ([`learn`]).
     let had_steps = as_note(&reply).is_some_and(has_steps);
     let unbacked = matches!((&kept, &backed), (Some((None, _)), Some((_, d))) if *d > 0)
         || (had_steps
@@ -3062,12 +3078,12 @@ async fn note(
                        "malformed": bad}))
         .await;
     if unbacked {
-        return Ok(Some(String::new()));
+        return Ok(Some((String::new(), false)));
     }
     if let Some(why) = bad {
         return Err(Malformed(why).into());
     }
-    Ok(kept.and_then(|k| k.0))
+    Ok(kept.and_then(|k| k.0).map(|n| (n, backed_step)))
 }
 
 /// What an item cites as resting on ([`NOTE_KINDS`]): `(runs: R2, R5)` or `(runs: procedures)`. The item without
@@ -3107,12 +3123,20 @@ fn cited(item: &str) -> (String, Option<(Vec<usize>, bool)>) {
 }
 
 /// `note`'s items of [`GATED`] sections, each without what it cites ([`cited`]), kept only where it rests on runs
-/// of at least `min_people` people of `shown` (its runs, as [`runs_text`] numbered them) or, where the writer was
-/// shown some (`procedures`), on the procedures: so a team note holds no lesson only one person's runs show, and
-/// none that cites nothing. With 1 (a person's own note), every item is kept. The note, and how many items were
-/// dropped.
-fn backed_only(note: &str, shown: &[&Run], min_people: usize, procedures: bool) -> (String, usize) {
+/// of at least `min_people` people of `shown` (its runs, as [`runs_text`] numbered them), whatever rewarded them,
+/// or, where the writer was shown some (`procedures`), on the procedures: so a team note holds no lesson only one
+/// person's runs show, and none that cites nothing. A pitfall rests on a run that went wrong. With 1 (a person's own
+/// note), every item is kept. The note, how many items were dropped, and how many steps it kept that rest on runs
+/// an outcome or a person rewarded (a model's reading alone backs none) of that many people, or on the procedures:
+/// a team note none of whose steps does isn't ratified ([`REWRITE_UNBACKED`]).
+fn gated(
+    note: &str,
+    shown: &[&Run],
+    min_people: usize,
+    procedures: bool,
+) -> (String, usize, usize) {
     let had_procedures = procedures;
+    let backed_steps = std::cell::Cell::new(0usize);
     // A team's note names no person ([`TEAM_ONLY`]): an item holding the address of someone who asked goes.
     let addresses: BTreeSet<String> = shown
         .iter()
@@ -3122,6 +3146,9 @@ fn backed_only(note: &str, shown: &[&Run], min_people: usize, procedures: bool) 
     let (text, dropped) = map_items_in(note, &GATED, |section, item| {
         let (text, cites) = cited(item);
         if min_people <= 1 {
+            if section == "Steps" {
+                backed_steps.set(backed_steps.get() + 1);
+            }
             return Some(text);
         }
         let lower = text.to_lowercase();
@@ -3129,20 +3156,31 @@ fn backed_only(note: &str, shown: &[&Run], min_people: usize, procedures: bool) 
             return None;
         }
         let (runs, procedures) = cites?;
-        // Only runs an outcome or a person backs: a model's reading of a run counts toward no lesson's people.
-        let backed: Vec<&Run> = runs
+        let from: Vec<&Run> = runs
             .iter()
             .filter_map(|n| shown.get(n.checked_sub(1)?))
             .copied()
-            .filter(|r| !judged(r))
             .collect();
-        // A pitfall is a failure that happened: it rests on at least one run that went wrong by its outcome or by
-        // the person, never on a model's reading alone, nor on the procedures.
-        if section == "Pitfalls" && !backed.iter().any(|r| !r.right) {
+        // A pitfall is a failure that happened: it rests on at least one run that went wrong, never on the
+        // procedures alone.
+        if section == "Pitfalls" && !from.iter().any(|r| !r.right) {
             return None;
         }
-        let people: BTreeSet<&str> = backed.iter().map(|r| r.asker.as_str()).collect();
-        ((procedures && had_procedures) || people.len() >= min_people).then_some(text)
+        let procedures = procedures && had_procedures;
+        let people: BTreeSet<&str> = from.iter().map(|r| r.asker.as_str()).collect();
+        if !procedures && people.len() < min_people {
+            return None;
+        }
+        // Whether runs an outcome or a person rewarded back it: a model's reading of a run backs nothing.
+        let backed: BTreeSet<&str> = from
+            .iter()
+            .filter(|r| !judged(r))
+            .map(|r| r.asker.as_str())
+            .collect();
+        if section == "Steps" && (procedures || backed.len() >= min_people) {
+            backed_steps.set(backed_steps.get() + 1);
+        }
+        Some(text)
     });
     // A citation anywhere else is taken out too: run numbers mean nothing past this learn.
     let text = text
@@ -3156,13 +3194,14 @@ fn backed_only(note: &str, shown: &[&Run], min_people: usize, procedures: bool) 
         })
         .collect::<Vec<_>>()
         .join("\n");
-    (text, dropped)
+    (text, dropped, backed_steps.get())
 }
 
 /// Situation `this`'s note `old`, changed by small edits where the scope curates advice ([`crate::advice_curate`]):
 /// the editor reads the note as items under ids and the situation's runs (as [`note`]'s advisor does, the ones not in
-/// `seen` marked new), and answers edits, applied here. The new text (`old` itself when nothing changed) and what
-/// the edits did; none when the answer holds no edits.
+/// `seen` marked new), and answers edits, applied here. The new text (`old` itself when nothing changed), what the
+/// edits did, and whether a step they added or changed is backed by outcomes or people's responses ([`gated`]);
+/// none when the answer holds no edits.
 #[allow(clippy::too_many_arguments)]
 async fn edit(
     cx: &Extractor,
@@ -3178,7 +3217,7 @@ async fn edit(
     (served, tally): (&str, &BTreeMap<(String, String), ItemTally>),
     reflector: Option<&Extractor>,
     store: &Store,
-) -> Result<Option<(String, curate::Edits)>> {
+) -> Result<Option<(String, curate::Edits, bool)>> {
     let this = key(category, situation);
     let shown = note_runs(runs);
     // Only the runs new to the note are read in full (and reflected on); those it took in already are shown briefly.
@@ -3231,9 +3270,9 @@ async fn edit(
         return Ok(None);
     };
     // An item added to or rewritten in Steps, Pitfalls, Verification or Triggers is kept only as a new note's would be
-    // ([`backed_only`]): the edit that doesn't rest on enough people is dropped, and the item stays as it was.
+    // ([`gated`]): the edit that doesn't rest on enough people is dropped, and the item stays as it was.
     let kinded = |s: &str| GATED.iter().any(|k| curate::same_section(k, s));
-    // Checked as the section it lands in would be: a pitfall needs a backed failure.
+    // Checked as the section it lands in would be: a pitfall needs a run that went wrong.
     let backed = |text: &str, section: &str| {
         let item = format!("- {text}");
         let section = GATED
@@ -3241,15 +3280,19 @@ async fn edit(
             .find(|k| curate::same_section(k, section))
             .copied()
             .unwrap_or("Steps");
-        let (kept, _) = backed_only(
+        let (kept, _, backed) = gated(
             &format!("## {section}\n{item}"),
             &shown,
             min_people,
             had_procedures,
         );
-        kept.lines().nth(1).and_then(item_text).map(String::from)
+        kept.lines()
+            .nth(1)
+            .and_then(item_text)
+            .map(|t| (t.to_string(), backed > 0))
     };
     let mut unbacked = 0;
+    let mut backed_step = false;
     let edits: Vec<curate::Edit> = edits
         .into_iter()
         .filter_map(|e| {
@@ -3263,7 +3306,10 @@ async fn edit(
             };
             let text = match lands {
                 Some(section) => match backed(text, section) {
-                    Some(t) => t,
+                    Some((t, b)) => {
+                        backed_step |= b;
+                        t
+                    }
                     None => {
                         unbacked += 1;
                         return None;
@@ -3300,13 +3346,13 @@ async fn edit(
     {
         return Err(Malformed(why).into());
     }
-    Ok(Some((text, done)))
+    Ok(Some((text, done, backed_step)))
 }
 
 /// The sections whose items carry a kind ([`NOTE_KINDS`]).
 const KINDED: [&str; 3] = ["Steps", "Pitfalls", "Verification"];
 
-/// The sections whose items a team note keeps only where they rest on enough people ([`backed_only`]): those of
+/// The sections whose items a team note keeps only where they rest on enough people ([`gated`]): those of
 /// [`KINDED`], and Triggers, which act on an agent's tool calls.
 const GATED: [&str; 4] = ["Steps", "Pitfalls", "Verification", "Triggers"];
 
@@ -3661,10 +3707,17 @@ fn strays(note: &str) -> Vec<(usize, &'static str)> {
     out
 }
 
-/// The reason a team note is held after a rewrite that kept no lesson backed by an outcome or people's responses
-/// ([`backed_only`]): shown in its listing until a rewrite keeps one.
+/// The reason a team note isn't ratified after a rewrite that kept no step backed by an outcome or people's
+/// responses ([`gated`]), though its situation's runs are: shown in its listing until a rewrite keeps one. The note
+/// is served all the same.
 pub(crate) const REWRITE_UNBACKED: &str = "its last rewrite kept no step backed by outcomes or people's responses \
-from enough people, so it isn't served until one does";
+from enough people, so it isn't ratified until one does";
+
+/// Whether `why` is [`REWRITE_UNBACKED`], or what it said before backing stopped holding a note back ("…, so it
+/// isn't served until one does").
+fn rewrite_unbacked(why: &str) -> bool {
+    why.starts_with("its last rewrite kept no step backed")
+}
 
 /// Whether `note`'s Steps hold a step.
 fn has_steps(note: &str) -> bool {
@@ -3973,7 +4026,7 @@ pub async fn seed(
     let with_note: BTreeSet<String> = map
         .notes
         .keys()
-        .filter(|k| !held.contains(*k) && !map.needs_backing.contains_key(*k))
+        .filter(|k| !held.contains(*k))
         .cloned()
         .collect();
     docs.push(
@@ -4194,8 +4247,9 @@ async fn learn_space(
     // The situations that may hold a note now: enough wrong runs, or enough right ones (how it's done here, where
     // people's sessions rarely go wrong), from enough people.
     let mut eligible: BTreeSet<String> = BTreeSet::new();
-    // Team notes whose situation still holds enough runs and people, but too few backed by an outcome or a person:
-    // kept, and served to no one, until they are ([`backing`]).
+    // Team notes whose situation holds enough runs and people, but too few backed by an outcome or a person
+    // ([`backing`]), or whose last rewrite kept no backed step ([`REWRITE_UNBACKED`]): served, and not ratified until
+    // they are.
     let mut needs_backing: BTreeMap<String, String> = BTreeMap::new();
     let idle_days = edit_idle_days();
     // The notes served or routed to lately ([`used_since`]), read only once a note is found to need an update.
@@ -4222,32 +4276,37 @@ async fn learn_space(
             continue;
         }
         let k = key(c, s);
-        if space.owner.is_none()
-            && let Some(why) = backing(rs, min_people)
-        {
-            if map.notes.contains_key(&k) {
-                if !map.needs_backing.contains_key(&k) {
-                    eprintln!("advice {k}: held until outcomes or people back it: {why}");
-                }
-                needs_backing.insert(k, why);
-                done.needs_backing += 1;
-            } else {
-                done.too_few += 1;
+        // Whether outcomes or people back the team's runs here ([`backing`]): the note is learned and served from runs
+        // of enough people whatever rewarded them, and ratified only once they do.
+        let unbacked = match space.owner {
+            None => backing(rs, min_people),
+            Some(_) => None,
+        };
+        if let Some(why) = &unbacked {
+            if map.notes.contains_key(&k) && !map.needs_backing.contains_key(&k) {
+                eprintln!(
+                    "advice {k}: served, not ratified until outcomes or people back it: {why}"
+                );
             }
-            continue;
+            needs_backing.insert(k.clone(), why.clone());
+            done.needs_backing += 1;
+            // A note a repository seeded stays until runs outcomes or people back come in ([`seed`]), served as it
+            // is: it isn't written again from runs only a model read.
+            if map.seeded.contains_key(&k) {
+                continue;
+            }
+        } else if map
+            .needs_backing
+            .get(&k)
+            .is_some_and(|w| rewrite_unbacked(w))
+        {
+            // A note whose last rewrite kept no backed step stays unratified until a rewrite keeps one: its runs pass
+            // the bar, but what it says rests on runs only a model read ([`REWRITE_UNBACKED`]).
+            needs_backing.insert(k.clone(), REWRITE_UNBACKED.into());
+            done.needs_backing += 1;
         }
         done.eligible += 1;
         eligible.insert(k.clone());
-        // A note whose last rewrite kept no backed lesson stays held until a rewrite keeps one: its runs pass the
-        // bar, but what it said rested on runs only a model read ([`REWRITE_UNBACKED`]).
-        if let Some(why) = map
-            .needs_backing
-            .get(&k)
-            .filter(|w| w.starts_with(REWRITE_UNBACKED))
-        {
-            needs_backing.insert(k.clone(), why.clone());
-            done.needs_backing += 1;
-        }
         // A held note is served to no one: no model call is spent on it until an admin releases it. Nor is one for
         // the conversation itself: the note it has stays, served to no one.
         if map.held.contains(&k) || conversation.contains(&k) {
@@ -4295,8 +4354,24 @@ async fn learn_space(
             }
             Some(_) => (rs.len(), wrong),
         };
+        // A team note whose runs outcomes or people don't back is written again for any new runs, as a person's own
+        // is: no backed run may ever come to bring it up to date.
+        let due = |was: &Written| match unbacked {
+            Some(_) => rewrite(
+                &Written {
+                    backed: was.runs,
+                    backed_wrong: was.wrong,
+                    ..was.clone()
+                },
+                rs.len(),
+                wrong,
+                &context,
+                sooner,
+            ),
+            None => rewrite(was, backed, backed_wrong, &context, sooner),
+        };
         if let Some(was) = map.written.get(&k)
-            && !rewrite(was, backed, backed_wrong, &context, sooner)
+            && !due(was)
             && !rewriting
         {
             done.waiting += 1;
@@ -4397,7 +4472,6 @@ async fn learn_space(
     }
     // A note kept only while its situation may hold one: a situation that lost its runs or its people
     // (forgotten, retracted), or has none left, is taken out of the map, so no note outlives what it was written from.
-    // A note held for backing stays, served to no one ([`withheld`]), so it comes back once its runs are backed.
     // A note a repository seeded stays while no runs back its situation ([`seed`]).
     let seeded = map.seeded.clone();
     let keep = |k: &String| {
@@ -4439,7 +4513,7 @@ async fn learn_space(
                             store,
                         )
                         .await
-                        .map(|n| n.map(|(t, e)| (t, Some(e)))),
+                        .map(|n| n.map(|(t, e, b)| (t, Some(e), b))),
                         None => note(
                             cx,
                             scope,
@@ -4454,7 +4528,7 @@ async fn learn_space(
                             store,
                         )
                         .await
-                        .map(|n| n.map(|t| (t, None))),
+                        .map(|n| n.map(|(t, b)| (t, None, b))),
                     };
                     (n, crate::extract::CALL_TOKENS.with(|t| t.get()))
                 })
@@ -4474,7 +4548,7 @@ async fn learn_space(
     for (k, h, w, n, tokens) in written {
         match n {
             // An edit that changed nothing: the note stands as it is, and waits for new runs again.
-            Ok(Some((_, Some(edits)))) if !edits.changed() => {
+            Ok(Some((_, Some(edits), _))) if !edits.changed() => {
                 if let Some(cur) = done.curation.as_mut() {
                     cur.unchanged += 1;
                 }
@@ -4483,7 +4557,7 @@ async fn learn_space(
             }
             // The shrink guard: an update that drops more than a quarter of what the note said is refused, and the
             // note stays as it was (until enough new runs ask again).
-            Ok(Some((_, Some(edits)))) if edits.dropped > curate::SHRINK_MAX => {
+            Ok(Some((_, Some(edits), _))) if edits.dropped > curate::SHRINK_MAX => {
                 eprintln!(
                     "advice {k}: an update that drops {:.0}% of the note was refused (at most {:.0}%): the note stays as it was ({} added, {} modified, {} removed)",
                     edits.dropped * 100.0,
@@ -4507,23 +4581,25 @@ async fn learn_space(
                 map.written.insert(k.clone(), Written { shown, ..w });
                 map.notes.insert(k, h);
             }
-            // Nothing written rests on enough people: no note is served (not the one before either, written
-            // before items were gated or from runs since outweighed), and none is asked for again until enough new
-            // runs come in ([`rewrite`]).
-            // A team note that had one is held with why, not left serving what it said before (written from runs
-            // a model read, or before items were gated), until a rewrite keeps a backed lesson.
-            Ok(Some((text, _)))
+            // Nothing written rests on enough people, and none is asked for again until enough new runs come in
+            // ([`rewrite`]). A team note that had one keeps serving it, not ratified ([`REWRITE_UNBACKED`]) unless
+            // outcomes or people's runs back it already, and gives a rewrite that keeps a backed step the chance to
+            // ratify it.
+            Ok(Some((text, _, _)))
                 if text.is_empty() && space.owner.is_none() && map.notes.contains_key(&k) =>
             {
-                eprintln!("advice {k}: held until outcomes or people back it: {REWRITE_UNBACKED}");
+                eprintln!(
+                    "advice {k}: its rewrite kept no step resting on runs of enough people; the note before stays, \
+                     served: {REWRITE_UNBACKED}"
+                );
                 if !map.needs_backing.contains_key(&k) {
                     done.needs_backing += 1;
+                    map.needs_backing.insert(k.clone(), REWRITE_UNBACKED.into());
                 }
-                map.needs_backing.insert(k.clone(), REWRITE_UNBACKED.into());
                 map.written.insert(k, w);
                 done.unbacked += 1;
             }
-            Ok(Some((text, _))) if text.is_empty() => {
+            Ok(Some((text, _, _))) if text.is_empty() => {
                 eprintln!(
                     "advice {k}: no lesson rests on runs of enough people, so the situation has no note"
                 );
@@ -4531,7 +4607,8 @@ async fn learn_space(
                 map.written.insert(k, w);
                 done.unbacked += 1;
             }
-            Ok(Some((text, edits))) => {
+            Ok(Some((text, edits, backed_step))) => {
+                let whole = edits.is_none();
                 // Each item keeps its id, and a new one gets its own.
                 let text = stamp_ids(&text, &k);
                 // Within its budget, without the items agents kept doing anyway ([`curb`]).
@@ -4560,8 +4637,26 @@ async fn learn_space(
                     tokens,
                     edits,
                 });
+                // Whether outcomes or people's responses back the note now (a team's: a person's own is theirs): a note
+                // whose runs they don't back stays unratified as its situation is; a note written whole, once a step
+                // rests on backed runs; an edited one, once an edit adds or changes such a step (else it stays as it
+                // was).
+                if space.owner.is_none() {
+                    let was = map.needs_backing.get(&k).cloned();
+                    let carried = was.as_deref().is_some_and(rewrite_unbacked);
+                    if was.is_none() || carried {
+                        if !backed_step && (whole || carried) {
+                            if !carried {
+                                eprintln!("advice {k}: served, not ratified: {REWRITE_UNBACKED}");
+                                done.needs_backing += 1;
+                            }
+                            map.needs_backing.insert(k.clone(), REWRITE_UNBACKED.into());
+                        } else {
+                            map.needs_backing.remove(&k);
+                        }
+                    }
+                }
                 map.written.insert(k.clone(), w);
-                map.needs_backing.remove(&k);
                 map.notes.insert(k, h);
                 done.notes += 1;
             }
@@ -5061,6 +5156,10 @@ pub struct Advised {
     /// The caller's own advice for the same question (a `mine:` note), served before this, the team's, and labelled
     /// as theirs ([`beside`]): never instead of it.
     pub own: Option<Box<Advised>>,
+    /// For a team note: whether outcomes or people don't back it yet ([`Map::needs_backing`]), and whether an admin
+    /// ratified it ([`ratify`]): what, with its evidence, says whether it is ratified ([`team_ratified`]).
+    pub unbacked: bool,
+    pub approved: bool,
 }
 
 impl Advised {
@@ -5515,6 +5614,12 @@ async fn route(
     };
     let space = team.as_ref().unwrap_or(space);
     let map = &maps[from];
+    let (unbacked, approved) = match (&candidates[i].1, map) {
+        (Candidate::Situation { key, .. }, Some(m)) if space.owner.is_none() => {
+            (m.unbacked(key).is_some(), m.ratified.contains_key(key))
+        }
+        _ => (false, false),
+    };
     let mut served = vec![];
     let mut version = None;
     let (note, skills) = match &candidates[i].1 {
@@ -5615,6 +5720,8 @@ async fn route(
         scope: (from > 0).then(|| session.scope().to_string()),
         version: version.filter(|_| noted),
         own: None,
+        unbacked,
+        approved,
     }))
 }
 
@@ -5987,7 +6094,7 @@ fn without_section(md: &str, heading: &str) -> String {
 }
 
 /// `md` without its `## ` sections that hold nothing but blank lines. A note's sections are kept empty rather than
-/// filled with invented entries, and the items the people bar drops ([`backed_only`]) can leave a section with none:
+/// filled with invented entries, and the items the people bar drops ([`gated`]) can leave a section with none:
 /// served as is, an agent reads an empty `## Steps` heading as advice with its procedure missing.
 fn without_empty_sections(md: &str) -> String {
     let lines: Vec<&str> = md.lines().collect();

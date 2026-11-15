@@ -61,8 +61,14 @@ jobs:
         run: cargo test --locked --no-run
       - name: REST catalog flows
         run: |
+          set -o pipefail
           source tests/fixtures/rest-catalog/env.sh
-          cargo test --locked --test it rest_catalog:: -- --nocapture
+          cargo test --locked --test it rest_catalog:: -- --nocapture 2>&1 | tee rest-catalog.log
+          # A flow that skips (its settings not set) passes without running: here that is a failure.
+          if grep -q "^SKIPPED " rest-catalog.log; then
+            echo "::error::rest_catalog flows skipped: tests/fixtures/rest-catalog/env.sh doesn't set what they read"
+            exit 1
+          fi
       - name: Catalog logs
         if: failure()
         run: docker compose -f tests/fixtures/rest-catalog/docker-compose.yml logs --tail 300

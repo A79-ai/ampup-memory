@@ -486,11 +486,41 @@ pub async fn from_user(
     typed: Vec<Typed>,
     still_theirs: impl Fn(&crate::people::directory::Directory) -> bool,
 ) -> Result<usize> {
+    let none = HashSet::new();
+    let kept = from_user_but(
+        store,
+        scope,
+        asker,
+        signed,
+        typed,
+        still_theirs,
+        &none,
+        None,
+    )
+    .await?;
+    Ok(kept.len())
+}
+
+/// [`from_user`] as if the notes `going` (episode ids, about to be deleted) weren't there: they are neither the
+/// person's map nor notes they have already. With some going (notes kept again from old sessions), a note the person
+/// forgot isn't kept again either: those sessions still say it. With `preview`, nothing is written: what it would keep
+/// is added there (`<category>/<topic>: <text>`). Answers the ids of the notes it kept (or would keep).
+#[allow(clippy::too_many_arguments)]
+pub async fn from_user_but(
+    store: &crate::Store,
+    scope: &crate::Scope,
+    asker: &str,
+    signed: &str,
+    typed: Vec<Typed>,
+    still_theirs: impl Fn(&crate::people::directory::Directory) -> bool,
+    going: &HashSet<String>,
+    preview: Option<&Mutex<Vec<String>>>,
+) -> Result<Vec<String>> {
     if !on() || typed.is_empty() || !crate::auth::is_acl_id(asker) {
-        return Ok(0);
+        return Ok(vec![]);
     }
     let Some(model) = Extractor::route_from_env()? else {
-        return Ok(0);
+        return Ok(vec![]);
     };
     let n = typed.len();
     let typed = &typed[n.saturating_sub(SAID_MAX)..];
@@ -501,12 +531,16 @@ pub async fn from_user(
         store.aggregation_view(scope).await?
     };
     let mut map = BTreeSet::new();
-    let mut ids = vec![];
+    let (mut ids, mut forgot) = (vec![], vec![]);
     for e in &view.episodes {
         let Some(rest) = e.source.strip_prefix(signed).filter(|r| is_kept(r)) else {
             continue;
         };
-        if e.acl.as_slice() != std::slice::from_ref(&own) {
+        if !going.is_empty() && e.acl.iter().any(|a| a == crate::FORGOTTEN) {
+            forgot.push(e.id.clone());
+            continue;
+        }
+        if e.acl.as_slice() != std::slice::from_ref(&own) || going.contains(&e.id) {
             continue;
         }
         if let Some((c, t)) = filed(rest) {
@@ -527,6 +561,17 @@ pub async fn from_user(
                 .map(|b| String::from_utf8_lossy(&b).trim().to_string()),
         );
     }
+    // What they forgot: compared with, never shown to the model.
+    let mut forgotten = vec![];
+    for chunk in forgot.chunks(64) {
+        forgotten.extend(
+            store
+                .episode_bodies(scope, chunk.to_vec())
+                .await?
+                .into_values()
+                .map(|b| String::from_utf8_lossy(&b).trim().to_string()),
+        );
+    }
     let map: Vec<(String, String)> = map.into_iter().collect();
     let found = find(&model, typed, &map, &already).await?;
     let found_n = found.len();
@@ -535,7 +580,7 @@ pub async fn from_user(
     let dir = store.directory().await?;
     let dir = &dir.dir;
     if !still_theirs(dir) {
-        return Ok(0);
+        return Ok(vec![]);
     }
     let pii = dir.redacts_pii(scope);
     let redact = |t: &str| match pii {
@@ -544,7 +589,7 @@ pub async fn from_user(
     };
     let mut eps = vec![];
     for k in found {
-        if already.iter().any(|a| same(&k.text, a)) {
+        if already.iter().chain(&forgotten).any(|a| same(&k.text, a)) {
             continue;
         }
         let body = redact(&k.text);
@@ -561,6 +606,23 @@ pub async fn from_user(
             &[own.as_str()],
         ));
     }
+    if let Some(p) = preview {
+        let mut p = p.lock().unwrap();
+        for e in &eps {
+            let filed = e
+                .source
+                .strip_prefix(signed)
+                .and_then(filed)
+                .unwrap_or_default();
+            p.push(format!(
+                "{}/{}: {}",
+                filed.0,
+                filed.1,
+                String::from_utf8_lossy(&e.body)
+            ));
+        }
+        return Ok(eps.into_iter().map(|e| e.episode_id).collect());
+    }
     if !eps.is_empty() {
         // Each a fact too, theirs alone as the note is (`crate::note_facts`).
         let facts = crate::note_facts::facts_of(&eps);
@@ -572,7 +634,7 @@ pub async fn from_user(
         eps.len(),
         typed.len()
     );
-    Ok(eps.len())
+    Ok(eps.into_iter().map(|e| e.episode_id).collect())
 }
 
 /// Who writes what [`share`] shares: no person's id (those are emails or `key:<org>/<name>`), under the

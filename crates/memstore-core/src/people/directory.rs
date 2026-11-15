@@ -3189,6 +3189,19 @@ impl std::fmt::Display for Invalid {
 
 impl std::error::Error for Invalid {}
 
+/// A change not made because the catalog or the object store refused for load (a rate limit or spent quota, a
+/// 503): nothing changed, and the same request can be made again after a wait. Its message is shown to the
+/// caller; a server answers it 503 with `Retry-After`. Carried as the context of the upstream's error, so the
+/// error's chain still says what the upstream answered (and when it asked to be called again).
+#[derive(Debug)]
+pub struct Busy(pub String);
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 macro_rules! invalid {
     ($($t:tt)*) => { return Err(Invalid(format!($($t)*)).into()) };
 }

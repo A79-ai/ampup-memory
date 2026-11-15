@@ -280,12 +280,13 @@ function LessonCard({ l, me, focused }: { l: Lesson; me: string; focused: boolea
       <div className="lesson-top">
         <span className={`badge ${mine ? "badge-mine" : "badge-team"}`}>{whose}</span>
         <span className="lesson-cat">{l.category}</span>
-        {l.status !== "served" && (
-          <span className="badge badge-warn" title={l.status_reason}>
-            {l.status}
+        {l.status !== "served" && <span className="badge badge-warn">{l.status}</span>}
+        {l.needs_backing && (
+          <span className="badge badge-warn" title={l.needs_backing}>
+            not ratified
           </span>
         )}
-        {l.evidence?.ratified && <span className="badge badge-ok">proven</span>}
+        {(l.ratified ?? l.evidence?.ratified) && <span className="badge badge-ok">ratified</span>}
         <span className="lesson-date muted" title={when(l.learned_at)}>
           learned {ago(l.learned_at)}
         </span>

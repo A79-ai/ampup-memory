@@ -55,12 +55,23 @@ replaces it. `by` is taken on the route alone: the `reward_run` MCP tool, whose 
 - `AMPUP_MEMORY_ADVICE_HOLDOUT` (0 to 1, default 0): that share of new sessions is routed but served nothing.
   Comparing served against withheld outcomes measures lift.
 
-### Evidence
+### Ratified
 
-Every note learning writes is served to everyone it is learned for; there is no trial arm and no gate. A note is
-reported ratified once it helped more people than it didn't, counted by each person's latest judged session, up to
-the scope's evidence bar: the team's `advice_evidence` setting, else the org's, else `AMPUP_MEMORY_ADVICE_EVIDENCE`
-(default 3). The bar is reported only (`list_advice`, `ampup-memory doctor`); it changes nothing that is served.
+Every note learning writes is served to everyone it is learned for; there is no trial arm and no gate. Whether a
+team note is **ratified** is reported, never a condition of serving: `ratified` in `list_advice`, the advice trail,
+`advice_usage` and `/lessons` (the Learned tab), and the evidence line an agent reads with the note. A team note is
+ratified when an org admin ratified it (`/admin {"op": "ratify_advice", "org", "keys"}`; `ratify: false` withdraws
+it, and a learn that writes the note again from other runs drops it), or when it is both:
+
+- **backed**: outcomes or people's own responses (a rating, a next message, what became of a PR; a reward the
+  recorder gave) back its situation's runs: a failure they showed against a success they showed, or successes they
+  showed from two people, from at least the people bar's worth of people (`advice_learn_people`); and a step of the
+  note rests on such runs. A model's reading (the judge's) backs nothing. A note that isn't carries `needs_backing`,
+  saying why, until a learn finds it is;
+- **past the evidence bar**: it helped more people than it didn't, counted by each person's latest judged session,
+  up to the scope's evidence bar: the team's `advice_evidence` setting, else the org's, else
+  `AMPUP_MEMORY_ADVICE_EVIDENCE` (default 3; 0 lets every note's evidence through).
+
 Runs are not evidence; only judged sessions are.
 
 ## Runs and rewards
@@ -103,9 +114,17 @@ curl -s localhost:8080/runs/reward -d '{"run_id": "…", "reward": 1, "reason": 
 
 Rules that matter:
 
-- **Team notes need people.** A team note is learned only from situations whose runs come from at least
-  `advice_learn_people` people (`AMPUP_MEMORY_ADVICE_LEARN_PEOPLE`, default 3, never below 2). One person's traces
-  can't make a team note.
+- **Team notes need people, not backing.** A team note is learned, and served, once its situation's runs come from at
+  least `advice_learn_people` people (`AMPUP_MEMORY_ADVICE_LEARN_PEOPLE`, default 3, never below 2), whatever
+  rewarded them: the judge's reading counts. Each step must cite runs of that many people, and each pitfall a run
+  that went wrong. One person's traces can't make a team note. Whether outcomes or people back it decides only
+  whether it is [ratified](#ratified); a note whose runs they don't back is written again after 5 new runs or 2 new
+  wrong ones of any kind, one whose runs they do after that many new backed ones. A note a repository seeded stays
+  until runs outcomes or people back come in.
+- **What a team note is held for.** A team note is served to no one when an org admin held it (`/admin {"op":
+  "hold_advice", "org", "keys"}`), when its situation is the conversation itself (going on with or steering work
+  under way: the team writes those no note), or, where the scope curates, when its served runs scored worse.
+  A note written in a broken form is refused, and the one before it stays.
 - **Personal notes.** A person with at least `AMPUP_MEMORY_ADVICE_MIN_NEW` (10) rewarded runs or sessions of their own
   also gets notes learned from those alone, served to them first, with no evidence bar.
 - **On its own.** Where an org's or team's admins set `advice: true`, `serve` learns every `AMPUP_MEMORY_ADVICE_SECS`

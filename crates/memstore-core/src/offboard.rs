@@ -29,7 +29,9 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{NamespaceIdent, TableIdent};
 use serde_json::{Value, json};
 
-use crate::people::directory::{Actor, Directory, Event, Forgotten, Invalid, Refused, user_id};
+use crate::people::directory::{
+    Actor, Busy, Directory, Event, Forgotten, Invalid, Refused, user_id,
+};
 use crate::{
     AGG_REQUESTS, AGGREGATES, CLOSURES, DEFAULT_ORG, DIRECTORY, DIRECTORY_SNAPSHOT, EPISODES,
     EXTRACTIONS, FACTS, FEEDBACK, INSTALLATIONS, KEY_USAGE, LEDGER, Ledger, MAIN, QA_LOG, QUOTES,
@@ -331,6 +333,25 @@ fn keep_all(b: &RecordBatch) -> Result<BooleanArray> {
 
 fn refused(msg: String) -> anyhow::Error {
     Refused(msg).into()
+}
+
+/// Rewrite probe tables are named this, then the second they were made and an id.
+const PROBE_PREFIX: &str = "rewrite_probe_";
+/// A probe table older than this is one a throttled try left behind, not one under way.
+const PROBE_STALE_SECS: i64 = 3600;
+
+/// The rewrite probe's failure at `step`: busy if the catalog refused it for load (tried again later, nothing
+/// changed), refused if the catalog can't take that step.
+fn busy_or_refused(step: &str, e: anyhow::Error) -> anyhow::Error {
+    if crate::is_transient(&e) {
+        return e.context(Busy(format!(
+            "the catalog is busy (it refused to {step} for load): nothing was changed, try again shortly"
+        )));
+    }
+    refused(format!(
+        "this catalog can't {step} ({e:#}): forgetting a person and deleting an org need it, so nothing was \
+         changed"
+    ))
 }
 
 /// Whether `actor` may delete, forget or export in `org`: the operator anywhere; an org's admins in their
@@ -1708,10 +1729,36 @@ impl Store {
     /// rows, rewrite the table keeping one (one commit replacing its data file, the old snapshot expired, the old
     /// file deleted), read it back, and drop it with purge. Refused, naming the step the catalog didn't take, if it
     /// can't: otherwise a forget or a delete would stop halfway, after the directory change.
+    ///
+    /// A catalog that refuses a step for load (BigLake's 429 RESOURCE_EXHAUSTED, a 503) says nothing about what
+    /// it can do: that is [`Busy`], tried again later, never refused as a catalog that can't.
     pub async fn check_rewrites(&self) -> Result<()> {
         let nsi = NamespaceIdent::new(SYSTEM_NS.into());
         let id = &uuid::Uuid::new_v4().simple().to_string()[..12];
-        let ident = TableIdent::new(nsi, format!("rewrite_probe_{id}"));
+        let secs = chrono::Utc::now().timestamp();
+        let ident = TableIdent::new(nsi.clone(), format!("{PROBE_PREFIX}{secs}_{id}"));
+        // A cheap read first: a throttled catalog is answered busy before the probe creates anything its
+        // cleanup (throttled too) couldn't drop. It also lists probes left by tries the catalog throttled
+        // mid-way, swept once they are older than any probe still under way.
+        let tables = match self.catalog().list_tables(&nsi).await {
+            Ok(t) => t,
+            Err(e) => return Err(busy_or_refused("list tables", e.into())),
+        };
+        for stale in tables.iter().filter(|t| {
+            t.name()
+                .strip_prefix(PROBE_PREFIX)
+                .and_then(|r| r.split_once('_'))
+                .and_then(|(s, _)| s.parse::<i64>().ok())
+                .is_some_and(|at| secs - at > PROBE_STALE_SECS)
+        }) {
+            // Best effort, and stopped at the first that won't go: a throttled catalog isn't asked again for
+            // each; the next check sweeps the rest.
+            if self.catalog().purge_table(stale).await.is_err()
+                && self.catalog().drop_table(stale).await.is_err()
+            {
+                break;
+            }
+        }
         let result = self.probe_rewrite(&ident).await;
         // Whatever the probe left goes (best effort: a catalog that can't purge gets a plain drop).
         if let Ok(table) = self.catalog().load_table(&ident).await {
@@ -1725,12 +1772,7 @@ impl Store {
             }
             let _ = table.file_io().delete_prefix(&loc).await;
         }
-        result.map_err(|(step, e)| {
-            refused(format!(
-                "this catalog can't {step} ({e:#}): forgetting a person and deleting an org need it, so nothing \
-                 was changed"
-            ))
-        })
+        result.map_err(|(step, e)| busy_or_refused(step, e))
     }
 
     async fn probe_rewrite(

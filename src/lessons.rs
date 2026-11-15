@@ -112,9 +112,19 @@ pub async fn run(
             let tallies = crate::sessions::evidence(store, scope).await?;
             for l in listed {
                 if let Some(mut v) = lesson(&l, None, &assigned, &log, &by_id, &me, reader, limit) {
+                    // Ratified: by an admin, or backed by outcomes or people and past the evidence bar. Every
+                    // lesson listed here is served either way.
+                    let earned = tallies
+                        .get(&l.key)
+                        .cloned()
+                        .unwrap_or_default()
+                        .ratified(bar);
+                    let ratified =
+                        crate::advice::team_ratified(l.approved, l.needs_backing.is_some(), earned);
+                    v["ratified"] = json!(ratified);
                     if let Some(t) = tallies.get(&l.key) {
                         let mut e = json!(t);
-                        e["ratified"] = json!(t.ratified(bar));
+                        e["ratified"] = json!(ratified);
                         v["evidence"] = e;
                     }
                     out.push(v);
@@ -298,8 +308,6 @@ fn lesson(
     };
     let status = if l.held {
         "held"
-    } else if l.needs_backing.is_some() {
-        "needs backing"
     } else if l.withheld.is_some() {
         "withheld"
     } else if l.conversation {
@@ -333,8 +341,9 @@ fn lesson(
             "trail": served, "more": served_more, "hidden": served_hidden,
         },
     });
+    // Why outcomes or people don't back it yet, so it isn't ratified: served all the same.
     if let Some(why) = &l.needs_backing {
-        v["status_reason"] = json!(why);
+        v["needs_backing"] = json!(why);
     }
     Some(v)
 }

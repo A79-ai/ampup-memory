@@ -701,6 +701,18 @@ pub async fn fits_chat(
     let wait = fit_chat_wait();
     let answered = tokio::time::timeout(wait, router.complete_with(&prompt, 50)).await;
     let said = match answered {
+        // An empty reply says neither yes nor no: unanswered, and said so, not read as advice that doesn't fit.
+        Ok(Ok(reply)) if reply.trim().is_empty() => {
+            eprintln!(
+                "advice: whether the routed advice fits wasn't answered ({} replied with nothing), none served",
+                router.model()
+            );
+            crate::advice_lookups::trouble(&format!(
+                "the fit check wasn't answered: {} replied with nothing",
+                router.model()
+            ));
+            return Fit::OffTask;
+        }
         Ok(Ok(reply)) => reply
             .trim()
             .trim_start_matches(['`', '*', '"', '\''])

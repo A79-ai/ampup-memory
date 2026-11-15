@@ -96,8 +96,8 @@ jobs:
       # packaged.
       - name: Build
         # --version names the release, which the plugin compares with the latest to keep the client current.
-        # .cargo/release.toml: fat LTO, and the dependencies that do no numeric work optimized for size: the server is
-        # half the size it is with the release profile alone, and its final link runs on one core for many minutes.
+        # .cargo/release.toml: the dependencies that do no numeric work optimized for size, which makes the server a
+        # fifth smaller than with the release profile alone.
         env:
           AMPUP_MEMORY_RELEASE: ${{ steps.kind.outputs.version }}
           TARGET: ${{ matrix.target }}
@@ -318,11 +318,13 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
+      # contents: to check the repo out (a job that lists its permissions gets only those).
+      contents: read
       id-token: write
     env:
       # 0.1.x on PyPI is the client alone, numbered by the client's releases: the server's start at 0.2.0.
       PYPI_FROM: "0.2.0"
-      # At most a release a week: each is ~65 MiB a platform, and PyPI caps the project's total (10 GiB unless it
+      # At most a release a week: each is ~85 MiB a platform, and PyPI caps the project's total (10 GiB unless it
       # raises it). The GitHub release and install.sh have every one.
       PYPI_MIN_DAYS: "7"
       # PyPI's per-file limit for the project: raise it here when PyPI raises it.

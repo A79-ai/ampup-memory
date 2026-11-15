@@ -9,7 +9,8 @@
 //!   no object of its tables or index, no table or namespace in the catalog, and no row in the audit or key
 //!   usage tables; the other org keeps everything.
 //! - Isolation: every caller reads only the scope they are entitled to, through either process.
-//! - The catalog can rewrite a table (`Store::check_rewrites`), which forget and org delete need.
+//! - The catalog can rewrite a table (`Store::check_rewrites`), which forget and org delete need; one throttled
+//!   while they check (BigLake's 429) has them answered busy (503, the catalog's `Retry-After`), nothing changed.
 //!
 //! They need the fixture in `tests/fixtures/rest-catalog` (the Iceberg REST fixture and MinIO):
 //!
@@ -357,6 +358,70 @@ async fn start_idp() -> String {
         }
     });
     issuer
+}
+
+/// A stand-in in front of the REST catalog at `upstream` that answers every request about a rewrite probe table
+/// as BigLake answers a spent quota (429 RESOURCE_EXHAUSTED, `Retry-After: 7`) and passes the rest through: a
+/// catalog that can rewrite tables but is throttled while a forget or a delete checks that it can.
+async fn throttling(upstream: &str) -> String {
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let upstream = upstream.trim_end_matches('/').to_string();
+    tokio::spawn(async move {
+        loop {
+            let (conn, _) = listener.accept().await.unwrap();
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        let upstream = upstream.clone();
+                        async move {
+                            use http_body_util::BodyExt;
+                            let path = req.uri().path_and_query().unwrap().to_string();
+                            if path.contains("rewrite_probe_") {
+                                let quota = json!({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
+                                    "message": "Quota exceeded for quota metric 'Iceberg REST catalog read requests'"}});
+                                return Ok::<_, hyper::Error>(
+                                    hyper::Response::builder()
+                                        .status(429)
+                                        .header("content-type", "application/json")
+                                        .header("retry-after", "7")
+                                        .body(Full::new(Bytes::from(quota.to_string())))
+                                        .unwrap(),
+                                );
+                            }
+                            let (parts, body) = req.into_parts();
+                            let body = body.collect().await?.to_bytes();
+                            let mut out = CLIENT
+                                .request(parts.method.clone(), format!("{upstream}{path}"))
+                                .body(body);
+                            for (k, v) in &parts.headers {
+                                if k != hyper::header::HOST && k != hyper::header::CONTENT_LENGTH {
+                                    out = out.header(k, v);
+                                }
+                            }
+                            let r = out.send().await.unwrap();
+                            let mut back = hyper::Response::builder().status(r.status().as_u16());
+                            for (k, v) in r.headers() {
+                                if k != hyper::header::TRANSFER_ENCODING
+                                    && k != hyper::header::CONTENT_LENGTH
+                                {
+                                    back = back.header(k, v);
+                                }
+                            }
+                            Ok(back.body(Full::new(r.bytes().await.unwrap())).unwrap())
+                        }
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(conn), svc)
+                    .await;
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}")
 }
 
 /// A POST with `bearer`: the HTTP status and the raw answer.
@@ -787,6 +852,53 @@ async fn forget_and_org_delete_remove_the_bytes_from_object_storage() {
         return;
     }
 
+    // A catalog that can rewrite tables but is throttled while the forget or the delete checks it can: not
+    // refused as a catalog that can't, but answered busy (503) with the catalog's own wait, nothing changed.
+    {
+        let throttled = serve(&rest, &throttling(&rest.uri).await, dir.path(), &issuer).await;
+        for (who, req) in [
+            (
+                &alice,
+                json!({"op": "forget_user", "user": "carol@acme.com", "org": acme}),
+            ),
+            (
+                &ADMIN_KEY.to_string(),
+                json!({"op": "delete_org", "org": acme, "confirm": acme}),
+            ),
+        ] {
+            let r = CLIENT
+                .post(format!("{}/admin", throttled.url))
+                .bearer_auth(who)
+                .body(req.to_string())
+                .send()
+                .await
+                .unwrap();
+            let (status, wait) = (r.status().as_u16(), r.headers().get("retry-after").cloned());
+            let body: Value = r.json().await.unwrap_or_default();
+            let error = body["error"].as_str().unwrap_or_default();
+            assert!(
+                status == 503
+                    && wait.as_ref().is_some_and(|w| w == "7")
+                    && error.contains("busy")
+                    && error.contains("nothing was changed")
+                    && !error.contains("can't"),
+                "{req}: {status} {wait:?} {body}"
+            );
+        }
+        for s in [a, b] {
+            until(s, &sel_a1, &carol, &a1_ids, "carol still reads a1", |r| {
+                r.as_ref().is_some_and(|r| r.contains(&tag("carolteam")))
+            })
+            .await;
+        }
+        for t in &carol_tags {
+            assert!(
+                !rest.objects_with(&acme_at, t).await.is_empty(),
+                "{t} gone though the catalog was busy"
+            );
+        }
+    }
+
     // Acme's admin forgets Carol through one process.
     let (status, body) = admin_as(
         a,
@@ -796,7 +908,8 @@ async fn forget_and_org_delete_remove_the_bytes_from_object_storage() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["forgotten"][&acme]["episodes"], 2, "{body}");
-    assert_eq!(body["forgotten"][&acme]["facts"], 2, "{body}");
+    // Her two notes' own facts (each remembered note is a fact citing it), carolfact and mixedfact.
+    assert_eq!(body["forgotten"][&acme]["facts"], 4, "{body}");
     // Gone from every read path of both processes; the rest of acme's memory stays.
     for s in [a, b] {
         until(s, &sel_acme, &bob, &acme_ids, "acme after forget", |r| {

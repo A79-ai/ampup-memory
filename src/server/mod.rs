@@ -5833,13 +5833,30 @@ async fn handle(
                         ),
                         // A request no one could make as it is (a value out of range, a name that can't be
                         // one): the caller fixes the request, so it says what is wrong, and refuses no one.
-                        None => match e.downcast_ref::<crate::people::directory::Invalid>() {
-                            Some(bad) => reply(StatusCode::BAD_REQUEST, json!({"error": bad.0})),
-                            None => reply(
-                                StatusCode::BAD_REQUEST,
-                                json!({"error": "bad request or change failed"}),
-                            ),
-                        },
+                        // Before the busy check, which reads the error's text, and this echoes the request.
+                        None if let Some(bad) =
+                            e.downcast_ref::<crate::people::directory::Invalid>() =>
+                        {
+                            reply(StatusCode::BAD_REQUEST, json!({"error": bad.0}))
+                        }
+                        // The catalog or the object store refused for load (BigLake's 429, a 503): refused no
+                        // one, so not audited as a refusal, and asked again after the wait the upstream named.
+                        None if memstore_core::is_transient(&e) => {
+                            let message = match e.downcast_ref::<crate::people::directory::Busy>() {
+                                Some(b) => b.0.clone(),
+                                None => "the catalog is busy: try again shortly".into(),
+                            };
+                            let mut r =
+                                reply(StatusCode::SERVICE_UNAVAILABLE, json!({"error": message}));
+                            let wait = memstore_core::wait_hint(&e).as_secs().max(1);
+                            r.headers_mut()
+                                .insert(hyper::header::RETRY_AFTER, wait.into());
+                            r
+                        }
+                        None => reply(
+                            StatusCode::BAD_REQUEST,
+                            json!({"error": "bad request or change failed"}),
+                        ),
                     }
                 }
             },
@@ -8447,6 +8464,59 @@ async fn directory_change(
         warnings.extend(more);
         let events: Vec<Value> = events.iter().map(|e| e.to_json()).collect();
         return Ok(json!({"org": org, "events": events, "warnings": warnings}));
+    }
+    if req["op"] == "renote" {
+        // Notes again from what people said (`crate::note_facts::renote`): keeps a scope's people's notes again
+        // from their sessions, then deletes its old notes (no fact of their own, or written before
+        // `written_before`). Rewrites everyone's notes, so the operator alone, and a dry run unless `dry_run` is
+        // false.
+        if !superuser {
+            return Err(Refused(format!(
+                "{} may not renote (only the operator may)",
+                who.user()
+            ))
+            .into());
+        }
+        let org = req["org"].as_str().unwrap_or_default();
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
+        let scope = match req["team"].as_str().filter(|t| !t.is_empty()) {
+            Some(t) => Scope::team(org, t).map_err(|e| Invalid(e.to_string()))?,
+            None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
+        };
+        let dry_run = req["dry_run"].as_bool() != Some(false);
+        // Notes written before this (RFC 3339) are old too, whatever their fact.
+        let before = match req["written_before"].as_str() {
+            None => None,
+            Some(t) => Some(
+                chrono::DateTime::parse_from_rfc3339(t)
+                    .map_err(|_| Invalid("written_before is an RFC 3339 time".into()))?
+                    .timestamp_micros(),
+            ),
+        };
+        // A sample: one person's sessions, their first `limit`; `preview` writes nothing and answers what each
+        // would keep beside the person's notes now.
+        let which = crate::note_facts::Renote {
+            person: req["person"].as_str().map(String::from),
+            limit: req["limit"].as_u64().map(|n| n as usize),
+            preview: req["preview"].as_bool() == Some(true),
+        };
+        let r = crate::note_facts::renote(&store, &scope, who.user(), before, dry_run, which)
+            .await
+            .map_err(|e| Invalid(format!("{e:#}")))?;
+        // Counts only: a preview's notes never reach the log.
+        eprintln!(
+            "renote: {} on {scope} (dry run: {dry_run}): {} old notes, {} sessions of {} people{}",
+            who.user(),
+            r.old_notes,
+            r.sessions,
+            r.people,
+            if r.preview.is_some() {
+                ", previewed"
+            } else {
+                ""
+            }
+        );
+        return Ok(json!({"scope": scope.to_string(), "dry_run": dry_run, "renoted": r}));
     }
     if req["op"] == "advice_traces" {
         // The conversations people asked for advice in, every word and tool result of them, to train an advice
@@ -11691,7 +11761,7 @@ fn browser_tools() -> Vec<Value> {
                 "category": strings("Category, or a list of them"),
                 "situation": strings("Situation, or a list of them"),
                 "text": {"type": "string", "description": "Substring of the situation's `when` or its note"},
-                "ratified": {"type": "boolean", "description": "Past the evidence bar (reported only: every note is served either way)"},
+                "ratified": {"type": "boolean", "description": "Ratified: by an admin, or backed by outcomes or people's responses and past the evidence bar (reported only: every note is served either way)"},
                 "min_helped": {"type": "integer"},
                 "min_served": {"type": "integer"},
                 "learned": window("Window on when the note was written"),
@@ -13671,6 +13741,8 @@ fn served_text(served: &crate::sessions::Served) -> String {
             note,
             evidence,
             bar,
+            unbacked,
+            approved,
             skills,
             own,
         } => format!(
@@ -13682,7 +13754,7 @@ fn served_text(served: &crate::sessions::Served) -> String {
             if situation.starts_with(crate::advice::MINE_KEY) {
                 OWN_ADVICE.to_string()
             } else {
-                evidence.line(*bar)
+                evidence.line(*bar, *unbacked, *approved)
             }
         ),
         Served::Procedures {

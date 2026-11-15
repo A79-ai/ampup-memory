@@ -4,27 +4,29 @@
 #   cargo build --release --config .cargo/release.toml --bin ampup-memory
 #
 # Not in Cargo.toml's release profile, because staging deploys, the Docker image and Tilt build that profile too, and
-# they rebuild often: with fat LTO every change relinks the whole server on one core, for many minutes.
+# they don't need the smaller binary.
 #
-# What each setting does to the aarch64-apple-darwin server (stripped; tar.gz):
-#   release profile alone                       282 MB; 107 MB
-#   + fat LTO, one codegen unit                 177 MB;  75 MB  each generic function once, not once per crate
-#   + dependencies at opt-level "s", but the    144 MB;  62 MB  (every dependency at "s": 118 MB; 51 MB, and vector
-#     ones below at 3                                            math 5x slower)
+# What each setting does to the aarch64-apple-darwin server (stripped; tar.gz), and the most memory a build step takes:
+#   release profile alone                       282 MB; 107 MB   9.2 GB
+#   + dependencies at opt-level "s", but the    240 MB;  85 MB   9.2 GB  (every dependency at "s" is smaller still,
+#     ones below at 3 (this file)                                         but vector math is 5x slower)
+#   + fat LTO, one codegen unit                 144 MB;  62 MB  12.5 GB  each generic function once, not once per crate
+#   + thin LTO instead                          239 MB;  85 MB  10.0 GB
 # ONNX Runtime, linked statically by ort, is 18 MB of it (7 MB compressed).
+#
+# No LTO: the release builds on GitHub's own runners in the public repository, and fat LTO's final link doesn't fit
+# them. On a 7 GB Apple Silicon runner both Mac builds ran past the three-hour limit, and the 16 GB Arm Linux runner
+# was killed (v0.2.0). Thin LTO costs as much memory and saves nothing. Without it the build takes the memory the
+# release profile always did, which those runners managed, and the wheel stays under PyPI's 100 MiB.
 #
 # opt-level "s" turns off LLVM's loop vectorizer, and the vector math is written for it: Lance's L2 distance over
 # 100,000 vectors of 384 dimensions takes 16 ms at "s" against 3 ms at 3. So the code that does numeric work per row
-# stays at 3: this workspace's own crates (and with them the LTO pass, which runs at the binary crate's level), Lance's
-# and Arrow's kernels and encodings, the local embedder's tokenizer and arrays, compression and the allocator. The rest
-# (DataFusion's SQL front end, the cloud SDKs and object stores, Iceberg, HTTP, TLS, serde) is glue, where size wins.
+# stays at 3: this workspace's own crates, Lance's and Arrow's kernels and encodings, the local embedder's tokenizer
+# and arrays, compression and the allocator. The rest (DataFusion's SQL front end, the cloud SDKs and object stores,
+# Iceberg, HTTP, TLS, serde) is glue, where size wins.
 #
 # Panics stay unwinding (no panic = "abort", which would drop __eh_frame and __gcc_except_tab): each connection is a
 # task of its own (src/server/mod.rs), and a request that panics must end that connection, not the server.
-
-[profile.release]
-lto = "fat"
-codegen-units = 1
 
 [profile.release.package."*"]
 opt-level = "s"

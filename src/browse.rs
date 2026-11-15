@@ -594,14 +594,15 @@ async fn advice(store: &Store, session: &Session, who: &Principal) -> Result<Vec
     Ok(listed["advice"].as_array().cloned().unwrap_or_default())
 }
 
-/// How a piece of advice stands, in a word for a list: `merged`, `held`, `needs backing` or `served`.
+/// How a piece of advice stands, in a word for a list: `merged`, `held`, `served` or, served all the same, `not
+/// ratified` (outcomes or people don't back it yet).
 fn advice_status(a: &Value) -> &'static str {
     if !a["merged_into"].is_null() {
         "merged"
     } else if a["held"] == true || !a["withheld"].is_null() {
         "held"
     } else if !a["needs_backing"].is_null() {
-        "needs backing"
+        "not ratified"
     } else {
         "served"
     }

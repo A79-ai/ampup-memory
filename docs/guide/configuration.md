@@ -106,8 +106,8 @@ Requests carry `X-Title: ampup-memory`, so their spend shows apart on a shared k
 | `AMPUP_MEMORY_ADVICE_MIN_NEW` (10) | New rewarded runs before a learn; also the runs a person needs for personal notes. |
 | `AMPUP_MEMORY_ADVICE_NOTE_MIN_NEW` (5) | New runs before a note is rewritten. |
 | `AMPUP_MEMORY_ADVICE_LEARN=off` | Stop the learning timer. |
-| `AMPUP_MEMORY_ADVICE_LEARN_PEOPLE` (3, never below 2) | People a team note's runs must come from. |
-| `AMPUP_MEMORY_ADVICE_EVIDENCE` (3) | People a note must have helped before it is reported ratified. Reported only: every note is served. |
+| `AMPUP_MEMORY_ADVICE_LEARN_PEOPLE` (3, never below 2) | People a team note's runs must come from, whatever rewarded them, for it to be learned and served. |
+| `AMPUP_MEMORY_ADVICE_EVIDENCE` (3) | People a note must have helped before it is reported ratified (a team note must also be backed by outcomes or people's responses). Reported only: every note is served. |
 | `AMPUP_MEMORY_ADVICE_HOLDOUT` (0) | Share of sessions routed but served no advice, to measure lift. |
 | `AMPUP_MEMORY_ADVICE_PERSONAL_MAX` (3) | People whose personal notes are learned per round; 0 turns personal notes off. |
 | `AMPUP_MEMORY_ADVICE_JUDGE=off`, `AMPUP_MEMORY_ADVICE_JUDGE_AFTER_SECS` (1800), `AMPUP_MEMORY_ADVICE_JUDGE_MAX` (50) | Judging unrewarded runs. |
@@ -129,7 +129,7 @@ per person and week, by the replica holding the writer lease. A send that fails 
 same idempotency key, which Resend dedupes on; MailerSend takes none, so there a retry after a send whose answer was
 lost could mail it twice.
 
-It is off without mail, so `serve --local` sends none unless mail is configured. `ampup-memory digest preview
+It is off unless `AMPUP_MEMORY_DIGEST=on`, so a server set up to mail invites sends no digests until asked to, and `serve --local` sends none. Last week's digests go out only in the day after Monday at `AMPUP_MEMORY_DIGEST_HOUR`: a server started later in the week waits for the next Monday. `ampup-memory digest preview
 --person <email> [--week last|this|2026-W46]` prints one without sending ([cli.md](cli.md)).
 
 | Variable | What it does |
@@ -137,8 +137,8 @@ It is off without mail, so `serve --local` sends none unless mail is configured.
 | `AMPUP_MEMORY_MAIL_FROM` | The sender, like `AmpUp Memory <memory@example.com>`. Without it no mail is sent: join requests are logged instead, and there is no digest. |
 | `RESEND_API_KEY` or `MAILERSEND_API_KEY` | The mail provider. |
 | `AMPUP_MEMORY_MAIL_URL` | Send the provider's request here instead (a relay, or a sink when checking locally). |
-| `AMPUP_MEMORY_DIGEST=off` | No digest from this server. It also needs `AMPUP_MEMORY_PUBLIC_URL` (its unsubscribe links) and `AMPUP_MEMORY_SECRET_KEY` (to seal them); without either the server logs why there is none. |
-| `AMPUP_MEMORY_DIGEST_HOUR` (14) | The hour (UTC) on Mondays from which last week's digests go out. |
+| `AMPUP_MEMORY_DIGEST=on` | Send the weekly digest (off by default). It also needs mail (above), `AMPUP_MEMORY_PUBLIC_URL` (its unsubscribe links) and `AMPUP_MEMORY_SECRET_KEY` (to seal them); without either the server logs why there is none. |
+| `AMPUP_MEMORY_DIGEST_HOUR` (14) | The hour (UTC) on Mondays from which last week's digests go out, for a day. |
 | `AMPUP_MEMORY_DIGEST_CHECK_SECS` (900) | How often the server looks for digests due. |
 | `AMPUP_MEMORY_EXPLORER_URL` | The Explorer the digest links into, `{org}` standing for the org: `https://console.example.com/o/{org}/studio`. A lesson or session opens as `#/x/<episode id>`, a team's with `?team=<team>`. Without it the digest has no links but its unsubscribe one. |
 
@@ -149,7 +149,7 @@ Opting out:
   It is recorded in the org's answer log as `digest:subscription:<person>`, and forgetting the person removes it.
 - **An org**: `ampup-memory org settings <org> --digest false` (or `/admin {"op": "set_settings", "settings":
   {"digest": false}}`) sends its members none. It is on by default, and an org-wide setting only: a team can't set it.
-- **A server**: `AMPUP_MEMORY_DIGEST=off`.
+- **A server**: leave `AMPUP_MEMORY_DIGEST` unset (or anything but `on`).
 
 ## Memory of what users say
 

@@ -16,8 +16,9 @@
 //!
 //! `advice`: the situations whose advice the caller may read, from their own space (`space: "mine"`), the
 //! team's (`"team"`) or both (`"all"`, the default), narrowed by `category`, `situation`, `text` (a substring of
-//! the situation's `when` or its note), `ratified` (past the evidence bar; every note is listed and
-//! served either way, the bar is reported only), `min_helped`, `min_served` and `learned` (`{gte, gt, lte,
+//! the situation's `when` or its note), `ratified` (an admin ratified it, or outcomes or people back its runs and it
+//! is past the evidence bar: `crate::advice::team_ratified`; every note is listed and served either way, ratifying
+//! is reported only), `min_helped`, `min_served` and `learned` (`{gte, gt, lte,
 //! lt}` on when the note was written). With `include: "text"` each entry carries its note. A person's own
 //! entries show no evidence: a tally is the team's, and counts other people's sessions. Where the scope curates
 //! advice (`crate::advice_curate`), a note withheld by reward says so (`withheld`: its served runs against the rest),
@@ -344,10 +345,11 @@ pub async fn advice(
         if l.held {
             v["held"] = json!(true);
         }
-        // An admin ratified it: served to everyone whatever its evidence.
+        // An admin ratified it, whatever its backing and evidence.
         if l.approved {
             v["approved"] = json!(true);
         }
+        // Why outcomes or people don't back it yet, so it isn't ratified: served all the same.
         if let Some(why) = &l.needs_backing {
             v["needs_backing"] = json!(why);
         }
@@ -378,8 +380,12 @@ pub async fn advice(
         let tallies = crate::sessions::evidence(store, scope).await?;
         for l in crate::advice::listed(session, store, who, &crate::advice::Space::team()).await? {
             let tally = tallies.get(&l.key).cloned().unwrap_or_default();
-            // Everyone reads what the team serves, and it serves every note: the bar is reported only.
-            let past = tally.ratified(bar) || l.approved;
+            // Everyone reads what the team serves, and it serves every note: ratifying is reported only.
+            let past = crate::advice::team_ratified(
+                l.approved,
+                l.needs_backing.is_some(),
+                tally.ratified(bar),
+            );
             add("team", l, Some(&tally), past);
         }
     }

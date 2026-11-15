@@ -94,9 +94,10 @@ fn share(var: &str, default: f64) -> f64 {
         .map_or(default, |s| s.clamp(0.0, 1.0))
 }
 
-/// The people a note must have helped before `scope` reports it ratified ([`Tally::ratified`]): its team's or
-/// org's `advice_evidence` setting (`Directory::advice_evidence`), else the server's `AMPUP_MEMORY_ADVICE_EVIDENCE`,
-/// default 3 (0 reports every note ratified). Reported only: every note is served whatever its tally.
+/// The people a note must have helped before `scope` reports it ratified ([`Tally::ratified`]; a team note must also
+/// be backed by outcomes or people: [`crate::advice::team_ratified`]): its team's or org's `advice_evidence` setting
+/// (`Directory::advice_evidence`), else the server's `AMPUP_MEMORY_ADVICE_EVIDENCE`, default 3 (0: every note's
+/// evidence is enough). Reported only: every note is served whatever its tally.
 pub fn min_evidence(dir: Option<&Directory>, scope: &Scope) -> usize {
     dir.and_then(|d| d.advice_evidence(scope))
         .unwrap_or_else(|| {
@@ -935,7 +936,7 @@ async fn settle(done: &[(Key, u64)]) {
 
 /// Whether row `l`'s asker may still have it in `scope`: not disabled, not removed from its org, and the org neither
 /// deleted nor made again since the session opened (a new org of the same name is another tenant).
-fn still_theirs(dir: &Directory, scope: &Scope, l: &Logged) -> bool {
+pub(crate) fn still_theirs(dir: &Directory, scope: &Scope, l: &Logged) -> bool {
     let id = crate::people::directory::user_id(&l.asker);
     if dir.disabled.get(&id) == Some(&true) {
         return false;
@@ -981,7 +982,7 @@ fn same_message(a: &str, b: &str) -> bool {
 /// The person's messages in `text`, each with the end of the reply before it: its `User:` turns where `turns` (a
 /// hook's conversation so far, a transcript), else the text as one message (a session's opening, a hook's
 /// question). An agent's own account of a session, with no turns, holds none of the person's words.
-fn typed_in(text: &str, turns: bool) -> Vec<crate::keep::Typed> {
+pub(crate) fn typed_in(text: &str, turns: bool) -> Vec<crate::keep::Typed> {
     let asks = asks(text);
     if asks.is_empty() && !turns {
         let (said, _) = person_said(text);
@@ -1269,6 +1270,10 @@ pub enum Served {
         note: String,
         evidence: Tally,
         bar: usize,
+        /// Whether outcomes or people don't back the note yet, and whether an admin ratified it: with `evidence`,
+        /// whether it is ratified ([`crate::advice::team_ratified`]).
+        unbacked: bool,
+        approved: bool,
         skills: Vec<crate::advice::Skill>,
         own: Option<Own>,
     },
@@ -1503,6 +1508,8 @@ async fn serve(
             note,
             evidence,
             bar,
+            unbacked,
+            approved,
             skills,
             ..
         } => Served::Note {
@@ -1510,6 +1517,8 @@ async fn serve(
             note,
             evidence,
             bar,
+            unbacked,
+            approved,
             skills,
             own: Some(mine),
         },
@@ -1530,6 +1539,8 @@ async fn serve(
             note: mine.note,
             evidence: Default::default(),
             bar: evidence_bar(store, scope).await?,
+            unbacked: false,
+            approved: false,
             skills: mine.skills,
             own: None,
         },
@@ -1560,6 +1571,8 @@ async fn serve_team(
             text: note,
             skills,
             version,
+            unbacked,
+            approved,
             ..
         }) => {
             s.served.push(k.clone());
@@ -1578,6 +1591,8 @@ async fn serve_team(
                 note,
                 evidence,
                 bar: evidence_bar(store, scope).await?,
+                unbacked,
+                approved,
                 skills,
                 own: None,
             }
@@ -3825,8 +3840,10 @@ impl Tally {
             .map(|v| v > 0.0 && self.helped >= self.not_helped)
     }
 
-    /// The tally in a line, as an agent is shown it with the note, judged by `bar` ([`min_evidence`]).
-    pub fn line(&self, bar: usize) -> String {
+    /// The tally in a line, as an agent is shown it with the note, judged by `bar` ([`min_evidence`]); `unbacked` and
+    /// `approved` as [`crate::advice::team_ratified`] reads them.
+    pub fn line(&self, bar: usize, unbacked: bool, approved: bool) -> String {
+        let ratified = crate::advice::team_ratified(approved, unbacked, self.ratified(bar));
         if self.served + self.withheld == 0 {
             return "Evidence: none yet (no judged session has used it).".into();
         }
@@ -3841,10 +3858,11 @@ impl Tally {
             "{}{value} so far (each person's latest judged session): served to {}, applied by {}, helped {}, \
              didn't help {}; sessions it was served in: {} succeeded, {} failed; withheld (holdout): {} sessions, \
              {} succeeded, {} failed.",
-            if self.ratified(bar) {
-                "Evidence (ratified)"
-            } else {
-                "Evidence (not yet ratified)"
+            match (ratified, unbacked) {
+                (true, _) => "Evidence (ratified)",
+                (false, true) =>
+                    "Evidence (not yet ratified: no outcome or person's response backs it yet)",
+                (false, false) => "Evidence (not yet ratified)",
             },
             self.served,
             self.applied,

@@ -96,6 +96,17 @@ pub fn cooldown(e: &anyhow::Error) -> Duration {
     })
 }
 
+/// How long a caller should wait before asking again after a transient `e`, to pass on as its own
+/// `Retry-After`: what the upstream asked for when it said, else a rate limit's or a blip's first step.
+pub fn wait_hint(e: &anyhow::Error) -> Duration {
+    let text = format!("{e:#}");
+    match retry_after(&text) {
+        Some(w) => w.clamp(Duration::from_secs(1), MAX_WAIT),
+        None if is_throttled_text(&text) => Duration::from_secs(5),
+        None => Duration::from_secs(1),
+    }
+}
+
 /// `Retry-After` from the response headers an error quotes: delay-seconds or an HTTP date (RFC 9110).
 fn retry_after(text: &str) -> Option<Duration> {
     let lower = text.to_ascii_lowercase();

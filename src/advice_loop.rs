@@ -12,8 +12,8 @@
 //!    `reward_run` later replaces any of them. At most `AMPUP_MEMORY_ADVICE_JUDGE_MAX` (default 50) runs a round.
 //!    Judging is on unless `AMPUP_MEMORY_ADVICE_JUDGE=off`. A judge's reward is a model's opinion (it has not been
 //!    checked against outcomes known otherwise, a benchmark's verifier), so what is learned from it is a candidate:
-//!    a note is served beyond the people whose sessions taught it only once others' judged sessions ratify it
-//!    (`crate::sessions`). Ended sessions are judged the same way, as they end (`crate::sessions::judge`).
+//!    a team note learned from it is served, and reported ratified only once outcomes or people's responses back it
+//!    (`crate::advice::team_ratified`). Ended sessions are judged the same way, as they end (`crate::sessions::judge`).
 //! 2. **Learn.** Once at least `AMPUP_MEMORY_ADVICE_MIN_NEW` (default 10) rewarded runs aren't in the advice map
 //!    yet, [`crate::advice::learn`] runs, for the audience the map was last learned for (everyone, `*`, at
 //!    first): an admin's narrower audience is never widened by the timer.

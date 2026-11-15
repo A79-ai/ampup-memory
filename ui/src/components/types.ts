@@ -186,7 +186,10 @@ export type Lesson = {
   note_id: string;
   learned_at: number;
   status: string;
-  status_reason?: string;
+  // A team lesson that outcomes or people's responses don't back yet: why it isn't ratified (it is served anyway).
+  needs_backing?: string;
+  // A team lesson's: ratified by an admin, or backed and past the evidence bar.
+  ratified?: boolean;
   learned_from: {
     runs: number;
     right: number;

@@ -1005,13 +1005,30 @@ impl Extractor {
         let mut temperature = takes_temperature(&self.model);
         // A model that refuses a temperature (newer Claude models deprecate it), or thinking turned off as it was
         // asked, is asked again without it, and isn't sent it again. Every call that sent it retries: calls in
-        // flight together are all refused, not only the first. Each retry learns one thing, so at most two.
+        // flight together are all refused, not only the first. A model that refuses a reasoning effort is asked again
+        // for a higher one, the same way. Each retry learns one thing, so at most four.
         loop {
             let off = self.thinking_off();
+            // Read again by the request itself, which sends it.
+            let effort = self.quick_effort(max_tokens);
             match self
                 .complete_once(system, prompt, max_tokens, temperature, off, usable)
                 .await
             {
+                // Its least effort refused, it is asked for low; low refused, for none at all.
+                Err(e) if effort.is_some() && refuses_effort(&e) => {
+                    let (set, then) = match effort {
+                        Some("low") => (&NO_EFFORT, "without one"),
+                        _ => (&NOT_LEAST_EFFORT, "for low"),
+                    };
+                    if set.lock().unwrap().insert(self.model.clone()) {
+                        eprintln!(
+                            "extract: {} refused reasoning effort {:?}; asking {then}",
+                            self.model,
+                            effort.unwrap_or_default()
+                        );
+                    }
+                }
                 Err(e) if temperature && refuses_temperature(&e) => {
                     if NO_TEMPERATURE.lock().unwrap().insert(self.model.clone()) {
                         eprintln!(
@@ -1055,6 +1072,32 @@ impl Extractor {
         sends.then(|| thinking_off(&self.model))
     }
 
+    /// The reasoning effort a short call asks an OpenAI reasoning model for (gpt-5-mini, the `openai` default, the
+    /// later gpt-5.x and the o-series), on OpenAI's API (`reasoning_effort`) or behind OpenRouter's `openai/`
+    /// (`reasoning.effort`). They think before they answer, at medium effort unless told otherwise, and the thinking
+    /// is waited on: at medium, gpt-5-mini took 3 to 12 s to say whether routed advice fits (one word), often past
+    /// the fit check's wait, so nothing was served; at its least (`minimal`) it took about 1 s and answered alike.
+    /// A one-word or one-line answer (at most [`LEAST_EFFORT_TOKENS`]: the fit check, a sentence rewritten) asks
+    /// for the model's least effort ([`least_effort`]); a short one (at most [`QUICK_TOKENS`]: routing, judging a
+    /// run, keeping a preference) for low; a long one (extracting, learning, compiling) keeps the model's default.
+    /// None for any other model. A model that refuses one is asked for the next ([`NOT_LEAST_EFFORT`],
+    /// [`NO_EFFORT`]).
+    fn quick_effort(&self, max_tokens: u32) -> Option<&'static str> {
+        if self.api != Api::OpenAi
+            || max_tokens > QUICK_TOKENS
+            || !reasoning(&self.model)
+            || NO_EFFORT.lock().unwrap().contains(&self.model)
+        {
+            return None;
+        }
+        if max_tokens <= LEAST_EFFORT_TOKENS
+            && !NOT_LEAST_EFFORT.lock().unwrap().contains(&self.model)
+        {
+            return Some(least_effort(&self.model));
+        }
+        Some("low")
+    }
+
     async fn complete_once(
         &self,
         system: Option<&str>,
@@ -1082,6 +1125,13 @@ impl Extractor {
                     Some(ThinkingOff::Disabled) => body["reasoning"] = json!({"enabled": false}),
                     Some(ThinkingOff::BetweenTools | ThinkingOff::LowEffort) => {
                         body["reasoning"] = json!({"effort": "low"})
+                    }
+                }
+                if let Some(e) = self.quick_effort(max_tokens) {
+                    if self.backend == "openrouter" {
+                        body["reasoning"] = json!({"effort": e});
+                    } else {
+                        body["reasoning_effort"] = json!(e);
                     }
                 }
                 (format!("{}/chat/completions", self.url), body)
@@ -1428,31 +1478,54 @@ impl Extractor {
     fn text(&self, url: &str, v: &Value) -> Result<String> {
         // A reply may open with blocks that aren't its answer (a Claude 5 model's thinking): the text is the
         // text blocks', in order.
-        let blocks = match self.api {
-            Api::OpenAi => {
-                return v["choices"][0]["message"]["content"]
-                    .as_str()
-                    .map(String::from)
-                    .ok_or_else(|| Refused(format!("{url}: no text in the model's reply")).into());
+        let text: String = match self.api {
+            Api::OpenAi => v["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .into(),
+            Api::Ollama => v["message"]["content"].as_str().unwrap_or_default().into(),
+            Api::Anthropic | Api::Bedrock => {
+                let blocks = match self.api {
+                    Api::Anthropic => &v["content"],
+                    _ => &v["output"]["message"]["content"],
+                };
+                blocks
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|b| b["text"].as_str())
+                    .collect()
             }
-            Api::Ollama => {
-                return v["message"]["content"]
-                    .as_str()
-                    .filter(|t| !t.is_empty())
-                    .map(String::from)
-                    .ok_or_else(|| Refused(format!("{url}: no text in the model's reply")).into());
-            }
-            Api::Anthropic => &v["content"],
-            Api::Bedrock => &v["output"]["message"]["content"],
         };
-        let text: String = blocks
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|b| b["text"].as_str())
-            .collect();
+        // An empty reply is an answer only from a model that stopped on its own, on an OpenAI-compatible API,
+        // which a prompt may allow ("or nothing"); the other APIs never take one. Else it is no answer, never one
+        // that says no, and why it stopped goes with the error: at the token cap (`length`, `max_tokens`) a model
+        // that thinks spent the cap thinking before it wrote a word.
         if text.is_empty() {
-            return Err(Refused(format!("{url}: no text in the model's reply")).into());
+            let stop = match self.api {
+                Api::OpenAi => &v["choices"][0]["finish_reason"],
+                Api::Anthropic => &v["stop_reason"],
+                Api::Bedrock => &v["stopReason"],
+                Api::Ollama => &v["done_reason"],
+            };
+            let stop = stop.as_str().unwrap_or("none given");
+            if self.api == Api::OpenAi
+                && stop == "stop"
+                && v["choices"][0]["message"]["content"].is_string()
+            {
+                return Ok(text);
+            }
+            let at_cap = matches!(stop, "length" | "max_tokens");
+            return Err(Refused(format!(
+                "{url}: no text in {}'s reply (stopped: {stop}){}",
+                self.model,
+                if at_cap {
+                    ": it reached the token cap before it answered"
+                } else {
+                    ""
+                }
+            ))
+            .into());
         }
         Ok(text)
     }
@@ -2878,6 +2951,41 @@ fn claude_without_sampling(model: &str) -> bool {
 fn refuses_temperature(e: &anyhow::Error) -> bool {
     e.downcast_ref::<Refused>()
         .is_some_and(|r| r.0.contains(": 400 ") && r.0.contains("temperature"))
+}
+
+/// The longest answer a call may ask for and still be a short one ([`Extractor::quick_effort`]): the router's
+/// 1,500 tokens and under.
+const QUICK_TOKENS: u32 = 1_500;
+
+/// The longest answer a call may ask for and still be one word or one line ([`Extractor::quick_effort`]): the
+/// fit check's 50 tokens, a sentence's 120.
+const LEAST_EFFORT_TOKENS: u32 = 200;
+
+/// The least reasoning effort an OpenAI reasoning model takes: `minimal` for gpt-5 and its mini and nano, `none`
+/// for the gpt-5.x after them (which refuse `minimal`), `low` for the o-series.
+fn least_effort(model: &str) -> &'static str {
+    let m = model.strip_prefix("openai/").unwrap_or(model);
+    if m == "gpt-5" || m.starts_with("gpt-5-") {
+        "minimal"
+    } else if m.starts_with("gpt-5.") {
+        "none"
+    } else {
+        "low"
+    }
+}
+
+/// Models that refused their least reasoning effort since the server started: they are asked for low.
+static NOT_LEAST_EFFORT: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// Models that refused a low reasoning effort since the server started: they are sent none.
+static NO_EFFORT: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// A 400 that names the reasoning effort (`reasoning_effort`, or OpenRouter's `reasoning.effort`).
+fn refuses_effort(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Refused>().is_some_and(|r| {
+        let m = r.0.to_ascii_lowercase();
+        m.contains(": 400 ") && m.contains("reasoning") && m.contains("effort")
+    })
 }
 
 /// An OpenAI reasoning model (`gpt-5…`, `o1…`, `o3…`, `o4…`, also behind a router's `openai/` prefix): it takes

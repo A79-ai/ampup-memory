@@ -112,7 +112,9 @@ curl -s localhost:8080/lessons -d '{"since": "2026-11-06"}'
 ```
 
 - `lesson` is the note as agents are served it (no item ids, no Evidence or Freshness), markdown; `title` is its
-  heading. `status`: `served`, `held`, `needs backing`, `withheld` or `not served`.
+  heading. `status`: `served`, `held`, `withheld` or `not served`. A team lesson says whether it is `ratified` (by an
+  admin, or backed by outcomes or people's responses and past the evidence bar: [advice](advice.md#ratified)), and,
+  when outcomes or people don't back it yet, `needs_backing` with why; it is served either way.
 - `learned_from`: the runs and sessions its situation was learned from (a session's graded requests count as runs of
   it). `served_in`: the sessions it was handed in since, `moment` where (`start`, `prompt`, `agent`, `next`, `fork`,
   `stuck`, `done`), and `helped` the judge's reading.

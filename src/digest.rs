@@ -16,10 +16,13 @@
 //!   name, so forgetting them takes it) as `sending` before the provider is called and `sent` after. A recorded
 //!   send is never made again; one left `sending` (the server stopped mid-send) or `failed` is retried with the same
 //!   idempotency key, which the provider keeps a day, and given up after that.
-//! - **Off.** Without a mail transport ([`crate::mail`]), `AMPUP_MEMORY_PUBLIC_URL` and `AMPUP_MEMORY_SECRET_KEY`
-//!   (the unsubscribe link is sealed with it) nothing is sent: `serve --local` sends nothing by default.
-//!   `AMPUP_MEMORY_DIGEST=off` turns it off for the server, the org setting `digest: false` for an org, and the
-//!   link in every digest for one person (`/digest/unsubscribe`, which also subscribes again).
+//! - **Off unless asked for.** A server sends digests only with `AMPUP_MEMORY_DIGEST=on`, besides a mail transport
+//!   ([`crate::mail`]), `AMPUP_MEMORY_PUBLIC_URL` and `AMPUP_MEMORY_SECRET_KEY` (the unsubscribe link is sealed with
+//!   it): a server already set up to mail invites doesn't start mailing every org's members when it is upgraded.
+//!   The org setting `digest: false` turns it off for an org, and the link in every digest for one person
+//!   (`/digest/unsubscribe`, which also subscribes again).
+//! - **Only on Mondays.** Last week's digests go out in the day after Monday at [`hour`]: a server started later in
+//!   the week sends none until the next Monday, rather than last week's days late.
 //! - **Preview.** `ampup-memory digest preview --person <email>` renders a person's digest without sending it.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -669,7 +672,10 @@ pub fn render(d: &Digest, links: &Links) -> Rendered {
             parts.push(format!("{} more of yours", l.from_yours.len() - 2));
         }
         if l.from_others > 0 {
-            parts.push(format!("{} from teammates", l.from_others));
+            parts.push(format!(
+                "{} by teammates",
+                plural(l.from_others, "run", "runs")
+            ));
         }
         if parts.is_empty() {
             String::new()
@@ -1104,14 +1110,10 @@ pub fn open_link(key: &SecretKey, t: &str) -> Result<Unsubscribe> {
 
 // ---- Sending ----
 
-/// Whether `AMPUP_MEMORY_DIGEST` leaves the digest on (it is, unless `off`).
+/// Whether `AMPUP_MEMORY_DIGEST` turns the digest on (it is off unless `on`).
 pub fn on_by_env() -> bool {
-    !std::env::var("AMPUP_MEMORY_DIGEST").is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "off" | "0" | "false"
-        )
-    })
+    std::env::var("AMPUP_MEMORY_DIGEST")
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true"))
 }
 
 /// The hour of Monday (UTC) from which last week's digests are sent: `AMPUP_MEMORY_DIGEST_HOUR`, default 14.
@@ -1123,10 +1125,15 @@ pub fn hour() -> i64 {
         .unwrap_or(14)
 }
 
-/// The week whose digests are due at `now` (µs): last week's, from Monday at [`hour`] on.
+/// How long after Monday at [`hour`] last week's digests may still go out: a day, as long as a provider keeps a
+/// send's idempotency key, so a retry within it is never a second mail.
+const SEND_WINDOW_US: i64 = 24 * 3_600_000_000;
+
+/// The week whose digests are due at `now` (µs): last week's, in the day from Monday at [`hour`]; none at other times.
 pub fn due(now: i64) -> Option<Week> {
     let this = Week::containing(now);
-    (now >= this.start + hour() * 3_600_000_000).then(|| this.previous())
+    let from = this.start + hour() * 3_600_000_000;
+    (now >= from && now < from + SEND_WINDOW_US).then(|| this.previous())
 }
 
 /// Everything a send needs: the mail transport, the key sealing unsubscribe links and the public URL they open.
@@ -1141,7 +1148,7 @@ impl Sender {
     /// The sender the environment configures, or why there is none.
     pub fn from_env() -> std::result::Result<Sender, String> {
         if !on_by_env() {
-            return Err("AMPUP_MEMORY_DIGEST is off".into());
+            return Err("AMPUP_MEMORY_DIGEST isn't on".into());
         }
         let mailer = mail::from_env().ok_or(
             "no mail is configured (AMPUP_MEMORY_MAIL_FROM with RESEND_API_KEY or MAILERSEND_API_KEY)",
