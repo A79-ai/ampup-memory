@@ -3280,7 +3280,8 @@ pub async fn export_org(
         if !store.catalog().table_exists(&facts_ident).await? {
             continue;
         }
-        let vis = store.visibility(&scope, MAIN).await?;
+        // Read now, not from this server's cache: what another writer deleted a moment ago stays out.
+        let vis = store.fresh_visibility(&scope, MAIN).await?;
         let (facts, entities) = export_facts(store, &ns, &vis, reader).await?;
         let episodes = export_episodes(store, &ns, &vis, reader).await?;
         out.push((format!("{name}/facts.jsonl"), facts));

@@ -1,0 +1,1264 @@
+/* Studio: the org's memory read like a clinical chart, in AmpUp's design system: warm paper, charcoal ink, 1px hairlines; earthy red only for a result out of range, ochre
+   for one to watch. Scoped to `.studio`. */
+
+.studio {
+  --paper: #fdfcf7;
+  --sheet: #ffffff;
+  --ink: #232428;
+  --ink-2: #4c4c4a;
+  --faint: #7f7e7c;
+  --rule: #e4e3de;
+  --rule-soft: #efede8;
+  --band: #f3e4db;
+  --hover: #f5f2ec;
+  --out: #b04a3a;
+  --watch: #b07a2e;
+  --within: #5e7a52;
+  --focus: #437dc6;
+  --sans:
+    "NeuMontreal", "Inter", "Atkinson Hyperlegible Next", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", sans-serif;
+  --mono:
+    "JetBrains Mono", "Atkinson Hyperlegible Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  color-scheme: light;
+
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  padding: 0 0 48px;
+  min-height: 70vh;
+  container: studio / inline-size;
+}
+
+.studio ::selection {
+  background: var(--band);
+  color: var(--ink);
+}
+.studio :focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.studio h1,
+.studio h2,
+.studio h3 {
+  font-family: var(--sans);
+  color: var(--ink);
+  margin: 0;
+  letter-spacing: 0;
+}
+.studio b {
+  font-weight: 700;
+}
+.st-quiet {
+  color: var(--ink-2);
+}
+.st-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* The banner across the top: whose chart, and as of when. */
+.st-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 32px;
+  padding: 14px 16px;
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+  background: var(--sheet);
+}
+.st-banner-who {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-right: auto;
+}
+.st-banner-who h1 {
+  font-size: 20px;
+  font-weight: 700;
+}
+.st-banner-who span {
+  color: var(--ink-2);
+}
+.st-banner-facts {
+  display: flex;
+  gap: 28px;
+  margin: 0;
+}
+.st-banner-facts div {
+  display: flex;
+  gap: 8px;
+}
+.st-banner-facts dt {
+  color: var(--ink-2);
+}
+.st-banner-facts dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+.st-btn {
+  all: unset;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--sheet);
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  text-decoration: none;
+}
+.st-btn:hover {
+  border-color: var(--ink-2);
+}
+.st-btn-strong {
+  border-color: var(--ink);
+  font-weight: 600;
+}
+
+.st-status {
+  font-size: 26px;
+  line-height: 1.25;
+  margin: 28px 16px 20px;
+  max-width: 62ch;
+  text-wrap: balance;
+}
+.st-out {
+  color: var(--out);
+}
+.st-error {
+  margin: 16px;
+  color: var(--out);
+}
+
+.st-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 32px;
+  padding: 0 16px;
+  align-items: start;
+}
+/* Sized by the panel it sits in, not the window: beside the sidebar, the handover goes above the table. */
+@container studio (max-width: 1280px) {
+  .st-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .st-handover {
+    order: -1;
+  }
+  .st-handover ol {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    column-gap: 24px;
+  }
+}
+
+/* The results: a lab report's table. */
+.st-table-wrap {
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--sheet);
+}
+/* Narrow screens scroll the table sideways; wide ones leave it unclipped so a row's menu can overhang. */
+@container studio (max-width: 960px) {
+  .st-table-wrap {
+    overflow-x: auto;
+  }
+}
+.st-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+.st-table th,
+.st-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--rule-soft);
+  text-align: left;
+  vertical-align: middle;
+}
+.st-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--hover);
+  border-bottom: 1px solid var(--rule);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.st-table thead th:first-child {
+  border-top-left-radius: 8px;
+}
+.st-table thead th:last-child {
+  border-top-right-radius: 8px;
+}
+.st-table tbody tr:last-child > * {
+  border-bottom: 0;
+}
+.st-group th {
+  background: var(--sheet);
+  font-size: 13px;
+  font-weight: 600;
+  padding-top: 16px;
+  padding-bottom: 6px;
+}
+.st-group .st-quiet {
+  font-weight: 400;
+}
+.st-row:hover td {
+  background: var(--hover);
+}
+.st-num {
+  text-align: right;
+  white-space: nowrap;
+}
+/* Figures in the hyperlegible mono; words stay in the sans. */
+.st-fig {
+  font-family: var(--mono);
+  font-size: 14px;
+}
+.st-table td:first-child {
+  min-width: 220px;
+}
+.st-c {
+  text-align: center;
+}
+.st-act {
+  width: 48px;
+  text-align: right;
+}
+.st-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.st-name-btn {
+  all: unset;
+  cursor: pointer;
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-color: var(--rule);
+  text-underline-offset: 3px;
+}
+.st-name-btn:hover {
+  text-decoration-color: var(--ink);
+}
+.st-note {
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.st-type,
+.st-since {
+  font-size: 14px;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.st-range {
+  color: var(--ink-2);
+}
+.st-flag {
+  font-weight: 700;
+  font-size: 13px;
+  white-space: nowrap;
+  color: var(--faint);
+}
+/* An abnormal result keeps its row: its value and flag are restyled in place. */
+.st-tone-out .st-value,
+.st-tone-out .st-flag {
+  color: var(--out);
+  font-weight: 700;
+}
+.st-tone-watch .st-value,
+.st-tone-watch .st-flag {
+  color: var(--watch);
+  font-weight: 700;
+}
+.st-pin {
+  fill: var(--ink);
+  stroke: var(--ink);
+  stroke-width: 1.3;
+  stroke-linejoin: round;
+  flex: none;
+}
+
+.st-fold {
+  all: unset;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+.st-chev {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  transition: transform 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.st-chev.open {
+  transform: rotate(90deg);
+}
+
+/* Traces: the 48 hours over the normal band. */
+.st-trace-wrap {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.st-trace {
+  display: block;
+  overflow: visible;
+}
+.st-trace-big {
+  width: 100%;
+  max-width: 560px;
+  height: auto;
+}
+.st-band {
+  fill: var(--band);
+}
+.st-line {
+  fill: none;
+  stroke: var(--ink);
+  stroke-width: 1.25;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.st-hot {
+  fill: none;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.st-hot-out {
+  stroke: var(--out);
+}
+.st-hot-watch {
+  stroke: var(--watch);
+}
+.st-since-line,
+.st-hover {
+  stroke: var(--faint);
+  stroke-dasharray: 2 3;
+  vector-effect: non-scaling-stroke;
+}
+.st-hover {
+  stroke: var(--ink);
+  stroke-dasharray: none;
+}
+.st-notrace {
+  font-size: 13px;
+}
+.st-readout {
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.st-detail td {
+  background: var(--hover);
+  padding: 14px 12px 18px;
+}
+.st-detail-in {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  align-items: flex-start;
+}
+.st-detail-in > .st-trace-wrap {
+  flex: 0 1 560px;
+}
+.st-detail-in p {
+  flex: 1 1 260px;
+  max-width: 62ch;
+  margin: 0;
+}
+
+/* Admin panes (Admin.tsx): People, Advice, Branches. Same sheet, same table. */
+.st-admin .st-banner {
+  gap: 12px 24px;
+}
+.st-admin .st-banner-facts {
+  flex-wrap: wrap;
+  gap: 8px 24px;
+}
+.st-admin .st-banner-facts div {
+  white-space: nowrap;
+}
+.st-pad {
+  margin: 20px 16px;
+}
+.st-pad-x {
+  margin: 16px 16px 0;
+}
+.st-lede {
+  margin: 16px 16px 0;
+  max-width: 70ch;
+}
+/* A second list in one pane (Owners: areas, then entities). */
+.st-subsection {
+  margin-top: 32px;
+  border-top: 1px solid var(--rule);
+}
+.st-subhead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 20px 16px 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+.st-subhead .st-quiet {
+  font-weight: 400;
+}
+.st-crumb {
+  margin: 12px 16px 0;
+}
+.st-nowrap {
+  white-space: nowrap;
+}
+.st-small {
+  font-size: 13px;
+}
+.st-within {
+  color: var(--within);
+}
+.st-watch {
+  color: var(--watch);
+  font-weight: 600;
+}
+.st-link {
+  all: unset;
+  cursor: pointer;
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--rule);
+  text-underline-offset: 3px;
+}
+.st-link:hover {
+  text-decoration-color: var(--ink);
+}
+.st-link:focus-visible,
+.st-name-btn:focus-visible,
+.st-chip:focus-visible,
+.st-seg-b:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.st-q {
+  font-weight: 400;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  max-width: 60ch;
+}
+.st-seg {
+  display: inline-flex;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.st-seg-b {
+  all: unset;
+  cursor: pointer;
+  padding: 0 12px;
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  font-size: 14px;
+  color: var(--ink-2);
+}
+.st-seg-b + .st-seg-b {
+  border-left: 1px solid var(--rule);
+}
+.st-seg-b.on {
+  background: var(--band);
+  color: var(--ink);
+  font-weight: 600;
+}
+.st-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.st-empty {
+  margin: 40px 16px;
+  max-width: 56ch;
+}
+.st-empty h2 {
+  font-size: 20px;
+  margin-bottom: 8px;
+}
+.st-empty .st-btn {
+  margin-top: 16px;
+}
+.st-answer {
+  white-space: pre-wrap;
+}
+.st-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.st-chip {
+  all: unset;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 2px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--sheet);
+}
+.st-chip:hover {
+  border-color: var(--ink-2);
+}
+.st-trail {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 24px;
+  width: 100%;
+}
+.st-trail h3 {
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+.st-uses {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+  font-size: 14px;
+}
+.st-owner-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px 16px;
+  margin: 20px 16px 0;
+}
+.st-owner-form label {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.st-owner-form select,
+.st-owner-form input {
+  font: inherit;
+  font-size: 14px;
+  color: var(--ink);
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  min-height: 36px;
+  padding: 0 10px;
+  min-width: 0;
+}
+.st-owner-form input {
+  width: 16rem;
+  max-width: 100%;
+}
+.st-owner-form select:focus-visible,
+.st-owner-form input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+@container studio (max-width: 960px) {
+  .st-trail {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* A conversation's trace (Trace.tsx): the transcript as numbered steps, what it used beside it. */
+.st-trace-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 24px;
+  margin: 20px 16px 0;
+  align-items: start;
+}
+.st-trace-main {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.st-trace-q {
+  margin: 0;
+  font-size: 17px;
+  max-width: 70ch;
+}
+.st-trace-side {
+  display: grid;
+  gap: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--sheet);
+}
+.st-trace-side h3,
+.st-outcome h3 {
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+.st-trace-side p {
+  margin: 0;
+}
+.st-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-left: 1px solid var(--rule);
+  margin-left: 14px;
+}
+.st-step {
+  position: relative;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 10px;
+  padding: 0 0 14px;
+  margin-left: -15px;
+}
+.st-step-n {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  color: var(--ink-2);
+}
+.st-step-user .st-step-n {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--paper);
+}
+.st-step-tool .st-step-n,
+.st-step-result .st-step-n {
+  border-style: dashed;
+}
+.st-step-body {
+  min-width: 0;
+  padding-top: 4px;
+}
+.st-step-head {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  margin-bottom: 2px;
+}
+.st-step-role {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+.st-step-user .st-step-role {
+  color: var(--ink);
+}
+.st-step-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 80ch;
+}
+.st-step-text.mono {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ink-2);
+  background: var(--hover);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+.st-outcome {
+  border-top: 1px solid var(--rule);
+  padding-top: 12px;
+}
+/* Each kind of step its mark: amber where advice came in, green where memory was read or written, red where a
+   call failed; the rest in ink. The same colours mark the lanes and the filters. */
+.st-trace-main {
+  --k-user: var(--ink);
+  --k-assistant: var(--ink-2);
+  --k-advice: var(--watch);
+  --k-read: var(--within);
+  --k-write: var(--within);
+  --k-session: var(--ink-2);
+  --k-tool: var(--faint);
+  --k-error: var(--out);
+  --k-system: var(--faint);
+  --k-text: var(--faint);
+}
+.st-step-advice .st-step-n {
+  border-color: var(--watch);
+  color: var(--watch);
+  font-weight: 700;
+}
+.st-step-read .st-step-n,
+.st-step-write .st-step-n {
+  border-color: var(--within);
+  color: var(--within);
+}
+.st-step-write .st-step-n {
+  border-width: 2px;
+}
+.st-step-error .st-step-n {
+  border-color: var(--out);
+  color: var(--out);
+}
+.st-step-advice .st-step-role {
+  color: var(--watch);
+}
+.st-step-read .st-step-role,
+.st-step-write .st-step-role {
+  color: var(--within);
+}
+.st-step-error .st-step-role {
+  color: var(--out);
+}
+.st-step-flash .st-step-body {
+  outline: 2px solid var(--focus);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+.st-gap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px 20px;
+  font-size: 13px;
+  color: var(--faint);
+}
+.st-lanes {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+.st-lanes-names {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--faint);
+}
+.st-lanes svg {
+  display: block;
+  width: 100%;
+  overflow: visible;
+}
+.st-lane-rule {
+  stroke: var(--rule-soft);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.st-lane-mark {
+  cursor: pointer;
+  fill: var(--k-tool);
+}
+.st-lane-mark:hover {
+  opacity: 0.6;
+}
+.st-lane-off {
+  opacity: 0.2;
+}
+.st-lane-user {
+  fill: var(--k-user);
+}
+.st-lane-assistant {
+  fill: var(--k-assistant);
+}
+.st-lane-advice {
+  fill: var(--k-advice);
+}
+.st-lane-read,
+.st-lane-write {
+  fill: var(--k-read);
+}
+.st-lane-session {
+  fill: var(--k-session);
+}
+.st-lane-error {
+  fill: var(--k-error);
+}
+.st-trace-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.st-filter {
+  all: unset;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--ink-2);
+  background: var(--sheet);
+}
+.st-filter:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.st-filter[aria-pressed="true"] {
+  border-color: var(--ink);
+  background: var(--band);
+  color: var(--ink);
+  font-weight: 600;
+}
+.st-filter-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--k-tool);
+}
+.st-filter-user .st-filter-dot {
+  background: var(--k-user);
+}
+.st-filter-assistant .st-filter-dot {
+  background: var(--k-assistant);
+}
+.st-filter-advice .st-filter-dot {
+  background: var(--k-advice);
+}
+.st-filter-read .st-filter-dot,
+.st-filter-write .st-filter-dot {
+  background: var(--k-read);
+}
+.st-filter-session .st-filter-dot {
+  background: var(--k-session);
+}
+.st-filter-error .st-filter-dot {
+  background: var(--k-error);
+}
+.st-trace-ctx {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.st-trace-filters select,
+.st-trace-filters input {
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  min-height: 30px;
+  padding: 0 8px;
+}
+.st-trace-filters input {
+  width: 14rem;
+  max-width: 100%;
+}
+.st-reward {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 22px;
+  font-weight: 700;
+}
+.st-reward-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--rule-soft);
+  position: relative;
+  overflow: hidden;
+}
+.st-reward-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 50%;
+  width: 1px;
+  background: var(--ink-2);
+}
+.st-reward-bar i {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--within);
+}
+.st-reward-bar i.st-reward-neg {
+  background: var(--out);
+}
+.st-kv {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px 12px;
+  margin: 8px 0 0;
+}
+.st-kv dt {
+  color: var(--faint);
+}
+.st-kv dd {
+  margin: 0;
+}
+.st-served {
+  display: grid;
+  gap: 1px;
+}
+@container studio (max-width: 960px) {
+  .st-trace-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* The ⋯ menu. */
+.st-menu-root {
+  position: relative;
+  display: inline-block;
+}
+.st-dots {
+  all: unset;
+  cursor: pointer;
+  display: inline-grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+}
+.st-dots svg {
+  fill: var(--ink);
+}
+.st-dots:hover,
+.st-dots[aria-expanded="true"] {
+  background: var(--band);
+}
+.st-menu {
+  position: absolute;
+  right: 0;
+  top: 40px;
+  z-index: 5;
+  min-width: 220px;
+  padding: 6px;
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  box-shadow:
+    0 8px 24px rgb(29 35 33 / 0.14),
+    0 1px 3px rgb(29 35 33 / 0.1);
+  text-align: left;
+}
+.st-mi {
+  all: unset;
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  color: var(--ink);
+}
+.st-mi:hover,
+.st-mi:focus-visible {
+  background: var(--hover);
+  outline: none;
+}
+.st-menu-sep {
+  height: 1px;
+  background: var(--rule-soft);
+  margin: 6px 4px;
+}
+
+/* The handover: what to do, ranked. */
+.st-handover {
+  border-top: 2px solid var(--ink);
+  padding-top: 12px;
+}
+.st-handover h2 {
+  font-size: 17px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.st-handover ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.st-handover li {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--rule);
+}
+.st-handover h3 {
+  font-size: 15px;
+  font-weight: 700;
+}
+.st-handover li p {
+  margin: 4px 0 10px;
+  color: var(--ink-2);
+}
+.st-item-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.st-fine {
+  font-size: 13px;
+  margin-top: 16px;
+}
+
+.st-note {
+  display: block;
+  border-left: 3px solid var(--ink);
+  background: var(--sheet);
+  padding: 12px 16px;
+  margin-bottom: 16px;
+}
+.st-note-src {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.st-note-body {
+  max-height: 420px;
+  overflow: auto;
+  font-size: 14px;
+}
+.st-clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.st-impact-note {
+  margin: 0 0 12px;
+}
+.st-impact {
+  margin: 0 0 28px;
+}
+.st-impact h2 {
+  font-size: 15px;
+  margin: 0 0 2px;
+}
+.st-impact > p {
+  margin: 0 0 8px;
+}
+.st-jump {
+  all: unset;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.st-jump:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.st-impact {
+  scroll-margin-top: 16px;
+}
+.st-impact-hurting h2 {
+  color: var(--out);
+}
+.st-items {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  font-size: 13px;
+}
+.st-items li {
+  margin: 0 0 4px;
+}
+.st-served-text summary {
+  cursor: pointer;
+  color: var(--ink-2);
+}
+.st-served-text[open] {
+  display: grid;
+  gap: 6px;
+}
+.st-served-text .st-step-text {
+  max-height: 24rem;
+  overflow: auto;
+}
+
+/* Serving: a share drawn as a hairline bar beside its figure. */
+.st-share {
+  display: inline-block;
+  width: 64px;
+  height: 6px;
+  margin-right: 6px;
+  vertical-align: middle;
+  background: var(--rule-soft);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.st-share i {
+  display: block;
+  height: 100%;
+  background: var(--ink-2);
+}
+/* A session's advice lookups, in its People row and its trace. */
+.st-lookups td {
+  vertical-align: top;
+}
+.st-lookup-items li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.st-lookup-items li:last-child {
+  border-bottom: 0;
+}
+
+/* The trace as one tree (Trace.tsx): the conversation's parts (its sessions), each person's message heading
+   the turn it led to, the turn's steps beneath it on the rule. */
+.st-tree,
+.st-turns {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.st-part {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 10px 12px 4px;
+  background: var(--sheet);
+}
+.st-part-here {
+  border-color: var(--ink-2);
+}
+.st-part-head,
+.st-turn-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  min-width: 0;
+}
+.st-part-head {
+  margin-bottom: 10px;
+}
+.st-part-tag {
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 0 8px;
+  color: var(--ink-2);
+}
+.st-turn > .st-steps {
+  margin-top: 8px;
+  margin-left: 28px;
+}
+.st-turn-ask {
+  flex: 1 1 0;
+  min-width: 0;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 2px 0;
+  cursor: pointer;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 14em;
+  overflow: auto;
+}
+.st-turn-ask b {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.st-turn-n {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  height: 22px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 11px;
+  vertical-align: 1px;
+}
+.st-turn-lead .st-turn-ask {
+  cursor: default;
+  font-style: italic;
+}
+.st-turn-gap {
+  margin-left: 0;
+}
+.st-fold-b {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--ink-2);
+  cursor: pointer;
+  align-self: flex-start;
+  margin-top: 2px;
+}
+.st-fold-b:hover {
+  background: var(--hover);
+}
+.st-fold-b .st-chev {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  transition: transform 0.12s;
+}
+.st-fold-b .st-chev.open {
+  transform: rotate(90deg);
+}
+.st-tree-acts {
+  display: inline-flex;
+  gap: 12px;
+  margin-left: auto;
+}
+.st-tree-empty {
+  margin: 0 0 10px 32px;
+}
+.st-trace-q-part {
+  font-size: 15px;
+}
+button.st-step-n {
+  cursor: pointer;
+  font-family: inherit;
+  padding: 0;
+}
+button.st-step-n:hover {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.st-step-linked .st-step-body {
+  outline: 2px solid var(--focus);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+@media (max-width: 700px) {
+  .st-turn > .st-steps {
+    margin-left: 14px;
+  }
+  .st-tree-acts {
+    margin-left: 0;
+  }
+}

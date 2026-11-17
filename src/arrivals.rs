@@ -330,8 +330,19 @@ async fn read_for_facts(store: &Store, ns: &str) -> Result<Arc<HashMap<String, V
     Ok(index)
 }
 
+/// What an episode is called, read from its body ([`title`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Titled {
+    /// Its title, as a list shows it.
+    pub title: String,
+    /// The title its type reads from its record (a call's recorder title), when it gives one.
+    pub named: Option<String>,
+    /// What its type says the record is of (a call's `meeting:<id>`), when it says.
+    pub subject: Option<String>,
+}
+
 /// Titles read once per server, by episode id: an episode's id is its text's hash, so its title never changes.
-static TITLES: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+static TITLES: LazyLock<Mutex<HashMap<String, Titled>>> = LazyLock::new(Default::default);
 /// Titles held at most; past it, they are read again.
 const MAX_TITLES: usize = 10_000;
 /// A title's characters at most.
@@ -345,13 +356,36 @@ pub async fn titles(
     who: &Principal,
     listed: &mut [Unread],
 ) -> Result<()> {
+    let ask: Vec<(String, String)> = listed
+        .iter()
+        .filter(|u| u.title.is_none())
+        .map(|u| (u.episode_id.clone(), u.source.clone()))
+        .collect();
+    let held = titled(store, session, who, &ask).await?;
+    for u in listed.iter_mut().filter(|u| u.title.is_none()) {
+        u.title = held.get(&u.episode_id).map(|t| t.title.clone());
+    }
+    Ok(())
+}
+
+/// What each of these episodes (id, source) is called, for those the reader may read in `session`'s scope: held
+/// once per server, so only an episode not read before has its body read.
+pub async fn titled(
+    store: &Store,
+    session: &Session,
+    who: &Principal,
+    eps: &[(String, String)],
+) -> Result<HashMap<String, Titled>> {
+    let readable: Vec<&(String, String)> = eps
+        .iter()
+        .filter(|(id, _)| session.vis().can_see_episode(id, who))
+        .collect();
     let missing: Vec<String> = {
         let held = TITLES.lock().unwrap();
-        listed
+        readable
             .iter()
-            .filter(|u| u.title.is_none() && !held.contains_key(&u.episode_id))
-            .filter(|u| session.vis().can_see_episode(&u.episode_id, who))
-            .map(|u| u.episode_id.clone())
+            .filter(|(id, _)| !held.contains_key(id))
+            .map(|(id, _)| id.clone())
             .collect()
     };
     if !missing.is_empty() {
@@ -361,33 +395,39 @@ pub async fn titles(
             held.clear();
         }
         for (id, body) in bodies {
-            let Some(u) = listed.iter().find(|u| u.episode_id == id) else {
+            let Some((_, source)) = readable.iter().find(|(e, _)| *e == id) else {
                 continue;
             };
-            held.insert(id, title(&u.source, &body));
+            held.insert(id, title(source, &body));
         }
     }
     let held = TITLES.lock().unwrap();
-    for u in listed.iter_mut().filter(|u| u.title.is_none()) {
-        if session.vis().can_see_episode(&u.episode_id, who) {
-            u.title = held.get(&u.episode_id).cloned();
-        }
-    }
-    Ok(())
+    Ok(readable
+        .iter()
+        .filter_map(|(id, _)| Some((id.clone(), held.get(id)?.clone())))
+        .collect())
 }
 
 /// An episode's title: its first line, or of a record kept as JSON (a thread, a call), what its type says the
 /// title is, else its first line as its type reads it.
-fn title(source: &str, body: &[u8]) -> String {
+fn title(source: &str, body: &[u8]) -> Titled {
     let text = String::from_utf8_lossy(body);
+    let (mut named, mut subject) = (None, None);
     let first = match text.trim_start().starts_with('{') {
         true => {
             let mut ep = Episode::new(source, body, &[]);
             ep.source = source.to_string();
             let typed = crate::episode_types::of(&ep);
-            typed
-                .map(|t| t.header(&ep))
-                .and_then(|h| h.title.or(h.subject))
+            let header = typed.map(|t| t.header(&ep)).unwrap_or_default();
+            named = header
+                .title
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| clip(&t));
+            subject = header.subject.clone();
+            header
+                .title
+                .or(header.subject)
                 .filter(|t| !t.trim().is_empty())
                 .or_else(|| {
                     typed
@@ -402,10 +442,19 @@ fn title(source: &str, body: &[u8]) -> String {
             .unwrap_or_default()
             .to_string(),
     };
-    let first = first.split_whitespace().collect::<Vec<_>>().join(" ");
-    let first = first.trim_start_matches('#').trim();
-    match first.char_indices().nth(TITLE_CHARS) {
-        Some((i, _)) => format!("{}…", &first[..i]),
-        None => first.to_string(),
+    Titled {
+        title: clip(&first),
+        named,
+        subject,
+    }
+}
+
+/// A line as a title: its words, without a heading's `#`, at most [`TITLE_CHARS`] characters.
+fn clip(line: &str) -> String {
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let line = line.trim_start_matches('#').trim();
+    match line.char_indices().nth(TITLE_CHARS) {
+        Some((i, _)) => format!("{}…", &line[..i]),
+        None => line.to_string(),
     }
 }

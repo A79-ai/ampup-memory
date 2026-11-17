@@ -36,6 +36,9 @@ ampup-memory service install                 # or keep it running in the backgro
 - No Docker, no catalog service, no sign-in. Every request reads as one caller in group `local` (or the groups
   given after the port). It binds to 127.0.0.1 and refuses to start if `AMPUP_MEMORY_SERVE_BIND` names anything else;
   requests whose `Host` or `Origin` isn't this machine are refused.
+- Look at your memory: open `http://127.0.0.1:<port>/studio/` (or run `ampup-memory studio`). The Studio is built
+  into the binary; one built from source without Node.js says how to build it in
+  (`npm --prefix studio ci && npm --prefix studio run build`, then `cargo build` again). Other servers don't serve it.
 - One process owns a directory at a time. Commands with `--local DIR` (`schema set`, `runs load`, `compile`,
   `advice`, `extract`, `load`, …) need the server stopped.
 

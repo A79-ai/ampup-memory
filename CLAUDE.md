@@ -27,7 +27,6 @@
 - `deploy/` holds self-hosting material: container images (`deploy/docker`, `deploy/spcs`), the GCP modules and
   scripts (`deploy/gcp`), least-privilege IAM templates (`deploy/iam`), the Snowflake Native App (`deploy/native`),
   Databricks notes and the deployment agent's manifests.
-- `ui/` is a Next.js browser for an AmpUp Memory server (see `ui/README.md`).
 
 ## Run it locally
 
@@ -61,8 +60,7 @@
   `docs/directory.md` (and answer its threat-model questions) before changing the directory or authentication.
 - Other checks CI runs: `python3 -m unittest discover -s harness -p test_search_cpu_bench.py`; for `deploy/iam` and
   `deploy/gcp/terraform`, `terraform fmt -check -recursive`, `terraform validate`, `terraform test` and
-  `python3 deploy/iam/check_permissions.py`. CI doesn't build `ui/`: for a change there, run `npm test` and
-  `npm run lint` in `ui/` yourself.
+  `python3 deploy/iam/check_permissions.py`.
 
 ## Pull requests
 

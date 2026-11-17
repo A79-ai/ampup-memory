@@ -17,7 +17,8 @@
 //! Request: `{"space"?: "mine" | "team" | "all", "person"?: <user>, "key"?: <lesson key>, "since"?: <time>,
 //! "limit"?: <trail entries per side>}`. `person` narrows `mine` to one person's (only an admin names someone else);
 //! `since` keeps the lessons written at or after it (µs, an RFC 3339 time or a date); `limit` is 12 by default and
-//! at most 200, newest first, with the rest counted.
+//! at most 200, newest first, with the rest counted. `"probe": true` answers at once, with no lessons: whether the
+//! server has them. `"count": true` answers only how many there are (and whose), with no lessons and no trails.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,7 +68,15 @@ pub async fn run(
         .as_u64()
         .map_or(LIMIT, |n| n as usize)
         .clamp(1, MAX_LIMIT);
+    // A probe (the Studio asking whether this server has lessons): yes, without reading every session.
+    if req["probe"] == true {
+        return Ok(
+            json!({"reader": {"user": reader.who.user(), "everyone": reader.every_session},
+                         "people": [], "count": null, "lessons": []}),
+        );
+    }
 
+    let count_only = req["count"] == true;
     let scope = session.scope();
     let log = crate::sessions::list(store, scope).await?;
     let by_id: BTreeMap<&str, &Logged> = log.iter().map(|l| (l.answer_id.as_str(), l)).collect();
@@ -86,6 +95,7 @@ pub async fn run(
     }
     let mut out: Vec<Value> = vec![];
     let mut owners: BTreeSet<String> = BTreeSet::new();
+    let mut counts = 0;
     for owner in &people {
         // A person's own lessons are written for them alone: read as them (an admin reads them as `notes/` does).
         let as_owner = Principal::from_parts(owner.clone(), vec![]);
@@ -93,6 +103,14 @@ pub async fn run(
         let mine = Space::mine(owner);
         let listed = crate::advice::listed(session, store, who, &mine).await?;
         if listed.is_empty() {
+            continue;
+        }
+        if count_only {
+            let n = counted(&listed, only, since);
+            if n > 0 {
+                owners.insert(owner.clone());
+                counts += n;
+            }
             continue;
         }
         let assigned = crate::advice::assigned(session, store, who, &mine).await?;
@@ -106,7 +124,9 @@ pub async fn run(
     if space != "mine" && person.is_none() {
         let team = Space::team();
         let listed = crate::advice::listed(session, store, reader.who, &team).await?;
-        if !listed.is_empty() {
+        if count_only {
+            counts += counted(&listed, only, since);
+        } else if !listed.is_empty() {
             let assigned = crate::advice::assigned(session, store, reader.who, &team).await?;
             let bar = crate::sessions::evidence_bar(store, scope).await?;
             let tallies = crate::sessions::evidence(store, scope).await?;
@@ -132,6 +152,17 @@ pub async fn run(
             }
         }
     }
+    if count_only {
+        if only.is_some() && counts == 0 {
+            return Err(crate::browse::NotFound.into());
+        }
+        return Ok(json!({
+            "reader": {"user": reader.who.user(), "everyone": reader.every_session},
+            "people": owners,
+            "count": counts,
+            "lessons": [],
+        }));
+    }
     out.retain(|v| {
         only.is_none_or(|k| v["key"] == k)
             && since.is_none_or(|t| v["learned_at"].as_i64().is_some_and(|at| at >= t))
@@ -151,6 +182,19 @@ pub async fn run(
         "count": out.len(),
         "lessons": out,
     }))
+}
+
+/// How many of `listed` are lessons the answer keeps: with a note, of the key asked for, learned at `since` or later.
+fn counted(listed: &[Listed], only: Option<&str>, since: Option<i64>) -> usize {
+    listed
+        .iter()
+        .filter(|l| {
+            l.note
+                .as_ref()
+                .is_some_and(|(_, at, _)| since.is_none_or(|t| *at >= t))
+                && only.is_none_or(|k| l.key == k)
+        })
+        .count()
 }
 
 /// One lesson with its trail, as the caller may read it; none for a situation with no note (procedures only).

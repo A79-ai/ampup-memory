@@ -9,6 +9,15 @@ default, where a newer value replaces the older; or `many`, where values accumul
 - A `ref` may be marked `part_of` (a meeting is part of its deal): passage search treats passages about the part
   as about the whole.
 - A `many` attribute may be marked `"list": true` when its values are held at once (the tools a customer uses).
+- An `enum` with `values` is closed: a write must name one of them, and is stored as the value it names, ignoring
+  case (`HIGH` is stored as `high`). `aliases` maps the other spellings sources write onto those values, so a
+  CRM's own words land on the same ones instead of being refused. Without `values`, an enum is open and takes any
+  value as written (an org's own pipeline stages).
+
+  ```json
+  "priority": {"type": "enum", "values": ["low", "medium", "high"],
+               "aliases": {"normal": "medium", "urgent": "high", "none": "low"}}
+  ```
 - `guidance` lines tell agents how the domain's questions map onto the types; they appear in `query_memory`'s
   description.
 - `metrics` name stored `count` queries an agent can run by name.
@@ -18,7 +27,8 @@ default, where a newer value replaces the older; or `many`, where values accumul
 ampup-memory schema list                                      # the built-in schemas
 ampup-memory schema check my-schema.json                      # check a file, no catalog needed
 ampup-memory schema set org:acme sales                        # a built-in name, or a file
-ampup-memory schema set org:acme my-schema.json --branch try  # try it on a branch; main keeps its own
+ampup-memory schema set org:acme my-schema.json --branch try  # try it on a branch (made if new); main keeps its own
+ampup-memory schema set org:acme my-schema.json --propose     # where entities have owners: stage it and propose it
 ampup-memory schema set org:acme my-schema.json --dry-run     # every check a set would make; commit nothing
 ampup-memory schema set org:acme my-schema.json --breaking    # a breaking change on main (raise `version` too)
 ampup-memory schema get org:acme
@@ -26,11 +36,20 @@ ampup-memory schema set org ./my-schema.json --local ~/.ampup-memory   # a lapto
 ```
 
 A schema is committed through the ledger like any write. A scope without one stays untyped. Additive changes (new
-types, predicates, enum values, a wider `ref`) apply in place. A change that would read stored facts differently
-is breaking: on main it needs a higher `version` and `--breaking`.
+types, predicates, enum values, an enum's `aliases`, a wider `ref`) apply in place. A change that would read stored
+facts differently is breaking: on main it needs a higher `version` and `--breaking`. Closing an open enum (giving it
+`values`) is breaking: facts already stored keep the value they were written with, and the set doesn't check them
+against the new `values`, so look at what is stored before closing one.
+
+A branch takes any change, a breaking one too; main's rules apply when it is merged. Where any entity in the scope
+has an owner ([ownership](../ownership.md)), a schema change needs all of them, so main refuses it: `--propose`
+stages it on a branch (`schema/<name>-v<version>`, or `--branch`) and proposes it, checked first as main would take
+it (`--breaking` and a higher version for a breaking change). An owner approves it in the Studio's Review or with
+`/admin` `review_proposal`, or an org admin does for all of them, and that publishes it to main. Over HTTP an org
+admin sends `set_schema` with `"propose": true` (and `"breaking": true`).
 
 Writes to a typed scope are checked: the entity id names its type (`deal:42`), the attribute is declared (unless
-the schema's `mode` is `open`), and the value parses (`$120,000` is stored as `120000`).
+the schema's `mode` is `open`), and the value parses (`$120,000` is stored as `120000`; a closed enum's `HIGH` as `high`).
 
 ## Extraction
 

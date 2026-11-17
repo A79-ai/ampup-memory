@@ -656,7 +656,7 @@ pub(super) fn start(st: &Arc<State>, c: Config, tick: Duration) {
         return;
     }
     let st2 = st.clone();
-    st.background(async move {
+    st.background("maintenance_window", async move {
         let st = st2;
         let mut walk = ScopeWalk::default();
         // When the window last finished with each scope, as far as this server knows (read from the scope's

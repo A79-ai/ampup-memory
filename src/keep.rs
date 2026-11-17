@@ -640,6 +640,8 @@ pub async fn from_user_but(
 /// Who writes what [`share`] shares: no person's id (those are emails or `key:<org>/<name>`), under the
 /// remembered-note prefix no key may ingest under, so it is searched and extracted as any note is.
 pub const SHARER: &str = "memstore";
+/// What the reason kept for a share names it by in the answer log, `keep/shared/<episode>`.
+pub const SHARED_KEY: &str = "keep/shared/";
 /// The most notes one pass reads, newest first.
 const SHARE_NOTES: usize = 300;
 /// The most of one note it reads.
@@ -831,7 +833,23 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
         }
         let ep = crate::Episode::sourced(&shared_source, text.as_bytes(), &["*"]);
         let facts = crate::note_facts::facts_of(std::slice::from_ref(&ep));
-        store.commit(scope, SHARER, &[ep], &facts).await?;
+        store
+            .commit(scope, SHARER, std::slice::from_ref(&ep), &facts)
+            .await?;
+        // Why it was shared, for the Review page's "done automatically": how many people said it, a count only.
+        use crate::qa_log::StoreQaLog;
+        let why = crate::qa_log::Logged {
+            answer_id: ep.episode_id.clone(),
+            asker: SHARER.to_string(),
+            question: format!("{SHARED_KEY}{}", ep.episode_id),
+            answer: Some(format!("{} people said the same", who.len())),
+            asked_at: crate::now_micros(),
+            kind: Some(crate::dream::REASON_KIND.into()),
+            ..Default::default()
+        };
+        if let Err(e) = store.write_qa(scope, SHARER, &why).await {
+            eprintln!("keep: share in {scope}: why not kept: {e:#}");
+        }
         eprintln!(
             "keep: shared with {scope} what {} people said: {text}",
             who.len()
@@ -1165,10 +1183,11 @@ pub async fn own_matching(
         );
         for i in 0..ids.len() {
             // Their profile (`crate::profile`) and their notes dream's records (`crate::notes_dream`) aren't notes
-            // of theirs to forget: they are drawn from them (`memstore:`).
-            let theirs = sources[i]
-                .strip_prefix(&own)
-                .is_some_and(|s| !s.starts_with("run:") && !s.starts_with("memstore:"));
+            // of theirs to forget: they are drawn from them (`memstore:`). A fact they added themselves, or text
+            // they pasted or uploaded in Studio (`crate::origin::added`), is what they said, so it is theirs to forget.
+            let theirs = sources[i].strip_prefix(&own).is_some_and(|s| {
+                !s.starts_with("run:") && (!s.starts_with("memstore:") || crate::origin::added(s))
+            });
             if theirs && vis.committed.contains(&commits[i]) && vis.can_see_episode(&ids[i], who) {
                 found.insert(ids[i].clone(), at[i].unwrap_or_default());
             }

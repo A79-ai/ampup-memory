@@ -1,0 +1,334 @@
+/* Add to memory and its receipt, inside the memory browser's visual system (memory.css tokens). */
+
+.memory {
+  .learn {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+    margin-bottom: var(--s5);
+  }
+  .learn-head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s3);
+    margin-bottom: var(--s4);
+  }
+  .learn-title {
+    font-weight: 600;
+    font-size: var(--t-md);
+  }
+  .learn-sub {
+    font-size: var(--t-sm);
+  }
+  .learn-drop {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--s1);
+    padding: var(--s5) var(--s4);
+    border: 1.5px dashed var(--line-strong);
+    border-radius: var(--r);
+    background: var(--surface-2);
+    color: var(--ink-2);
+    font-size: var(--t-sm);
+    text-align: center;
+    cursor: pointer;
+    transition:
+      border-color 0.12s,
+      background 0.12s;
+  }
+  .learn-drop:hover,
+  .learn-drop:focus-visible,
+  .learn-drop.is-over {
+    outline: none;
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent-text);
+  }
+  .learn-types {
+    font-size: var(--t-xs);
+  }
+  .learn-files {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: var(--s3) 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  .learn-x {
+    display: inline-grid;
+    place-items: center;
+    color: var(--muted);
+    border-radius: 999px;
+  }
+  .learn-x:hover {
+    color: var(--error);
+  }
+  textarea.learn-paste {
+    margin-top: var(--s3);
+    font: var(--t-sm) / 1.6 var(--font);
+  }
+  .learn-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s3);
+    margin-top: var(--s3);
+  }
+  .learn-whose {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .learn-inline {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--s3);
+    margin-top: var(--s3);
+  }
+  .learn-inline .receipt {
+    flex: 1;
+  }
+  .learn-remember {
+    height: 30px;
+    padding: 0 var(--s3);
+  }
+
+  /* The receipt */
+  .receipt {
+    padding: var(--s4) var(--s5);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+  }
+  .receipt-compact {
+    padding: var(--s3) var(--s4);
+    gap: var(--s2);
+    box-shadow: none;
+    background: var(--surface-2);
+  }
+  .receipt-head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s3);
+  }
+  .receipt-head-text {
+    flex: 1;
+    min-width: 0;
+  }
+  .receipt-mark {
+    display: inline-grid;
+    place-items: center;
+    flex: none;
+    width: 26px;
+    height: 26px;
+    border-radius: 999px;
+    background: var(--sunken);
+    color: var(--muted);
+  }
+  .receipt-mark.is-done {
+    background: var(--ok-soft);
+    color: var(--ok);
+  }
+  .receipt-mark.is-pending {
+    background: var(--warn-soft);
+    color: var(--warn);
+  }
+  .receipt-eyebrow {
+    font-size: var(--t-xs);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .receipt-title {
+    font-weight: 600;
+    font-size: var(--t-md);
+  }
+  .receipt-from {
+    font-weight: 450;
+    color: var(--muted);
+  }
+  .receipt-note {
+    font-size: var(--t-sm);
+    color: var(--warn);
+    background: var(--warn-soft);
+    border-radius: var(--r-sm);
+    padding: var(--s2) var(--s3);
+  }
+  .receipt-block {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .receipt-label {
+    font-size: var(--t-xs);
+    font-weight: 600;
+    color: var(--muted);
+  }
+  .receipt-entity {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+  }
+  a.chip {
+    text-decoration: none;
+  }
+  a.chip:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent-text);
+  }
+  .receipt-count {
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+  }
+  .receipt-tag {
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .receipt-facts {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    overflow: hidden;
+  }
+  .receipt-fact {
+    display: grid;
+    grid-template-columns: minmax(110px, 180px) minmax(90px, 160px) minmax(0, 1fr);
+    gap: var(--s3);
+    padding: 6px var(--s3);
+    border-top: 1px solid var(--line);
+    font-size: var(--t-sm);
+  }
+  .receipt-fact:first-child {
+    border-top: 0;
+  }
+  .receipt-fact-entity {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: left;
+  }
+  .receipt-fact-pred {
+    color: var(--muted);
+  }
+  .receipt-fact-value {
+    overflow-wrap: anywhere;
+  }
+  .receipt-known .receipt-fact {
+    background: var(--surface-2);
+  }
+  .receipt-more {
+    font-size: var(--t-xs);
+  }
+  .receipt-items {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 0;
+    padding: var(--s2) 0 0;
+    list-style: none;
+    border-top: 1px solid var(--line);
+    font-size: var(--t-sm);
+  }
+  .receipt-item {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 6px var(--s2);
+  }
+  .receipt-item .icon {
+    align-self: center;
+    color: var(--muted);
+  }
+  .receipt-item.is-refused .icon,
+  .receipt-item.is-failed .icon {
+    color: var(--error);
+  }
+  .receipt-item.is-pending .icon {
+    color: var(--warn);
+  }
+  .receipt-item-name {
+    font-weight: 550;
+  }
+  .receipt-item-what {
+    color: var(--muted);
+  }
+  .receipt-item.is-refused .receipt-item-what {
+    color: var(--error);
+  }
+  @media (max-width: 640px) {
+    .receipt-fact {
+      grid-template-columns: 1fr;
+      gap: 2px;
+    }
+  }
+}
+
+.memory .learn-open {
+  margin: 0 0 var(--s4);
+}
+
+/* Under an Ask answer, inside its card. */
+.memory .agent-result > .learn-inline {
+  margin: 0;
+  padding: 0 var(--s6) var(--s5);
+}
+
+/* The page's reset reverts `hidden`: the picker is opened from the drop zone, never shown. */
+.memory .learn-file {
+  display: none;
+}
+
+.memory {
+  dialog.learn-dialog {
+    position: fixed;
+    width: min(640px, calc(100vw - 32px));
+    max-height: calc(100vh - 64px);
+    overflow: auto;
+    margin: auto;
+    padding: var(--s5);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    background: var(--bg);
+    color: var(--ink);
+    font: inherit;
+  }
+  dialog.learn-dialog::backdrop {
+    background: rgb(0 0 0 / 0.35);
+  }
+  dialog.learn-dialog .learn {
+    margin-bottom: 0;
+  }
+  dialog.learn-dialog .learn-card {
+    padding: 0;
+    border: 0;
+    box-shadow: none;
+    background: transparent;
+  }
+  .learn-dialog-x {
+    position: absolute;
+    top: var(--s3);
+    right: var(--s3);
+    display: inline-grid;
+    place-items: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--r);
+    background: transparent;
+    color: var(--ink-2);
+    cursor: pointer;
+  }
+  .learn-dialog-x:hover {
+    background: var(--surface-2);
+  }
+}

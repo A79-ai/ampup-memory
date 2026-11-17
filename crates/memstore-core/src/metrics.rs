@@ -402,6 +402,75 @@ pub static LEDGER_COMPACTION_CLI_NEEDED: std::sync::LazyLock<IntGauge> = std::sy
     },
 );
 
+/// Reads of a scope's visibility state, by how each was served: `current` (the state of the tables read),
+/// `lagged` (main's last state while the next is built, [`crate::Store::pin_lagging`]) or `built` (built, or waited for,
+/// before it was served).
+pub static VIS_READS: std::sync::LazyLock<prometheus::IntCounterVec> = std::sync::LazyLock::new(
+    || {
+        prometheus::IntCounterVec::new(
+            Opts::new(
+                "memstore_visibility_reads_total",
+                "Reads of a scope's visibility state, by how each was served (current, lagged, built)",
+            ),
+            &["served"],
+        )
+        .unwrap()
+    },
+);
+
+/// Reads that may have been served main's last state but were built for first, by why (a fixed set of reasons the
+/// store names).
+pub static VIS_LAG_REFUSED: std::sync::LazyLock<prometheus::IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounterVec::new(
+            Opts::new(
+                "memstore_visibility_lag_refused_total",
+                "Reads that could have lagged but waited for a visibility build, by why",
+            ),
+            &["why"],
+        )
+        .unwrap()
+    });
+
+/// Seconds a visibility state took to build, by whether a read waited for it (`read`) or not (`background`).
+pub static VIS_BUILD_SECONDS: std::sync::LazyLock<prometheus::HistogramVec> =
+    std::sync::LazyLock::new(|| {
+        prometheus::HistogramVec::new(
+            HistogramOpts::new(
+                "memstore_visibility_build_seconds",
+                "Seconds a scope's visibility state took to build, by whether a read waited (read) or not (background)",
+            )
+            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]),
+            &["trigger"],
+        )
+        .unwrap()
+    });
+
+/// Visibility states built, by how: `incremental` (the last state with what was appended since) or `full`.
+pub static VIS_BUILDS: std::sync::LazyLock<prometheus::IntCounterVec> = std::sync::LazyLock::new(
+    || {
+        prometheus::IntCounterVec::new(
+        Opts::new(
+            "memstore_visibility_builds_total",
+            "Visibility states built, by how: incremental (the last state with what was appended since) or full",
+        ),
+        &["how"],
+    )
+    .unwrap()
+    },
+);
+
+/// Lagged reads a fresh build showed held something it took away (`AMPUP_MEMORY_VIS_ORACLE`): never more than 0.
+pub static VIS_ORACLE_DIVERGENCE: std::sync::LazyLock<IntCounter> = std::sync::LazyLock::new(
+    || {
+        IntCounter::new(
+            "memstore_visibility_oracle_divergence_total",
+            "Lagged visibility reads a fresh build showed held memory it took away (checked when AMPUP_MEMORY_VIS_ORACLE is on)",
+        )
+        .unwrap()
+    },
+);
+
 /// Bytes of decoded table rows the store's cache holds, the system tables aside: what `AMPUP_MEMORY_CACHE_BYTES`
 /// caps. Set after each cold load of a table.
 pub static CACHE_BYTES: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {

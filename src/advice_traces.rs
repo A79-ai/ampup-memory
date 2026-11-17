@@ -287,7 +287,7 @@ pub async fn keep(
     // Every part of the session under one source; one sent again (a retry) is the same episode, kept once.
     let ep = Episode::sourced(&source, &text, &acl).without_text_index();
     store
-        .commit(scope, who.user(), std::slice::from_ref(&ep), &[])
+        .commit_record(scope, who.user(), std::slice::from_ref(&ep))
         .await?;
     Ok(json!({"kept": true, "episode_id": ep.episode_id, "calls": total_calls}))
 }

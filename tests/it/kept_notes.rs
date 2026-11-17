@@ -9,7 +9,7 @@
 //!   call with capture off, or a message it read before. What it keeps is filed under `keep:<category>:<topic>`
 //!   after the person's signature, for them alone; a note they have already isn't kept again; their map and notes
 //!   are what the model is shown next time. No caller writes under `keep`, and facts are never extracted from a
-//!   kept note nor from a session's record (`AMPUP_MEMORY_EXTRACT_SESSIONS` is off). `/browse` files the notes and sessions for their owner only.
+//!   kept note (a session's record, once it ends, is read). `/browse` files the notes and sessions for their owner only.
 //! - What a session's work taught is advice's: each graded request is a run of the person's own advice
 //!   (`<session>#<offset>`), and its `[preference]` items are handed at a session's start with their notes.
 //! - Someone forgotten while the keep model ran gets nothing written after it.
@@ -843,7 +843,8 @@ async fn preferences_are_kept_from_what_people_type() {
         "{kept:#?}"
     );
 
-    // Facts: a note she remembers is read; her sessions' records and her kept notes never are.
+    // Facts: a note she remembers is read, and her sessions' records once they end; her kept notes never are (an
+    // extraction may be shown one as what memory already holds, never handed it to read).
     rig.tool(
         &carol,
         None,
@@ -858,14 +859,22 @@ async fn preferences_are_kept_from_what_people_type() {
             .then_some(())
     })
     .await;
+    until("her second session's record extracted", async || {
+        seen.extraction_prompts()
+            .iter()
+            .any(|p| p.contains("Bump the web app"))
+            .then_some(())
+    })
+    .await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     for p in seen.extraction_prompts() {
-        for said in ["Add a lint step", "Bump the web app"] {
-            assert!(
-                !p.contains(said),
-                "a session's record was read for facts: {said}"
-            );
-        }
+        // What memory already holds, offered so it isn't recorded again, is not what the extraction reads.
+        let p = match p.split_once("Facts already recorded") {
+            Some((head, rest)) => {
+                format!("{head}{}", rest.split_once("\n\n").map_or("", |(_, t)| t))
+            }
+            None => p.clone(),
+        };
         for (.., note) in &kept {
             assert!(
                 !p.contains(note.as_str()),

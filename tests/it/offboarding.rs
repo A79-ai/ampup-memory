@@ -548,8 +548,8 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         .commit(&acme, "test", &[org_wide], &[org_wide_fact])
         .await
         .unwrap();
-    // An acme message, and a fact from it, that its source then deleted: in no export.
-    let deleted = Episode::new("slack:C9:1.0", b"xqdeleted owner note", &["group:acme"]);
+    // An acme message shared with the whole org, and a fact from it, that its source then deleted: in no export.
+    let deleted = Episode::new("slack:C9:1.0", b"xqdeleted owner note", &["group:acme.all"]);
     let deleted_fact = Fact::new("deal:xqdeleted", "owner", "xqdeleted").from_episodes(&[&deleted]);
     store
         .commit(
@@ -590,6 +590,9 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     let acme_ids = [org_note.as_str(), bob_org.as_str(), carol_org.as_str()];
     let a1_ids = [team_note.as_str(), carol_team.as_str()];
     let b_ids = [b_note.as_str(), erin_org.as_str()];
+    // The server sees what this test wrote to the tables itself within its staleness window (1 s), not at once,
+    // the delete too: until then it serves the deleted message (Bob may read it: it was shared with the whole
+    // org), and its export would hold it.
     until(s, "?org=acme", &bob, &acme_ids, "bob reads acme", |r| {
         r.as_ref().is_some_and(|r| {
             [
@@ -602,6 +605,7 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
             ]
             .iter()
             .all(|t| r.contains(t))
+                && !r.contains("xqdeleted")
         })
     })
     .await;
@@ -679,6 +683,42 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     assert!(
         !everything.contains(&a_key_sha) && !everything.contains("msk_"),
         "a key in the export"
+    );
+    // A message deleted by another writer (another server, a connector's sync) just after an export: the next
+    // export, at once, leaves it out, though this server read the org a moment ago.
+    let gone = Episode::new("slack:C9:2.0", b"xqjustgone owner note", &["group:acme"]);
+    let gone_fact = Fact::new("deal:xqjustgone", "owner", "xqjustgone").from_episodes(&[&gone]);
+    store
+        .commit(&acme, "test", &[gone], &[gone_fact])
+        .await
+        .unwrap();
+    let again = dir.path().join("export-again");
+    let export_again = || {
+        let _ = std::fs::remove_dir_all(&again);
+        let (ok, out, err) = memstore(
+            &home,
+            &["org", "export", "acme", "--out", again.to_str().unwrap()],
+        );
+        assert!(ok, "{out}{err}");
+        [
+            "org/facts.jsonl",
+            "org/episodes.jsonl",
+            "org/entities.jsonl",
+        ]
+        .iter()
+        .map(|p| std::fs::read_to_string(again.join(p)).unwrap())
+        .collect::<String>()
+    };
+    let before = export_again();
+    assert!(before.contains("xqjustgone"), "{before}");
+    store
+        .retract_episodes(&acme, "test", &AclTarget::Source("slack:C9:2.0".into()))
+        .await
+        .unwrap();
+    let after = export_again();
+    assert!(
+        !after.contains("xqjustgone"),
+        "a message deleted just before an export exported: {after}"
     );
     // Acme's admin exports what she may read, as every read path gives it to her: the org's scope, with what
     // acme shares with all its members (she holds it as they do, though `/admin` resolves no read), not team a1
@@ -817,14 +857,15 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         "a retracted message stays stored until a purge"
     );
 
-    // Acme's admin purges what acme's sources deleted: the message and its fact leave every file, the rest
-    // of acme's memory stays, and running it again finds nothing.
+    // Acme's admin purges what acme's sources deleted: the messages and their facts leave every file, the
+    // rest of acme's memory stays, and running it again finds nothing.
     let (status, body) = admin_as(s, &alice, json!({"op": "purge_retracted", "org": "acme"})).await;
     assert_eq!(status, 200, "{body}");
     let done: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(done["purged"]["episodes"], 1, "{body}");
-    assert_eq!(done["purged"]["facts"], 1, "{body}");
+    assert_eq!(done["purged"]["episodes"], 2, "{body}");
+    assert_eq!(done["purged"]["facts"], 2, "{body}");
     assert_eq!(in_files("xqdeleted"), Vec::<PathBuf>::new());
+    assert_eq!(in_files("xqjustgone"), Vec::<PathBuf>::new());
     for t in acme_tags.iter().chain(&carol_tags) {
         assert!(!in_files(t).is_empty(), "{t} went with a purge");
     }
@@ -1459,6 +1500,74 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         "a hook that lost its marker would send the part she forgot again: {body}"
     );
     assert!(!episode(&carol, part3).await.contains("xqcarolsaw"));
+    // A fact Acme's admin adds in Studio (`add_fact`) is what she said, so it is hers to forget: forget_memory's
+    // own-notes list finds it for her and not for Carol, she forgets it by its id, and it is read no more.
+    let (status, body) = admin_as(
+        s,
+        &alice,
+        json!({"op": "add_fact", "org": "acme", "entity": "deal:xqstudio", "predicate": "amount",
+               "value": "xqalicesaid"}),
+    )
+    .await;
+    assert_eq!(status, 200, "an admin adds a fact: {body}");
+    let added: Value = serde_json::from_str(&body).unwrap();
+    let said = added["result"]["episode_id"].as_str().unwrap().to_string();
+    let as_alice = |name: &str, args: Value| {
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": name, "arguments": args}});
+        let who = alice.clone();
+        async move { post(&format!("{s}/mcp?org=acme"), &who, &call).await.1 }
+    };
+    let body = as_alice("forget_memory", json!({"matching": "xqalicesaid"})).await;
+    assert!(
+        body.contains(&said),
+        "the fact she added isn't hers to forget: {body}"
+    );
+    let body = tool("forget_memory", json!({"matching": "xqalicesaid"})).await;
+    assert!(
+        !body.contains(&said),
+        "Carol may forget what Alice said: {body}"
+    );
+    let body = as_alice("forget_memory", json!({"episode_id": said})).await;
+    assert!(body.contains(&format!("forgot episode {said}")), "{body}");
+    let body = episode(&alice, json!({"episode_id": said})).await;
+    assert!(
+        !body.contains("xqalicesaid"),
+        "what she forgot is read: {body}"
+    );
+    let body = as_alice("forget_memory", json!({"matching": "xqalicesaid"})).await;
+    assert!(!body.contains(&said), "what she forgot is listed: {body}");
+    // So is text she pastes into Studio's "Add to memory" (`/learn`): filed as hers, found for her and not for
+    // Carol, forgotten by its id, and read no more.
+    let (status, body) = post(
+        &format!("{s}/learn?org=acme"),
+        &alice,
+        &json!({"items": [{"kind": "paste", "text": "xqalicepasted the renewal is due in March"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "she pastes text: {body}");
+    let added: Value = serde_json::from_str(&body).unwrap();
+    let pasted = added["added"][0]["episode_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let body = as_alice("forget_memory", json!({"matching": "xqalicepasted"})).await;
+    assert!(
+        body.contains(&pasted),
+        "the text she pasted isn't hers to forget: {body}"
+    );
+    let body = tool("forget_memory", json!({"matching": "xqalicepasted"})).await;
+    assert!(
+        !body.contains(&pasted),
+        "Carol may forget what Alice pasted: {body}"
+    );
+    let body = as_alice("forget_memory", json!({"episode_id": pasted})).await;
+    assert!(body.contains(&format!("forgot episode {pasted}")), "{body}");
+    let body = episode(&alice, json!({"episode_id": pasted})).await;
+    assert!(
+        !body.contains("xqalicepasted"),
+        "what she forgot is read: {body}"
+    );
     let forgot = dir.path().join("export-forgot");
     let (ok, out, err) = memstore(
         &home,
@@ -2145,6 +2254,9 @@ async fn a_forgotten_note_leaves_its_owners_profile() {
         // The notes that bear on a session's task are picked by their words, never by a decisions model the
         // machine's keys would reach.
         std::env::set_var("AMPUP_MEMORY_DECIDE", "off");
+        // A search may be served what it saw last while the next is built, a minute apart here: a search served
+        // past a forget would stay wrong long enough to be seen below.
+        std::env::set_var("AMPUP_MEMORY_VIS_REFRESH_MS", "60000");
     }
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =
@@ -2396,6 +2508,68 @@ async fn a_forgotten_note_leaves_its_owners_profile() {
     }
     let read = tool(&carol, "get_episode", json!({"document": dream_key})).await;
     assert!(!read.contains("xpdreamsaid"), "{read}");
+
+    // Her sessions' own records, committed since a search last built what reads see, may wait for its next build;
+    // a forget never does, though another writer made it: the server's search stops finding what she forgot as
+    // soon as it reads the tables past the forget (its snapshot is up to a second old).
+    let search = || {
+        tool(
+            &carol,
+            "search_memory",
+            json!({"query": "xpfoldthree", "k": 10}),
+        )
+    };
+    assert!(search().await.contains(&ids[3]), "the fourth note is found");
+    let opened = tool(
+        &carol,
+        "start_session",
+        json!({"harness": "test", "context": "tidy the build"}),
+    )
+    .await;
+    let sid = opened
+        .split("\"session_id\":")
+        .nth(1)
+        .and_then(|s| s.split('"').nth(1))
+        .unwrap_or_else(|| panic!("no session id: {opened}"))
+        .to_string();
+    let ended = tool(
+        &carol,
+        "end_session",
+        json!({"session_id": sid, "transcript": "User: tidy the build\nClaude: tidied", "outcome": "done"}),
+    )
+    .await;
+    assert!(ended.contains("\"ended\""), "{ended}");
+    assert!(search().await.contains(&ids[3]), "the fourth note is found");
+    assert!(
+        store
+            .forget(&acme, "carol@acme.com", &ids[3], |_| true)
+            .await
+            .unwrap(),
+        "she forgot the fourth note"
+    );
+    // Each search here may be served main's last state while the next is built; in a debug build each such read
+    // is checked against a fresh build of the same tables, and refused if it held what was forgotten.
+    let t = Instant::now();
+    loop {
+        let found = search().await;
+        assert!(
+            !found.contains("visibility oracle"),
+            "a lagged search held what she forgot: {found}"
+        );
+        if !found.contains(&ids[3]) {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "a search still finds what she forgot: {found}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        memstore::metrics::VIS_ORACLE_DIVERGENCE.get(),
+        0,
+        "a lagged read held what a fresh build took away"
+    );
 
     // Acme's admin forgets Carol: every version of her profile goes from every file, with her notes.
     assert!(

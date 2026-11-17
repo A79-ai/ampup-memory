@@ -208,36 +208,78 @@ impl Reads {
         filter: Option<&search::Filter>,
         rank: search::Rank,
     ) -> Result<Scoped<search::Hit>> {
+        let (hits, _) = self
+            .search_why(store, who, query, k, valid_at, filter, rank, false)
+            .await?;
+        Ok(hits)
+    }
+
+    /// [`Reads::search`], and with `explain` each scope's candidates the caller may read that aren't hits, and why
+    /// ([`search::search_why`]), each with the index of the scope it is from ([`Reads::scope_at`]); read across
+    /// scopes, a hit of one scope that the merge left out is one too, cut below.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_why(
+        &self,
+        store: &Store,
+        who: &Principal,
+        query: &str,
+        k: usize,
+        valid_at: Option<i64>,
+        filter: Option<&search::Filter>,
+        rank: search::Rank,
+        explain: bool,
+    ) -> Result<(Scoped<search::Hit>, Vec<(usize, search::Miss)>)> {
         let one = move |s: &Session| {
             let s = s.clone();
             async move {
-                match filter {
-                    Some(f) => {
-                        s.search_filtered(store, who, query, k, valid_at, f, rank)
-                            .await
-                    }
-                    None => s.search(store, who, query, k, valid_at, rank).await,
-                }
+                s.search_why(store, who, query, k, valid_at, filter, rank, explain)
+                    .await
             }
         };
         if !self.fans_out() {
-            let items = one(&self.own).await?;
+            let (items, missed) = one(&self.own).await?;
             self.note(items.len(), served_episodes(&items));
-            return Ok(Scoped {
-                items,
-                from: HashMap::new(),
-            });
+            return Ok((
+                Scoped {
+                    items,
+                    from: HashMap::new(),
+                },
+                missed.into_iter().map(|m| (0, m)).collect(),
+            ));
         }
         let (own, also) = tokio::join!(
             one(&self.own),
             futures::future::join_all(self.also.iter().map(one))
         );
+        let mut missed: Vec<(usize, search::Miss)> = vec![];
+        let own = own.map(|(hits, m)| {
+            missed.extend(m.into_iter().map(|m| (0, m)));
+            hits
+        });
+        let also: Vec<Result<Vec<search::Hit>>> = also
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                r.map(|(hits, m)| {
+                    missed.extend(m.into_iter().map(|m| (i + 1, m)));
+                    hits
+                })
+            })
+            .collect();
         let lists = self.lists(own?, also, "search");
         let sources = self
             .sources(store, &lists, |h: &search::Hit| {
                 h.fact.source_episodes.iter().map(String::as_str).collect()
             })
             .await?;
+        let all: Vec<(usize, search::Hit)> = match explain {
+            true => lists
+                .iter()
+                .enumerate()
+                .flat_map(|(i, l)| l.iter().map(move |h| (i, h.clone())))
+                .collect(),
+            false => vec![],
+        };
         let merged = dedup(
             merge(lists, |h: &search::Hit| h.score),
             |h| h.fact.source_episodes.iter().map(String::as_str).collect(),
@@ -246,7 +288,17 @@ impl Reads {
         );
         let out = scoped(merged, k, |h| h.fact.fact_id.clone());
         self.note(out.items.len(), served_episodes(&out.items));
-        Ok(out)
+        if explain {
+            let kept: HashSet<&str> = out.items.iter().map(|h| h.fact.fact_id.as_str()).collect();
+            for (i, mut h) in all {
+                if !kept.contains(h.fact.fact_id.as_str()) {
+                    h.group.clear();
+                    let cut = search::Cut::Below;
+                    missed.push((i, search::Miss { hit: h, cut }));
+                }
+            }
+        }
+        Ok((out, missed))
     }
 
     /// The top `k` passages across the scopes read, as [`Reads::search`] merges facts: by score, a passage of an

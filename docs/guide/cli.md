@@ -27,6 +27,7 @@ environment names. Stop the server first: one process owns a directory at a time
 | `ampup-memory service install [DIR] [--port p]` | Keep `serve --local` running in the background: started now, at login and again if it stops. Run it again to pick up a new binary. |
 | `ampup-memory service save-model [DIR]` | Save the model this environment names (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `AMPUP_MEMORY_LLM*`) in `DIR/llm.json`, as `install` does, without installing the service. `serve --local` and the server a coding agent's session starts learn with it from their next start. |
 | `ampup-memory service status\|restart\|logs [-f] [-n lines]\|uninstall` | How the service is (pid, port, data, log, whether it answers), restart it, read its log, or stop and remove it (the data stays). |
+| `ampup-memory studio [--port p]` | Open the Studio, the web page for looking at your memory, in a browser: `http://127.0.0.1:<port>/studio/` of the local server (`serve --local` or the service; the port is the service's, else 8080). Says so when nothing serves there. |
 | `ampup-memory mcp` | The server's MCP endpoint over stdio, signed in as the CLI is. |
 | `ampup-memory doctor` | Whether this machine's memory works. Exits non-zero when the server can't be used. |
 | `ampup-memory identity check` | What `serve` makes of this environment's identity settings. |
@@ -94,7 +95,7 @@ environment names. Stop the server first: one process owns a directory at a time
 | `ampup-memory schema list` | The built-in schemas. |
 | `ampup-memory schema check <name or file>` | Check a schema without a catalog. |
 | `ampup-memory schema get <scope> [--branch b] [--local DIR]` | A scope's schema. |
-| `ampup-memory schema set <scope> <name or file> [--branch b] [--breaking] [--dry-run] [--local DIR]` | Set it. |
+| `ampup-memory schema set <scope> <name or file> [--branch b] [--breaking] [--propose] [--dry-run] [--local DIR]` | Set it; a new `--branch` is made from main. `--propose`: stage it on a branch and propose it to the scope's entity owners. |
 | `ampup-memory episode-type list`, `show <type>`, `units <type\|auto> <file> [--source s] [--quote q]` | Episode types and how they cite. |
 
 ## Workspaces

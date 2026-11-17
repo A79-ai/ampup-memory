@@ -15,8 +15,12 @@
 //!   (Slack's `bot_id`, `bot_profile`, `app_id` or `bot_message` subtype: [`crate::episode_types::Cite::Message`]).
 //!   A note is an agent's even when it relays what the person said: the server can't tell a relay from a
 //!   conclusion, and what a person types reaches memory as their own words another way (below).
-//! - **stated**: a call or meeting's transcript or notes, an email, a chat message, a note, and what the server
-//!   kept from what a person typed in a session (`keep`) or shared because several people said it.
+//! - **stated**: a call or meeting's transcript or notes, an email, a chat message, a note, what the server
+//!   kept from what a person typed in a session (`keep`) or shared because several people said it, and a fact a
+//!   person added themselves as an org admin (`add_fact`: Studio's "Add a fact" and "This is wrong") or stated
+//!   in settling a conflict (`resolve_conflict` with a value), or text they pasted or uploaded in Studio's "Add to
+//!   memory" (`/learn`), which they typed or chose, value and all, so it is their statement, not an agent's
+//!   conclusion. Not a service key's: a key is a program, whatever it adds.
 //! - **observed**: a record a system keeps (a CRM change, an issue tracker's ticket, an error report, a pull
 //!   request) and a document loaded; anything else a connector delivers.
 //!
@@ -42,6 +46,14 @@ pub enum Origin {
 /// several people said it.
 pub const KEPT: &str = "keep";
 pub const SHARED: &str = "memstore:shared";
+/// What follows a person in the source of a fact they added themselves (`add_fact`), before the source they
+/// named: `mcp:remember_memory:<them>:memstore:fact:<label>`. Under `memstore:`, which no note may take, so only
+/// the server files it.
+pub const ADDED: &str = "memstore:fact";
+/// What follows a person in the source of text they added themselves in Studio's "Add to memory" (`/learn`: pasted
+/// or uploaded), before what it was: `mcp:remember_memory:<them>:memstore:learn:paste:<first words>`. Under
+/// `memstore:` too, so no agent's note passes for it.
+pub const LEARNED: &str = "memstore:learn";
 
 impl Origin {
     /// Its name, as JSON answers carry it.
@@ -61,7 +73,8 @@ impl Origin {
                 .strip_prefix(crate::REMEMBER_SOURCE)
                 .and_then(|s| s.strip_prefix(':'))
                 == Some(SHARED);
-            return match kept || shared {
+            let added = added(rest) && !author_is_key(source);
+            return match kept || shared || added {
                 true => Origin::Stated,
                 false => Origin::Agent,
             };
@@ -134,6 +147,31 @@ fn remembered(source: &str) -> Option<&str> {
     let skip = if rest.starts_with("key:") { 4 } else { 0 };
     let end = skip + rest[skip..].find(':')?;
     Some(&rest[end + 1..])
+}
+
+/// Whether `rest`, what follows a person in a source, is what they added themselves in Studio: a fact ([`ADDED`])
+/// or text they pasted or uploaded ([`LEARNED`]).
+pub fn added(rest: &str) -> bool {
+    under(rest, ADDED) || learned(rest)
+}
+
+/// Whether `rest`, what follows a person in a source, is text they pasted or uploaded in Studio ([`LEARNED`]).
+pub fn learned(rest: &str) -> bool {
+    under(rest, LEARNED)
+}
+
+/// Whether `rest` is `tail`, or starts with it and a `:`.
+fn under(rest: &str, tail: &str) -> bool {
+    rest.strip_prefix(tail)
+        .is_some_and(|r| r.is_empty() || r.starts_with(':'))
+}
+
+/// Whether the author of a `remember_memory` episode from `source` is a service key (`key:<org>/<name>`).
+fn author_is_key(source: &str) -> bool {
+    source
+        .strip_prefix(crate::REMEMBER_SOURCE)
+        .and_then(|s| s.strip_prefix(':'))
+        .is_some_and(|s| s.starts_with("key:"))
 }
 
 /// Who said what an episode from `source` holds, as one source is told from another where who supports a fact is

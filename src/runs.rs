@@ -244,7 +244,7 @@ impl Recorder<'_> {
         // The traces first, then the log entries naming them: a trace forgotten takes its entry with it, and
         // traces that couldn't be written (a cap) leave no entry behind.
         let episodes: Vec<Episode> = runs.iter().map(|r| r.episode.clone()).collect();
-        store.commit(scope, who.user(), &episodes, &[]).await?;
+        store.commit_record(scope, who.user(), &episodes).await?;
         let logged: Vec<crate::qa_log::RunEntry> = runs
             .iter()
             .map(|r| crate::qa_log::RunEntry {

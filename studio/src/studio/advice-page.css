@@ -1,0 +1,335 @@
+/* Studio's Advice page (AdvicePage.tsx): a list of advice beside the chosen one's page. */
+.ap {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.ap-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line);
+}
+.ap-head h1 {
+  margin: 0;
+  font-size: 18px;
+}
+.ap-muted {
+  color: var(--muted);
+}
+.ap-small {
+  font-size: 12px;
+}
+.ap-caps {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ap-nowrap {
+  white-space: nowrap;
+}
+.ap-pad {
+  padding: 16px 20px;
+}
+.ap-pad-y {
+  padding: 12px 0;
+}
+.ap-ok {
+  color: var(--ok);
+}
+.ap-bad {
+  color: var(--error);
+}
+.ap-error {
+  color: var(--error);
+}
+.ap-said {
+  color: var(--ok);
+  margin: 4px 0 8px;
+}
+.ap-num {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.ap-seg {
+  display: flex;
+  margin-left: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.ap-seg button,
+.ap-chips button,
+.ap-tabs button {
+  background: none;
+  border: 0;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+.ap-seg button {
+  padding: 5px 10px;
+}
+.ap-seg button.on {
+  background: var(--code-bg);
+  color: var(--ink);
+}
+
+.ap-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+  padding: 14px 20px;
+  margin: 0;
+}
+.ap-tiles > div,
+.ap-tile-btn {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+.ap-tile-btn {
+  cursor: pointer;
+  border-color: var(--accent-soft);
+}
+.ap-tile-btn.on {
+  border-color: var(--accent);
+}
+.ap-tiles dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+.ap-tiles dd {
+  margin: 2px 0 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+.ap-tiles-4 {
+  padding: 12px 0;
+}
+
+.ap-split {
+  display: grid;
+  grid-template-columns: minmax(260px, 340px) 1fr;
+  border-top: 1px solid var(--line);
+  min-height: 520px;
+}
+.ap-list {
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+  max-height: 75vh;
+}
+.ap-filter {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ap-filter input {
+  width: 100%;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+.ap-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 4px 0 8px;
+}
+.ap-chips button {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+.ap-chips button.on {
+  background: var(--accent-soft);
+  border-color: var(--accent-soft);
+  color: var(--accent-text);
+}
+.ap-item {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+  padding: 10px 14px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ap-item:hover {
+  background: var(--code-bg);
+}
+.ap-item.on {
+  background: var(--code-bg);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.ap-item-top,
+.ap-item-sub {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+.ap-bar {
+  display: flex;
+  flex: none;
+  width: 96px;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--line);
+}
+.ap-bar i {
+  background: var(--ok);
+}
+.ap-bar u {
+  background: var(--error);
+}
+
+.ap-detail {
+  padding: 16px 22px;
+  min-width: 0;
+}
+.ap-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 4px 0 8px;
+}
+.ap-title h2 {
+  margin: 0;
+  font-size: 18px;
+}
+.ap-actions {
+  margin-left: auto;
+}
+.ap-badge {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.ap-badge-ok {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--ok) 18%, transparent);
+  color: var(--ok);
+}
+.ap-badge-held {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--error) 16%, transparent);
+  color: var(--error);
+}
+.ap-btn {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: 0;
+  border-radius: 7px;
+  padding: 6px 12px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ap-btn2 {
+  background: none;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 11px;
+  font: inherit;
+  cursor: pointer;
+}
+.ap-btn:disabled,
+.ap-btn2:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.ap-tabs {
+  display: flex;
+  gap: 18px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 10px;
+}
+.ap-tabs button {
+  padding: 7px 0;
+  border-bottom: 2px solid transparent;
+}
+.ap-tabs button.on {
+  color: var(--ink);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+.ap-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.ap-table th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+  padding: 6px 10px 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+.ap-table td {
+  padding: 9px 10px 9px 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.ap-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ap-link:hover {
+  text-decoration: underline;
+}
+.ap-note {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+}
+.ap-diag {
+  padding: 14px 20px;
+  border-top: 1px solid var(--line);
+}
+.ap-diag-in {
+  margin-top: 12px;
+}
+
+@media (max-width: 760px) {
+  .ap-split {
+    grid-template-columns: 1fr;
+  }
+  .ap-list {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    max-height: 40vh;
+  }
+  .ap-seg {
+    margin-left: 0;
+  }
+}

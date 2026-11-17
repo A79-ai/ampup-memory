@@ -1,0 +1,103 @@
+/* The page around the pages when the local server serves them: a thin top bar, then the pages across the window. */
+:root {
+  --local-bg: #fdfcf7;
+  --local-bar: #ffffff;
+  --local-ink: #232428;
+  --local-muted: #7f7e7c;
+  --local-line: #e4e3de;
+  color-scheme: light;
+}
+:root[data-studio-theme="dark"] {
+  --local-bg: #18181a;
+  --local-bar: #1d1d20;
+  --local-ink: #ecebe6;
+  --local-muted: #a3a29e;
+  --local-line: #34343a;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-studio-theme="system"] {
+    --local-bg: #18181a;
+    --local-bar: #1d1d20;
+    --local-ink: #ecebe6;
+    --local-muted: #a3a29e;
+    --local-line: #34343a;
+    color-scheme: dark;
+  }
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--local-bg);
+  color: var(--local-ink);
+  font:
+    15px/1.5 "NeuMontreal",
+    "Inter",
+    "Atkinson Hyperlegible Next",
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.local-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--local-line);
+  background: var(--local-bar);
+}
+.local-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--local-ink);
+  font-weight: 650;
+  text-decoration: none;
+  min-width: 0;
+}
+.local-brand .logo {
+  --accent: var(--local-ink);
+  --accent-ink: var(--local-bg);
+  flex: none;
+}
+.local-where {
+  font-weight: 400;
+  font-size: 13px;
+  color: var(--local-muted);
+  white-space: nowrap;
+}
+.local-theme {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--local-muted);
+}
+.local-theme select {
+  font: inherit;
+  color: var(--local-ink);
+  background: var(--local-bg);
+  border: 1px solid var(--local-line);
+  border-radius: 8px;
+  padding: 4px 8px;
+}
+.local-main {
+  padding: 16px 20px 24px;
+}
+@media (max-width: 600px) {
+  .local-top,
+  .local-main {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  .local-where,
+  .local-theme > span {
+    display: none;
+  }
+}

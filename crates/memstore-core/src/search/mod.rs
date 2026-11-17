@@ -57,6 +57,8 @@ pub fn dims() -> i32 {
 /// Reciprocal rank fusion constant: a fact's score is the sum of 1/(RRF_K + rank) over the
 /// keyword and vector rankings.
 pub const RRF_K: f32 = 60.0;
+/// How many of one name's records of what happened ([`crate::WHAT_HAPPENED`]) a fact search serves: its newest.
+pub const NEWEST_RECORDS: usize = 3;
 /// A hit's keyword and vector scores are scaled by `max(1 / (1 + age in years), RECENCY_FLOOR)`
 /// before ranking (see [`Rank`]): recency reorders near-ties and never outranks a clearly better match.
 pub const RECENCY_FLOOR: f32 = 0.75;
@@ -2668,7 +2670,8 @@ impl PreparedCandidates {
 #[cfg(test)]
 mod candidate_tests;
 
-/// Fact rows read from index parts (see [`rows`]): about 4 KB each with the embedding (on a production deployment), so at
+/// Fact rows read from index parts (see [`rows`]) for a search's keyword lists, whose hits are scored by vector
+/// from their embedding: about 4 KB each with the embedding (on a production deployment), so at
 /// most a few hundred MB. `AMPUP_MEMORY_INDEX_FACT_ROWS` overrides.
 const FACT_ROWS_MAX: usize = 100_000;
 
@@ -2697,8 +2700,8 @@ fn decode_rows(b: &RecordBatch) -> Result<Vec<FactRow>> {
         .collect())
 }
 
-/// Fact rows read by an entity's, a key's or some facts' ids ([`keyed`] scans, [`key_lookup`]), without the
-/// embedding: a search's groups read every fact of their entities, thousands for a big deal, and the embedding,
+/// Fact rows read by an entity's, a key's or some facts' ids ([`keyed`] scans, [`key_lookup`]), and a search's
+/// candidates that only a vector list named ([`ranked`]), without the embedding: a search's groups read every fact of their entities, thousands for a big deal, and the embedding,
 /// which only ranking uses, is most of a row (a few KB of about 4). About 1 KB each, so at most a few hundred MB.
 /// `AMPUP_MEMORY_INDEX_KEYED_ROWS` overrides.
 const KEYED_ROWS_MAX: usize = 200_000;
@@ -2708,8 +2711,21 @@ static KEYED_ROWS: std::sync::LazyLock<rows::RowCache<FactRow>> =
 
 /// The rows `ids` of index part `ds` without their embeddings (see [`KEYED_ROWS`]), by id.
 async fn keyed_rows(ds: &Dataset, ids: Vec<u64>) -> Result<HashMap<u64, Arc<FactRow>>> {
-    let rows = KEYED_ROWS.get(ds, &ids, FACT_COLUMNS, decode_rows).await?;
-    Ok(ids.into_iter().zip(rows).collect())
+    Ok(keyed_rows_counted(ds, ids).await?.0)
+}
+
+/// [`keyed_rows`], with how many rows it took from the part's files (the rest came from the row cache).
+async fn keyed_rows_counted(
+    ds: &Dataset,
+    ids: Vec<u64>,
+) -> Result<(HashMap<u64, Arc<FactRow>>, usize)> {
+    if ids.is_empty() {
+        return Ok((HashMap::new(), 0));
+    }
+    let (rows, taken) = KEYED_ROWS
+        .get_counted(ds, &ids, FACT_COLUMNS, decode_rows)
+        .await?;
+    Ok((ids.into_iter().zip(rows).collect(), taken))
 }
 
 /// The rows `ids` of index part `ds`, by id: from the row cache, the missing ones in one read.
@@ -2722,6 +2738,9 @@ async fn fact_rows_counted(
     ds: &Dataset,
     ids: Vec<u64>,
 ) -> Result<(HashMap<u64, Arc<FactRow>>, usize)> {
+    if ids.is_empty() {
+        return Ok((HashMap::new(), 0));
+    }
     let columns: Vec<&str> = FACT_COLUMNS.iter().copied().chain(["vec"]).collect();
     let (rows, taken) = FACT_ROWS
         .get_counted(ds, &ids, &columns, decode_rows)
@@ -2943,7 +2962,78 @@ pub struct Hit {
     pub group: Vec<Fact>,
     /// Where the fact's words came from, as the episodes it cites say ([`crate::Vis::fact_origin`]).
     pub origin: Option<crate::origin::Origin>,
+    /// How its score was made, for an explanation: set while ranking, never read by it.
+    pub parts: Parts,
 }
+
+/// How a hit's score was made ([`Hit::score`]), as the ranking computed it: `(keyword + meaning) * origin * time`,
+/// plus 1 when `time_first`. Recency, when on, is already in both sides ([`Hit::recency`]).
+#[derive(Debug, Clone, Default)]
+pub struct Parts {
+    /// How the two sides were fused: `blend` (`ALPHA` of min-max normalized meaning, the rest of normalized keyword)
+    /// or `rrf` (reciprocal-rank fusion, with fewer than 3 hits on a side or the classic ranking). Empty: not scored.
+    pub fusion: &'static str,
+    /// The keyword side's part of the score.
+    pub keyword: f32,
+    /// The meaning side's part of the score.
+    pub meaning: f32,
+    /// Cosine similarity to the query, when the fact was among the nearest.
+    pub similarity: Option<f32>,
+    /// The scale its origin gave the score: `AGENT_SCALE` for what only an agent wrote, else 1.
+    pub origin: f32,
+    /// The scale the time the query names gave it: `TIME_DAMP` for a value naming only other times, `1 + TIME_BOOST`
+    /// in time with `TIME_MODE` 2, else 1.
+    pub time: f32,
+    /// Ranked ahead of every fact outside the time the query names (`TIME_MODE` 1).
+    pub time_first: bool,
+}
+
+/// A fact the search found and the caller may read that isn't among the hits, and why ([`search_why`]). A fact the
+/// caller may not read is never a candidate, so never one of these.
+#[derive(Debug, Clone)]
+pub struct Miss {
+    pub hit: Hit,
+    pub cut: Cut,
+}
+
+/// Why a candidate isn't a hit.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cut {
+    /// It ranked below the hits returned.
+    Below,
+    /// A newer version of the same one-valued attribute, which the caller may read, replaced it (that fact's id).
+    Superseded(String),
+    /// An older record of what happened under one name: the newest [`NEWEST_RECORDS`] are kept.
+    OlderRecord,
+    /// It says what a better-ranked hit says, which was shown instead (that hit's id).
+    Duplicate(String),
+    /// A claim of absence that what arrived since contradicts ([`crate::absence`]).
+    Contradicted,
+}
+
+impl Cut {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Cut::Below => "below",
+            Cut::Superseded(_) => "superseded",
+            Cut::OlderRecord => "older_record",
+            Cut::Duplicate(_) => "duplicate",
+            Cut::Contradicted => "contradicted",
+        }
+    }
+
+    /// The fact it names: the newer version, or the hit shown instead.
+    pub fn by(&self) -> Option<&str> {
+        match self {
+            Cut::Superseded(id) | Cut::Duplicate(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// Near misses an explained search returns at most: the best ranked of those cut below the hits, then the others.
+pub const MISSES_BELOW: usize = 6;
+pub const MISSES: usize = 12;
 
 /// Facts a grouped hit brings at most (see [`Rank::group`]); `AMPUP_MEMORY_RANK_GROUP` overrides.
 pub const GROUP: usize = 4;
@@ -3315,6 +3405,30 @@ pub async fn search_with(
     filter: Option<&Filter>,
     rank: Rank,
 ) -> Result<Vec<Hit>> {
+    let (hits, _) = search_why(
+        store, scope, vis, pin, who, query, k, valid_at, filter, rank, false,
+    )
+    .await?;
+    Ok(hits)
+}
+
+/// [`search_with`], and with `explain` the candidates it found that aren't hits and why ([`Miss`]): at most
+/// [`MISSES`], the best ranked first. The hits are the same with `explain` or without: collecting the misses only
+/// reads what ranking computed.
+#[allow(clippy::too_many_arguments)]
+pub async fn search_why(
+    store: &Store,
+    scope: &Scope,
+    vis: &crate::Vis,
+    pin: Option<&IndexPin>,
+    who: &Principal,
+    query: &str,
+    k: usize,
+    valid_at: Option<i64>,
+    filter: Option<&Filter>,
+    rank: Rank,
+    explain: bool,
+) -> Result<(Vec<Hit>, Vec<Miss>)> {
     // A classic ranking's pool grows with `k`, as its lists did before the current ranking.
     let mut pool = match rank.classic {
         true => k * FETCH_MULTIPLE,
@@ -3323,13 +3437,15 @@ pub async fn search_with(
     .max(1);
     let mut out: Vec<Hit> = vec![];
     let mut shown: HashSet<String> = HashSet::new();
+    let mut misses: Vec<Miss> = vec![];
     loop {
         // Enough of this pool's hits to find what's left of `k` past those already shown.
         let want = k + shown.len();
-        let (hits, deeper) = ranked(
-            store, scope, vis, pin, who, query, want, valid_at, filter, rank, pool,
+        let (hits, deeper, missed) = ranked(
+            store, scope, vis, pin, who, query, want, valid_at, filter, rank, pool, explain,
         )
         .await?;
+        misses.extend(missed);
         for mut h in hits {
             if out.len() >= k {
                 break;
@@ -3341,10 +3457,44 @@ pub async fn search_with(
             out.push(h);
         }
         if out.len() >= k || !deeper || pool >= MAX_FETCH {
-            return Ok(out);
+            break;
         }
         pool = (pool * 4).min(MAX_FETCH);
     }
+    if !explain {
+        return Ok((out, vec![]));
+    }
+    // What any pool missed that no pool showed, each once, as the first pool to miss it said.
+    let shown: HashSet<&str> = out
+        .iter()
+        .flat_map(|h| std::iter::once(&h.fact).chain(&h.group))
+        .map(|f| f.fact_id.as_str())
+        .collect();
+    let mut seen = HashSet::new();
+    misses.retain(|m| {
+        !shown.contains(m.hit.fact.fact_id.as_str()) && seen.insert(m.hit.fact.fact_id.clone())
+    });
+    Ok((out, bounded(misses)))
+}
+
+/// At most [`MISSES`] misses, best ranked first: the first [`MISSES_BELOW`] of those cut below the hits, and the others
+/// (superseded, folded, older records), a superseded one (never scored) after those that were.
+pub fn bounded(mut misses: Vec<Miss>) -> Vec<Miss> {
+    misses.sort_by(|a, b| {
+        let unscored = |m: &Miss| m.hit.parts.fusion.is_empty();
+        unscored(a)
+            .cmp(&unscored(b))
+            .then(b.hit.score.total_cmp(&a.hit.score))
+            .then(a.hit.fact.fact_id.cmp(&b.hit.fact.fact_id))
+    });
+    let mut below = 0;
+    misses.retain(|m| {
+        let keep = m.cut != Cut::Below || below < MISSES_BELOW;
+        below += usize::from(m.cut == Cut::Below);
+        keep
+    });
+    misses.truncate(MISSES);
+    misses
 }
 
 /// A fact search taking this many ms logs its phases, as a passage search does (`AMPUP_MEMORY_RANK_SLOW_MS`).
@@ -3415,11 +3565,12 @@ async fn ranked(
     filter: Option<&Filter>,
     rank: Rank,
     pool: usize,
-) -> Result<(Vec<Hit>, bool)> {
+    explain: bool,
+) -> Result<(Vec<Hit>, bool, Vec<Miss>)> {
     // A request's own date (`[2028-01-01] Email …`) is when it was asked, not what it is about.
     let (asked_on, query) = when::request_date(query);
     if query.trim().is_empty() {
-        return Ok((vec![], false));
+        return Ok((vec![], false, vec![]));
     }
     let slow = SlowLog {
         scope: scope.to_string(),
@@ -3511,6 +3662,7 @@ async fn ranked(
             in_window: false,
             group: vec![],
             origin: None,
+            parts: Parts::default(),
         });
         if let Some((i, b)) = kw {
             h.signals[i] = h.signals[i].max(b);
@@ -3736,23 +3888,42 @@ async fn ranked(
     }
     let lists = futures::future::try_join_all(queries).await?;
     slow.mark("lists");
+    // Only a keyword list's rows need their embedding (a keyword hit is scored by vector from it, `for_list`); a
+    // vector list's distance comes with its ids. So the rows only vector lists name are read without it, a
+    // tenth of the bytes, from the cache that keeps rows that way ([`KEYED_ROWS`]): on a production deployment
+    // most of a search's time was its rows read from storage, 1 to 5 s, the embeddings most of their bytes.
     let fetched = futures::future::try_join_all(parts.iter().enumerate().map(|(part, (ds, _))| {
-        let ids: Vec<u64> = lists
-            .iter()
-            .filter(|l| l.0 == part)
-            .flat_map(|l| l.2.iter().map(|(id, _)| *id))
-            .collect();
+        let mut keyword_ids: Vec<u64> = vec![];
+        let mut vector_ids: Vec<u64> = vec![];
+        for l in lists.iter().filter(|l| l.0 == part) {
+            let to = match l.1 {
+                Some(_) => &mut keyword_ids,
+                None => &mut vector_ids,
+            };
+            to.extend(l.2.iter().map(|(id, _)| *id));
+        }
+        let with_vec: HashSet<u64> = keyword_ids.iter().copied().collect();
+        vector_ids.retain(|id| !with_vec.contains(id));
         let log = &slow.lists;
         async move {
             let t = std::time::Instant::now();
-            let asked = ids.len();
-            let (rows, taken) = fact_rows_counted(ds, ids).await?;
+            let asked = (keyword_ids.len(), vector_ids.len());
+            let (with, without) = tokio::try_join!(
+                fact_rows_counted(ds, keyword_ids),
+                keyed_rows_counted(ds, vector_ids)
+            )?;
             if let Ok(mut l) = log.lock() {
                 l.push(format!(
-                    "part {part} rows {} ms {taken} of {asked} taken from storage",
-                    t.elapsed().as_millis()
+                    "part {part} rows {} ms {} of {} taken from storage, {} of {} without the embedding",
+                    t.elapsed().as_millis(),
+                    with.1 + without.1,
+                    asked.0 + asked.1,
+                    without.1,
+                    asked.1
                 ));
             }
+            let mut rows = with.0;
+            rows.extend(without.0);
             anyhow::Ok(rows)
         }
     }))
@@ -3845,14 +4016,29 @@ async fn ranked(
     // informative terms they contain, times the best indexed score, so a fresh exact match
     // ranks with the best hits.
     // ponytail: the tail estimate ignores IDF; keep index-wide term stats if fresh rows misrank.
-    let mut out: Vec<Hit> = hits
+    let (mut out, replaced): (Vec<Hit>, Vec<Hit>) = hits
         .into_inner()
         .unwrap()
         .into_values()
-        .filter(|h| !superseded(&h.fact, &newest))
-        .collect();
+        .partition(|h| !superseded(&h.fact, &newest));
     for h in out.iter_mut() {
         h.bm25 = keyword.iter().zip(h.signals).map(|((_, w), s)| w * s).sum();
+    }
+    // An explanation's: each version the reader may read that a newer one they may read replaced, never scored.
+    let mut missed: Vec<Miss> = vec![];
+    if explain {
+        for mut h in replaced {
+            h.bm25 = keyword.iter().zip(h.signals).map(|((_, w), s)| w * s).sum();
+            h.parts.similarity = h.distance.map(|d| (1.0 - d / 2.0).max(0.0));
+            let by = newest
+                .get(&(h.fact.entity.clone(), h.fact.predicate.clone()))
+                .map(|(_, _, id)| id.clone())
+                .unwrap_or_default();
+            missed.push(Miss {
+                hit: h,
+                cut: Cut::Superseded(by),
+            });
+        }
     }
     let top = out
         .iter()
@@ -3903,17 +4089,30 @@ async fn ranked(
             };
             let s = sim(h).map_or(0.0, |x| norm(x, slo, shi));
             h.score = alpha * s + (1.0 - alpha) * k;
+            h.parts.fusion = "blend";
+            h.parts.keyword = (1.0 - alpha) * k;
+            h.parts.meaning = alpha * s;
         }
     } else {
         out.sort_by(|a, b| kw(b).total_cmp(&kw(a)).then(tiebreak(a, b)));
         for (r, h) in out.iter_mut().filter(|h| h.bm25 > 0.0).enumerate() {
             h.score += 1.0 / (RRF_K + r as f32);
+            h.parts.keyword = 1.0 / (RRF_K + r as f32);
         }
         let sem = |h: &Hit| sim(h).unwrap_or(f32::NEG_INFINITY);
         out.sort_by(|a, b| sem(b).total_cmp(&sem(a)).then(tiebreak(a, b)));
         for (r, h) in out.iter_mut().filter(|h| h.distance.is_some()).enumerate() {
             h.score += 1.0 / (RRF_K + r as f32);
+            h.parts.meaning = 1.0 / (RRF_K + r as f32);
         }
+        for h in out.iter_mut() {
+            h.parts.fusion = "rrf";
+        }
+    }
+    for h in out.iter_mut() {
+        h.parts.similarity = h.distance.map(|d| (1.0 - d / 2.0).max(0.0));
+        h.parts.origin = 1.0;
+        h.parts.time = 1.0;
     }
     // What only an agent wrote ranks below what was observed or stated about as well matched (`AGENT_SCALE`). The
     // classic ranking is the ranking as it was, so it is left alone.
@@ -3922,6 +4121,7 @@ async fn ranked(
         h.origin = vis.fact_origin(&h.fact);
         if h.origin == Some(crate::origin::Origin::Agent) && !rank.classic {
             h.score *= agent;
+            h.parts.origin = agent;
         }
     }
     // The time the query names: a fact stated in it, or whose value names one of its years, is in time; one
@@ -3938,15 +4138,18 @@ async fn ranked(
             h.in_window = w.contains(h.fact.valid_from) || named;
             if stated.is_some() && !named {
                 h.score *= damp;
+                h.parts.time *= damp;
             }
             if mode == 2 && h.in_window {
                 h.score *= 1.0 + boost;
+                h.parts.time *= 1.0 + boost;
             }
         }
         if mode == 1 {
             // In time first, each side in score order.
             for h in out.iter_mut().filter(|h| h.in_window) {
                 h.score += 1.0;
+                h.parts.time_first = true;
             }
         }
     }
@@ -3955,6 +4158,42 @@ async fn ranked(
             .total_cmp(&a.score)
             .then(kw(b).total_cmp(&kw(a)))
             .then(tiebreak(a, b))
+    });
+    // An explanation's: every scored candidate, in rank order, and why those not shown were cut where ranking said.
+    let scored: Vec<Hit> = match explain {
+        true => out.clone(),
+        false => vec![],
+    };
+    let mut cut: HashMap<String, Cut> = HashMap::new();
+    // Records of what happened under one name are one running story: the newest tell where it stands now, and an
+    // older one its words matched would serve a state since moved on. Of each name's, the newest
+    // `NEWEST_RECORDS` hits stay, in rank order.
+    let mut newest_records: HashMap<&str, Vec<i64>> = HashMap::new();
+    for h in out
+        .iter()
+        .filter(|h| h.fact.predicate == crate::WHAT_HAPPENED)
+    {
+        newest_records
+            .entry(h.fact.entity.as_str())
+            .or_default()
+            .push(h.fact.valid_from);
+    }
+    let cutoff: HashMap<String, i64> = newest_records
+        .into_iter()
+        .filter_map(|(e, mut at)| {
+            at.sort_unstable_by(|a, b| b.cmp(a));
+            at.get(NEWEST_RECORDS - 1).map(|&t| (e.to_string(), t))
+        })
+        .collect();
+    out.retain(|h| {
+        let keep = h.fact.predicate != crate::WHAT_HAPPENED
+            || cutoff
+                .get(&h.fact.entity)
+                .is_none_or(|&t| h.fact.valid_from >= t);
+        if explain && !keep {
+            cut.insert(h.fact.fact_id.clone(), Cut::OlderRecord);
+        }
+        keep
     });
     // A dream's names of a thing (`_name`, `_alias`) are for finding it by another name (`match`, a passage search's
     // name variants), not what it holds: never a hit, nor a group's member (below), where they would push out what
@@ -4001,6 +4240,12 @@ async fn ranked(
             };
             let at = match at {
                 Some(i) => {
+                    if explain {
+                        cut.insert(
+                            h.fact.fact_id.clone(),
+                            Cut::Duplicate(kept[i].fact.fact_id.clone()),
+                        );
+                    }
                     kept[i].group.push(h.fact.clone());
                     if link {
                         folded[i].push(h);
@@ -4029,7 +4274,8 @@ async fn ranked(
             h.group.clear();
         }
         kept.truncate(k);
-        return Ok((kept, saturated));
+        missed.extend(misses_of(scored, &kept, cut));
+        return Ok((kept, saturated, missed));
     }
     // Groups: each hit brings the other facts about its entity from its source episodes, then the other
     // items of its list (same entity and predicate), best ranked first, up to `rank.group`; a fact shown in
@@ -4147,7 +4393,27 @@ async fn ranked(
         h.group = group;
         groups.push(h);
     }
-    Ok((groups, saturated))
+    missed.extend(misses_of(scored, &groups, cut));
+    Ok((groups, saturated, missed))
+}
+
+/// The scored candidates (in rank order) that `shown` doesn't hold as a hit or in a hit's group, each with why: as
+/// `cut` says, else it ranked below. A dream's names of a thing are never one (they are never hits).
+fn misses_of(scored: Vec<Hit>, shown: &[Hit], mut cut: HashMap<String, Cut>) -> Vec<Miss> {
+    let shown: HashSet<&str> = shown
+        .iter()
+        .flat_map(|h| std::iter::once(&h.fact).chain(&h.group))
+        .map(|f| f.fact_id.as_str())
+        .collect();
+    scored
+        .into_iter()
+        .filter(|h| !shown.contains(h.fact.fact_id.as_str()) && !crate::dream_name(&h.fact))
+        .map(|mut h| {
+            h.group.clear();
+            let cut = cut.remove(&h.fact.fact_id).unwrap_or(Cut::Below);
+            Miss { hit: h, cut }
+        })
+        .collect()
 }
 
 /// Every fact row with this key, as (commit id, fact), before visibility filtering: from the

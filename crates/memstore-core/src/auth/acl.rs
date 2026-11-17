@@ -108,6 +108,49 @@ impl AclIndex {
         }
     }
 
+    /// This index with `added` episodes (none of them in it) appended: what [`AclIndex::build`] gives for the
+    /// union, under a new [`AclIndex::id`], so nothing memoized for this snapshot is served for the next.
+    pub fn extended<'a>(
+        &self,
+        added: impl IntoIterator<Item = (&'a String, &'a Vec<String>)>,
+    ) -> Self {
+        let (mut ordinal, mut ids, mut by_entry) = (
+            self.ordinal.clone(),
+            self.ids.clone(),
+            self.by_entry.clone(),
+        );
+        for (episode, acl) in added {
+            debug_assert!(!ordinal.contains_key(episode));
+            let o = ids.len() as u32;
+            ordinal.insert(episode.clone(), o);
+            ids.push(episode.clone());
+            for entry in acl {
+                by_entry.entry(norm_entry(entry)).or_default().insert(o);
+            }
+        }
+        AclIndex {
+            id: NEXT_INDEX.fetch_add(1, Ordering::Relaxed),
+            ordinal,
+            ids,
+            by_entry,
+            cache: Mutex::default(),
+        }
+    }
+
+    /// Each entry's episodes by id, ordinal-blind: two indexes granting the same are equal here.
+    pub fn grants(&self) -> HashMap<&str, std::collections::BTreeSet<&str>> {
+        self.by_entry
+            .iter()
+            .filter(|(_, b)| !b.is_empty())
+            .map(|(e, b)| {
+                (
+                    e.as_str(),
+                    b.iter().map(|o| self.ids[o as usize].as_str()).collect(),
+                )
+            })
+            .collect()
+    }
+
     /// Identifies this snapshot, so a caller can memoize its visible set per snapshot.
     pub fn id(&self) -> u64 {
         self.id

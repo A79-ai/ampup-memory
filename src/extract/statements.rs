@@ -177,6 +177,7 @@ pub(super) fn schema(base: &Schema, kind: &dyn EpisodeType) -> anyhow::Result<Sc
                 value: ValueType::Text,
                 card: Card::Many,
                 values: None,
+                aliases: Default::default(),
                 to: vec![],
                 unit: None,
                 part_of: false,

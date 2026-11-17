@@ -45,7 +45,7 @@ pub(super) async fn handle(
                 .await?;
             Ok(json!({}))
         }
-        "entity_owners" => serde_json::to_value(store.entity_owners(&scope).await?),
+        "entity_owners" => serde_json::to_value(store.entity_owners_held(&scope).await?),
         "list_proposals" => {
             let limit = req["limit"].as_u64().unwrap_or(200).clamp(1, 500) as usize;
             serde_json::to_value(json!({"proposals": store
@@ -57,7 +57,17 @@ pub(super) async fn handle(
                 )
                 .await?}))
         }
-        "entity_graph" => serde_json::to_value(store.entity_graph(&scope, &reader).await?),
+        "entity_graph" => {
+            // At most `limit` entities (default 300, the most a page draws), keeping `entity` among them.
+            let max = req["limit"].as_u64().unwrap_or(300).clamp(1, 2000) as usize;
+            let keep = req["entity"].as_str().filter(|e| !e.is_empty());
+            let graph =
+                serde_json::to_value(store.entity_graph(&scope, &reader, max, keep).await?)?;
+            // Each node named, where its id says nothing (a meeting by its call's title).
+            let session = store.pin(&scope, crate::MAIN).await?;
+            let eps = crate::browse::episodes(store, &session, &reader).await?;
+            Ok(crate::names::attach(store, &session, &reader, graph, &eps).await?)
+        }
         "propose_branch" => serde_json::to_value(
             store
                 .propose_branch(&scope, field("branch"), &reader)

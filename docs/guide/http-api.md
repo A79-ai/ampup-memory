@@ -87,7 +87,7 @@ curl -s localhost:8080/browse -d '{"op": "ls", "path": ["entities", "deal", "42"
 ### What it learned: `/lessons`
 
 `POST /lessons` (also `/browse {"op": "lessons"}`) answers each learned lesson (an advice note: the caller's own,
-`space: "mine"`, or the team's) with its trail, newest first. The Explorer's Learned tab reads it, and anything that
+`space: "mine"`, or the team's) with its trail, newest first. The console's Learned section reads it, and anything that
 reports what the memory learned (a weekly digest) can read the same:
 
 ```bash
@@ -165,8 +165,9 @@ as if it didn't exist.
 | `GET /metrics` | Prometheus text; the admin key only on the public port, or anyone on `AMPUP_MEMORY_METRICS_PORT` |
 | `GET /.well-known/oauth-protected-resource` | The identity provider and CLI client id, for OAuth sign-in (RFC 9728) |
 
-The CLI's people commands (`ampup-memory org`, `team`, `member`, `apikey`, `audit`) call `/admin` when signed in. See
-[security-model.md](security-model.md).
+The CLI's people commands (`ampup-memory org`, `team`, `member`, `apikey`, `audit`) call `/admin` when signed in. On
+`serve --local` the one caller is its org's admin: an op without `org` acts on the org served, and the directory's,
+operator's and dream ops are refused. See [security-model.md](security-model.md#who-a-caller-is).
 
 ## Errors
 

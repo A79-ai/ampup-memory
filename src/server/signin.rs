@@ -59,7 +59,7 @@ pub(super) async fn on_me(
                 eprintln!(
                     "signin request: {u} asked {org}'s admins to approve an unverified sign-in"
                 );
-                state.background(notify(Arc::clone(state), org.clone(), u.clone()));
+                state.background("notify", notify(Arc::clone(state), org.clone(), u.clone()));
             }
             status("waiting")
         }

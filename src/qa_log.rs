@@ -12,7 +12,7 @@
 //! never shown, and is swept by the scope's next erasure), and forgetting a person erases what they asked.
 //! The log is read by whoever owns the catalog (`memstore qa-log`): questions are the askers' own words.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -21,8 +21,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    Ledger, MAIN, OnConflict, Principal, QA_LOG, Scope, Store, append, now_micros, optional_f64,
-    optional_strings, split_list, strings, timestamps, ts,
+    Ledger, MAIN, OnConflict, Principal, QA_LOG, Scope, Store, View, append, now_micros,
+    optional_f64, optional_strings, split_list, strings, timestamps, ts,
 };
 
 /// Longest question kept, in characters.
@@ -92,11 +92,12 @@ pub struct Logged {
 }
 
 /// Whether `l` is the engine's own record rather than something a person asked or ran: a dream job
-/// ([`crate::dream_jobs`]) or a digest's send or subscription ([`crate::digest`]). Neither is anyone's activity.
+/// ([`crate::dream_jobs`]), a digest's send or subscription ([`crate::digest`]), or why a dream or a team share
+/// decided something ([`crate::dream::REASON_KIND`]). None is anyone's activity.
 pub fn internal(l: &Logged) -> bool {
     matches!(
         l.kind.as_deref(),
-        Some(crate::dream_jobs::KIND | crate::digest::KIND)
+        Some(crate::dream_jobs::KIND | crate::digest::KIND | crate::dream::REASON_KIND)
     )
 }
 
@@ -695,18 +696,81 @@ pub async fn judged(store: &Store, scope: &Scope, judgements: &[Judgement]) -> R
 }
 
 /// The log on main, newest answer first, each answer as its newest row; only `goal`'s with one.
+///
+/// Decoding the log's rows is most of what an activity, lessons or advice read costs, and a page asks for it
+/// several times at once, so the decoded rows are kept per scope, by data file: a write to the log gives a new
+/// snapshot, of which only the files not decoded before are decoded. What may be read
+/// (committed, not retracted, not erased or forgotten) is applied to them on every call, from main's visibility
+/// as it is now. Never cached by time.
 pub async fn list(store: &Store, scope: &Scope, goal: Option<&str>) -> Result<Vec<Logged>> {
-    let vis = store.visibility(scope, MAIN).await?;
+    // Main's last state may serve while the next is built: what was recorded since comes with it, so an entry
+    // logged a moment ago is listed, and nothing taken away is.
+    let view = store.lagging_view(scope, MAIN).await?;
     let rows = store.side_rows(&scope.namespace(), QA_LOG).await?;
-    // Each answer's newest row, except that a session its agent ended is final: no row without that end (a
-    // conversation kept, or the sweep's idle end, from a read taken before the end landed) supersedes it.
-    let mut newest: BTreeMap<String, ((bool, i64), Logged)> = BTreeMap::new();
-    // A session's PRs as every row of it holds them (`crate::session_prs::merge`): they only grow, and a row written
-    // from a read taken before another pod's row landed would otherwise drop what that row added.
-    let mut prs_of: BTreeMap<String, Vec<crate::session_prs::Pr>> = BTreeMap::new();
-    // Each entry's newest review ([`review`]): (when, reward, reason). It stands over any row that isn't one, so a
-    // row written from a read taken before the review landed doesn't undo it.
-    let mut review_of: BTreeMap<String, (i64, f64, String)> = BTreeMap::new();
+    let decoded = decoded(scope, rows);
+    Ok(newest(&view, &decoded, goal))
+}
+
+/// One row of the log as written, decoded.
+struct Row {
+    commit: String,
+    /// A session's final end (an agent's, discarded, empty), which outranks a later row that isn't one.
+    final_end: bool,
+    /// The session's PRs this row holds, when it holds any.
+    prs: Option<Vec<crate::session_prs::Pr>>,
+    /// A reviewer's grade this row records: (reward, reason).
+    review: Option<(f64, String)>,
+    logged: Logged,
+}
+
+/// Each batch's decoded rows, in the snapshot's order.
+type Chunks = Arc<Vec<Arc<Vec<Row>>>>;
+/// The decoded rows per scope, with the snapshot they were decoded from (held, so a pointer is never reused).
+type Decoded = (Arc<Vec<arrow_array::RecordBatch>>, Chunks);
+static DECODED: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, Decoded>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A batch's identity: its first column, shared by every read of the same data file.
+fn batch_id(b: &arrow_array::RecordBatch) -> usize {
+    Arc::as_ptr(b.column(0)) as *const () as usize
+}
+
+fn decoded(scope: &Scope, rows: Arc<Vec<arrow_array::RecordBatch>>) -> Chunks {
+    let key = scope.to_string();
+    let last = DECODED.lock().unwrap().get(&key).cloned();
+    if let Some((r, d)) = &last
+        && Arc::ptr_eq(r, &rows)
+    {
+        crate::phases::mark("qa_log cached");
+        return d.clone();
+    }
+    // The batches decoded before, by identity: `last` holds their snapshot, so no pointer here is reused meanwhile.
+    let known: HashMap<usize, Arc<Vec<Row>>> = match &last {
+        Some((r, d)) => r.iter().map(batch_id).zip(d.iter().cloned()).collect(),
+        None => HashMap::new(),
+    };
+    let mut fresh = 0;
+    let d: Chunks = Arc::new(
+        rows.iter()
+            .map(|b| {
+                known.get(&batch_id(b)).cloned().unwrap_or_else(|| {
+                    fresh += 1;
+                    Arc::new(decode(std::slice::from_ref(b)))
+                })
+            })
+            .collect(),
+    );
+    crate::phases::mark(match fresh == rows.len() {
+        true => "qa_log decoded",
+        false => "qa_log appended",
+    });
+    DECODED.lock().unwrap().insert(key, (rows, d.clone()));
+    d
+}
+
+/// Every row of the log, in the order written.
+fn decode(rows: &[arrow_array::RecordBatch]) -> Vec<Row> {
+    let mut out = vec![];
     for b in rows.iter() {
         let s = |c: &str| strings(b, c);
         let o = |c: &str| optional_strings(b, c);
@@ -738,112 +802,129 @@ pub async fn list(store: &Store, scope: &Scope, goal: Option<&str>) -> Result<Ve
             vec![None; n]
         };
         for i in 0..n {
-            // An answer citing an episode retracted or erased since is gone with it, even one logged while
-            // the erasure ran (its rows are swept by the next erasure in the scope), as is one citing a
-            // retracted fact.
-            if !vis.committed.contains(&commit[i])
-                || split_list(&episodes[i]).iter().any(|e| vis.is_gone(e))
-                || split_list(&cited[i])
-                    .iter()
-                    .any(|f| vis.retracted_facts.contains(f))
-            {
-                continue;
-            }
-            if let Some(p) = prs[i]
-                .as_deref()
-                .and_then(|v| serde_json::from_str::<Vec<crate::session_prs::Pr>>(v).ok())
-                .filter(|p| !p.is_empty())
-            {
-                crate::session_prs::merge(prs_of.entry(id[i].clone()).or_default(), p);
-            }
             let at = at[i].unwrap_or_default();
-            if let (Some(r), Some(why)) = (reward[i], reward_reason[i].as_deref())
-                && why.starts_with(REVIEWED)
-                && review_of.get(&id[i]).is_none_or(|(t, _, _)| *t < at)
-            {
-                review_of.insert(id[i].clone(), (at, r, why.to_string()));
-            }
-            // A session's final end (an agent's, discarded, empty) outranks a later row that isn't one.
-            let rank = (
-                kind[i].as_deref() == Some("session")
+            out.push(Row {
+                commit: commit[i].clone(),
+                final_end: kind[i].as_deref() == Some("session")
                     && ended[i].is_some()
                     && matches!(
                         ended_by[i].as_deref(),
                         Some("agent" | "discarded" | "empty")
                     ),
-                at,
-            );
-            if newest.get(&id[i]).is_some_and(|(r, _)| *r >= rank) {
-                continue;
-            }
-            newest.insert(
-                id[i].clone(),
-                (
-                    rank,
-                    Logged {
-                        answer_id: id[i].clone(),
-                        asker: asker[i].clone(),
-                        goal: g[i].clone(),
-                        question: question[i].clone(),
-                        answer: answer[i].clone(),
-                        rating: rating[i].clone(),
-                        cited: split_list(&cited[i]),
-                        episodes: split_list(&episodes[i]),
-                        asked_at: asked[i].unwrap_or_default(),
-                        kind: kind[i].clone(),
-                        reward: reward[i],
-                        reward_reason: reward_reason[i].clone(),
-                        updated_at: at,
-                        session: (kind[i].as_deref() == Some("session")).then(|| SessionPart {
-                            harness: harness[i].clone(),
-                            arm: arm[i].clone().unwrap_or_else(|| "advice".into()),
-                            served: served[i].as_deref().map(split_list).unwrap_or_default(),
-                            withheld: withheld[i].as_deref().map(split_list).unwrap_or_default(),
-                            conversation: conversation[i].clone(),
-                            ended_at: ended[i],
-                            verdicts: verdicts[i].clone(),
-                            acl: acl[i].as_deref().map(split_list).unwrap_or_default(),
-                            ended_by: ended_by[i].clone(),
-                            fires: fires[i]
-                                .as_deref()
-                                .and_then(|f| serde_json::from_str(f).ok())
-                                .unwrap_or_default(),
-                            branch: branch[i].clone(),
-                            served_versions: served_versions[i]
-                                .as_deref()
-                                .and_then(|v| serde_json::from_str(v).ok())
-                                .unwrap_or_default(),
-                            lookups: lookups[i]
-                                .as_deref()
-                                .and_then(|v| serde_json::from_str(v).ok())
-                                .unwrap_or_default(),
-                            prs: prs[i]
-                                .as_deref()
-                                .and_then(|v| serde_json::from_str(v).ok())
-                                .unwrap_or_default(),
-                            thread: thread[i].clone(),
-                        }),
-                    },
-                ),
-            );
+                prs: prs[i]
+                    .as_deref()
+                    .and_then(|v| serde_json::from_str::<Vec<crate::session_prs::Pr>>(v).ok())
+                    .filter(|p| !p.is_empty()),
+                review: match (reward[i], reward_reason[i].as_deref()) {
+                    (Some(r), Some(why)) if why.starts_with(REVIEWED) => Some((r, why.to_string())),
+                    _ => None,
+                },
+                logged: Logged {
+                    answer_id: id[i].clone(),
+                    asker: asker[i].clone(),
+                    goal: g[i].clone(),
+                    question: question[i].clone(),
+                    answer: answer[i].clone(),
+                    rating: rating[i].clone(),
+                    cited: split_list(&cited[i]),
+                    episodes: split_list(&episodes[i]),
+                    asked_at: asked[i].unwrap_or_default(),
+                    kind: kind[i].clone(),
+                    reward: reward[i],
+                    reward_reason: reward_reason[i].clone(),
+                    updated_at: at,
+                    session: (kind[i].as_deref() == Some("session")).then(|| SessionPart {
+                        harness: harness[i].clone(),
+                        arm: arm[i].clone().unwrap_or_else(|| "advice".into()),
+                        served: served[i].as_deref().map(split_list).unwrap_or_default(),
+                        withheld: withheld[i].as_deref().map(split_list).unwrap_or_default(),
+                        conversation: conversation[i].clone(),
+                        ended_at: ended[i],
+                        verdicts: verdicts[i].clone(),
+                        acl: acl[i].as_deref().map(split_list).unwrap_or_default(),
+                        ended_by: ended_by[i].clone(),
+                        fires: fires[i]
+                            .as_deref()
+                            .and_then(|f| serde_json::from_str(f).ok())
+                            .unwrap_or_default(),
+                        branch: branch[i].clone(),
+                        served_versions: served_versions[i]
+                            .as_deref()
+                            .and_then(|v| serde_json::from_str(v).ok())
+                            .unwrap_or_default(),
+                        lookups: lookups[i]
+                            .as_deref()
+                            .and_then(|v| serde_json::from_str(v).ok())
+                            .unwrap_or_default(),
+                        prs: prs[i]
+                            .as_deref()
+                            .and_then(|v| serde_json::from_str(v).ok())
+                            .unwrap_or_default(),
+                        thread: thread[i].clone(),
+                    }),
+                },
+            });
         }
+    }
+    out
+}
+
+/// The answers `vis` lets be read, each as its newest row; only `goal`'s with one; newest first.
+fn newest(view: &View, chunks: &[Arc<Vec<Row>>], goal: Option<&str>) -> Vec<Logged> {
+    let rows: Vec<&Row> = chunks.iter().flat_map(|c| c.iter()).collect();
+    // Each answer's newest row, except that a session its agent ended is final: no row without that end (a
+    // conversation kept, or the sweep's idle end, from a read taken before the end landed) supersedes it.
+    let mut newest: BTreeMap<&str, ((bool, i64), usize)> = BTreeMap::new();
+    // A session's PRs as every row of it holds them (`crate::session_prs::merge`): they only grow, and a row written
+    // from a read taken before another pod's row landed would otherwise drop what that row added.
+    let mut prs_of: BTreeMap<&str, Vec<crate::session_prs::Pr>> = BTreeMap::new();
+    // Each entry's newest review ([`review`]): (when, reward, reason). It stands over any row that isn't one, so a
+    // row written from a read taken before the review landed doesn't undo it.
+    let mut review_of: BTreeMap<&str, (i64, f64, &str)> = BTreeMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        let l = &r.logged;
+        // An answer citing an episode retracted or erased since is gone with it, even one logged while the
+        // erasure ran (its rows are swept by the next erasure in the scope), as is one citing a retracted fact.
+        if !view.is_committed(&r.commit)
+            || l.episodes.iter().any(|e| view.is_gone(e))
+            || l.cited.iter().any(|f| view.vis.retracted_facts.contains(f))
+        {
+            continue;
+        }
+        let id = l.answer_id.as_str();
+        if let Some(p) = &r.prs {
+            crate::session_prs::merge(prs_of.entry(id).or_default(), p.clone());
+        }
+        let at = l.updated_at;
+        if let Some((rw, why)) = &r.review
+            && review_of.get(id).is_none_or(|(t, _, _)| *t < at)
+        {
+            review_of.insert(id, (at, *rw, why));
+        }
+        let rank = (r.final_end, at);
+        if newest.get(id).is_some_and(|(k, _)| *k >= rank) {
+            continue;
+        }
+        newest.insert(id, (rank, i));
     }
     let mut out: Vec<Logged> = newest
         .into_values()
-        .map(|(_, mut l)| {
-            if let (Some(s), Some(p)) = (l.session.as_mut(), prs_of.remove(&l.answer_id)) {
+        .map(|(_, i)| &rows[i].logged)
+        .filter(|l| goal.is_none_or(|g| l.goal.as_deref() == Some(g)))
+        .map(|l| {
+            let mut l = l.clone();
+            if let (Some(s), Some(p)) = (l.session.as_mut(), prs_of.remove(l.answer_id.as_str())) {
                 crate::session_prs::merge(&mut s.prs, p);
             }
-            if let Some((_, r, why)) = review_of.remove(&l.answer_id) {
+            if let Some((_, r, why)) = review_of.remove(l.answer_id.as_str()) {
                 l.reward = Some(r);
-                l.reward_reason = Some(why);
+                l.reward_reason = Some(why.to_string());
             }
             l
         })
-        .filter(|l| goal.is_none_or(|g| l.goal.as_deref() == Some(g)))
         .collect();
     out.sort_by_key(|l| std::cmp::Reverse(l.asked_at));
-    Ok(out)
+    out
 }
 
 /// The QA log's reads and writes on a [`Store`] (an inherent impl until the store moved to memstore-core).

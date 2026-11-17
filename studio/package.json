@@ -1,0 +1,73 @@
+{
+  "name": "ampup-memory-studio",
+  "version": "0.1.0",
+  "description": "AmpUp Memory's pages: browse, search and review a team's memory, for a hosted console or `ampup-memory serve --local`",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./helpers": {
+      "types": "./lib/types/helpers.d.ts",
+      "default": "./lib/helpers.js"
+    },
+    "./style.css": "./lib/style.css",
+    "./app/*": "./dist/*"
+  },
+  "sideEffects": [
+    "*.css"
+  ],
+  "files": [
+    "dist",
+    "lib",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/A79-ai/ampup-memory.git",
+    "directory": "studio"
+  },
+  "homepage": "https://github.com/A79-ai/ampup-memory/tree/main/studio",
+  "bugs": "https://github.com/A79-ai/ampup-memory/issues",
+  "keywords": [
+    "ampup",
+    "memory",
+    "agents",
+    "react",
+    "studio"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run build:app && npm run build:lib && npm run build:types",
+    "build:app": "vite build",
+    "build:lib": "vite build --config vite.lib.config.ts",
+    "build:types": "tsc -p tsconfig.types.json",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "dependencies": {
+    "@fontsource/atkinson-hyperlegible-mono": "5.3.0",
+    "@fontsource/atkinson-hyperlegible-next": "5.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7",
+    "@vitejs/plugin-react": "4.7.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "typescript": "6.0.3",
+    "vite": "6.4.4"
+  }
+}

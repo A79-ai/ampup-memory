@@ -1,0 +1,154 @@
+/* What the pages stand on outside the Explorer's own system (memory/memory.css, which starts every element from
+   the browser's defaults): the palette, type and plain elements that Advice, Learned and the Studio panes read.
+   In a cascade layer of its own, so the pages' own styles, and a host's, always win over it. Scoped to the
+   pages' root, `.memory-studio`, so nothing here reaches a host's other pages. */
+@layer studio-base {
+  :where(.memory-studio) {
+    --bg: #fdfcf7;
+    --surface: #ffffff;
+    --ink: #232428;
+    --muted: #7f7e7c;
+    --line: #e4e3de;
+    --accent: #232428;
+    --accent-ink: #fefdfb;
+    --accent-soft: #f3e4db;
+    --accent-text: #6e3a26;
+    --gold: #c15f3c;
+    --link: #3c71b2;
+    --error: #b04a3a;
+    --ok: #5e7a52;
+    --warn-bg: #f6ebd4;
+    --code-bg: #f5f2ec;
+    --radius: 12px;
+    --mono:
+      "JetBrains Mono", "Atkinson Hyperlegible Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    color-scheme: light;
+
+    color: var(--ink);
+    font:
+      15px/1.5 "NeuMontreal",
+      "Inter",
+      "Atkinson Hyperlegible Next",
+      ui-sans-serif,
+      system-ui,
+      -apple-system,
+      "Segoe UI",
+      sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* The sections' sidebar beside the section shown. */
+  :where(.memory-studio) {
+    display: grid;
+    grid-template-columns: 224px minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+  }
+  :where(.memory-studio) > :where(.studio-goals) {
+    min-width: 0;
+  }
+  @media (max-width: 900px) {
+    :where(.memory-studio) {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  :where(.memory-studio) :where(*, *::before, *::after) {
+    box-sizing: border-box;
+  }
+  :where(.memory-studio) :where(h1) {
+    font-size: 24px;
+    line-height: 1.25;
+    margin: 0 0 6px;
+    letter-spacing: -0.01em;
+  }
+  :where(.memory-studio) :where(h2) {
+    font-size: 18px;
+    margin: 0 0 10px;
+  }
+  :where(.memory-studio) :where(h3) {
+    font-size: 15px;
+    margin: 18px 0 8px;
+  }
+  :where(.memory-studio) :where(p) {
+    margin: 0 0 12px;
+  }
+  :where(.memory-studio) :where(code) {
+    font:
+      13px/1.4 ui-monospace,
+      SFMono-Regular,
+      Menlo,
+      monospace;
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 5px;
+    overflow-wrap: anywhere;
+  }
+  :where(.memory-studio) :where(a) {
+    color: var(--link);
+  }
+  :where(.memory-studio) :where(.muted) {
+    color: var(--muted);
+  }
+  :where(.memory-studio) :where(.small) {
+    font-size: 13px;
+  }
+  :where(.memory-studio) :where(.error) {
+    color: var(--error);
+  }
+  :where(.memory-studio) :where(.ok) {
+    color: var(--ok);
+  }
+  :where(.memory-studio) :where(button, .button) {
+    white-space: nowrap;
+    font: inherit;
+    font-size: 14px;
+    border-radius: 8px;
+    padding: 8px 14px;
+    cursor: pointer;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--ink);
+    text-decoration: none;
+    display: inline-block;
+  }
+  :where(.memory-studio) :where(button:disabled) {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  :where(.memory-studio) :where(button.link) {
+    border: 0;
+    background: none;
+    padding: 0;
+    color: var(--link);
+  }
+  :where(.memory-studio) :where(button.small) {
+    padding: 4px 10px;
+    font-size: 13px;
+  }
+  :where(.memory-studio) :where(:focus-visible) {
+    outline: 2px solid var(--gold);
+    outline-offset: 2px;
+  }
+  :where(.memory-studio) :where(input, select, textarea) {
+    font: inherit;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    width: 100%;
+  }
+  :where(.memory-studio) :where(.panel) {
+    min-width: 0;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 28px;
+  }
+  @media (max-width: 900px) {
+    :where(.memory-studio) :where(.panel) {
+      padding: 18px;
+    }
+  }
+}

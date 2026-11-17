@@ -103,6 +103,50 @@ pub fn record_of(ep: &crate::Episode) -> Option<(&str, &str)> {
         .flatten()
 }
 
+// What a conflict is ever about: one answer two sources can disagree on. Two values of an attribute that holds
+// several (a thing's requirements, a summary, free text) are both true, never in conflict: reconcile records no
+// conflict on one, and marks and lists leave out one recorded before it checked.
+/// Whether `f` is one answer two sources can disagree on: a schema predicate holding one value that is not free
+/// text or a reference, or an undeclared one whose value is a short label. Never one the engine keeps (`_alias`).
+pub fn one_value(schema: Option<&crate::query::schema::Schema>, f: &Fact) -> bool {
+    if f.predicate.starts_with('_') {
+        return false;
+    }
+    let ty = f
+        .entity_type
+        .clone()
+        .or_else(|| {
+            schema
+                .and_then(|s| s.entity_type(&f.entity))
+                .map(String::from)
+        })
+        .unwrap_or_else(|| {
+            f.entity
+                .split_once(':')
+                .map(|(t, _)| t)
+                .unwrap_or("")
+                .into()
+        });
+    use crate::query::schema::{Card, ValueType};
+    match schema.and_then(|s| s.predicate(&ty, &f.predicate)) {
+        // Free text and references are notes and links, not one answer that two sources can disagree on.
+        Some(p) => {
+            !p.list && p.card != Card::Many && !matches!(p.value, ValueType::Text | ValueType::Ref)
+        }
+        // Undeclared: only a short label (a date, an amount, a name), never a sentence.
+        None => short_label(&f.value),
+    }
+}
+
+/// A value short enough to be one answer: one line, at most six words and sixty characters.
+fn short_label(v: &str) -> bool {
+    let v = v.trim();
+    !v.is_empty()
+        && !v.contains('\n')
+        && v.chars().count() <= 60
+        && v.split_whitespace().count() <= 6
+}
+
 /// The recorded conflicts, from the committed documents' versions by key: each fact with the facts it was recorded
 /// in conflict with, both ways. Only `records` count, the committed episodes from a [`SOURCE`] source that aren't
 /// retracted: a document a caller files under [`PREFIX`] records nothing.
@@ -142,8 +186,10 @@ pub async fn marks(
         return Ok(HashMap::new());
     };
     let vis = session.vis();
+    let schema = session.schema();
     let pairs: Vec<(&str, &str)> = facts
         .iter()
+        .filter(|f| one_value(schema.as_deref(), f))
         .flat_map(|f| {
             vis.conflicts_of(&f.fact_id)
                 .iter()

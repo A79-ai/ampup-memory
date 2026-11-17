@@ -92,6 +92,23 @@ jobs:
           arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
           .github/scripts/onnxruntime-x86_64-apple-darwin.sh "$RUNNER_TEMP/onnxruntime"
           echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime" >> "$GITHUB_ENV"
+      # The Studio, which build.rs embeds in ampup-memory from studio/dist: built first, with Node pinned and its
+      # packages as studio/package-lock.json locks them, for a server release (a client release ships no server).
+      # STUDIO_DIST: .github/scripts/release-check.sh checks the binary serves this build.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.kind.outputs.kind == 'server'
+        with:
+          node-version: 24.22.2
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+      - name: Build the Studio
+        if: steps.kind.outputs.kind == 'server'
+        run: |
+          npm --prefix studio ci
+          npm --prefix studio run build
+          test -s studio/dist/index.html
+          du -sh studio/dist
+          echo "STUDIO_DIST=$PWD/studio/dist" >> "$GITHUB_ENV"
       # Both, for either kind: the check runs ampup-memory-client against ampup-memory. Only this release's kind is
       # packaged.
       - name: Build

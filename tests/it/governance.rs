@@ -471,6 +471,17 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
     let e = Env::start().await;
     let entity = "policy:refund-window";
     let (before, _) = e.seed(entity, "thirty").await;
+    // Another entity links to it, so its name (given below) shows on that one's page too.
+    let link = Episode::sourced(
+        "policy:shipping:link",
+        b"shipping follows the refund window",
+        &["group:acme.all"],
+    );
+    let linked = Fact::new("policy:shipping", "applies_to", entity).from_episodes(&[&link]);
+    e.store
+        .commit(&e.scope, "seed", from_ref(&link), from_ref(&linked))
+        .await
+        .unwrap();
     e.ok(
         &e.alice,
         json!({"op":"set_entity_owner","entity":entity,"owner":"bob@acme.com"}),
@@ -513,8 +524,11 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
     );
     let private_id = private.episode_id.clone();
     let fact = Fact::new(entity, "refund_days", "xprivate-value").from_episodes(&[&private]);
+    // Its display name too: pages name an entity by it (the graph, the Explorer's list, its page, its links), so
+    // whoever can't read the note must never see it there either.
+    let name = Fact::new(entity, "_name", "xprivate-value name").from_episodes(&[&private]);
     e.store
-        .commit_on(&e.scope, "private", "agent", &[private], &[fact])
+        .commit_on(&e.scope, "private", "agent", &[private], &[fact, name])
         .await
         .unwrap();
     // Only Carol reads it, so it changes nothing Bob or anyone else reads: nothing for him to review (he couldn't
@@ -525,26 +539,48 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
     assert_ne!(status, 200, "{body}");
     assert!(!body.to_string().contains("xprivate-value"), "{body}");
     e.store.merge(&e.scope, "private", "agent").await.unwrap();
+    // Its facts, and everywhere it is named: the type's list, its page, the page of one linking to it, the graph.
     let read = |token: String| {
-        let url = format!("{}/browse", e.url);
+        let url = e.url.clone();
         async move {
-            post(
-                &url,
-                &token,
-                &json!({"org":"acme","op":"ls","path":["entities","policy","refund-window"]}),
-            )
-            .await
-            .1
+            let mut all = String::new();
+            for (path, body) in [
+                (
+                    "browse",
+                    json!({"org":"acme","op":"ls","path":["entities","policy","refund-window"]}),
+                ),
+                (
+                    "browse",
+                    json!({"org":"acme","op":"ls","path":["entities","policy"]}),
+                ),
+                (
+                    "browse",
+                    json!({"org":"acme","op":"entity","path":["entities","policy","refund-window"]}),
+                ),
+                (
+                    "browse",
+                    json!({"org":"acme","op":"entity","path":["entities","policy","shipping"]}),
+                ),
+                ("admin", json!({"org":"acme","op":"entity_graph"})),
+            ] {
+                let (status, answer) = post(&format!("{url}/{path}"), &token, &body).await;
+                assert_eq!(status, 200, "{body}: {answer}");
+                all.push_str(&answer);
+            }
+            all
         }
     };
-    // The server's reads catch up with a commit made beside it within a few seconds.
+    // The server's reads catch up with a commit made beside it within a few seconds. She reads it, and as its name
+    // on each page that names it.
+    let named = |all: &str| all.matches(r#""title":"xprivate-value name""#).count();
     let start = Instant::now();
     let mut hers = read(e.carol.clone()).await;
-    while !hers.contains("xprivate-value") && start.elapsed() < Duration::from_secs(20) {
+    while named(&hers) < 4 && start.elapsed() < Duration::from_secs(20) {
         tokio::time::sleep(Duration::from_millis(200)).await;
         hers = read(e.carol.clone()).await;
     }
-    assert!(hers.contains("xprivate-value"), "{hers}");
+    assert!(hers.contains(r#""value":"xprivate-value""#), "{hers}");
+    assert_eq!(named(&hers), 4, "{hers}");
     assert!(!read(e.bob.clone()).await.contains("xprivate-value"));
     let theirs = e.ok(&e.bob, json!({"op":"list_proposals"})).await;
     assert!(!theirs.to_string().contains("xprivate-value"), "{theirs}");

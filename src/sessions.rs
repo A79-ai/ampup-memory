@@ -1088,10 +1088,10 @@ pub async fn list(store: &Store, scope: &Scope) -> Result<Vec<Logged>> {
         return Ok(all);
     }
     // As the log's own rows are read: one citing an episode erased or retracted since is gone with it.
-    let vis = store.visibility(scope, MAIN).await?;
+    let view = store.lagging_view(scope, MAIN).await?;
     let held: Vec<Logged> = held
         .into_iter()
-        .filter(|l| !l.episodes.iter().any(|e| vis.is_gone(e)))
+        .filter(|l| !l.episodes.iter().any(|e| view.is_gone(e)))
         .collect();
     for mut h in held {
         match all.iter_mut().find(|l| l.answer_id == h.answer_id) {
@@ -1603,8 +1603,8 @@ async fn serve_team(
 
 /// Whether `source` is a session's conversation so far (`<signed>memstore:session:<id>:conversation`): an episode of the
 /// asker's own, written again at every advice step, which the session's end copies into its transcript
-/// (`<signed>session:<id>`). Facts aren't extracted from it, nor from the record, unless
-/// `AMPUP_MEMORY_EXTRACT_SESSIONS` is on ([`crate::extract::typed`]).
+/// (`<signed>session:<id>`). Facts aren't extracted from it unless `AMPUP_MEMORY_EXTRACT_SESSIONS=all`; the record
+/// of the session, once it ends, is ([`crate::extract::typed`]).
 pub fn conversation_so_far(source: &str) -> bool {
     // `<signed>memstore:session:<id>:conversation`, or `<signed>session:<id>:conversation` as sessions before it kept.
     source
@@ -1646,7 +1646,7 @@ async fn keep_conversation(
     )
     .version_of(&conversation_key(id));
     store
-        .commit(scope, who.user(), std::slice::from_ref(&ep), &[])
+        .commit_record(scope, who.user(), std::slice::from_ref(&ep))
         .await?;
     s.conversation = Some(ep.episode_id);
     // The PRs it opened or pushed to so far, so what becomes of one finds the session while it is still open.
@@ -2780,7 +2780,7 @@ pub async fn end(
     if let Some(t) = &transcript {
         let ep = transcript_episode(signed, &id, &l.question, t, outcome, &s.acl);
         store
-            .commit(scope, asker, std::slice::from_ref(&ep), &[])
+            .commit_record(scope, asker, std::slice::from_ref(&ep))
             .await?;
         l.episodes.push(ep.episode_id);
     }
@@ -3127,7 +3127,7 @@ pub async fn judge(
     }
     if let Some((ep, task, c)) = recovered {
         store
-            .commit(scope, &fresh.asker, std::slice::from_ref(&ep), &[])
+            .commit_record(scope, &fresh.asker, std::slice::from_ref(&ep))
             .await?;
         fresh.episodes.push(ep.episode_id);
         crate::session_prs::merge(&mut fs.prs, crate::session_prs::links_in(&c));

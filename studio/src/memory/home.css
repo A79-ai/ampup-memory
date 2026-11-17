@@ -1,0 +1,242 @@
+/* Studio's Home (home.tsx): what changed, what was answered, what needs the reader. In the memory's tokens. */
+
+.memory {
+  .hm {
+    max-width: 1040px;
+  }
+  .hm-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: var(--s4);
+    margin-bottom: var(--s6);
+  }
+  .hm-head .subtitle {
+    margin: var(--s1) 0 0;
+  }
+  .hm-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s2);
+  }
+  .hm-actions a.btn,
+  .hm-new a.btn {
+    color: var(--ink);
+    text-decoration: none;
+    cursor: pointer;
+  }
+  /* The dream, under the title (an admin's): its last pass, and a link to what it did on its own this week. */
+  .hm-dream {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--s2) var(--s3);
+    max-width: 640px;
+    margin-bottom: var(--s6);
+    padding: var(--s3) var(--s4);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    background: var(--surface);
+    font-size: var(--t-sm);
+    color: var(--ink-2);
+  }
+  .hm-dream > .icon {
+    color: var(--muted);
+  }
+  .hm-dream-text {
+    flex: 1 1 260px;
+    min-width: 0;
+  }
+  .hm-dream-when {
+    color: var(--faint);
+  }
+  .hm-dream-done {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+  }
+  /* Nothing waits on the reader: one calm line. */
+  .hm-calm {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    margin: 0;
+    font-size: var(--t-sm);
+    color: var(--muted);
+  }
+  .hm-calm .icon {
+    color: var(--ok);
+  }
+  .hm-calm + .hm-needs {
+    margin-top: var(--s3);
+  }
+  .hm-sec {
+    margin-bottom: var(--s8);
+  }
+  .hm-sec .h-section {
+    margin-top: 0;
+  }
+  .hm-tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: var(--s3);
+  }
+  .hm-tiles-sm {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  }
+  .hm-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--s4) var(--s5);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow-sm);
+    color: var(--ink);
+    text-decoration: none;
+    transition: border-color 0.12s;
+  }
+  .hm-tile:hover {
+    border-color: var(--line-strong);
+  }
+  .hm-tile:focus-visible,
+  .hm-need a:focus-visible,
+  .hm-source:focus-visible {
+    outline: none;
+    box-shadow: var(--focus);
+  }
+  .hm-n {
+    font-family: var(--mono);
+    font-size: var(--t-2xl);
+    font-weight: 600;
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+  }
+  .hm-tiles-sm .hm-n {
+    font-size: var(--t-xl);
+  }
+  .hm-label {
+    font-size: var(--t-sm);
+    color: var(--ink-2);
+  }
+  .hm-note {
+    font-size: var(--t-xs);
+    color: var(--muted);
+  }
+  .hm-fig {
+    font-family: var(--mono);
+  }
+  .hm-by {
+    margin: var(--s3) 0 0;
+    font-size: var(--t-sm);
+    color: var(--muted);
+  }
+  .hm-needs {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    max-width: 640px;
+  }
+  .hm-need a {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    padding: var(--s3) var(--s4);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    background: var(--surface);
+    color: var(--muted);
+    text-decoration: none;
+  }
+  .hm-need a .icon {
+    margin-left: auto;
+    color: var(--faint);
+  }
+  .hm-need a:hover {
+    border-color: var(--line-strong);
+  }
+  .hm-need-on a {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    font-weight: 600;
+  }
+  .hm-sources {
+    list-style: none;
+    margin: var(--s4) 0 0;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    background: var(--surface);
+    overflow: hidden;
+  }
+  .hm-sources li + li {
+    border-top: 1px solid var(--line);
+  }
+  .hm-source {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: var(--s3);
+    padding: var(--s2) var(--s4);
+    color: var(--ink);
+    text-decoration: none;
+    font-size: var(--t-sm);
+  }
+  .hm-source:hover {
+    background: var(--sunken);
+  }
+  .hm-source-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hm-fresh,
+  .hm-quiet {
+    min-width: 11em;
+    text-align: right;
+    white-space: nowrap;
+  }
+  .hm-fresh {
+    color: var(--ok);
+  }
+  .hm-quiet {
+    color: var(--faint);
+  }
+  .hm-new .state {
+    margin-bottom: var(--s6);
+  }
+  .hm-steps {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: var(--s3);
+  }
+  .hm-steps h3 {
+    margin: 0 0 var(--s2);
+    font-size: var(--t-md);
+    font-weight: 650;
+  }
+  .hm-steps p {
+    margin: 0 0 var(--s3);
+    font-size: var(--t-sm);
+  }
+  @media (max-width: 600px) {
+    .hm-source {
+      grid-template-columns: auto minmax(0, 1fr) auto;
+    }
+    .hm-source .hm-fresh,
+    .hm-source .hm-quiet {
+      grid-column: 2 / -1;
+      text-align: left;
+    }
+  }
+}

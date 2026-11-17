@@ -629,6 +629,27 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
         .find(|l| l.answer_id == sid)
         .and_then(|l| l.episodes.first().cloned())
         .expect("the session's transcript");
+    // A session's own records may reach reads with the next background build of what they see
+    // (`AMPUP_MEMORY_VIS_REFRESH_MS`): before anyone asks, carol reads her transcript.
+    let start = Instant::now();
+    loop {
+        let (_, raw) = mcp_call(
+            s,
+            "?org=acme",
+            &carol,
+            "get_episode",
+            json!({"episode_id": session_episode}),
+        )
+        .await;
+        if raw.contains(SESSION) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "carol never read her session's transcript: {raw}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     // Members' personal keys, each made by the member signed in as themselves: carol's (in team a1), and the
     // admin alice's, which reads as a member and manages nothing.
     let in_30_days = std::time::SystemTime::now()
@@ -930,10 +951,22 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
                     &mine_memory,
                 ),
                 ("/episode", json!({"calls": all_ids}), &mine_memory),
-                // The memory UI's tree: every scope's facts are on entities `deal:<tag>`.
+                // The browse tree: every scope's facts are on entities `deal:<tag>`.
                 (
                     "/browse",
                     json!({"op": "ls", "path": ["entities", "deal"]}),
+                    &mine_facts,
+                ),
+                // Narrowed to what a source taught, and what each source taught: counted and named only from
+                // what the caller may read.
+                (
+                    "/browse",
+                    json!({"op": "ls", "path": ["entities", "deal"], "from": "note:"}),
+                    &mine_facts,
+                ),
+                (
+                    "/browse",
+                    json!({"op": "sources", "top": 20}),
                     &mine_facts,
                 ),
                 // The filterable lists: every fact the caller may read (each with the sources of the episodes
@@ -3350,15 +3383,38 @@ async fn a_claim_of_absence_counts_only_what_its_reader_may_read() {
         .await
         .unwrap();
     store.ensure_scope(&globex).await.unwrap();
+    let globex_tickets = [ticket(5, "group:globex.all"), ticket(6, "group:globex.all")];
     store
-        .commit(
-            &globex,
-            "ingest",
-            &[ticket(5, "group:globex.all"), ticket(6, "group:globex.all")],
-            &[],
-        )
+        .commit(&globex, "ingest", &globex_tickets, &[])
         .await
         .unwrap();
+    // These were written beside the server, not through it, and it reads each org's tables from a cache up to a
+    // second behind such writes: its warm-up can load acme's between two of the commits above, and a read within
+    // that second is answered from what had arrived by then (fewer arrivals, never more). So before anyone asks,
+    // the last write in each org must be readable on the server: acme's tables it then reads hold every commit
+    // above, and globex's hold its tickets, so a count that took them in would show.
+    let holds = async |user: &str, org: &str, e: &Episode| -> bool {
+        let (_, raw) = mcp_call(
+            &url,
+            &format!("?org={org}"),
+            &id_token(&issuer, user),
+            "get_episode",
+            json!({"episode_id": e.episode_id}),
+        )
+        .await;
+        let (text, err) = tool_text(&raw);
+        !err && text.contains(&*String::from_utf8_lossy(&e.body))
+    };
+    let start = Instant::now();
+    while !(holds("dave@acme.com", "acme", &acme_tickets[2]).await
+        && holds("gary@globex.com", "globex", &globex_tickets[1]).await)
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the server never caught up with the last tickets"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     // What a reader is told of each claim, read as of tomorrow so a contradicted one is kept and marked.
     let tomorrow = chrono::Utc::now()
         .checked_add_days(chrono::Days::new(1))

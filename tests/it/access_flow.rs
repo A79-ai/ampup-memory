@@ -251,8 +251,11 @@ async fn a_users_access_follows_their_token_their_slack_channels_and_their_sourc
         )
         .await;
 
-    let org_wide = jwt("ben@x.com", &[ORG], ORG, 3600);
-    env.eventually(&org_wide, &general.episode_id, true).await; // the server has caught up with the writes
+    // The server has caught up with the writes once the last of them reads: its warm-up may have loaded the tables
+    // between two of them, and within a second it answers from that (the first readable, the last not yet).
+    let acme_team = jwt("amy@x.com", &[ORG, "o1.acct.acme"], ORG, 3600);
+    env.eventually(&acme_team, &acme_call.episode_id, true)
+        .await;
 
     // Nobody gets in without proving who they are.
     for token in [None, Some("msk_not_a_real_key"), Some("garbage")] {

@@ -1,0 +1,151 @@
+/* An entity's page (entity.tsx), in the memory browser's tokens (memory.css). */
+
+.memory {
+  .en-prov {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 10px;
+    margin-top: 8px;
+    font-size: var(--t-xs);
+    color: var(--muted);
+  }
+  /* Where a fact came from is read whole ("<person> pasted it in Studio"): at its own width, on a line of its own
+     when the line is short, and wrapped only when even that is too narrow, never ending in an ellipsis. */
+  .en-prov .chip {
+    flex-shrink: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: left;
+    line-height: 1.35;
+  }
+  .en-prov .chip > svg {
+    flex: none;
+  }
+  /* The facts and the disputes lay out by their own width, not the window's: in a hosted console the page sits
+     beside its sidebar and the tree, and three columns left the value column a few pixels wide. */
+  .en-facts,
+  .en-disputes {
+    container-type: inline-size;
+  }
+  .en-aud {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .en-aud-closed {
+    color: var(--accent-text);
+    font-weight: 550;
+  }
+  .en-fix {
+    font-size: var(--t-xs);
+  }
+  .en-correct {
+    display: grid;
+    gap: var(--s2);
+    margin-top: var(--s3);
+    padding: var(--s3) var(--s4);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    background: var(--surface-2);
+    max-width: 520px;
+  }
+  .en-correct .field {
+    width: 100%;
+    min-width: 0;
+  }
+  .en-correct p {
+    margin: 0;
+  }
+  .en-correct-row {
+    display: flex;
+    gap: var(--s2);
+  }
+  .en-head-link {
+    margin-left: auto;
+    font-weight: 500;
+    font-size: var(--t-xs);
+  }
+  .en-disputes {
+    display: flex;
+    flex-direction: column;
+  }
+  .en-dispute {
+    display: grid;
+    grid-template-columns: minmax(130px, 200px) minmax(0, 1fr);
+    gap: var(--s2) var(--s5);
+    padding: 14px var(--s5);
+    border-top: 1px solid var(--line);
+  }
+  .en-dispute:first-child {
+    border-top: 0;
+  }
+  .en-dispute .fact-key {
+    display: grid;
+    gap: 2px;
+  }
+  .en-sides {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--s4);
+  }
+  .en-side {
+    min-width: 0;
+  }
+  .en-keep {
+    padding: 1px 10px;
+    font-size: var(--t-xs);
+  }
+  .en-err {
+    padding: 0 var(--s5) var(--s3);
+    margin: 0;
+  }
+  .en-more > summary.h-section {
+    margin-top: var(--s8);
+  }
+  .en-graph svg {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  .en-links {
+    margin-top: var(--s3);
+  }
+  .en-link-row {
+    display: contents;
+  }
+  .en-graph-note {
+    margin: var(--s2) 0 0;
+  }
+  @media (max-width: 760px) {
+    .en-dispute,
+    .en-sides {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+  /* After the rules they narrow, which they override. */
+  @container (max-width: 680px) {
+    .en-facts .fact {
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--s1);
+    }
+    .en-facts .fact-side {
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-start;
+      text-align: left;
+      margin-top: var(--s2);
+      min-width: 0;
+    }
+    .en-facts .fact-when {
+      justify-content: flex-start;
+    }
+  }
+  @container (max-width: 720px) {
+    .en-dispute,
+    .en-sides {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+}

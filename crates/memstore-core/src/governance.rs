@@ -65,6 +65,29 @@ impl OwnerApprovalRequired {
     }
 }
 
+/// A proposal no longer describes what publishing it would change (its base, its branch or the owners moved):
+/// the branch is proposed again to be decided.
+#[derive(Debug)]
+pub struct StaleProposal;
+
+impl std::fmt::Display for StaleProposal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("proposal is stale; propose the current revision")
+    }
+}
+
+impl std::error::Error for StaleProposal {}
+
+impl StaleProposal {
+    /// Whether `e`, or what it wraps, is this refusal.
+    pub fn caused(e: &anyhow::Error) -> bool {
+        e.chain().any(|c| c.is::<Self>())
+    }
+}
+
+/// How many times a reviewed change is proposed again when main moved over it before its decision.
+const REVIEW_TRIES: u64 = 4;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Owner {
     pub entity: String,
@@ -201,7 +224,8 @@ pub struct ProposalSummary {
     pub entities: Vec<String>,
     pub changes: usize,
     /// Its first fact change (entity, predicate, value), so two proposals on one entity read apart in a list.
-    /// The reader may read it: a proposal is listed only to someone who may read all of its evidence.
+    /// The reader may read it: a proposal is listed only to someone who may read all of its evidence. With no fact
+    /// change, its schema change: `{"predicate": "schema", "value": "<name> v<version>"}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,6 +243,12 @@ pub struct GraphNode {
     pub facts: usize,
     /// Open proposals (pending, approved or stale) that change it.
     pub pending: Vec<String>,
+    /// Its display name, from a fact the reader may read (`schema::display_names`); absent when none names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// When the first fact the reader may read about it holds from (µs); absent when it has none (a link's end).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct GraphEdge {
@@ -232,6 +262,9 @@ pub struct GraphEdge {
 pub struct Graph {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
+    /// How many entities there are in all: `nodes` holds at most the `max` asked for.
+    #[serde(default)]
+    pub total: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -648,22 +681,48 @@ impl Store {
                 .filter(|c| !c.is_null(i))
                 .map(|c| c.value(i).to_string())
         };
-        let facts: Vec<(String, Fact)> = self
-            .governance_rows(scope, FACTS)
-            .await?
-            .iter()
-            .flat_map(|b| decode_facts(b, "source_episodes"))
-            .collect();
+        // Read on the columns as stored, never decoded whole: a busy scope's facts table is hundreds of thousands
+        // of rows, read on every list of proposals.
+        let facts = self.governance_rows(scope, FACTS).await?;
         let mut side = Vec::new();
         for table in [CLOSURES, QUOTES, RETRACTIONS, EPISODES, SCHEMAS] {
             side.push((table, self.governance_rows(scope, table).await?));
         }
+        let text = |b: &RecordBatch, name: &str| -> Option<StringArray> {
+            b.column_by_name(name)
+                .and_then(|c| c.as_string_opt::<i32>())
+                .cloned()
+        };
+        fn at(c: &StringArray, i: usize) -> Option<&str> {
+            (!c.is_null(i)).then(|| c.value(i))
+        }
+        // The facts columns each check reads, per batch.
+        struct FactCols {
+            commit: StringArray,
+            entity: StringArray,
+            predicate: StringArray,
+            fact: StringArray,
+            sources: StringArray,
+        }
+        let fact_cols: Vec<FactCols> = facts
+            .iter()
+            .map(|b| {
+                Ok(FactCols {
+                    commit: text(b, "commit_id").context("facts: commit_id")?,
+                    entity: text(b, "entity").context("facts: entity")?,
+                    predicate: text(b, "predicate").context("facts: predicate")?,
+                    fact: text(b, "fact_id").context("facts: fact_id")?,
+                    sources: text(b, "source_episodes").context("facts: source_episodes")?,
+                })
+            })
+            .collect::<Result<_>>()?;
         for p in open {
             let before = ledger.reachable(&p.base);
             let since: HashSet<&String> = main
                 .iter()
                 .filter(|c| !before.contains(*c) && !state.metadata.contains(*c))
                 .collect();
+            let since_str: HashSet<&str> = since.iter().map(|c| c.as_str()).collect();
             let keys: HashSet<(&str, &str)> = p
                 .changes
                 .iter()
@@ -675,32 +734,37 @@ impl Store {
                 .iter()
                 .filter_map(|c| c["id"].as_str().or(c["fact_id"].as_str()))
                 .collect();
+            let on_key = |f: &FactCols, i: usize| {
+                f.entity.is_valid(i)
+                    && f.predicate.is_valid(i)
+                    && keys.contains(&(f.entity.value(i), f.predicate.value(i)))
+            };
             // Its evidence, and what the values on its keys cite (what its owners reviewed as "before"): an ACL
             // change or a delete of one of those changes what they read.
-            let evidence: HashSet<&str> = p
-                .evidence
-                .iter()
-                .map(String::as_str)
-                .chain(
-                    facts
-                        .iter()
-                        .filter(|(_, f)| keys.contains(&(f.entity.as_str(), f.predicate.as_str())))
-                        .flat_map(|(_, f)| f.source_episodes.iter().map(String::as_str)),
-                )
-                .collect();
-            let touched_fact = facts.iter().any(|(c, f)| {
-                since.contains(c)
-                    && (keys.contains(&(f.entity.as_str(), f.predicate.as_str()))
-                        || ids.contains(f.fact_id.as_str())
-                        || f.source_episodes
-                            .iter()
-                            .any(|e| evidence.contains(e.as_str())))
+            let mut evidence: HashSet<&str> = p.evidence.iter().map(String::as_str).collect();
+            for f in &fact_cols {
+                for i in (0..f.entity.len()).filter(|i| on_key(f, *i)) {
+                    if let Some(s) = at(&f.sources, i) {
+                        evidence.extend(s.split(',').filter(|e| !e.is_empty()));
+                    }
+                }
+            }
+            let touched_fact = fact_cols.iter().any(|f| {
+                (0..f.commit.len()).any(|i| {
+                    at(&f.commit, i).is_some_and(|c| since_str.contains(c))
+                        && (on_key(f, i)
+                            || at(&f.fact, i).is_some_and(|x| ids.contains(x))
+                            || at(&f.sources, i)
+                                .is_some_and(|s| s.split(',').any(|e| evidence.contains(e))))
+                })
             });
             let touched_side = side.iter().any(|(table, rows)| {
                 rows.iter().any(|b| {
-                    let commits = strings(b, "commit_id");
+                    let Some(commits) = text(b, "commit_id") else {
+                        return false;
+                    };
                     (0..b.num_rows()).any(|i| {
-                        since.contains(&commits[i])
+                        at(&commits, i).is_some_and(|c| since_str.contains(c))
                             && match *table {
                                 SCHEMAS => true,
                                 EPISODES => col(b, "episode_id", i)
@@ -728,12 +792,16 @@ impl Store {
         Ok(Ledger::from_batches(&snap.rows, &scope.namespace()))
     }
 
+    /// Records `event` on main. With `expected`, only while main's heads are still those (an owner's change,
+    /// decided against main as it was read); without, on main as it stands: a proposal, a decision on one or the
+    /// record of what an admin stated, which the publication check reads against main when it publishes
+    /// ([`Store::authorize_publication`]: a proposal main moved over is stale there, and publishes nothing).
     async fn governance_event(
         &self,
         scope: &Scope,
         who: &Principal,
         event: Event,
-        expected: Vec<String>,
+        expected: Option<Vec<String>>,
     ) -> Result<()> {
         self.check_fence()?;
         let ns = scope.namespace();
@@ -756,7 +824,9 @@ impl Store {
         self.invalidate(&ns, TABLE);
         self.append_ledger(&id, scope, MAIN, who.user(), &|ledger| {
             anyhow::ensure!(
-                sorted(ledger.heads(MAIN)) == expected,
+                expected
+                    .as_ref()
+                    .is_none_or(|e| sorted(ledger.heads(MAIN)) == *e),
                 "memory changed while recording review; retry"
             );
             Ok(ledger.heads(MAIN))
@@ -789,8 +859,10 @@ impl Store {
         };
         dir.resolve(who.user(), via, Some(org), team)?;
         let user = auth::norm_id(user);
+        // A `serve --local` store's one member is its caller, whom the directory doesn't list.
+        let local_self = via.local_admin.is_some() && user == auth::norm_id(who.user());
         anyhow::ensure!(
-            dir.holds_member(&user, org, team),
+            local_self || dir.holds_member(&user, org, team),
             "owner must be a member of this scope"
         );
         self.ensure_scope(scope).await?;
@@ -823,7 +895,7 @@ impl Store {
                 entity: entity.into(),
                 user,
             },
-            sorted(ledger.heads(MAIN)),
+            Some(sorted(ledger.heads(MAIN))),
         )
         .await?;
         self.entity_owners(scope)
@@ -872,19 +944,29 @@ impl Store {
             Event::OwnerRemoved {
                 entity: entity.into(),
             },
-            sorted(ledger.heads(MAIN)),
+            Some(sorted(ledger.heads(MAIN))),
         )
         .await
     }
 
+    /// Who owns what now: read from the ledger and the governance table as they are now, and folded. Only the
+    /// fold: whether main moved past an open proposal ([`Store::moved_past`], a read of every table) says nothing
+    /// about owners.
     pub async fn entity_owners(&self, scope: &Scope) -> Result<Vec<Owner>> {
         let ledger = self.governance_ledger(scope).await?;
-        Ok(self
-            .governance_state(scope, &ledger)
-            .await?
-            .owners
-            .into_values()
-            .collect())
+        let rows = self.governance_rows(scope, TABLE).await?;
+        Ok(fold(&rows, &ledger)?.owners.into_values().collect())
+    }
+
+    /// Who owns what, from the ledger and governance table as this server holds them (each at most
+    /// `AMPUP_MEMORY_MAX_STALENESS_MS` behind, refreshed in the background; a change made here is seen at once):
+    /// for showing owners and filtering a list by them. What lets someone act (resolving a conflict, a review)
+    /// reads them as they are now ([`Store::entity_owners`]). Forcing both reloads at every Studio page load
+    /// spent the catalog's read quota, and a ledger reloaded for one reader is one every reader here waits on.
+    pub async fn entity_owners_held(&self, scope: &Scope) -> Result<Vec<Owner>> {
+        let ledger = self.ledger(scope).await?;
+        let rows = self.side_rows(&scope.namespace(), TABLE).await?;
+        Ok(fold(&rows, &ledger)?.owners.into_values().collect())
     }
 
     pub(crate) async fn check_owned_subject_merge(
@@ -1671,7 +1753,7 @@ impl Store {
             Event::Proposal {
                 proposal: p.clone(),
             },
-            sorted(ledger.heads(MAIN)),
+            None,
         )
         .await?;
         if !readable {
@@ -1764,6 +1846,29 @@ impl Store {
         who: &Principal,
         mut p: Proposal,
     ) -> Result<Proposal> {
+        // A schema change carries the whole schema: say what it changes on main at the base, as `before` (the schema
+        // it replaces) and `value` (`<name> v<version>`), with what the move breaks and adds. A schema has no ACL.
+        if p.changes.iter().any(|c| c["kind"] == SCHEMAS) {
+            let was = self
+                .schema_at(&scope.namespace(), &ledger.reachable(&p.base))
+                .await?;
+            let named =
+                |s: &schema::Schema| serde_json::json!(format!("{} v{}", s.name, s.version));
+            for c in p.changes.iter_mut().filter(|c| c["kind"] == SCHEMAS) {
+                let Some(new) = c["body"]
+                    .as_str()
+                    .and_then(|b| schema::Schema::parse(b).ok())
+                else {
+                    continue;
+                };
+                c["value"] = named(&new);
+                c["before"] = was.as_ref().map_or(serde_json::Value::Null, named);
+                if let Some(old) = &was {
+                    c["breaking"] = serde_json::json!(new.breaking_changes(old));
+                    c["adds"] = serde_json::json!(new.additions(old));
+                }
+            }
+        }
         let wanted: HashSet<(String, String)> = p
             .changes
             .iter()
@@ -1895,6 +2000,24 @@ impl Store {
         Ok(p)
     }
 
+    /// The schema the commits `at` hold: their latest committed one, as a branch's visibility picks it.
+    async fn schema_at(&self, ns: &str, at: &HashSet<String>) -> Result<Option<schema::Schema>> {
+        let mut latest: Option<(i64, String)> = None;
+        for b in self.side_rows(ns, SCHEMAS).await?.iter() {
+            let (commit, body) = (strings(b, "commit_id"), strings(b, "body"));
+            let recorded = timestamps(b, "recorded_at");
+            for i in 0..b.num_rows() {
+                let t = recorded[i].unwrap_or_default();
+                if at.contains(&commit[i]) && latest.as_ref().is_none_or(|(seen, _)| t >= *seen) {
+                    latest = Some((t, body[i].clone()));
+                }
+            }
+        }
+        latest
+            .map(|(_, body)| schema::Schema::parse(&body))
+            .transpose()
+    }
+
     /// Each evidence episode's source and time, from the rows the proposal's branch committed.
     async fn evidence_details(&self, scope: &Scope, p: &Proposal) -> Result<Vec<EvidenceRef>> {
         let ns = scope.namespace();
@@ -1970,10 +2093,22 @@ impl Store {
                 updated_at: s.updated_at,
                 entities,
                 changes: p.changes.len(),
-                first: p.changes.iter().find(|c| c["kind"] == "fact").map(|c| {
-                    serde_json::json!({"entity": c["entity"], "predicate": c["predicate"],
-                        "value": c["value"]})
-                }),
+                first: p
+                    .changes
+                    .iter()
+                    .find(|c| c["kind"] == "fact")
+                    .map(|c| {
+                        serde_json::json!({"entity": c["entity"], "predicate": c["predicate"],
+                            "value": c["value"]})
+                    })
+                    // A schema change names no entity: the schema it moves to.
+                    .or_else(|| {
+                        p.changes.iter().find(|c| c["kind"] == SCHEMAS).map(|c| {
+                            serde_json::json!({"predicate": "schema", "value": format!("{} v{}",
+                                c["name"].as_str().unwrap_or_default(),
+                                c["version"].as_str().unwrap_or_default())})
+                        })
+                    }),
                 stale_reason: s.stale_reason,
             });
         }
@@ -1988,7 +2123,16 @@ impl Store {
 
     /// The entities of main as this reader sees them, linked where a fact names another entity, with
     /// the owners and the open proposals drawn over them.
-    pub async fn entity_graph(&self, scope: &Scope, who: &Principal) -> Result<Graph> {
+    /// The entities `who` may read and the links between them, cut to at most `max` entities: every owned one,
+    /// every one a change waits on, and `keep`, then those with the most facts; only the links between the ones
+    /// kept. A page lays out a few hundred at most, so it is never sent thousands.
+    pub async fn entity_graph(
+        &self,
+        scope: &Scope,
+        who: &Principal,
+        max: usize,
+        keep: Option<&str>,
+    ) -> Result<Graph> {
         let ns = scope.namespace();
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
@@ -2067,21 +2211,46 @@ impl Store {
         }
         let mut all: BTreeSet<String> = entities;
         all.extend(pending.keys().cloned());
-        let nodes = all
+        let mut shown = crate::query::schema::display_names(&facts, now);
+        let mut nodes: Vec<GraphNode> = all
             .into_iter()
-            .map(|id| GraphNode {
-                kind: id
-                    .split_once(':')
-                    .map(|(t, _)| t)
-                    .unwrap_or("_")
-                    .to_string(),
-                owner: state.owners.get(&id).map(|o| o.user.clone()),
-                facts: counts.get(id.as_str()).copied().unwrap_or_default(),
-                pending: pending.remove(&id).unwrap_or_default(),
-                id,
+            .map(|id| {
+                let shown = shown.remove(&id);
+                GraphNode {
+                    title: shown.as_ref().and_then(|s| s.title.clone()),
+                    since: shown.map(|s| s.since),
+                    kind: id
+                        .split_once(':')
+                        .map(|(t, _)| t)
+                        .unwrap_or("_")
+                        .to_string(),
+                    owner: state.owners.get(&id).map(|o| o.user.clone()),
+                    facts: counts.get(id.as_str()).copied().unwrap_or_default(),
+                    pending: pending.remove(&id).unwrap_or_default(),
+                    id,
+                }
             })
             .collect();
-        Ok(Graph { nodes, edges })
+        let total = nodes.len();
+        if total > max {
+            let must = |n: &GraphNode| {
+                n.owner.is_some() || !n.pending.is_empty() || keep == Some(n.id.as_str())
+            };
+            nodes.sort_by(|a, b| {
+                must(b)
+                    .cmp(&must(a))
+                    .then(b.facts.cmp(&a.facts))
+                    .then(a.id.cmp(&b.id))
+            });
+            nodes.truncate(max);
+            let kept: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+            edges.retain(|e| kept.contains(e.from.as_str()) && kept.contains(e.to.as_str()));
+        }
+        Ok(Graph {
+            nodes,
+            edges,
+            total,
+        })
     }
 
     pub async fn proposal(&self, scope: &Scope, id: &str, who: &Principal) -> Result<Review> {
@@ -2133,10 +2302,9 @@ impl Store {
         if p.heads.iter().all(|h| ledger.visible(MAIN).contains(h)) {
             return self.review_from(scope, &ledger, &state, p, who).await;
         }
-        anyhow::ensure!(
-            state.current(&ledger, p)?,
-            "proposal is stale; propose the current revision"
-        );
+        if !state.current(&ledger, p)? {
+            return Err(StaleProposal.into());
+        }
         anyhow::ensure!(!state.rejected.contains(id), "proposal was rejected");
         if !approve || !state.approvals.get(id).is_some_and(|a| a.contains(&user)) {
             self.governance_event(
@@ -2154,7 +2322,7 @@ impl Store {
                     // A rejection ends nothing.
                     expires_at: expires_at.filter(|_| approve),
                 },
-                sorted(ledger.heads(MAIN)),
+                None,
             )
             .await?;
         }
@@ -2224,26 +2392,41 @@ impl Store {
             None,
         )
         .await?;
-        let review = self
-            .propose_as(scope, branch, who, true, None)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("proposal made without a review"))?;
+        // Where main moved over what it changes before it was published (the proposal went stale), the branch is
+        // proposed again as main is now and that is decided, rather than fail and leave the branch undecided.
         let me = auth::norm_id(who.user());
-        if review.status == "published" || !(admin || review.proposal.required_owners.contains(&me))
-        {
-            return Ok(Some(review));
+        let mut tries = 0;
+        loop {
+            let review = self
+                .propose_as(scope, branch, who, true, None)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("proposal made without a review"))?;
+            if review.status == "published"
+                || !(admin || review.proposal.required_owners.contains(&me))
+            {
+                return Ok(Some(review));
+            }
+            let (id, digest) = (review.proposal.id.clone(), review.proposal.digest.clone());
+            match Box::pin(
+                self.review_proposal(scope, &id, &digest, who, true, None, admin, expires_at),
+            )
+            .await
+            {
+                // Stale when decided, or by its merge (main refused it: the approval no longer matches main).
+                Err(e)
+                    if (StaleProposal::caused(&e) || OwnerApprovalRequired::caused(&e))
+                        && tries + 1 < REVIEW_TRIES =>
+                {
+                    tries += 1
+                }
+                r => return r.map(Some),
+            }
         }
-        let (id, digest) = (review.proposal.id.clone(), review.proposal.digest.clone());
-        Ok(Some(
-            Box::pin(self.review_proposal(scope, &id, &digest, who, true, None, admin, expires_at))
-                .await?,
-        ))
     }
 
     /// Records that an org admin stated `added` on main (and ended `ended`, or kept `kept`) where no owner reviews
     /// it: a decision with no proposal ([`Approval`], `stated`). The caller checked they administer the org and
-    /// committed the facts first. Ids only. Retried while main moves under it; a record that still can't be made is
-    /// an error, though the facts stay committed.
+    /// committed the facts first. Ids only. A record that can't be made is an error, though the facts stay committed.
     pub async fn record_stated(
         &self,
         scope: &Scope,
@@ -2260,23 +2443,11 @@ impl Store {
             ended: ended.to_vec(),
             expires_at: Some(expires_at),
         };
-        let mut last = None;
-        for attempt in 0..8u64 {
-            if attempt > 0 {
-                // A busy main (extraction commits every few seconds) moves under the record: wait a little longer
-                // each time.
-                tokio::time::sleep(std::time::Duration::from_millis(50 * attempt * attempt)).await;
-            }
-            let ledger = self.governance_ledger(scope).await?;
-            match self
-                .governance_event(scope, who, event.clone(), sorted(ledger.heads(MAIN)))
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(e) => last = Some(e),
-            }
-        }
-        Err(last.unwrap().context("recording the decision"))
+        // On main as it stands: a busy main (extraction commits every few seconds) moving under it changes nothing
+        // it records.
+        self.governance_event(scope, who, event, None)
+            .await
+            .context("recording the decision")
     }
 
     /// Every decision that published facts to main ([`Approval`]), oldest first: approved proposals once
@@ -2788,7 +2959,7 @@ impl Store {
                 model: model.into(),
                 confidence,
             },
-            sorted(ledger.heads(MAIN)),
+            Some(sorted(ledger.heads(MAIN))),
         )
         .await?;
         if !approve {

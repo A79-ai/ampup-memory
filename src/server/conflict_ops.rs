@@ -3,11 +3,12 @@
 //! - `add_fact` (an org admin): a fact as the admin states it, from a source of its own, with no model: what an
 //!   admin knows that the sources don't say, or a second account of a value to set beside the first;
 //! - `check_conflicts` (an org admin): reconcile's conflict check over the scope as it is now, without waiting for
-//!   the next write: two open facts of one thing and attribute that holds one value at a time, with different
+//!   the next write (it answers how many it recorded, and the first page of them): two open facts of one thing and attribute that holds one value at a time, with different
 //!   values from different sources, are recorded in conflict ([`crate::conflicts`]), as write-time reconcile records
 //!   them. Only facts the admin may read are compared, and a read marks a conflict only for readers of both facts;
 //! - `list_conflicts` (a member): the conflicts between facts the caller may read, with the owner of each thing
-//!   and whether the caller may settle it;
+//!   and whether the caller may settle it, a page at a time (`limit`, at most 200; `after`, the last page's `next`)
+//!   with the `total`;
 //! - `resolve_conflict` (the thing's owner, or an org admin): keep one fact, or state the value, which ends both.
 //!   What loses is ended, not deleted: history keeps it. The ending cites the engine's record of the resolution (ids
 //!   only), and where the thing is owned it goes through owner review, approved by the one resolving it.
@@ -125,7 +126,9 @@ async fn stated(
 }
 
 /// The source a fact an admin states is from: its own, unless they name it (`source`), so two facts they add
-/// read as two accounts, and two under one name as one source revising itself.
+/// read as two accounts, and two under one name as one source revising itself. Filed under
+/// [`crate::origin::ADDED`], which no note may take, so it reads as the admin's own statement (`stated`), not an
+/// agent's note: a correction made in Studio ranks as what a person said, beside what it corrects.
 fn admin_source(who: &Principal, label: &str) -> String {
     let label = match label {
         "" => uuid::Uuid::new_v4().to_string(),
@@ -141,7 +144,11 @@ fn admin_source(who: &Principal, label: &str) -> String {
             .take(64)
             .collect(),
     };
-    format!("{REMEMBER_SOURCE}:{}:fact:{label}", who.user())
+    format!(
+        "{REMEMBER_SOURCE}:{}:{}:{label}",
+        who.user(),
+        crate::origin::ADDED
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -221,52 +228,11 @@ async fn add_fact(
     )
 }
 
-/// Whether `f` is one answer two sources can disagree on: a schema predicate holding one value that is not free
-/// text or a reference, or an undeclared one whose value is a short label. Never one the engine keeps (`_alias`).
-fn single_valued(schema: Option<&query::schema::Schema>, f: &Fact) -> bool {
-    if f.predicate.starts_with('_') {
-        return false;
-    }
-    let ty = f
-        .entity_type
-        .clone()
-        .or_else(|| {
-            schema
-                .and_then(|s| s.entity_type(&f.entity))
-                .map(String::from)
-        })
-        .unwrap_or_else(|| {
-            f.entity
-                .split_once(':')
-                .map(|(t, _)| t)
-                .unwrap_or("")
-                .into()
-        });
-    use query::schema::{Card, ValueType};
-    match schema.and_then(|s| s.predicate(&ty, &f.predicate)) {
-        // Free text and references are notes and links, not one answer that two sources can disagree on.
-        Some(p) => {
-            !p.list && p.card != Card::Many && !matches!(p.value, ValueType::Text | ValueType::Ref)
-        }
-        // Undeclared: only a short label (a date, an amount, a name), never a sentence.
-        None => short_label(&f.value),
-    }
-}
-
-/// A value short enough to be one answer: one line, at most six words and sixty characters.
-fn short_label(v: &str) -> bool {
-    let v = v.trim();
-    !v.is_empty()
-        && !v.contains('\n')
-        && v.chars().count() <= 60
-        && v.split_whitespace().count() <= 6
-}
-
 async fn check(store: &Store, who: &Principal, scope: &Scope) -> Result<Value> {
     let session = store.pin(scope, MAIN).await?;
     let schema = session.schema();
     let mut facts = session.read(store, who, Some(i64::MAX)).await?;
-    facts.retain(|f| f.valid_to.is_none() && single_valued(schema.as_deref(), f));
+    facts.retain(|f| f.valid_to.is_none() && conflicts::one_value(schema.as_deref(), f));
     facts.sort_by(|a, b| (b.valid_from, &b.fact_id).cmp(&(a.valid_from, &a.fact_id)));
     facts.truncate(MAX_CHECKED);
     let ids: Vec<String> = facts
@@ -325,10 +291,15 @@ async fn check(store: &Store, who: &Principal, scope: &Scope) -> Result<Value> {
         store
             .commit_derived(scope, who.user(), &records, &[], &[], &[])
             .await?;
+        // The admin who asked reads the thing next: its facts show in dispute on that read, not on the next build.
+        store.content_written(scope);
     }
+    let recorded = pairs.len();
+    // The first page of what it recorded: `list_conflicts` pages through them all.
+    pairs.truncate(PAGE);
     Ok(json!({
         "checked": facts.len(),
-        "recorded": pairs.len(),
+        "recorded": recorded,
         "conflicts": pairs,
         // Off, reads don't mark them (the org's or team's `conflicts` setting): owners still list and settle them.
         "marked_in_reads": conflicts::on(store, scope).await,
@@ -336,6 +307,10 @@ async fn check(store: &Store, who: &Principal, scope: &Scope) -> Result<Value> {
 }
 
 /// The conflicts between open facts `who` may read, each once, with the owner of its thing.
+/// Most conflicts one page lists, and how many when the caller doesn't say.
+const MAX_PAGE: usize = 200;
+const PAGE: usize = 50;
+
 async fn list(
     store: &Store,
     who: &Principal,
@@ -343,36 +318,58 @@ async fn list(
     scope: &Scope,
     req: &Value,
 ) -> Result<Value> {
-    let session = store.pin(scope, MAIN).await?;
-    let facts = session.read(store, who, Some(i64::MAX)).await?;
-    let open: HashMap<&str, &Fact> = facts
-        .iter()
-        .filter(|f| f.valid_to.is_none())
-        .map(|f| (f.fact_id.as_str(), f))
-        .collect();
+    use crate::people::directory::Invalid;
+    let limit = match &req["limit"] {
+        Value::Null => PAGE,
+        v => v
+            .as_u64()
+            .filter(|n| (1..=MAX_PAGE as u64).contains(n))
+            .ok_or_else(|| Invalid(format!("limit is a whole number from 1 to {MAX_PAGE}")))?
+            as usize,
+    };
+    let after = req["after"].as_str().filter(|a| !a.is_empty());
+    // Shown and filtered by, not acted on: as this server holds them.
     let owners: HashMap<String, String> = store
-        .entity_owners(scope)
+        .entity_owners_held(scope)
         .await?
         .into_iter()
         .map(|o| (o.entity, o.user))
         .collect();
     let me = auth::norm_id(who.user());
-    let entity = req["entity"].as_str().filter(|e| !e.is_empty());
     let mine = req["mine"] == true;
+    // Only the conflicts on what the caller owns, and they own nothing: none, without reading a fact.
+    if mine && !owners.values().any(|u| *u == me) {
+        return Ok(json!({"conflicts": [], "total": 0, "next": null}));
+    }
+    // Main's last visibility state while the next is built: a list never waits for a build of what another
+    // conversation just wrote, and never holds what was taken away (a resolution's ending of a fact included).
+    let session = store.pin_lagging(scope, MAIN).await?;
     let vis = session.vis();
-    let ids: Vec<String> = open
-        .values()
-        .filter_map(|f| f.source_episodes.first().cloned())
-        .collect();
-    let sources = session.episode_sources(store, who, &ids).await?;
-    let side = |f: &Fact| {
-        let ep = f.source_episodes.first();
-        json!({"fact_id": f.fact_id, "value": f.value, "since": f.valid_from,
-            "since_day": crate::freshness::day(f.valid_from), "quote": f.quote,
-            "episode_id": ep, "source": ep.and_then(|e| sources.get(e)).map(|s| &s.0)})
+    let schema = session.schema();
+    // Only the facts recorded in conflict, not every fact of the scope.
+    let ids: Vec<String> = vis.conflicted().map(String::from).collect();
+    let facts = match ids.is_empty() {
+        true => vec![],
+        false => {
+            session
+                .read_in(store, who, search::Col::FactId, &ids, Some(i64::MAX))
+                .await?
+        }
     };
-    let mut out = vec![];
+    let open: HashMap<&str, &Fact> = facts
+        .iter()
+        .filter(|f| f.valid_to.is_none() && conflicts::one_value(schema.as_deref(), f))
+        .map(|f| (f.fact_id.as_str(), f))
+        .collect();
+    let entity = req["entity"].as_str().filter(|e| !e.is_empty());
+    let mut pairs: Vec<(String, &Fact, &Fact)> = vec![];
     for a in open.values() {
+        if entity.is_some_and(|e| e != a.entity) {
+            continue;
+        }
+        if mine && owners.get(&a.entity) != Some(&me) {
+            continue;
+        }
         for b in vis.conflicts_of(&a.fact_id) {
             let Some(b) = open.get(b.as_str()) else {
                 continue;
@@ -381,25 +378,45 @@ async fn list(
             if (a.valid_from, &a.fact_id) > (b.valid_from, &b.fact_id) {
                 continue;
             }
-            if entity.is_some_and(|e| e != a.entity) {
-                continue;
-            }
+            // The page's order and its cursor: by thing, attribute, then the pair.
+            let key = [&a.entity, &a.predicate, &a.fact_id, &b.fact_id]
+                .map(|s| s.as_str())
+                .join("\u{1f}");
+            pairs.push((key, a, b));
+        }
+    }
+    pairs.sort_by(|x, y| x.0.cmp(&y.0));
+    let total = pairs.len();
+    let from = after.map_or(0, |a| pairs.partition_point(|p| p.0.as_str() <= a));
+    let page = &pairs[from..(from + limit).min(total)];
+    let next = (from + limit < total)
+        .then(|| page.last().map(|p| p.0.clone()))
+        .flatten();
+    // Where each side was said, for the page's facts only.
+    let eps: Vec<String> = page
+        .iter()
+        .flat_map(|(_, a, b)| [a, b])
+        .filter_map(|f| f.source_episodes.first().cloned())
+        .collect();
+    let sources = session.episode_sources(store, who, &eps).await?;
+    let side = |f: &Fact| {
+        let ep = f.source_episodes.first();
+        json!({"fact_id": f.fact_id, "value": f.value, "since": f.valid_from,
+            "since_day": crate::freshness::day(f.valid_from), "quote": f.quote,
+            "episode_id": ep, "source": ep.and_then(|e| sources.get(e)).map(|s| &s.0)})
+    };
+    let out: Vec<Value> = page
+        .iter()
+        .map(|(_, a, b)| {
             let owner = owners.get(&a.entity);
-            if mine && owner != Some(&me) {
-                continue;
-            }
-            out.push(json!({
+            json!({
                 "entity": a.entity, "predicate": a.predicate, "owner": owner,
                 "can_resolve": admin || owner == Some(&me),
                 "facts": [side(a), side(b)],
-            }));
-        }
-    }
-    out.sort_by(|x, y| {
-        (x["entity"].as_str(), x["predicate"].as_str())
-            .cmp(&(y["entity"].as_str(), y["predicate"].as_str()))
-    });
-    Ok(json!({"conflicts": out}))
+            })
+        })
+        .collect();
+    Ok(json!({"conflicts": out, "total": total, "next": next}))
 }
 
 enum Choice<'a> {
@@ -497,8 +514,22 @@ async fn resolve(
         .version_of(&key);
     ep.occurred_at = now;
     let mut new = vec![];
+    // A value the resolver states is their statement, as a fact they add is ([`admin_source`]): the fact cites
+    // their words first, then the record. Forgetting them takes their words, not the resolution (the endings cite
+    // only the record).
+    let mut episodes = vec![];
+    if kept.is_none() {
+        let body = format!("{} {}: {said}", fa.entity, fa.predicate);
+        let mut theirs =
+            Episode::sourced(&admin_source(who, "resolution"), body.as_bytes(), &["*"]);
+        theirs.occurred_at = now;
+        crate::episode_types::check(&theirs).map_err(|e| Invalid(format!("{e:#}")))?;
+        episodes.push(theirs);
+    }
+    episodes.push(ep.clone());
     if kept.is_none() || restated.is_some() {
-        let mut f = Fact::new(&fa.entity, &fa.predicate, &said).from_episodes(&[&ep]);
+        let cited: Vec<&Episode> = episodes.iter().collect();
+        let mut f = Fact::new(&fa.entity, &fa.predicate, &said).from_episodes(&cited);
         f.quote = Some(said.chars().take(300).collect());
         if let Some(k) = restated {
             f.source_episodes = k.source_episodes.clone();
@@ -531,7 +562,7 @@ async fn resolve(
             who,
             admin,
             &branch,
-            from_ref(&ep),
+            &episodes,
             &new,
             &closures,
             Some(expires_at),

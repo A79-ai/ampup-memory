@@ -36,6 +36,16 @@ With `token` identity, set `AMPUP_MEMORY_PUBLIC_URL` to the server's public URL:
 `WWW-Authenticate` name it, never a request's `Host` header (which the caller sets). A server that listens beyond
 loopback refuses to start without it.
 
+`serve --local`'s one caller owns the data directory it serves, so it is the admin of the org it serves (an org
+scope, `default` unless named) and of no other: `/admin`'s ops on that org's memory work for it (people's activity,
+advice ratify and trail, branch diff and merge, owners, reviews, conflicts, schema, offboarding), and an op that
+names another org or team, changes the directory (members, teams, keys, settings), is the operator's or runs dream
+jobs is refused, saying so. Any other server that identifies no one refuses every `/admin` op. A local server answers
+only requests addressed to 127.0.0.1, localhost or [::1] (`Host`, and `Origin` when a browser sends one), so a page
+that rebinds its own domain there is refused; of browser pages it answers only one it served itself (`Origin` is
+exactly `http://` + `Host`) and those `AMPUP_MEMORY_ALLOWED_ORIGINS` lists. A page of any other origin, another port on
+the machine included, can't drive it.
+
 `ampup-memory identity check` reports what `serve` makes of the environment and exits non-zero when a part fails. Run
 it in a deploy's smoke step.
 

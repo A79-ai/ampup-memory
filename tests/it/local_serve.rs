@@ -157,6 +157,56 @@ async fn a_web_page_that_rebinds_its_domain_to_this_machine_is_refused() {
     assert!(search(port, "billing export owner").await.contains("priya"));
 }
 
+#[tokio::test]
+async fn only_a_page_the_local_server_served_drives_its_admin_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    remember(dir.path(), "billing export", "priya").await;
+    let port = free_port();
+    let _server = serve_local(dir.path(), port, &[]).await;
+    // The local caller is its org's admin: `/admin` reads and changes its memory, so only this machine's own
+    // pages may send it, never another site's page in the same browser.
+    let ask = json!({"op": "entity_graph"});
+    let http = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/admin");
+    let here = format!("127.0.0.1:{port}");
+    for (why, host, origin) in [
+        (
+            "a cross-site page",
+            here.clone(),
+            "https://evil.example".to_string(),
+        ),
+        (
+            "a page that rebinds its domain",
+            format!("evil.example:{port}"),
+            format!("http://evil.example:{port}"),
+        ),
+    ] {
+        let res = http
+            .post(&url)
+            .header("host", host)
+            .header("origin", origin)
+            .json(&ask)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 403, "{why}");
+        let body = res.text().await.unwrap();
+        assert!(!body.contains("billing export"), "{why}: {body}");
+    }
+    // The page this server served (Studio) sends its own origin, and is answered as the org's admin.
+    let res = http
+        .post(&url)
+        .header("host", &here)
+        .header("origin", format!("http://{here}"))
+        .json(&ask)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let body = res.text().await.unwrap();
+    assert!(body.contains("billing export"), "{body}");
+}
+
 /// An MCP tool call: its text and whether it failed.
 async fn tool(port: u16, name: &str, args: Value) -> (String, bool) {
     let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",

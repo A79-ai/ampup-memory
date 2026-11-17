@@ -200,13 +200,14 @@ pub(crate) fn author_of(source: &str) -> Option<(&str, &str)> {
 /// Whether what follows a note's author in its source is a note to hand at a session's start: not a run's trace, a
 /// session's record (`memstore:session:<id>`, or `session:<id>` before it) or the conversation a Stop kept of one, a hook's session note (what was said, not
 /// what to honour) or its transcript, nor what the server files under them (`memstore:`: a profile, a notes
-/// dream's records).
+/// dream's records), but for text they pasted or uploaded in Studio (`crate::origin::LEARNED`), which is theirs as
+/// any note of theirs is.
 pub(crate) fn is_note(rest: &str) -> bool {
     !rest.starts_with("run:")
         && !rest.starts_with("session:")
         && !rest.starts_with(crate::transcripts::SOURCE)
         && !crate::keep::session_note(rest)
-        && !rest.starts_with("memstore:")
+        && (!rest.starts_with("memstore:") || crate::origin::learned(rest))
 }
 
 /// One person's notes and their profile in a session.

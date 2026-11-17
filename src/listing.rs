@@ -224,14 +224,14 @@ pub async fn facts(
         .collect();
     let total = facts.len();
     // A total order: newest first (or oldest), ties by id.
-    facts.sort_by(|a, b| {
+    let order = |a: &Fact, b: &Fact| {
         let by_time = if oldest {
             a.valid_from.cmp(&b.valid_from)
         } else {
             b.valid_from.cmp(&a.valid_from)
         };
         by_time.then_with(|| a.fact_id.cmp(&b.fact_id))
-    });
+    };
     if let Some((t, id)) = &after {
         facts.retain(|f| {
             let key = (f.valid_from, &f.fact_id);
@@ -243,6 +243,13 @@ pub async fn facts(
             }
         });
     }
+    // Only the page (and one past it, to know there is more) is sorted: sorting every fact in a scope of
+    // hundreds of thousands was most of what a page cost.
+    if facts.len() > limit + 1 {
+        facts.select_nth_unstable_by(limit, order);
+        facts.truncate(limit + 1);
+    }
+    facts.sort_by(order);
     let more = facts.len() > limit;
     facts.truncate(limit);
     let next = more
@@ -367,7 +374,9 @@ pub async fn advice(
     };
     if space != "team" {
         let mine = crate::advice::Space::mine(who.user());
-        for l in crate::advice::listed(session, store, who, &mine).await? {
+        let listed = crate::advice::listed(session, store, who, &mine).await?;
+        crate::phases::mark("advice mine");
+        for l in listed {
             // A person's own: served to them at once, and nobody else's tally is theirs to see.
             if min_helped == 0 && min_served == 0 {
                 add("mine", l, None, true);
@@ -378,7 +387,11 @@ pub async fn advice(
         let scope = session.scope();
         let bar = crate::sessions::evidence_bar(store, scope).await?;
         let tallies = crate::sessions::evidence(store, scope).await?;
-        for l in crate::advice::listed(session, store, who, &crate::advice::Space::team()).await? {
+        crate::phases::mark("advice evidence");
+        let listed =
+            crate::advice::listed(session, store, who, &crate::advice::Space::team()).await?;
+        crate::phases::mark("advice team");
+        for l in listed {
             let tally = tallies.get(&l.key).cloned().unwrap_or_default();
             // Everyone reads what the team serves, and it serves every note: ratifying is reported only.
             let past = crate::advice::team_ratified(

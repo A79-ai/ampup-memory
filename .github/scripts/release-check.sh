@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # An ampup-memory binary as a user installs it, checked end to end: it serves a local store, and as a client of that
 # server (`ampup-memory doctor`, the SessionStart hook, `ampup-memory mcp` over stdio) it finds it up, opens a session and
-# lists the MCP tools. The release workflow runs it on each build and again on what install.sh installs.
+# lists the MCP tools; with STUDIO_DIST, it serves that build of the Studio. The release workflow runs it on each
+# build and again on what install.sh installs.
 #
 #   .github/scripts/release-check.sh <ampup-memory binary> [<ampup-memory-client binary>]
 #
@@ -57,6 +58,15 @@ curl -sf "$AMPUP_MEMORY_URL/" >/dev/null && ok "serve --local is up on $port" ||
   no "serve --local never came up: $(tail -5 "$work/serve.log")"
   exit 1
 }
+
+# The Studio this build embeds, where the release built one (STUDIO_DIST, its studio/dist): served at /studio/ as built.
+if [ -n "${STUDIO_DIST:-}" ]; then
+  if curl -sf "$AMPUP_MEMORY_URL/studio/" | cmp -s - "$STUDIO_DIST/index.html"; then
+    ok "serve --local serves the Studio it was built with at /studio/"
+  else
+    no "/studio/ isn't $STUDIO_DIST/index.html: was studio/dist built before cargo?"
+  fi
+fi
 
 out=$("$CLIENT" doctor 2>&1)
 printf '%s' "$out" | grep -q "AmpUp Memory at $AMPUP_MEMORY_URL: up" && ok "doctor finds it up" || no "doctor: $out"

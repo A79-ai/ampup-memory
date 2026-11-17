@@ -228,7 +228,7 @@ pub(super) async fn run(
         };
         tokens_in += v["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
         tokens_out += v["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-        if let Some(c) = v["usage"]["cost"].as_f64() {
+        if let Some(c) = turn_cost(&v["usage"]) {
             cost = Some(cost.unwrap_or(0.0) + c);
         }
         let msg = &v["choices"][0]["message"];
@@ -319,6 +319,21 @@ pub(super) async fn run(
         "cost": cost,
         "ms": started.elapsed().as_millis() as u64,
     }))
+}
+
+/// What one model turn cost, from OpenRouter's `usage`: its own charge (`cost`) and, with the provider's key on the
+/// account (BYOK, `is_byok`), what the provider charged (`cost_details.upstream_inference_cost`). A BYOK turn's
+/// `cost` is only OpenRouter's fee, often 0, so alone it reads as free. None when the backend says neither.
+fn turn_cost(usage: &Value) -> Option<f64> {
+    let own = usage["cost"].as_f64();
+    let upstream = match usage["is_byok"].as_bool() {
+        Some(true) => usage["cost_details"]["upstream_inference_cost"].as_f64(),
+        _ => None,
+    };
+    match (own, upstream) {
+        (None, None) => None,
+        (own, upstream) => Some(own.unwrap_or(0.0) + upstream.unwrap_or(0.0)),
+    }
 }
 
 /// The first `n` characters of `s`, marked when cut.

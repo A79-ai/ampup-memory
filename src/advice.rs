@@ -1881,13 +1881,24 @@ pub(crate) fn item_tallies(
 /// map they can't read leaves only the sessions. Each note also has the sessions it was withheld from (the holdout)
 /// and its `evidence`: the tally serving and ratification go by, whether it is ratified, and whether people's own
 /// outcomes prove it. Programs' sessions ([`crate::sessions::automated`]) are left out.
+/// The team's advice categories, by name: what a picker offers (an owner's area), from the map alone, without
+/// reading the answer log the trail reads.
+pub async fn categories(store: &Store, scope: &Scope, who: &Principal) -> Result<Value> {
+    let session = store.pin(scope, crate::MAIN).await?;
+    let map = read_map(&session, store, who, &Space::team()).await?;
+    let names: Vec<&String> = map.iter().flat_map(|m| m.categories.keys()).collect();
+    Ok(json!({"categories": names}))
+}
+
 pub async fn trail(
     store: &Store,
     scope: &Scope,
     who: &Principal,
     only: Option<&str>,
 ) -> Result<Value> {
-    let session = store.pin(scope, crate::MAIN).await?;
+    // A page of what advice did: the last visibility state serves, never waiting for a build of what was just
+    // written (it never holds what was taken away).
+    let session = store.pin_lagging(scope, crate::MAIN).await?;
     let space = Space::team();
     let map = read_map(&session, store, who, &space).await?;
     let log = crate::qa_log::list(store, scope, None).await?;
@@ -2100,7 +2111,8 @@ pub async fn usage(
     every: bool,
     since: i64,
 ) -> Result<Value> {
-    let session = store.pin(scope, crate::MAIN).await?;
+    // A page of how advice is used: the last visibility state serves (see [`trail`]).
+    let session = store.pin_lagging(scope, crate::MAIN).await?;
     let space = Space::team();
     let Some(m) = read_map(&session, store, who, &space).await? else {
         return Ok(json!({"advice": [], "every": every}));
@@ -2109,6 +2121,12 @@ pub async fn usage(
     let tallies = crate::sessions::evidence(store, scope).await?;
     let log = crate::qa_log::list(store, scope, None).await?;
     let conversation = m.conversation();
+    let wanted = m
+        .notes
+        .keys()
+        .filter(|k| !conversation.contains(*k))
+        .cloned();
+    let mut notes = notes_of(&session, store, who, &space, wanted).await?;
     let mut out = vec![];
     for (c, cat) in &m.categories {
         for (s, sit) in &cat.situations {
@@ -2116,9 +2134,7 @@ pub async fn usage(
             if !m.notes.contains_key(&k) || conversation.contains(&k) {
                 continue;
             }
-            let Some((note_id, learned_at, body)) =
-                session.document(store, who, &space.note(&k), None).await?
-            else {
+            let Some((note_id, learned_at, body)) = notes.remove(&k).flatten() else {
                 continue;
             };
             let (mut used, mut ok, mut bad, mut last) = (0usize, 0usize, 0usize, None::<i64>);
@@ -2182,6 +2198,36 @@ pub async fn usage(
     Ok(json!({"advice": out, "every": every, "since": since}))
 }
 
+/// How many advice notes are read from the object store at once: one at a time, a map of a few hundred notes
+/// took seconds to list.
+const NOTE_READS_PARALLEL: usize = 16;
+
+/// The notes at `keys` in `space` that `who` may read, read [`NOTE_READS_PARALLEL`] at a time; a key with no
+/// note `who` may read maps to None.
+async fn notes_of(
+    session: &Session,
+    store: &Store,
+    who: &Principal,
+    space: &Space,
+    keys: impl Iterator<Item = String>,
+) -> Result<BTreeMap<String, Option<(String, i64, Vec<u8>)>>> {
+    use futures::{FutureExt, StreamExt, future::BoxFuture};
+    type Read<'a> = BoxFuture<'a, Result<(String, Option<(String, i64, Vec<u8>)>)>>;
+    // Boxed: an unboxed stream of borrowing futures isn't provably Send to the server's spawn.
+    let reads: Vec<Read<'_>> = keys
+        .map(|k| {
+            let key = space.note(&k);
+            async move { Ok((k, session.document(store, who, &key, None).await?)) }.boxed()
+        })
+        .collect();
+    futures::stream::iter(reads)
+        .buffer_unordered(NOTE_READS_PARALLEL)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect()
+}
+
 /// Every situation `space`'s map holds that `who` may read the map of, each with its note when `who` may read
 /// that too. A situation with neither a note nor linked skills is a bare entry the router doesn't serve: left out.
 pub(crate) async fn listed(
@@ -2194,18 +2240,15 @@ pub(crate) async fn listed(
         return Ok(vec![]);
     };
     let held = withheld(store, session.scope(), Some(&map)).await;
+    let mut notes = notes_of(session, store, who, space, map.notes.keys().cloned()).await?;
     let mut out = vec![];
     for (c, cat) in &map.categories {
         for (s, sit) in &cat.situations {
             let k = key(c, s);
-            let note = if map.notes.contains_key(&k) {
-                session
-                    .document(store, who, &space.note(&k), None)
-                    .await?
-                    .map(|(id, at, body)| (id, at, String::from_utf8_lossy(&body).into_owned()))
-            } else {
-                None
-            };
+            let note = notes
+                .remove(&k)
+                .flatten()
+                .map(|(id, at, body)| (id, at, String::from_utf8_lossy(&body).into_owned()));
             if note.is_none() && sit.skills.is_empty() {
                 continue;
             }

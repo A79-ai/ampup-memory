@@ -59,6 +59,12 @@ ampup-memory service status     # running, pid, port, data, log, and whether it 
 
 `ampup-memory service uninstall` stops it; the memory stays. See [cli.md](cli.md#the-background-service).
 
+### Look at your memory
+
+Open http://127.0.0.1:8080/studio/ (the port you serve on), or run `ampup-memory studio`, which opens it in your
+browser: the Studio browses and searches what the local server keeps. Only `serve --local` serves it, to this
+machine alone.
+
 With a coding agent's hooks (the Claude Code plugin, or `ampup-memory hooks install`) you needn't do either: where no
 team server is named, a session's start runs `ampup-memory serve --local --background` when nothing answers on
 port 8080 ([coding-agents.md](coding-agents.md#claude-code); `AMPUP_MEMORY_AUTOSTART=0` turns it off). Where no

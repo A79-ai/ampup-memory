@@ -351,7 +351,7 @@ pub async fn read_session(
     at: Option<&str>,
 ) -> Result<Session> {
     let Some(at) = at else {
-        return store.pin(scope, branch.unwrap_or(MAIN)).await;
+        return store.pin_lagging(scope, branch.unwrap_or(MAIN)).await;
     };
     if at.starts_with(crate::pins::PREFIX) {
         let pin = store.find_pin(scope, at).await?;

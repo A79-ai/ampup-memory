@@ -204,6 +204,13 @@ enum Cmd {
     /// `logs [-f] [-n lines]`
     #[command(subcommand)]
     Service(ServiceCmd),
+    /// Open the Studio, the web page for looking at your memory, in a browser: the local server's
+    /// (`serve --local` or the service) at http://127.0.0.1:<port>/studio/
+    Studio {
+        /// The local server's port (else the service's, else 8080)
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Expire all but the last `keep` Iceberg snapshots of the system tables and a scope's tables, and delete the
     /// metadata only they named (every commit does this as it goes, and serve on a timer)
     Maintain {
@@ -611,12 +618,16 @@ enum SchemaCmd {
         schema: String,
         #[arg(long, default_value = memstore::MAIN)]
         branch: String,
-        /// Allow a breaking change on main (the version must also be higher)
+        /// Allow a breaking change on main (the version must also be higher), or in a proposal (`--propose`)
         #[arg(long)]
         breaking: bool,
         /// Make every check the set would (the breaking-change check too) and commit nothing
         #[arg(long)]
         dry_run: bool,
+        /// For a scope whose entities have owners: stage it on `--branch` (else `schema/<name>-v<version>`) and
+        /// propose it to them; their approval, or an org admin's, publishes it to main
+        #[arg(long)]
+        propose: bool,
         /// A `serve --local` directory, instead of the catalog the environment names (stop the server first)
         #[arg(long)]
         local: Option<PathBuf>,
@@ -1341,37 +1352,130 @@ async fn schema_get(store: &Store, scope: &str, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// `memstore schema set`: commit `schema` (a built-in name or a file) as the scope's on `branch`; with
-/// `dry_run`, make the same checks and commit nothing.
+/// How `schema set` commits.
+struct SchemaSet<'a> {
+    breaking: bool,
+    dry_run: bool,
+    propose: bool,
+    local: Option<&'a std::path::Path>,
+}
+
+/// `memstore schema set`: commit `schema` (a built-in name or a file) as the scope's on `branch`, made from main if
+/// it isn't there; with `propose`, stage it on a branch and propose it to the scope's owners; with `dry_run`, make
+/// the same checks and commit nothing.
 async fn schema_set(
     store: &Store,
     scope: &str,
     schema: &str,
     branch: &str,
-    breaking: bool,
-    dry_run: bool,
+    how: SchemaSet<'_>,
 ) -> Result<()> {
+    use memstore::schema_change;
     let s = memstore::query::schema::Schema::load(schema)?;
-    if dry_run {
-        let was = store
-            .check_schema(&Scope::parse(scope)?, branch, &s, breaking)
-            .await?;
-        let was = was.map_or(String::new(), |w| {
-            format!(" (was {} v{})", w.name, w.version)
-        });
+    let sc = Scope::parse(scope)?;
+    let named = |w: &memstore::query::schema::Schema| format!("{} v{}", w.name, w.version);
+    if how.propose {
+        let branch = match branch {
+            memstore::MAIN => schema_change::branch_for(&s),
+            b => b.to_string(),
+        };
+        if how.dry_run {
+            anyhow::ensure!(
+                schema_change::owned(store, &sc).await?,
+                "no entity of {scope} has an owner, so there is no one to review its schema: set it on main"
+            );
+            let was = store
+                .check_schema(&sc, memstore::MAIN, &s, how.breaking)
+                .await?;
+            let was = was.map_or(String::new(), |w| format!(" (main is at {})", named(&w)));
+            println!(
+                "would: stage {} on branch {branch} of {scope} and propose it to its owners{was}",
+                named(&s)
+            );
+            return Ok(());
+        }
+        let who = memstore::Principal::new("cli", &[]);
+        let (made, review) =
+            schema_change::propose(store, &sc, &branch, &who, &s, how.breaking).await?;
+        let p = &review.proposal;
+        let owners: Vec<&str> = p.required_owners.iter().map(String::as_str).collect();
         println!(
-            "would: {scope} on {branch} uses schema {} v{}{was}",
-            s.name, s.version
+            "{scope}: schema {} staged on branch {branch}{} and proposed to {}",
+            named(&s),
+            if made { " (made from main)" } else { "" },
+            owners.join(", ")
+        );
+        println!("proposal {} ({}), digest {}", p.id, review.status, p.digest);
+        println!(
+            "An owner approves it in the Studio (Review), or with POST /admin {{\"op\": \"review_proposal\", \
+             \"proposal\": \"{}\", \"digest\": \"{}\", \"decision\": \"approve\"}}; an org admin's approval \
+             decides for every owner. The last approval publishes it to main.",
+            p.id, p.digest
         );
         return Ok(());
     }
-    let id = store
-        .set_schema(&Scope::parse(scope)?, branch, "cli", &s, breaking)
-        .await?;
+    if branch == memstore::MAIN {
+        // A schema change needs every owner in the scope: main refuses it, so say how it goes through them.
+        if schema_change::owned(store, &sc).await? {
+            let local = how
+                .local
+                .map_or(String::new(), |d| format!(" --local {}", d.display()));
+            anyhow::bail!(
+                "entities in {scope} have owners, and a schema change needs their approval, so main takes it only \
+                 through a proposal. Stage it on a branch and propose it:\n  ampup-memory schema set {scope} {schema} \
+                 --propose{}{local}\nthen an owner approves it in the Studio (Review) or with POST /admin \
+                 review_proposal; an org admin's approval decides for all of them, and publishes it.",
+                if how.breaking { " --breaking" } else { "" }
+            );
+        }
+        if how.dry_run {
+            let was = store.check_schema(&sc, branch, &s, how.breaking).await?;
+            let was = was.map_or(String::new(), |w| format!(" (was {})", named(&w)));
+            println!("would: {scope} on {branch} uses schema {}{was}", named(&s));
+            return Ok(());
+        }
+        let id = store
+            .set_schema(&sc, branch, "cli", &s, how.breaking)
+            .await?;
+        println!(
+            "{scope} on {branch} now uses schema {} (commit {id})",
+            named(&s)
+        );
+        return Ok(());
+    }
+    let exists = store.branch_heads(&sc).await?.contains_key(branch);
+    if how.dry_run {
+        let was = match exists {
+            true => store.check_schema(&sc, branch, &s, how.breaking).await?,
+            false => {
+                s.check()?;
+                None
+            }
+        };
+        let was = was.map_or(String::new(), |w| format!(" (was {})", named(&w)));
+        let made = if exists { "" } else { " (made from main)" };
+        println!(
+            "would: {scope} on {branch}{made} uses schema {}{was}",
+            named(&s)
+        );
+        return Ok(());
+    }
+    let (id, made) = schema_change::stage(store, &sc, branch, "cli", &s).await?;
     println!(
-        "{scope} on {branch} now uses schema {} v{} (commit {id})",
-        s.name, s.version
+        "{scope} on {branch}{} now uses schema {} (commit {id})",
+        if made { " (made from main)" } else { "" },
+        named(&s)
     );
+    // A branch takes any change; main's rules apply at the merge. Say so now rather than after an approval.
+    if let Err(e) = store.check_schema(&sc, memstore::MAIN, &s, true).await {
+        println!("main would refuse it as it stands: {e:#}");
+    }
+    if schema_change::owned(store, &sc).await? {
+        println!(
+            "Entities in {scope} have owners: propose it to them with POST /admin {{\"op\": \"propose_branch\", \
+             \"branch\": \"{branch}\"}}, or run this again adding --propose."
+        );
+    }
     Ok(())
 }
 
@@ -2019,6 +2123,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
                 ServiceCmd::Logs { follow, lines } => memstore::service::logs(*follow, *lines),
             };
         }
+        Cmd::Studio { port } => return memstore::service::studio(*port).await,
         Cmd::Index(IndexArgs {
             cmd: None,
             scope: Some(scope),
@@ -2117,10 +2222,17 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             branch,
             breaking,
             dry_run,
+            propose,
             local: Some(dir),
         }) => {
             let store = local_store(dir).await?;
-            return schema_set(&store, scope, schema, branch, *breaking, *dry_run).await;
+            let how = SchemaSet {
+                breaking: *breaking,
+                dry_run: *dry_run,
+                propose: *propose,
+                local: Some(dir),
+            };
+            return schema_set(&store, scope, schema, branch, how).await;
         }
         Cmd::Backfill {
             scope,
@@ -2771,8 +2883,17 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             branch,
             breaking,
             dry_run,
+            propose,
             ..
-        }) => schema_set(&store, &scope, &schema, &branch, breaking, dry_run).await?,
+        }) => {
+            let how = SchemaSet {
+                breaking,
+                dry_run,
+                propose,
+                local: None,
+            };
+            schema_set(&store, &scope, &schema, &branch, how).await?
+        }
         Cmd::Brief {
             scope,
             user,
@@ -3007,6 +3128,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
         | Cmd::SupportBundle { .. }
         | Cmd::Hooks { .. }
         | Cmd::Service(_)
+        | Cmd::Studio { .. }
         | Cmd::Gen { .. }
         | Cmd::Embed { .. }
         | Cmd::Dataset(_)
@@ -3589,6 +3711,14 @@ async fn serve_local(dir: &str, port: u16, scope: Scope, groups: Vec<String>) ->
         scope.namespace(),
         dir.display(),
         groups.join(", group:")
+    );
+    eprintln!(
+        "ampup-memory: Studio: http://127.0.0.1:{port}/studio/{}",
+        if memstore::server::studio::built() {
+            ""
+        } else {
+            " (not built into this binary: it says how)"
+        }
     );
     memstore::server::serve_with(
         port,

@@ -33,10 +33,12 @@ pub mod compaction;
 mod conflict_ops;
 mod decision_ops;
 mod dream_jobs;
+mod dream_review;
 mod episode_page;
 mod file_keys;
 mod governance;
 mod join;
+mod learn;
 mod lobby;
 pub mod maintenance;
 mod purpose;
@@ -45,6 +47,7 @@ mod reads;
 mod reports;
 mod routing;
 mod signin;
+pub mod studio;
 mod unsubscribe;
 pub mod writer;
 
@@ -206,9 +209,14 @@ impl State {
         store
     }
 
-    /// Run `work` as background writing: stopped at shutdown before the writer lease is released.
-    fn background(&self, work: impl std::future::Future<Output = ()> + Send + 'static) {
-        let task = tokio::spawn(work);
+    /// Run `work` as background writing: stopped at shutdown before the writer lease is released. Its catalog
+    /// loads count as `name`'s ([`crate::loads`]).
+    fn background(
+        &self,
+        name: &'static str,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let task = tokio::spawn(crate::loads::by(name, work));
         let mut tasks = self.background.lock().unwrap();
         tasks.retain(|t| !t.is_finished());
         tasks.push(task.abort_handle());
@@ -329,7 +337,8 @@ struct DirectoryAuth {
 
 /// Orgs' providers and keys are re-read from the directory at most this often (and after a change made
 /// here): a stream of tokens from unknown issuers, or of unknown keys, doesn't turn into a stream of
-/// catalog reads. So a key revoked through another server stops working here within this long.
+/// catalog reads. So a key revoked through another server stops working here within this long, or, while the
+/// catalog can't be read, within the store's hard staleness limit ([`directory_auth`]).
 const PROVIDERS_TTL: Duration = Duration::from_secs(5);
 
 impl State {
@@ -404,7 +413,8 @@ pub struct Options {
     pub bind: Option<String>,
     /// Answer only requests addressed to this machine by name (`Host` and any `Origin` are 127.0.0.1,
     /// localhost or [::1]), so a web page that rebinds its own domain to 127.0.0.1 can't reach a server
-    /// that has no sign-in.
+    /// that has no sign-in. Such a server (`serve --local`, the only one that sets it) also serves the Studio, the
+    /// web page for looking at your memory, at `/studio/` (`studio`).
     pub loopback_only: bool,
     /// `remember_memory` and `/remember` commit straight into the served scope, whatever it is (a single
     /// person's own store: `serve --local`). Otherwise only an org's or team's memory the directory gave the
@@ -568,6 +578,11 @@ pub async fn serve_with(
     metrics.register(Box::new(crate::metrics::LEDGER_DATA_FILES.clone()));
     metrics.register(Box::new(crate::metrics::LEDGER_COMPACTED_AT.clone()));
     metrics.register(Box::new(crate::metrics::LEDGER_COMPACTION_SECONDS.clone()));
+    metrics.register(Box::new(crate::metrics::VIS_READS.clone()));
+    metrics.register(Box::new(crate::metrics::VIS_LAG_REFUSED.clone()));
+    metrics.register(Box::new(crate::metrics::VIS_BUILD_SECONDS.clone()));
+    metrics.register(Box::new(crate::metrics::VIS_ORACLE_DIVERGENCE.clone()));
+    metrics.register(Box::new(crate::metrics::VIS_BUILDS.clone()));
     metrics.register(Box::new(crate::metrics::LEDGER_COMPACTION_FAILURES.clone()));
     metrics.register(Box::new(
         crate::metrics::LEDGER_COMPACTION_CLI_NEEDED.clone(),
@@ -765,7 +780,7 @@ pub async fn serve_with(
     {
         let st = state.clone();
         let bg = st.clone();
-        bg.background(async move {
+        bg.background("note_facts", async move {
             let mut walk = ScopeWalk::default();
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -806,7 +821,7 @@ pub async fn serve_with(
             false => None,
         };
         let bg = st.clone();
-        bg.background(async move {
+        bg.background("sessions", async move {
             let mut walk = ScopeWalk::default();
             loop {
                 tokio::time::sleep(every).await;
@@ -859,7 +874,7 @@ pub async fn serve_with(
                             || dir.as_ref().is_some_and(|d| d.learns_advice(&scope)))
                     {
                         let (store, scope, cx) = (store.clone(), scope.clone(), cx.clone());
-                        st.background(async move {
+                        st.background("advice_personal", async move {
                             match crate::advice_loop::personal_soon(&store, &scope, &cx).await {
                                 Ok(0) => {}
                                 Ok(n) => eprintln!(
@@ -894,7 +909,7 @@ pub async fn serve_with(
                 sender.mailer.provider()
             );
             let st = state.clone();
-            state.background(async move {
+            state.background("digest", async move {
                 let mut walk = ScopeWalk::default();
                 let mut done = std::collections::BTreeSet::new();
                 loop {
@@ -970,7 +985,7 @@ pub async fn serve_with(
         // with `refresh` summarises one subject now.
         let ast = state.clone();
         let ready = settled.clone();
-        state.background(async move {
+        state.background("aggregate", async move {
             let mut walk = ScopeWalk::default();
             let mut last: std::collections::HashMap<Scope, std::time::Instant> = Default::default();
             loop {
@@ -1057,7 +1072,7 @@ pub async fn serve_with(
                 );
                 let dst = state.clone();
                 let ready = settled.clone();
-                state.background(async move {
+                state.background("dream", async move {
                     let mut walk = ScopeWalk::default();
                     loop {
                         tokio::time::sleep(Duration::from_secs(3600).min(gate.every)).await;
@@ -1103,8 +1118,76 @@ pub async fn serve_with(
                 });
             }
         }
+        // What a person just added in Studio (`/learn`), read at once (`crate::extract::run_added`), for its
+        // receipt: not when the round below next reaches its scope, which waits for every scope's backlog. The
+        // server that took it says so in the ledger (`crate::extract::ADDED_WAKE`), so the one that extracts finds
+        // it whichever server took it (one that only serves extracts nothing), within seconds, and at once when it
+        // was this one ([`learn::WAKE`]).
+        {
+            let (st, lst, ex) = (state.clone(), state.clone(), ex.clone());
+            lst.background("added_poll", async move {
+                let mut walk = ScopeWalk::default();
+                let mut scopes: Vec<Scope> = vec![];
+                // A few minutes back: what was added just before this server took the lease.
+                let mut since = crate::now_micros() - 300_000_000;
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(ADDED_POLL) => {}
+                        _ = learn::WAKE.notified() => {}
+                    }
+                    if !st.writer.holds() {
+                        continue;
+                    }
+                    let store = st.writing_store();
+                    // Fresh: another server wrote it, which this one's cached ledger may not show yet.
+                    store.invalidate(crate::SYSTEM_NS, "ledger");
+                    let added = match store.committed_by(crate::extract::ADDED_WAKE, since).await {
+                        Ok((added, newest)) => {
+                            since = newest;
+                            added
+                        }
+                        Err(e) => {
+                            eprintln!("learn: the ledger couldn't be read: {e:#}");
+                            continue;
+                        }
+                    };
+                    if added.is_empty() {
+                        continue;
+                    }
+                    if added
+                        .iter()
+                        .any(|ns| !scopes.iter().any(|s| s.namespace() == *ns))
+                    {
+                        scopes = walk.next(&st, &store).await;
+                    }
+                    let dir = crate::people::directory::Directory::load(&store).await.ok();
+                    for scope in scopes.iter().filter(|s| added.contains(&s.namespace())) {
+                        if !cell::mine(scope) || !st.writer.holds() {
+                            continue;
+                        }
+                        let ex = match dir.as_ref().and_then(|d| d.model(scope, |s| s.extract_model.as_ref())) {
+                            Some(m) => ex.with_model(&m),
+                            None => ex.clone(),
+                        };
+                        let asked = std::time::Instant::now();
+                        // After a round reading this scope, if one is: they would read the same episodes.
+                        let _turn = crate::extract::turn(scope).await;
+                        store.invalidate(&scope.namespace(), crate::EPISODES);
+                        let read = crate::extract::run_added(&store, scope, &ex, 50);
+                        match crate::log_org::with(scope.org_name(), read).await {
+                            Ok(r) if r.episodes + r.failed > 0 => eprintln!(
+                                "extracted what was added to {scope} in {:.1}s: {} episodes, {} facts ({} refused by the schema), {} ended, {} failed",
+                                asked.elapsed().as_secs_f64(), r.episodes, r.facts, r.refused, r.closed, r.failed
+                            ),
+                            Ok(_) => {}
+                            Err(e) => eprintln!("extraction of what was added to {scope} failed: {e:#}"),
+                        }
+                    }
+                }
+            });
+        }
         let ext = state.clone();
-        ext.background(async move {
+        ext.background("extract", async move {
             // While the API is down (every call this round failed for want of it), wait twice as long
             // each round, up to five minutes, rather than asking it about every episode every few seconds.
             let mut wait = every;
@@ -1127,6 +1210,10 @@ pub async fn serve_with(
                         if !lease.holds() {
                             return (read, down, waiting);
                         }
+                        // What was just added there is being read: this round comes back to it next time.
+                        let Some(_turn) = crate::extract::try_turn(&scope) else {
+                            return (read, down, waiting);
+                        };
                         // The org's (or team's) extraction model, where the operator chose one.
                         let ex = &match dir.as_ref().and_then(|d| d.model(&scope, |s| s.extract_model.as_ref())) {
                             Some(m) => ex.with_model(&m),
@@ -1228,7 +1315,7 @@ pub async fn serve_with(
             }
         );
         let cst = state.clone();
-        cst.background(async move {
+        cst.background("compile", async move {
             let mut wait = every;
             let mut walk = ScopeWalk::default();
             loop {
@@ -1326,7 +1413,7 @@ pub async fn serve_with(
             }
         );
         let lst = state.clone();
-        lst.background(async move {
+        lst.background("runs", async move {
             let mut wait = every;
             let mut walk = ScopeWalk::default();
             let mut tried: HashMap<Scope, std::collections::BTreeSet<String>> = HashMap::new();
@@ -1379,7 +1466,7 @@ pub async fn serve_with(
     {
         let st = state.clone();
         let lst = state.clone();
-        lst.background(async move {
+        lst.background("advice_requests", async move {
             let every = crate::advice_requests::every();
             let mut walk = ScopeWalk::default();
             let mut scopes: Vec<Scope> = vec![];
@@ -1438,7 +1525,7 @@ pub async fn serve_with(
                 every.as_secs()
             );
             let lst = state.clone();
-            lst.background(async move {
+            lst.background("auto_review", async move {
                 let mut walk = ScopeWalk::default();
                 let mut asked: HashMap<Scope, std::collections::HashSet<(String, String)>> =
                     HashMap::new();
@@ -1497,7 +1584,7 @@ pub async fn serve_with(
             .unwrap_or(10usize)
             .max(1);
         let st = state.clone();
-        tokio::spawn(async move {
+        tokio::spawn(crate::loads::by("maintenance", async move {
             // The first round once the warm-up is done (it reads the same tables), and then after a random part
             // of a round's interval, at most five minutes: servers restarted together don't all read every table
             // in the same minute.
@@ -1536,7 +1623,7 @@ pub async fn serve_with(
                 }
                 compaction::observe(&st, &compact).await;
             }
-        });
+        }));
         // The window is looked at as often as the rounds run, at least every minute.
         maintenance::start(&state, window, Duration::from_secs(every.min(60)));
     }
@@ -1563,7 +1650,7 @@ pub async fn serve_with(
             let started = Instant::now();
             let bound = ready_timeout();
             let (needed_tx, needed) = tokio::sync::oneshot::channel();
-            let warming = tokio::spawn(warm_up(st.clone(), needed_tx));
+            let warming = tokio::spawn(crate::loads::by("warm_up", warm_up(st.clone(), needed_tx)));
             // What a sign-in needs, unbounded: a server that can't read who is disabled isn't ready.
             if needed.await.is_err() {
                 return; // warm-up stopped (the server is stopping)
@@ -1577,7 +1664,7 @@ pub async fn serve_with(
                 ),
             }
             st.ready.store(true, std::sync::atomic::Ordering::Release);
-            tokio::spawn(keep_warm(st));
+            tokio::spawn(crate::loads::by("keep_warm", keep_warm(st)));
         });
     }
     // What holds memory, every AMPUP_MEMORY_MEMORY_LOG_SECS (default 30, 0 for never): the process (resident,
@@ -1614,8 +1701,17 @@ pub async fn serve_with(
             }
         });
     }
+    // What this server spent of the catalog's read quota, and on what, once a minute (`crate::loads`).
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            if let Some(r) = crate::loads::report() {
+                eprintln!("catalog in the last minute: {r}");
+            }
+        }
+    });
     let every = catalog_refresh();
-    tokio::spawn(async move {
+    tokio::spawn(crate::loads::by("catalog_refresh", async move {
         loop {
             if let Err(e) = refresh(&bg).await {
                 eprintln!("refresh failed (serving the previous store): {e:#}");
@@ -1625,7 +1721,7 @@ pub async fn serve_with(
             let _ = tokio::task::spawn_blocking(crate::metrics::trim_allocator).await;
             tokio::time::sleep(every).await;
         }
-    });
+    }));
     anyhow::ensure!(
         !state.any_scope
             || (state.fixed() && ["127.0.0.1", "localhost", "::1"].contains(&bind.as_str())),
@@ -1972,7 +2068,23 @@ async fn listen(
                                     let query = req.uri().query().unwrap_or_default().to_string();
                                     Ok(unsubscribe::route(state.clone(), req, query).await)
                                 }
-                                Err(req) => handle(state.clone(), req, internal).await,
+                                // The Studio (`studio`), on `serve --local` only: the files of a web page, which
+                                // call the routes `handle` answers.
+                                Err(req)
+                                    if !internal
+                                        && state.loopback_only
+                                        && studio::is_studio(req.uri().path())
+                                        && addressed_to_this_machine(req.headers()) =>
+                                {
+                                    Ok(studio::route(req.method(), req.uri().path()))
+                                }
+                                Err(req) => {
+                                    crate::loads::by(
+                                        "request",
+                                        handle(state.clone(), req, internal),
+                                    )
+                                    .await
+                                }
                             }
                         }))
                         .await;
@@ -2254,7 +2366,23 @@ async fn request_principal(
         admin: false,
     };
     if matches!(source, Identity::Fixed) {
-        return Ok(plain(Principal::new(SERVICE_PRINCIPAL, &groups)));
+        // `serve --local`: its one caller owns the data directory it serves, so they are the admin of the org it
+        // serves (`SignIn::local_admin`). Not on any other server that identifies no one (the dev loop's), whose
+        // callers are anyone who reaches it.
+        let local_admin = match &state.scope {
+            Scope::Org | Scope::NamedOrg(_) if state.loopback_only => {
+                state.scope.org_name().map(String::from)
+            }
+            _ => None,
+        };
+        return Ok(Authed {
+            who: Principal::new(SERVICE_PRINCIPAL, &groups),
+            via: SignIn {
+                local_admin,
+                ..Default::default()
+            },
+            admin: false,
+        });
     }
     // Fail closed: no token, or a lookup that fails, is no access.
     let token = caller_token.ok_or_else(|| anyhow::anyhow!("no caller token"))?;
@@ -2394,6 +2522,8 @@ async fn request_principal(
                 operator: c.operator,
                 unverified: c.unverified,
                 recorded: false,
+                // A token proves a caller of a server with sign-in, never a local server's own caller.
+                local_admin: None,
             };
             let who = if c.person || via.key.is_some() {
                 // Anyone an identity provider knows can sign in, and an org's key reads its own scope:
@@ -2477,7 +2607,28 @@ async fn directory_auth(state: &State) -> Result<DirectoryAuth> {
     // revoked through another server stops working here within the TTL, not the TTL and the fold's age.
     let asked = std::time::Instant::now();
     let store = state.store.read().unwrap().clone();
-    let folded = store.directory_loaded_after(Some(asked)).await?;
+    let folded = match store.directory_loaded_after(Some(asked)).await {
+        Ok(f) => f,
+        // The catalog is throttling or down (as when every server restarts at once): the providers and keys read
+        // last stand for up to the hard staleness limit, so callers already known here aren't refused or told to
+        // retry for it. What changed in the directory since takes effect once it is read again.
+        Err(e) if upstream_failure(&e) => match &*state.providers.lock().unwrap() {
+            Some((at, d)) if at.elapsed() < store.hard_staleness() => {
+                static SAID: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+                let mut said = SAID.lock().unwrap();
+                if said.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
+                    *said = Some(Instant::now());
+                    eprintln!(
+                        "sign-in: the directory can't be read now, using the providers and keys read {} ms ago: {e:#}",
+                        at.elapsed().as_millis()
+                    );
+                }
+                return Ok(d.clone());
+            }
+            _ => return Err(e),
+        },
+        Err(e) => return Err(e),
+    };
     let dir = &folded.dir;
     let keys = dir
         .orgs
@@ -3979,6 +4130,10 @@ fn ready_timeout() -> Duration {
     )
 }
 
+/// How often the server that extracts looks in the ledger for what was just added in Studio on another server
+/// ([`crate::extract::ADDED_WAKE`]).
+const ADDED_POLL: Duration = Duration::from_secs(3);
+
 /// What this server does (`AMPUP_MEMORY_ROLE`), so index builds and the rest of the background writing can run
 /// apart from the servers answering reads: their memory spikes then never land beside a query.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4132,14 +4287,25 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
     use futures::StreamExt;
     let store = &store;
     let read_at = &st.read_at;
-    let since = chrono::Utc::now().timestamp_millis() - warm_days() * 86_400_000;
+    // Only a scope that holds memory written lately: warming never makes tables, and an idle org's indexes would
+    // hold memory no one reads (its first read loads them). Which those are, from the ledger every server reads
+    // anyway, not a catalog call per org and team in the directory (a deploy restarting every server made those
+    // all at once).
+    let since = crate::now_micros() - warm_days() * 86_400_000_000;
+    let written = match store.committed_by("", since).await {
+        Ok((written, _)) => written,
+        Err(e) => {
+            eprintln!("warm-up: the ledger can't be read, other scopes are left to reads: {e:#}");
+            return;
+        }
+    };
+    scopes.retain(|s| written.contains(&s.namespace()));
+    // Kept warm for a while after (`keep_warm`), as if read `warm_grace` before `keep_warm_idle` runs out.
+    let kept_until = Instant::now()
+        .checked_sub(keep_warm_idle().saturating_sub(warm_grace()))
+        .unwrap_or_else(Instant::now);
     futures::stream::iter(scopes)
         .for_each_concurrent(4, |scope| async move {
-            // Only a scope that holds memory written lately: warming never makes tables, and an idle
-            // org's indexes would hold memory no one reads (its first read loads them).
-            if !written_since(store, &scope, since).await {
-                return;
-            }
             let t = Instant::now();
             match search::warm(store, &scope).await {
                 Ok(()) => {
@@ -4149,10 +4315,12 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
                         crate::metrics::process_memory()
                     );
                     warm_advice(store, &scope).await;
+                    // A request's read since keeps its own, later time.
                     read_at
                         .lock()
                         .unwrap()
-                        .insert(scope.clone(), Instant::now());
+                        .entry(scope.clone())
+                        .or_insert(kept_until);
                 }
                 Err(e) => eprintln!(
                     "warming {scope} failed (reads load it): {}",
@@ -4168,17 +4336,28 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
 /// refreshed behind a read, but past `AMPUP_MEMORY_HARD_STALENESS_MS` (60 s) a read waits for them: on a busy org that
 /// is a catalog walk and the unindexed files read from object storage, 30 s on one production deployment. A scope read now and then
 /// went past 60 s between reads, so its next reader paid for it; touched every 20 s it never does. The scopes
-/// touched are the served one, and those a request selected (or the start's warm-up loaded, so a new server, ready
-/// when it has warmed, is as warm for its first caller as the old one was for its last) within [`keep_warm_idle`],
-/// a few at a time. Each touch reloads every table of the scope from the catalog (they are past
-/// `AMPUP_MEMORY_MAX_STALENESS_MS` by then): touching every scope ever selected spent a catalog's read quota on
-/// orgs nobody read (staging, Nov 2026: 2,800 table loads a minute against a 3,000 limit, its test orgs among them).
+/// touched are the served one, and those a request selected within [`keep_warm_idle`] (or the start's warm-up loaded,
+/// within [`warm_grace`]: a new server, ready when it has warmed, is as warm for its first caller as the old one was
+/// for its last), a few at a time. A touch reloads from the catalog only the tables at least half way to the hard
+/// limit ([`Store::refreshing_after`]), not every table past `AMPUP_MEMORY_MAX_STALENESS_MS`: touching every scope
+/// ever selected, every table each time, spent a catalog's read quota on orgs nobody read (staging, Nov 2026: 2,800
+/// table loads a minute against a 3,000 limit, its test orgs among them).
 fn keep_warm_every() -> Option<Duration> {
     let secs = std::env::var("AMPUP_MEMORY_KEEP_WARM_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(20);
     (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// How long a scope the start's warm-up loaded is kept warm when no request reads it (`AMPUP_MEMORY_WARM_GRACE_SECS`,
+/// default 300): a deploy restarts every server at once, and each warmed every org written lately, most of which no
+/// one reads before the next deploy.
+fn warm_grace() -> Duration {
+    std::env::var("AMPUP_MEMORY_WARM_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(Duration::from_secs(300), Duration::from_secs)
 }
 
 /// How long after its last read a scope is still kept warm (`AMPUP_MEMORY_KEEP_WARM_IDLE_SECS`, default 1800).
@@ -4212,9 +4391,12 @@ async fn keep_warm(st: Arc<State>) {
         scopes.dedup();
         scopes.retain(cell::mine);
         scopes.truncate(MOST);
+        // A touch reloads only what is half way to the hard limit: what a read refreshed lately (a scope in use) is
+        // left as it is, and the rest is reloaded every other touch or so, never at each one.
+        let fresh_enough = store.hard_staleness() / 2;
         for scope in scopes {
             let t = Instant::now();
-            match search::warm(&store, &scope).await {
+            match Store::refreshing_after(fresh_enough, search::warm(&store, &scope)).await {
                 Ok(()) if t.elapsed() > Duration::from_secs(5) => {
                     eprintln!("keep-warm of {scope} took {} ms", t.elapsed().as_millis())
                 }
@@ -4246,29 +4428,13 @@ async fn warm_advice(store: &Store, scope: &Scope) {
     }
 }
 
-/// How recently a scope's episodes must have changed for the start to warm it: `AMPUP_MEMORY_WARM_DAYS`,
+/// How recently a scope must have had a commit on main for the start to warm it: `AMPUP_MEMORY_WARM_DAYS`,
 /// default 7. The served scope is warmed whatever its age.
 fn warm_days() -> i64 {
     std::env::var("AMPUP_MEMORY_WARM_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(7)
-}
-
-/// Whether `scope`'s episodes table exists and was last committed at or after `since` (ms): read from the
-/// table's metadata, not its rows.
-async fn written_since(store: &Store, scope: &Scope, since: i64) -> bool {
-    let ident = iceberg::TableIdent::new(
-        iceberg::NamespaceIdent::new(scope.namespace()),
-        crate::EPISODES.into(),
-    );
-    if !store.has_table(&ident).await.unwrap_or(false) {
-        return false;
-    }
-    match store.catalog().load_table(&ident).await {
-        Ok(t) => t.metadata().last_updated_ms() >= since,
-        Err(_) => false,
-    }
 }
 
 /// The scopes a background loop (extraction, compiling) goes over each round. Not only those requests
@@ -4893,8 +5059,16 @@ async fn refresh(state: &Arc<State>) -> Result<()> {
         .with_chunking(previous.chunking().0, previous.chunking().1),
     );
     *state.store.write().unwrap() = store.clone();
-    let rewarm = store.clone();
-    tokio::spawn(async move { rewarm.rewarm().await });
+    // Reloading every cached table only matters when a cached copy can outlive a refresh: with the hard staleness
+    // limit shorter than the refresh, a read past it reloads through this catalog anyway, and a reload of every
+    // table of every org at each refresh spent read quota on tables no one asked for again.
+    if store.hard_staleness() >= catalog_refresh() {
+        let rewarm = store.clone();
+        tokio::spawn(crate::loads::by(
+            "rewarm",
+            async move { rewarm.rewarm().await },
+        ));
+    }
     // A worker's walk over the directory, kept across rounds (it remembers the scopes whose tables it has
     // completed).
     static WALK: std::sync::LazyLock<tokio::sync::Mutex<ScopeWalk>> =
@@ -4912,7 +5086,7 @@ async fn refresh(state: &Arc<State>) -> Result<()> {
         let store = state.writing_store();
         let lease = state.writer.clone();
         let st = state.clone();
-        state.background(async move {
+        state.background("index", async move {
             // Requests select the scopes a serving server indexes; a worker is sent none, so it indexes every
             // scope in the directory that holds memory.
             if st.role == Role::Worker {
@@ -5080,9 +5254,19 @@ async fn handle(
         .and_then(|v| v.to_str().ok())
     {
         let allowed = std::env::var("AMPUP_MEMORY_ALLOWED_ORIGINS").unwrap_or_default();
-        if !allowed
-            .split(',')
-            .any(|a| !a.is_empty() && a.trim() == origin)
+        // A page this local server served itself (Studio): its origin is exactly the address the request was sent
+        // to, a loopback one (`addressed_to_this_machine` above). A page of any other origin, another port on
+        // this machine included, sends its own `Origin`, which no page can set.
+        let same_origin = state.loopback_only
+            && req
+                .headers()
+                .get(hyper::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .is_some_and(|h| origin == format!("http://{h}"));
+        if !same_origin
+            && !allowed
+                .split(',')
+                .any(|a| !a.is_empty() && a.trim() == origin)
         {
             refused(None, "-", 403, audit::Reason::Origin);
             return Ok(reply(
@@ -5238,6 +5422,9 @@ async fn handle(
     let installations = !internal && path == "/installations";
     let ingest = !internal && path == "/ingest";
     let remember_route = !internal && path == "/remember";
+    // The Studio's "Add to memory" (`learn`): files and text added by hand, and what was learned from them.
+    let learn_route = !internal && path == "/learn";
+    let learn_status = !internal && path == "/learn/status";
     // The filterable lists are `/browse` ops with a path of their own: its scope selection, ACLs and metering.
     let list_op = match path.as_str() {
         "/facts/list" => Some("facts"),
@@ -5271,6 +5458,12 @@ async fn handle(
         return Ok(reply(
             StatusCode::METHOD_NOT_ALLOWED,
             json!({"error": "POST {source, body, acl?} to /remember"}),
+        ));
+    }
+    if (learn_route || learn_status) && req.method() != hyper::Method::POST {
+        return Ok(reply(
+            StatusCode::METHOD_NOT_ALLOWED,
+            json!({"error": "POST {items, for?} to /learn, {episode_ids} to /learn/status"}),
         ));
     }
     if retract_route && req.method() != hyper::Method::POST {
@@ -5392,6 +5585,8 @@ async fn handle(
         && !installations
         && !ingest
         && !remember_route
+        && !learn_route
+        && !learn_status
         && !browse
         && !agent_route
         && !retract_route
@@ -5423,7 +5618,7 @@ async fn handle(
     // The app the call came from, for the advice log (`advice_calls`).
     let app = advice_calls::app_of(req.headers());
     // `/remember` carries a hook's whole session, `/transcripts` a part of one's transcript.
-    let max_body = if ingest || remember_route || transcripts_route || seed_route {
+    let max_body = if ingest || remember_route || learn_route || transcripts_route || seed_route {
         MAX_INGEST_BODY
     } else if runs_route || traces_route {
         MAX_RUNS_BODY
@@ -6294,7 +6489,7 @@ async fn handle(
             ingest_reply(ingest_episodes(&state, &scope, &who, &body, via.key.as_ref()).await);
         return Ok(reply(status, v));
     }
-    if remember_route || forget_route || close_route || facts_route {
+    if remember_route || forget_route || close_route || facts_route || learn_route {
         let Some(who) = who else {
             return Ok(reply(StatusCode::NOT_FOUND, json!({"error": "not here"})));
         };
@@ -6325,10 +6520,11 @@ async fn handle(
                 (&org, i),
                 &key,
                 &scope.to_string(),
-                match (forget_route, close_route, facts_route) {
-                    (true, _, _) => "/forget",
-                    (_, true, _) => "/close",
-                    (_, _, true) => "/facts",
+                match (forget_route, close_route, facts_route, learn_route) {
+                    (true, _, _, _) => "/forget",
+                    (_, true, _, _) => "/close",
+                    (_, _, true, _) => "/facts",
+                    (_, _, _, true) => "/learn",
                     _ => "/remember",
                 },
                 true,
@@ -6337,7 +6533,7 @@ async fn handle(
         }
         // These read what they write about (the fact, the cited text): an ingest key, which writes only,
         // may not use them, or their answers would tell it about text it may not read.
-        if (close_route || facts_route) && !via.may_read() {
+        if (close_route || facts_route || learn_route) && !via.may_read() {
             return Ok(reply(
                 StatusCode::FORBIDDEN,
                 json!({"error": format!("{} only writes: it is an ingest key", who.user())}),
@@ -6434,6 +6630,41 @@ async fn handle(
         if let Some(r) = stopped(&state, "ingest") {
             return Ok(r);
         }
+        if learn_route {
+            let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let store = state.store.read().unwrap().clone();
+            return Ok(match writes {
+                Writes::Scope => match learn::add(&state, &store, &scope, &who, &args).await {
+                    Ok(v) => {
+                        crate::usage::METER.op(crate::usage::Op::Turn, who.user());
+                        reply(StatusCode::OK, v)
+                    }
+                    Err(ref e)
+                        if let Some(c) = e.downcast_ref::<crate::workspace::CapReached>() =>
+                    {
+                        reply(
+                            StatusCode::FORBIDDEN,
+                            json!({"error": c.0, "cap_reached": true}),
+                        )
+                    }
+                    Err(e) => match e.downcast_ref::<ToolError>() {
+                        Some(m) => reply(StatusCode::BAD_REQUEST, json!({"error": m.0})),
+                        None => {
+                            eprintln!("learn failed: {e:#}");
+                            crate::report::failure("learn", &e);
+                            reply(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                json!({"error": "learn failed"}),
+                            )
+                        }
+                    },
+                },
+                _ => reply(
+                    StatusCode::FORBIDDEN,
+                    json!({"error": "this memory is written through a queue: what it learns comes at the next ingest, so remember it there"}),
+                ),
+            });
+        }
         let args: Value = match serde_json::from_slice(&body) {
             Ok(v @ Value::Object(_)) => v,
             _ => {
@@ -6486,7 +6717,10 @@ async fn handle(
     )
     .await
     {
-        Ok(s) => s,
+        Ok(s) => {
+            crate::phases::mark("pinned");
+            s
+        }
         Err(e) => {
             eprintln!("refused {path}: {e:#} (app {app})");
             return Ok(reply(
@@ -6527,7 +6761,9 @@ async fn handle(
         // search_memory and get_episode also read the scopes this one's `reads` setting names.
         let reads = match tool_call(&body) {
             Some(("/mcp search_memory" | "/mcp get_episode", _)) => {
-                Reads::of(&state, &store, session).await
+                let r = Reads::of(&state, &store, session).await;
+                crate::phases::mark("reads");
+                r
             }
             _ => Reads::alone(session),
         };
@@ -6792,15 +7028,18 @@ async fn handle(
                     .unwrap_or(false);
                 let writing = match crate::extract::Extractor::advice_from_env() {
                     Ok(Some(cx)) if !kept.sources.is_empty() && (kept.rewrite || !has) => {
-                        state.background(crate::repo_advice::write_notes(
-                            store.clone(),
-                            scope.clone(),
-                            who.clone(),
-                            acl,
-                            kept.repo.clone(),
-                            kept.sources.clone(),
-                            cx,
-                        ));
+                        state.background(
+                            "repo_advice",
+                            crate::repo_advice::write_notes(
+                                store.clone(),
+                                scope.clone(),
+                                who.clone(),
+                                acl,
+                                kept.repo.clone(),
+                                kept.sources.clone(),
+                                cx,
+                            ),
+                        );
                         true
                     }
                     _ => false,
@@ -7225,6 +7464,29 @@ async fn handle(
                     reply(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         json!({"error": "advice failed"}),
+                    )
+                }
+            },
+        });
+    }
+    if learn_status {
+        let who = who.expect("public port");
+        let store = state.store.read().unwrap().clone();
+        let args = serde_json::from_slice::<Value>(&body).unwrap_or_default();
+        let receipt = learn::status(&state, &store, &session, &who, &args).await;
+        return Ok(match receipt {
+            Ok(v) => {
+                crate::usage::METER.op(crate::usage::Op::Read, who.user());
+                reply(StatusCode::OK, v)
+            }
+            Err(e) => match e.downcast_ref::<ToolError>() {
+                Some(m) => reply(StatusCode::BAD_REQUEST, json!({"error": m.0})),
+                None => {
+                    eprintln!("learn status failed: {e:#}");
+                    crate::report::failure("learn status", &e);
+                    reply(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": "learn status failed"}),
                     )
                 }
             },
@@ -7743,6 +8005,8 @@ const PERSONAL_KEY_ROUTES: &[&str] = &[
     "/advice/seed",
     "/brief",
     "/remember",
+    "/learn",
+    "/learn/status",
     "/forget",
     "/sessions",
     "/sessions/end",
@@ -8119,6 +8383,53 @@ const DIRECTORY_KEY_OPS: [&str; 7] = [
     "delete_team",
 ];
 
+/// The `/admin` ops `serve --local`'s caller may send as the admin of its org (`SignIn::local_admin`): those on
+/// the org's memory (its people's activity, advice, branches, owners and reviews, schema, offboarding). Not the
+/// directory's changes (it holds no local org), the operator's, or dreams (Kubernetes jobs): those are refused
+/// as not available locally.
+const LOCAL_ADMIN_OPS: [&str; 40] = [
+    "show",
+    "get_schema",
+    "set_schema",
+    "audit",
+    "decisions",
+    "activity",
+    "conversation",
+    "user_facts",
+    "review_conversation",
+    "advice_trail",
+    "advice_traces",
+    "branch_diff",
+    "merge_branch",
+    "clear_empty_sessions",
+    "mark_automated_sessions",
+    "name_session_tasks",
+    "hold_advice",
+    "ratify_advice",
+    "learn_advice",
+    "set_entity_owner",
+    "remove_entity_owner",
+    "entity_owners",
+    "list_proposals",
+    "propose_branch",
+    "get_proposal",
+    "review_proposal",
+    "entity_graph",
+    "add_fact",
+    "check_conflicts",
+    "list_conflicts",
+    "resolve_conflict",
+    "dream_decisions",
+    "undo_dream_decision",
+    "dismiss_dream_decision",
+    "apply_dream_decision",
+    "dream_now",
+    "forget_user",
+    "export_org",
+    "purge_retracted",
+    "retention",
+];
+
 /// 421 for a request about `org`, which isn't this cell's: its own cell's servers answer it.
 fn misdirected(org: &str) -> Reply {
     json_reply(
@@ -8210,11 +8521,29 @@ async fn directory_change(
     body: &[u8],
 ) -> Result<Value> {
     use crate::people::directory::{Actor, Change, Directory, Invalid, Refused, apply, plan};
-    if state.fixed() {
+    // A server that identifies no one manages nothing, but for `serve --local`'s caller, the admin of its org.
+    if state.fixed() && via.local_admin.is_none() {
         return Err(Refused("this server doesn't identify callers".into()).into());
     }
-    let req: Value =
+    let mut req: Value =
         serde_json::from_slice(body).map_err(|_| Invalid("body is not JSON".into()))?;
+    if let Some(local) = &via.local_admin {
+        // An op names the local org, or none, which is the local org.
+        if let Some(m) = req.as_object_mut()
+            && m.get("org").is_none_or(Value::is_null)
+        {
+            m.insert("org".into(), json!(local));
+        }
+        // The directory holds no local org (no people, teams, keys or settings to change), there is no operator's
+        // catalog of orgs, and no Kubernetes to run dream jobs.
+        if !LOCAL_ADMIN_OPS.contains(&req["op"].as_str().unwrap_or_default()) {
+            return Err(Refused(format!(
+                "{:?} isn't available on a local server (serve --local): its one caller manages the memory it serves, not a directory of people, teams, keys and settings, an operator's orgs or dream jobs",
+                req["op"].as_str().unwrap_or_default()
+            ))
+            .into());
+        }
+    }
     if let Some(k) = &via.key {
         // A directory key (a SCIM bridge's) manages its org's members and teams, and sees the org: `plan`
         // holds it to its own org and to members who aren't admins. Every other key manages nothing.
@@ -8243,6 +8572,23 @@ async fn directory_change(
     let store = state.store.read().unwrap().clone();
     if req["op"] == "decisions" {
         return decision_ops::handle(state, &store, who, via, &req)
+            .await
+            .map_err(|e| match e.is::<Invalid>() {
+                true => e,
+                false => Refused(format!("{e:#}")).into(),
+            });
+    }
+    if matches!(
+        req["op"].as_str(),
+        Some(
+            "dream_decisions"
+                | "undo_dream_decision"
+                | "dismiss_dream_decision"
+                | "apply_dream_decision"
+                | "dream_now"
+        )
+    ) {
+        return dream_review::handle(state, &store, who, via, &req)
             .await
             .map_err(|e| match e.is::<Invalid>() {
                 true => e,
@@ -8299,6 +8645,63 @@ async fn directory_change(
         // A dry run makes every check the set would (the schema, its version, a breaking change against
         // the org's schema now) and commits nothing.
         let dry_run = req["dry_run"] == true;
+        let named = |s: &crate::query::schema::Schema| format!("{} v{}", s.name, s.version);
+        let owned = crate::schema_change::owned(&store, &scope)
+            .await
+            .map_err(|e| Refused(format!("{e:#}")))?;
+        if req["propose"] == true {
+            // Where entities have owners: staged on a branch (`branch`, else one named for the schema) and proposed
+            // to them as the caller. `breaking` allows a breaking change, as main would take it: at a higher version.
+            let branch = req["branch"]
+                .as_str()
+                .filter(|b| !b.is_empty())
+                .map_or_else(|| crate::schema_change::branch_for(&schema), String::from);
+            let breaking = req["breaking"] == true;
+            let refused = |e: anyhow::Error| Refused(format!("{e:#}"));
+            if !owned {
+                return Err(Refused(format!(
+                    "no entity of {org} has an owner, so there is no one to review its schema: set it without propose"
+                ))
+                .into());
+            }
+            if dry_run {
+                store
+                    .check_schema(&scope, MAIN, &schema, breaking)
+                    .await
+                    .map_err(refused)?;
+                let change = format!(
+                    "{org} memory would propose schema {} on branch {branch}",
+                    named(&schema)
+                );
+                return Ok(json!({"changes": [change], "dry_run": true}));
+            }
+            let (_, review) = crate::schema_change::propose(
+                &store,
+                &scope,
+                &branch,
+                &as_member(who, org),
+                &schema,
+                breaking,
+            )
+            .await
+            .map_err(refused)?;
+            let change = format!(
+                "{org} memory: schema {} proposed on branch {branch}",
+                named(&schema)
+            );
+            return Ok(
+                json!({"changes": [change], "dry_run": false, "branch": branch,
+                             "proposal": review}),
+            );
+        }
+        if owned {
+            return Err(Refused(format!(
+                "entities in {org} have owners, and a schema change needs their approval: send set_schema again with \
+                 \"propose\": true (and \"breaking\": true for a breaking change at a higher version) to stage it on \
+                 a branch and propose it. An owner's approval, or an org admin's for all of them, publishes it."
+            ))
+            .into());
+        }
         let was = store
             .check_schema(&scope, MAIN, &schema, false)
             .await
@@ -8612,6 +9015,8 @@ async fn directory_change(
                 .map_err(|e| Refused(format!("{e:#}")))?,
             None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
         };
+        // A page of the log: read through the last visibility state with what was recorded since, never waiting
+        // for a build of what was just written.
         let log = crate::qa_log::list(&store, &scope, None).await?;
         let mut v = if req["op"] == "conversation" {
             let id = req["id"].as_str().unwrap_or_default();
@@ -8746,7 +9151,11 @@ async fn directory_change(
                 .map_err(|e| Refused(format!("{e:#}")))?,
             None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
         };
-        let mut v = crate::advice::trail(&store, &scope, who, req["key"].as_str()).await?;
+        // Only the categories' names (a picker's), without the trail's read of every session.
+        let mut v = match req["categories_only"] == true {
+            true => crate::advice::categories(&store, &scope, who).await?,
+            false => crate::advice::trail(&store, &scope, who, req["key"].as_str()).await?,
+        };
         v["org"] = json!(org);
         v["scope"] = json!(scope.to_string());
         return Ok(v);
@@ -9098,7 +9507,7 @@ async fn directory_change(
         };
         let s = scope.clone();
         let store = state.writing_store();
-        state.background(async move {
+        state.background("advice_learn", async move {
             let _claim = claim;
             let pass = crate::advice::Pass {
                 resort,
@@ -9302,14 +9711,14 @@ async fn directory_change(
             && !events.is_empty()
         {
             let (st, org, user) = (Arc::clone(state), org.clone(), who.user().to_string());
-            state.background(join::notify(st, org, user));
+            state.background("notify", join::notify(st, org, user));
         }
         // An unverified sign-in let in: the person is told they can sign in now.
         if let Change::ApproveSignIn { org, user, .. } = &change
             && !events.is_empty()
         {
             let (st, org, user) = (Arc::clone(state), org.clone(), user.clone());
-            state.background(signin::approved(st, org, user));
+            state.background("notify", signin::approved(st, org, user));
         }
         if matches!(
             change,
@@ -10048,7 +10457,7 @@ async fn search_rows(
             // optional: which page, as an offset or the cursor a previous page returned; the answer is then
             // {"hits", "cursor"} (the cursor of the next page, or null)
             let page = &r[arg + 4];
-            let (hits, next, _) = facts(
+            let (hits, next, _, _) = facts(
                 reads,
                 &store,
                 who,
@@ -10438,7 +10847,12 @@ async fn facts(
     explain: bool,
     tags: &[String],
     filter: Option<&search::Filter>,
-) -> Result<(Vec<Value>, Option<String>, Vec<(String, Vec<String>)>)> {
+) -> Result<(
+    Vec<Value>,
+    Option<String>,
+    Vec<(String, Vec<String>)>,
+    Vec<Value>,
+)> {
     // A page: an offset, or a cursor (`<offset>.<fingerprint>.<pins>`) that reads what its first page read.
     let fingerprint = {
         use sha2::Digest;
@@ -10460,6 +10874,8 @@ async fn facts(
         crate::auth::hex(&h)[..16].to_string()
     };
     let (offset, pin) = page_start(page, &fingerprint)?;
+    // The query's informative words, as an explanation counts those a fact shares.
+    let terms = search::fact_terms(query).len();
     if offset + k > MAX_DEPTH {
         return Err(ToolError(format!("a search pages to {MAX_DEPTH} facts at most")).into());
     }
@@ -10505,11 +10921,15 @@ async fn facts(
     only.extend(filter.cloned());
     // Each scope read is searched with this scope's ranking, and the hits merged (`Reads::search`).
     let only = (!only.is_empty()).then_some(search::Filter::And(only));
-    let reads::Scoped {
-        items: mut found,
-        from,
-    } = reads
-        .search(
+    // With `explain`, the candidates the caller may read that aren't hits, and why (never one they may not read).
+    let (
+        reads::Scoped {
+            items: mut found,
+            from,
+        },
+        mut missed,
+    ) = reads
+        .search_why(
             store,
             who,
             query,
@@ -10517,10 +10937,30 @@ async fn facts(
             valid_at,
             only.as_ref(),
             rank,
+            explain,
         )
         .await?;
     crate::phases::mark("fact search");
     let more = found.len() > offset + k;
+    // The hit past this page is one ranked below it; those of earlier pages were shown there.
+    if explain && let Some(h) = found.get(offset + k) {
+        let i = from.get(&h.fact.fact_id).copied().unwrap_or(0);
+        let cut = search::Cut::Below;
+        missed.push((
+            i,
+            search::Miss {
+                hit: h.clone(),
+                cut,
+            },
+        ));
+    }
+    let shown_before: HashSet<String> = found
+        .iter()
+        .take(offset)
+        .flat_map(|h| std::iter::once(&h.fact).chain(&h.group))
+        .map(|f| f.fact_id.clone())
+        .collect();
+    missed.retain(|(_, m)| !shown_before.contains(&m.hit.fact.fact_id));
     let found: Vec<_> = found.drain(..).skip(offset).take(k).collect();
     let next = match (more, pin) {
         (false, _) => None,
@@ -10560,10 +11000,44 @@ async fn facts(
                 Some(crate::freshness::Mark::Contradicted { .. })
             )
     });
+    if explain {
+        for h in &gone {
+            let i = from.get(&h.fact.fact_id).copied().unwrap_or(0);
+            let cut = search::Cut::Contradicted;
+            missed.push((
+                i,
+                search::Miss {
+                    hit: h.clone(),
+                    cut,
+                },
+            ));
+        }
+    }
     let gone: Vec<(String, Vec<String>)> = gone
         .into_iter()
         .map(|h| (h.fact.fact_id, h.fact.source_episodes))
         .collect();
+    // An explanation names where each fact came from: its first episode's source and time, where the caller may
+    // read that episode in their own scope.
+    let sources: HashMap<String, (String, i64)> = match explain {
+        true => {
+            let ids: Vec<String> = found
+                .iter()
+                .map(|h| &h.fact)
+                .chain(missed.iter().map(|(_, m)| &m.hit.fact))
+                .filter_map(|f| f.source_episodes.first().cloned())
+                .collect();
+            session.episode_sources(store, who, &ids).await?
+        }
+        false => HashMap::new(),
+    };
+    let source_json = |f: &crate::Fact| {
+        f.source_episodes.first().and_then(|e| {
+            sources
+                .get(e)
+                .map(|(source, at)| json!({"episode_id": e, "source": source, "occurred_at": at}))
+        })
+    };
     for h in &found {
         let mut v = json!({
             "entity": h.fact.entity, "predicate": h.fact.predicate, "value": h.fact.value,
@@ -10608,13 +11082,11 @@ async fn facts(
             v["episode_type"] = json!(t);
         }
         if explain {
-            // Why it ranked here: the keyword score and how many of the query's words it shares, its distance in
-            // meaning, the recency scale, and whether it came from the not-yet-indexed tail.
-            v["explain"] = json!({
-                "bm25": h.bm25, "terms_matched": h.terms_matched, "distance": h.distance,
-                "recency": h.recency, "from_tail": h.from_tail, "score": h.score,
-                "in_window": h.in_window,
-            });
+            // Why it ranked here: its rank, the signals the ranking scored it by and each one's part of the score.
+            v["explain"] = why_json(h, offset + hits.len() + 1, terms);
+            if let Some(s) = source_json(&h.fact) {
+                v["source"] = s;
+            }
         }
         if !h.group.is_empty() {
             v["facts"] = json!(
@@ -10657,7 +11129,95 @@ async fn facts(
         }
         hits.push(v);
     }
-    Ok((hits, next, gone))
+    let missed = match explain {
+        true => {
+            let mut out = missed_json(&reads, store, who, missed, terms, valid_at).await?;
+            for v in out.iter_mut() {
+                let first = v["source_episodes"][0].as_str().map(String::from);
+                if let Some((source, at)) = first.as_ref().and_then(|e| sources.get(e)) {
+                    v["source"] = json!({"episode_id": first, "source": source, "occurred_at": at});
+                }
+            }
+            out
+        }
+        false => vec![],
+    };
+    Ok((hits, next, gone, missed))
+}
+
+/// Why a fact ranked where it did, as an explained search answers it (`explain`): its rank (none for a miss), its
+/// score, how keyword and meaning were fused, and each signal the ranking scored it by with its part of the score:
+/// keyword (its BM25 and how many of the query's `terms` informative words it shares), meaning (its cosine
+/// similarity), its origin's scale, and the time the query names; recency only where the scope ranks by it. The
+/// old flat fields (`bm25`, `distance`, ...) are kept for earlier readers.
+fn why_json(h: &search::Hit, rank: usize, terms: usize) -> Value {
+    let p = &h.parts;
+    let mut v = json!({
+        "score": h.score, "fusion": (!p.fusion.is_empty()).then_some(p.fusion),
+        "signals": {
+            "keyword": {"part": p.keyword, "bm25": h.bm25, "terms_matched": h.terms_matched, "terms": terms},
+            "meaning": {"part": p.meaning, "similarity": p.similarity},
+            "origin": {"scale": p.origin, "origin": h.origin.map(|o| o.name())},
+            "time": {"in_window": h.in_window, "scale": p.time, "first": p.time_first},
+        },
+        "bm25": h.bm25, "terms_matched": h.terms_matched, "distance": h.distance,
+        "recency": h.recency, "from_tail": h.from_tail, "in_window": h.in_window,
+    });
+    if rank > 0 {
+        v["rank"] = json!(rank);
+    }
+    if h.recency != 1.0 {
+        v["signals"]["recency"] = json!({"scale": h.recency});
+    }
+    v
+}
+
+/// What an explained search found that the caller may read but didn't return, best ranked first and at most
+/// [`search::MISSES`]: each fact as a hit is shown, with why it was cut (`cut`, and `by`, the fact that replaced it
+/// or was shown instead, where there is one) and how it scored. Every one was a candidate of the caller's own
+/// search, so one they may not read is never among them, nor counted.
+async fn missed_json(
+    reads: &Reads,
+    store: &Store,
+    who: &Principal,
+    missed: Vec<(usize, search::Miss)>,
+    terms: usize,
+    valid_at: Option<i64>,
+) -> Result<Vec<Value>> {
+    let mut at: HashMap<String, usize> = HashMap::new();
+    let mut misses = vec![];
+    for (i, m) in missed {
+        if at.contains_key(&m.hit.fact.fact_id) {
+            continue;
+        }
+        at.insert(m.hit.fact.fact_id.clone(), i);
+        misses.push(m);
+    }
+    let misses = search::bounded(misses);
+    let shown: Vec<&crate::Fact> = misses.iter().map(|m| &m.hit.fact).collect();
+    let marks = reads.marks(store, who, &shown, valid_at, false).await?;
+    Ok(misses
+        .iter()
+        .map(|m| {
+            let f = &m.hit.fact;
+            let mut v = json!({
+                "entity": f.entity, "predicate": f.predicate, "value": f.value,
+                "valid_from": f.valid_from, "valid_to": f.valid_to, "fact_id": f.fact_id,
+                "source_episodes": f.source_episodes, "quote": f.quote,
+                "written_by": m.hit.written_by,
+                "cut": m.cut.name(), "by": m.cut.by(),
+                "explain": why_json(&m.hit, 0, terms),
+            });
+            if reads.fans_out() {
+                v["scope"] = json!(reads.scope_at(at[&f.fact_id]).to_string());
+            }
+            if let Some(mk) = marks.get(&f.fact_id) {
+                v["freshness"] = mk.to_json(&f.predicate);
+            }
+            origin_json(&mut v, m.hit.origin, f.valid_from);
+            v
+        })
+        .collect())
 }
 
 /// A fact's origin in a JSON answer ([`crate::origin`]): `origin`, and for an agent's the `origin_note` a text answer
@@ -10919,6 +11479,7 @@ async fn mcp(
             ok(json!({"tools": tools}))
         }
         "tools/call" => {
+            crate::phases::mark("call");
             let name = req["params"]["name"].as_str().unwrap_or_default();
             // The advice and session tools carry what a person typed: masked before anything reads it.
             let said = matches!(name, "get_advice" | "start_session" | "end_session").then(|| {
@@ -11159,7 +11720,7 @@ async fn mcp(
                         }
                     };
                     match searched {
-                        Ok((hits, next, gone)) => {
+                        Ok((hits, next, gone, missed)) => {
                             let contradicted = gone.len();
                             // A name the search asks about that nothing in memory mentions: say so, so the
                             // reader stops looking rather than reading the nearest matches as an answer.
@@ -11189,11 +11750,15 @@ async fn mcp(
                             let plain = missing.is_empty()
                                 && passages.is_empty()
                                 && arrived.is_none()
-                                && contradicted == 0;
+                                && contradicted == 0
+                                && !explain;
                             let v = match (first, plain) {
                                 (true, true) => json!(hits),
                                 (true, false) => {
                                     let mut v = json!({"hits": hits});
+                                    if explain {
+                                        v["missed"] = json!(missed);
+                                    }
                                     if contradicted > 0 {
                                         v["left_out_contradicted"] = json!(contradicted);
                                     }
@@ -11213,6 +11778,9 @@ async fn mcp(
                                 }
                                 _ => {
                                     let mut v = json!({"hits": hits, "cursor": next});
+                                    if explain {
+                                        v["missed"] = json!(missed);
+                                    }
                                     if contradicted > 0 {
                                         v["left_out_contradicted"] = json!(contradicted);
                                     }
@@ -11876,7 +12444,7 @@ fn tools(schema: Option<&crate::query::schema::Schema>) -> Value {
                     "format": {"type": "string", "enum": ["text", "json"], "description": "text (default): results as described above. json: the matching facts one by one, with entity, predicate, value, valid_from (microseconds since epoch), fact_id, the ids of the episodes each cites, score and written_by (extract:<model>, or posted by an agent, a script or an import)"},
                     "offset": {"type": "integer", "description": "Skip this many of the best results (a later page)"},
                     "cursor": {"type": "string", "description": "The cursor a previous page returned: the next page, of the memory as that first page read it"},
-                    "explain": {"type": "boolean", "description": "With format \"json\": also say why each fact ranked where it did (keyword score, words matched, distance in meaning, recency)"},
+                    "explain": {"type": "boolean", "description": "With format \"json\": also say why each fact ranked where it did (its rank, the keyword and meaning signals and each one's part of the score, origin and time scales), and list the best of the facts found but not returned, with why (`missed`)"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Only facts carrying every one of these tags"},
                     "as_of": {"type": "string", "description": "A date (YYYY-MM-DD, the whole day) or RFC 3339 time: search the memory as it stood then (the values that held then, newer facts ranking higher as of then). Default: now, or the connection's as_of"},
                     "start_date": {"type": "string", "description": "A date or time: only facts first stated on or after it"},
@@ -14608,6 +15176,12 @@ fn remembered_by(source: &str) -> Option<&str> {
 
 /// `remember_memory`'s source and body, checked.
 fn remember_args(args: &Value) -> Result<(&str, &str)> {
+    remember_args_as(args, false)
+}
+
+/// [`remember_args`], where `learned` (what a person added in Studio, which `/learn` files) lets the source be the
+/// one the server files that under ([`crate::origin::LEARNED`]): no caller's note may take it.
+fn remember_args_as(args: &Value, learned: bool) -> Result<(&str, &str)> {
     let source = args["source"].as_str().unwrap_or_default().trim();
     let body = args["body"].as_str().unwrap_or_default();
     if source.is_empty() || body.trim().is_empty() {
@@ -14618,6 +15192,7 @@ fn remember_args(args: &Value) -> Result<(&str, &str)> {
     if source
         .get(..9)
         .is_some_and(|s| s.eq_ignore_ascii_case("memstore:"))
+        && !(learned && crate::origin::learned(source))
     {
         return Err(ToolError(format!(
             "source {source:?}: sources under memstore: are AmpUp Memory's own"
@@ -14719,7 +15294,30 @@ async fn commit_remembered(
     who: &Principal,
     args: &Value,
 ) -> Result<(String, String)> {
-    let (source, body) = remember_args(args)?;
+    commit_note(state, store, scope, who, args, false).await
+}
+
+/// [`commit_remembered`] of what a person added in Studio (`/learn`), filed under [`crate::origin::LEARNED`] so it
+/// reads as their own statement, not an agent's note.
+async fn commit_learned(
+    state: &State,
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    args: &Value,
+) -> Result<(String, String)> {
+    commit_note(state, store, scope, who, args, true).await
+}
+
+async fn commit_note(
+    state: &State,
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    args: &Value,
+    learned: bool,
+) -> Result<(String, String)> {
+    let (source, body) = remember_args_as(args, learned)?;
     let (body, _) = redacted_for(store, scope, body).await?;
     let body = body.as_str();
     // What the share pass writes is filed under its own author: no caller writes as it.
@@ -14945,7 +15543,7 @@ async fn ask(session: &Session, store: &Store, who: &Principal, args: &Value) ->
         return Err(ToolError("question is required".into()).into());
     }
     // ask_memory answers from the caller's own scope.
-    let (hits, _, _) = facts(
+    let (hits, _, _, _) = facts(
         &Reads::alone(session.clone()),
         store,
         who,

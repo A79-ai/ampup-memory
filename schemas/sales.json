@@ -1,6 +1,6 @@
 {
   "name": "sales",
-  "version": 1,
+  "version": 2,
   "description": "B2B sales memory: deals, accounts, contacts and reps from the CRM, plus what calls, emails and notes say about them (stakeholders, commitments, objections, competitors, qualification).",
   "types": {
     "deal": {
@@ -97,7 +97,8 @@
       "description": "A to-do in AmpUp or the CRM; its name is the subject. Ids are task:<id>.",
       "predicates": {
         "status": {"type": "enum", "description": "open, completed, dismissed, expired and the like (open enum).", "pending": ["open", "not_started", "in_progress", "waiting"]},
-        "priority": {"type": "enum"},
+        "priority": {"type": "enum", "values": ["low", "medium", "high"], "description": "How urgent the task is. A CRM's own spellings are stored as one of these (Normal as medium, P0 as high).",
+                     "aliases": {"none": "low", "normal": "medium", "urgent": "high", "critical": "high", "p0": "high", "p1": "medium", "p2": "low"}},
         "due": {"type": "timestamp", "plan": true},
         "owner": {"type": "ref", "to": ["rep"]},
         "source": {"type": "string", "description": "Where the task came from, such as AmpUp or hubspot."},

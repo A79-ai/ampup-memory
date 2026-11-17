@@ -1,0 +1,358 @@
+/* "Why this answer" (why.tsx): shown in Ask (the memory browser's styles) and in a trace (Studio's), so it takes
+   whichever set of tokens it sits in, each with the other's name as a fallback. Every rule is under the pages' root,
+   so it outranks the memory browser's reset (`.memory :where(...) { all: revert }`). */
+
+.memory-studio .why {
+  --why-ink: var(--ink, #19191c);
+  --why-muted: var(--muted, var(--faint, #656669));
+  --why-line: var(--line, var(--rule, #e4e3de));
+  --why-surface: var(--surface, var(--sheet, #ffffff));
+  --why-sunken: var(--sunken, var(--rule-soft, #f5f2ec));
+  --why-accent: var(--accent, #c15f3c);
+  --why-kw: #c15f3c;
+  --why-mn: #2e6fa8;
+  --why-warn: var(--warn, #9a6b16);
+  --why-error: var(--error, #b0412b);
+  --why-ok: var(--ok, #2f6b3a);
+  border: 1px solid var(--why-line);
+  border-radius: 10px;
+  background: var(--why-surface);
+  color: var(--why-ink);
+  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.memory-studio .why * {
+  box-sizing: border-box;
+}
+.memory-studio .why a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--why-line);
+  text-underline-offset: 2px;
+}
+.memory-studio .why a:hover {
+  text-decoration-color: currentColor;
+}
+.memory-studio .why-small {
+  font-size: 12px;
+}
+.memory-studio .why-muted {
+  color: var(--why-muted);
+}
+.memory-studio .why-error {
+  color: var(--why-error);
+}
+.memory-studio .why-ok {
+  color: var(--why-ok);
+}
+.memory-studio .why-mono {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.92em;
+}
+.memory-studio .why-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+.memory-studio .why-title {
+  font-weight: 650;
+  font-size: 14px;
+}
+.memory-studio .why-q {
+  margin-top: 2px;
+}
+.memory-studio .why-q-label {
+  color: var(--why-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-right: 4px;
+}
+.memory-studio .why-replay {
+  margin: 8px 0 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--why-sunken);
+  color: var(--why-muted);
+  font-size: 12px;
+}
+.memory-studio .why-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 10px 0 4px;
+  color: var(--why-muted);
+}
+.memory-studio .why-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.memory-studio .why-sw {
+  display: inline-block;
+  width: 10px;
+  height: 8px;
+  border-radius: 2px;
+}
+.memory-studio .why-sw-kw {
+  background: var(--why-kw);
+}
+.memory-studio .why-sw-mn {
+  background: var(--why-mn);
+}
+.memory-studio .why-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.memory-studio .why-item {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  gap: 8px;
+  padding: 9px 0;
+  border-top: 1px solid var(--why-line);
+}
+.memory-studio .why-list > .why-item:first-child {
+  border-top: 0;
+}
+.memory-studio .why-rank {
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  color: var(--why-muted);
+  text-align: right;
+}
+.memory-studio .why-x {
+  color: var(--why-error);
+}
+.memory-studio .why-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.memory-studio .why-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+.memory-studio .why-fact {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.memory-studio .why-entity {
+  font-weight: 600;
+}
+.memory-studio .why-pred {
+  color: var(--why-muted);
+}
+.memory-studio .why-value {
+  font-weight: 550;
+}
+.memory-studio .why-struck .why-value,
+.memory-studio dd.why-struck {
+  text-decoration: line-through;
+  text-decoration-color: var(--why-error);
+}
+.memory-studio .why-struck {
+  color: var(--why-muted);
+}
+.memory-studio .why-quote {
+  color: var(--why-muted);
+  font-style: italic;
+}
+.memory-studio .why-prov {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 0;
+  color: var(--why-muted);
+}
+.memory-studio .why-prov > * + *::before {
+  content: "·";
+  margin: 0 6px;
+  color: var(--why-line);
+}
+.memory-studio .why-reason {
+  color: var(--why-ink);
+}
+.memory-studio .why-tag {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--why-sunken);
+}
+.memory-studio .why-tag-warn {
+  color: var(--why-warn);
+}
+.memory-studio .why-bars {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin-top: 2px;
+}
+.memory-studio .why-bar {
+  display: flex;
+  width: 160px;
+  max-width: 100%;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--why-sunken);
+}
+.memory-studio .why-bar > i {
+  display: block;
+  height: 100%;
+}
+.memory-studio .why-nums {
+  display: inline-flex;
+  gap: 10px;
+  color: var(--why-muted);
+  font-variant-numeric: tabular-nums;
+}
+.memory-studio .why-flags {
+  color: var(--why-warn);
+}
+.memory-studio .why-sub {
+  margin: 12px 0 2px;
+  font-weight: 650;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--why-muted);
+}
+.memory-studio .why-lost .why-item {
+  opacity: 0.92;
+}
+.memory-studio .why-with summary {
+  cursor: pointer;
+  color: var(--why-muted);
+}
+.memory-studio .why-with ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+.memory-studio .why-btn {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--why-line);
+  background: var(--why-surface);
+  color: var(--why-ink);
+  cursor: pointer;
+}
+.memory-studio .why-btn:hover {
+  border-color: var(--why-muted);
+}
+.memory-studio .why-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.memory-studio .why-primary {
+  background: var(--why-ink);
+  border-color: var(--why-ink);
+  color: var(--why-surface);
+}
+.memory-studio .why-quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--why-muted);
+}
+.memory-studio .why-wrong {
+  margin-left: auto;
+  color: var(--why-muted);
+}
+.memory-studio .why-wrong:hover,
+.memory-studio .why-wrong[aria-expanded="true"] {
+  color: var(--why-error);
+  border-color: var(--why-error);
+}
+.memory-studio .why-tail {
+  color: var(--why-muted);
+}
+.memory-studio .why-fix {
+  margin-top: 6px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px dashed var(--why-line);
+  background: var(--why-sunken);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.memory-studio .why-fix-kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 10px;
+  margin: 0;
+}
+.memory-studio .why-fix-kv dt {
+  color: var(--why-muted);
+}
+.memory-studio .why-fix-kv dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.memory-studio .why-fix-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.memory-studio .why-fix-field input {
+  font: inherit;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--why-line);
+  background: var(--why-surface);
+  color: var(--why-ink);
+}
+.memory-studio .why-fix-field input:focus {
+  outline: none;
+  border-color: var(--why-accent);
+}
+.memory-studio .why-fix-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+@media (max-width: 560px) {
+  .memory-studio .why-bar {
+    width: 100%;
+  }
+  .memory-studio .why-wrong {
+    margin-left: 0;
+  }
+}
+
+/* In a trace, beneath the memory read it explains. */
+.memory-studio .st-step-why {
+  margin-top: 8px;
+  max-width: 820px;
+}
+/* In Ask, beneath an arm's answer: one per search the agent made. */
+.memory-studio .why-answer {
+  border-top: 1px solid var(--line, #e4e3de);
+  padding: 10px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.memory-studio .why-answer > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+}
+.memory-studio .why-answer[open] > summary {
+  margin-bottom: 8px;
+}
+.memory-studio .why-answer .why + .why {
+  margin-top: 10px;
+}

@@ -527,6 +527,12 @@ pub async fn status() -> Result<()> {
             Answer::Free => "(not answering)",
         }
     );
+    if let Answer::Ours { .. } = answer {
+        println!(
+            "studio: http://127.0.0.1:{}/studio/ (`ampup-memory studio` opens it)",
+            u.port
+        );
+    }
     println!("data: {}", u.dir.display());
     println!(
         "log: {} (rotated at 20 MB, {LOG_ROTATED} older kept)",
@@ -556,6 +562,64 @@ pub async fn status() -> Result<()> {
             "nothing answers on port {}: `ampup-memory service logs` says why",
             u.port
         ),
+    }
+}
+
+/// `ampup-memory studio`: the local server's Studio, the web page for looking at your memory, opened in a browser.
+/// The server on `port`, else the background service's, else the default port; it must be a `serve --local` one,
+/// the only kind that serves the Studio.
+pub async fn studio(port: Option<u16>) -> Result<()> {
+    let port = port
+        .or_else(|| platform::read().ok().flatten().map(|u| u.port))
+        .unwrap_or(PORT);
+    let url = format!("http://127.0.0.1:{port}/studio/");
+    match probe(port).await {
+        Answer::Ours { .. } => {}
+        Answer::Other => bail!(taken(port)),
+        Answer::Free => bail!(
+            "nothing serves on port {port}: start the local server (`ampup-memory serve --local`, or \
+             `ampup-memory service install` to keep it running), then `ampup-memory studio`"
+        ),
+    }
+    let served = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .no_proxy()
+        .build()?
+        .get(&url)
+        .send()
+        .await
+        // A server that isn't `--local` answers an unknown path too: with its liveness JSON, not a page.
+        .is_ok_and(|r| {
+            r.status().is_success()
+                && r.headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|t| t.starts_with("text/html"))
+        });
+    if !served {
+        bail!(
+            "the AmpUp Memory server on port {port} doesn't serve the Studio: only `ampup-memory serve --local` does"
+        );
+    }
+    println!("{url}");
+    open_browser(&url);
+    Ok(())
+}
+
+/// Opens `url` in the default browser, or says to open it.
+fn open_browser(url: &str) {
+    let opened = if cfg!(target_os = "macos") {
+        Command::new("open").arg(url).status()
+    } else if cfg!(windows) {
+        // Not through cmd.exe, which would read the URL's `&`s as command separators.
+        Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .status()
+    } else {
+        Command::new("xdg-open").arg(url).status()
+    };
+    if !opened.is_ok_and(|s| s.success()) {
+        eprintln!("(couldn't open a browser: open the URL above yourself)");
     }
 }
 

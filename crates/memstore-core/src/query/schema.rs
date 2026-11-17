@@ -21,6 +21,52 @@ use crate::{Episode, Fact};
 pub const NAME: &str = "_name";
 pub const ALIAS: &str = "_alias";
 
+/// The predicates an entity's display name is read from, best first: its display name, a plain `name` (an untyped
+/// or open scope's), then another name it goes by. Nothing domain-specific: a `title` may be a person's job title.
+pub const NAMED_BY: [&str; 3] = [NAME, "name", ALIAS];
+
+/// How an entity reads on a page: a name from its facts, if any names it, and when it was first recorded.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Shown {
+    pub title: Option<String>,
+    /// The earliest `valid_from` among its facts (µs).
+    pub since: i64,
+}
+
+/// Each entity's [`Shown`], from `facts`: the caller passes only facts its reader may read, so a name never comes
+/// from one they can't. Of the names, the best predicate in [`NAMED_BY`], then one that holds now over an ended
+/// one, then the newest. A value that is empty, the id itself, or too long to be a name is not one.
+pub fn display_names<'a>(
+    facts: impl IntoIterator<Item = &'a Fact>,
+    now: i64,
+) -> std::collections::HashMap<String, Shown> {
+    let mut best: std::collections::HashMap<&str, (usize, bool, i64, &str)> = Default::default();
+    let mut out: std::collections::HashMap<String, Shown> = Default::default();
+    for f in facts {
+        let s = out.entry(f.entity.clone()).or_insert(Shown {
+            title: None,
+            since: f.valid_from,
+        });
+        s.since = s.since.min(f.valid_from);
+        let Some(rank) = NAMED_BY.iter().position(|p| *p == f.predicate) else {
+            continue;
+        };
+        let v = f.value.trim();
+        if v.is_empty() || v == f.entity || v.chars().count() > 200 {
+            continue;
+        }
+        let key = (rank, f.valid_to.is_some_and(|t| t <= now), -f.valid_from, v);
+        match best.get(f.entity.as_str()) {
+            Some(b) if *b <= key => {}
+            _ => {
+                best.insert(&f.entity, key);
+                s.title = Some(v.to_string());
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Schema {
@@ -245,6 +291,10 @@ pub struct PredicateDef {
     /// `enum`: the allowed values. Absent means any value (an open enum, such as an org's stages).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
+    /// A closed `enum`: other spellings a source writes, each mapped to one of `values` (`"normal": "medium"`). A
+    /// write is stored as the declared value it names, matched ignoring case like `values` themselves.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
     /// `ref`: the entity types a value may name. Empty means any type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub to: Vec<String>,
@@ -459,6 +509,21 @@ impl Schema {
                     );
                     ensure!(!vs.is_empty(), "predicate {ty}.{p}: empty `values`");
                 }
+                if !pd.aliases.is_empty() {
+                    let Some(vs) = &pd.values else {
+                        bail!("predicate {ty}.{p}: `aliases` is only for an enum with `values`");
+                    };
+                    for (from, to) in &pd.aliases {
+                        ensure!(
+                            !from.trim().is_empty(),
+                            "predicate {ty}.{p}: an empty alias"
+                        );
+                        ensure!(
+                            vs.contains(to),
+                            "predicate {ty}.{p}: alias {from:?} names {to:?}, not one of its values"
+                        );
+                    }
+                }
                 if pd.unit.is_some() {
                     ensure!(
                         pd.value.numeric(),
@@ -597,6 +662,7 @@ impl Schema {
             value: ValueType::String,
             card,
             values: None,
+            aliases: BTreeMap::new(),
             to: vec![],
             unit: None,
             part_of: false,
@@ -736,12 +802,23 @@ impl Schema {
             }
             ValueType::Enum => {
                 if let Some(vs) = &pd.values {
-                    ensure!(
-                        vs.contains(&f.value),
-                        "{}: not one of {}",
-                        what(),
-                        vs.join(", ")
-                    );
+                    // A closed enum stores one of its values: as written, else the value or alias it names
+                    // ignoring case and surrounding space (`HIGH`, `Normal`).
+                    let said = f.value.trim();
+                    let found = vs
+                        .iter()
+                        .find(|v| *v == said)
+                        .or_else(|| vs.iter().find(|v| v.eq_ignore_ascii_case(said)))
+                        .or_else(|| {
+                            pd.aliases
+                                .iter()
+                                .find(|(a, _)| a.trim().eq_ignore_ascii_case(said))
+                                .map(|(_, v)| v)
+                        });
+                    let Some(v) = found else {
+                        bail!("{}: not one of {}", what(), vs.join(", "));
+                    };
+                    f.value = v.clone();
                 }
             }
             ValueType::Number | ValueType::Money => {
@@ -790,8 +867,8 @@ impl Schema {
     /// the typed columns and the type they were written with, so a change that reads them
     /// differently (a new value type, cardinality, unit or id rule, a narrower enum or ref, a
     /// removed type or predicate) silently changes answers. Additive changes (new types and
-    /// predicates, more enum values, an enum opened, a ref widened, descriptions, a `list` mark, strict to
-    /// open) return nothing.
+    /// predicates, more enum values, an enum opened, a ref widened, descriptions, a `list` mark, an enum's
+    /// `aliases`, strict to open) return nothing.
     pub fn breaking_changes(&self, old: &Schema) -> Vec<String> {
         let mut out = vec![];
         if self.name != old.name {
@@ -851,6 +928,44 @@ impl Schema {
                     (false, false) => op.to.iter().any(|t| !np.to.contains(t)),
                 };
                 if narrowed {
+                    out.push(format!("{ty}.{p} ref to {:?} -> {:?}", op.to, np.to));
+                }
+            }
+        }
+        out
+    }
+
+    /// What moving from `old` to this schema adds, which [`Schema::breaking_changes`] leaves out: new types and
+    /// predicates, new enum values, an enum opened, a ref widened, strict to open. With the breaking ones, what a
+    /// reviewer of a schema change reads instead of the whole schema.
+    pub fn additions(&self, old: &Schema) -> Vec<String> {
+        let mut out = vec![];
+        if self.mode == Mode::Open && old.mode == Mode::Strict {
+            out.push("mode strict -> open".into());
+        }
+        for (ty, nd) in &self.types {
+            let Some(od) = old.types.get(ty) else {
+                out.push(format!("type {ty} added"));
+                continue;
+            };
+            for (p, np) in &nd.predicates {
+                let Some(op) = od.predicates.get(p) else {
+                    out.push(format!("{ty}.{p} added"));
+                    continue;
+                };
+                match (&op.values, &np.values) {
+                    (Some(_), None) => out.push(format!("{ty}.{p} enum opened")),
+                    (Some(ov), Some(nv)) => {
+                        let new: Vec<&String> = nv.iter().filter(|v| !ov.contains(v)).collect();
+                        if !new.is_empty() {
+                            out.push(format!("{ty}.{p} enum values added: {new:?}"));
+                        }
+                    }
+                    _ => {}
+                }
+                let widened = !op.to.is_empty()
+                    && (np.to.is_empty() || np.to.iter().any(|t| !op.to.contains(t)));
+                if widened {
                     out.push(format!("{ty}.{p} ref to {:?} -> {:?}", op.to, np.to));
                 }
             }

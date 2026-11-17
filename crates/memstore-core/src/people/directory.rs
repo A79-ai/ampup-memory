@@ -865,6 +865,11 @@ pub struct SignIn {
     /// A recorder key acting for the member this names (`x-memstore-as`): what it records is the key's account of
     /// the member's work, never the member's own words, so nothing is kept as theirs from it (`memstore::keep`).
     pub recorded: bool,
+    /// The one caller of a `serve --local` server, which owns the data directory it serves: the admin of this org
+    /// (the one it serves), as if the directory said so, and of no other. The directory holds no such org: a
+    /// local store has no people to list, so its settings stay the defaults and nobody else is a member. Only
+    /// the server sets it, for its fixed caller on a loopback-only server; nothing a request says sets it.
+    pub local_admin: Option<String>,
 }
 
 impl SignIn {
@@ -2110,6 +2115,13 @@ impl Directory {
     /// domains and (through its own provider) groups give them. Orgs their provider doesn't vouch for, and
     /// orgs that require their own provider when they signed in through another, give them nothing.
     pub fn access(&self, user: &str, via: &SignIn) -> BTreeMap<String, Access> {
+        if let Some(org) = &via.local_admin {
+            let admin = Access {
+                role: Role::Admin,
+                teams: BTreeSet::new(),
+            };
+            return BTreeMap::from([(org.clone(), admin)]);
+        }
         let user = user_id(user);
         let mut out = BTreeMap::new();
         if let Some(k) = &via.key {

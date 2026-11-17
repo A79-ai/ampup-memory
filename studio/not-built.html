@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AmpUp Memory Studio</title>
+</head>
+<body>
+<h1>AmpUp Memory Studio</h1>
+<p>This <code>ampup-memory</code> was built without the Studio, the web page for looking at your memory.
+The server works as it is; only this page is missing.</p>
+<p>To build it in, from the repository's root (it needs Node.js), then build the binary again:</p>
+<pre>npm --prefix studio ci &amp;&amp; npm --prefix studio run build
+cargo build --release --bin ampup-memory</pre>
+<p>The released binaries carry the Studio already.</p>
+</body>
+</html>
