@@ -314,6 +314,10 @@ pub async fn dream_step(store: &Store, scope: &Scope, budget: Duration) -> Resul
     if !crate::dream::internal_scheduler()? {
         return Ok(json!({"result":"external_scheduler"}));
     }
+    // Its org may ask no model now (`crate::limits`): dreamed on a later night.
+    if crate::limits::paused(scope.org_name()) {
+        return Ok(json!({"result": "paused_by_org_limits"}));
+    }
     let on = crate::dream::On::from_env().is_some_and(|on| on.covers(scope));
     let ex = crate::extract::Extractor::dream_from_env()?;
     match (on, ex) {

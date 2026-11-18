@@ -35,6 +35,9 @@ pub struct Authorization {
     verified_email: bool,
     auth0: bool,
     auth0_org: Option<String>,
+    /// The sign-in passed a second factor: what an org that requires one takes (`Settings::require_mfa`).
+    #[serde(default)]
+    mfa: bool,
     /// An unverified password sign-in's Auth0 account: the job reaches only what an approval let it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unverified: Option<String>,
@@ -52,6 +55,7 @@ impl Authorization {
             verified_email: via.verified_email,
             auth0: via.auth0,
             auth0_org: via.auth0_org.clone(),
+            mfa: via.mfa,
             unverified: via.unverified.clone(),
         }
     }
@@ -73,6 +77,7 @@ impl Authorization {
             verified_email: self.verified_email,
             auth0: self.auth0,
             auth0_org: self.auth0_org.clone(),
+            mfa: self.mfa,
             unverified: self.unverified.clone(),
             ..Default::default()
         };
@@ -638,7 +643,14 @@ pub async fn worker(
     let deadline = chrono::Utc::now() + chrono::Duration::seconds(3900);
     let turn = Turn::acquire(store, &format!("dream-worker:{scope}:{id}"), deadline).await?;
     let writing = turn.store(store);
-    let result = async {
+    // The worker's model calls count against the org with every server's, and are held to its limits as theirs are.
+    let every = std::env::var("AMPUP_MEMORY_USAGE_PERSIST_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(Duration::from_secs(30), |s: u64| {
+            Duration::from_secs(s.max(5))
+        });
+    let result = crate::server::standalone(store, scope.org_name(), "dream-job", every, async {
         // Catalog-level access is operator authority. Restore only the identity approved in the record.
         writing.invalidate(crate::SYSTEM_NS, "ledger");
         writing.invalidate(&scope.namespace(), crate::QA_LOG);
@@ -695,7 +707,7 @@ pub async fn worker(
             }
         };
         tokio::select! { result = work => result, result = monitor => result }
-    }.await;
+    }).await;
     turn.finish(&writing).await;
     result
 }

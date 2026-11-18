@@ -44,7 +44,7 @@ This plugin connects Claude Code to AmpUp Memory. Each session starts with what 
   memory, which only you read, so a repo you don't trust can't put its instructions in your teammates' sessions.
   A file is sent again only when it changed. The server turns them into facts even where nothing else is
   extracted, so your first sessions already recall something.
-- **Commands.** `/ampup-memory:login [<server>] [--org <org>]` signs in, `+` or `-` (or `/ampup-memory:good [why]`, `/ampup-memory:bad [why]`, `/ampup-memory:outcome good|bad [why]`) rates the session, `/ampup-memory:remember <text>` remembers a note, `/ampup-memory:search <words>` searches the memory, `/ampup-memory:brief <name> [refresh]` says where something stands from its summary, `/ampup-memory:forget <episode id or words>` forgets something you remembered, and `/ampup-memory:status` (`ampup-memory doctor` in a terminal) says whether the memory works here: where it is and whether it's up, who you're calling as and until when, the org, what the memory runs there (extraction, advice learning and its evidence bar), and how the last hook went, with any warning it had.
+- **Commands.** `/ampup-memory:login [<server>] [--org <org>] [--create-org]` signs in, `+` or `-` (or `/ampup-memory:good [why]`, `/ampup-memory:bad [why]`, `/ampup-memory:outcome good|bad [why]`) rates the session, `/ampup-memory:remember <text>` remembers a note, `/ampup-memory:search <words>` searches the memory, `/ampup-memory:brief <name> [refresh]` says where something stands from its summary, `/ampup-memory:forget <episode id or words>` forgets something you remembered, and `/ampup-memory:status` (`ampup-memory doctor` in a terminal) says whether the memory works here: where it is and whether it's up, who you're calling as and until when, the org, what the memory runs there (extraction, advice learning and its evidence bar), and how the last hook went, with any warning it had.
 - **Tools.** The AmpUp Memory MCP server's tools are available to Claude: by default `start_session`, `get_advice`, `end_session`, `search_memory`, `get_episode`, `remember_memory` and `forget_memory`, plus `get_brief` and `list_briefs` where the schema summarises its subjects, and the rest with `AMPUP_MEMORY_MCP_TOOLS=all` on the server.
 
 Words that look like secrets are redacted from everything the hooks send: notes, session traces, transcripts, prompts and outcomes. That covers known key prefixes, JWTs, long random-looking strings, and the value of `password=`, `token:` and the like, including inside JSON and YAML.
@@ -76,7 +76,10 @@ never waits on a download. The MCP server and the commands install it first and 
 the CLI renews the sign-in. The server then says which orgs hold you: one, and you're in it; several, and
 `/ampup-memory:login --org <org>` names one; none yet, and `/ampup-memory:login --org <org>` asks to join that org: its admins
 are emailed a link that approves you (or they run `ampup-memory requests` and `ampup-memory invite`), and the next
-`/ampup-memory:login` gets in. With no server named it signs in to `AMPUP_MEMORY_URL`; with neither, it says the memory is the local server, which
+`/ampup-memory:login` gets in. Or, in none yet on a server that offers sign-up, make your own org:
+`/ampup-memory:login --create-org` (`ampup-memory-client join <server> --create-org`, which a terminal also offers
+without the flag). It takes a Google or GitHub sign-in whose email the provider verified; the org is yours, you its
+admin, and the CLI carries on signed in to it. With no server named it signs in to `AMPUP_MEMORY_URL`; with neither, it says the memory is the local server, which
 needs no sign-in. `AMPUP_MEMORY_ORG` names the org for everyone. An organization can set the server and org for everyone, together with
 the plugin itself, in Claude Code's managed settings:
 

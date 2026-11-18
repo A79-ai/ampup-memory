@@ -210,8 +210,14 @@ impl Decider {
             let batch: Vec<(String, Question)> =
                 questions.by_ref().take(QUESTIONS_PER_REQUEST).collect();
             let body = self.request(state, batch);
+            // Not for an org past its model allowance or its expiry (`crate::limits`): the question waits.
+            crate::extract::model_gate()?;
             let started = std::time::Instant::now();
             let v = self.send(&body).await?;
+            crate::limits::count(
+                v["usage"]["prompt_tokens"].as_u64().unwrap_or_default()
+                    + v["usage"]["completion_tokens"].as_u64().unwrap_or_default(),
+            );
             let latency_ms = started.elapsed().as_millis() as u64;
             // OpenRouter answers by name; OpenAI in a list, each naming its question.
             let answers: Vec<(String, &Value)> = match &v["answers"] {

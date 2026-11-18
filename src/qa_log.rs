@@ -21,7 +21,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    Ledger, MAIN, OnConflict, Principal, QA_LOG, Scope, Store, View, append, now_micros,
+    Ledger, MAIN, OnConflict, Principal, QA_LOG, Scope, Store, View, appended, now_micros,
     optional_f64, optional_strings, split_list, strings, timestamps, ts,
 };
 
@@ -706,6 +706,7 @@ pub async fn list(store: &Store, scope: &Scope, goal: Option<&str>) -> Result<Ve
     // Main's last state may serve while the next is built: what was recorded since comes with it, so an entry
     // logged a moment ago is listed, and nothing taken away is.
     let view = store.lagging_view(scope, MAIN).await?;
+    crate::phases::mark("qa_log view");
     let rows = store.side_rows(&scope.namespace(), QA_LOG).await?;
     let decoded = decoded(scope, rows);
     Ok(newest(&view, &decoded, goal))
@@ -986,7 +987,8 @@ impl StoreQaLog for Store {
         };
         let sp =
             |l: &Logged, f: &dyn Fn(&SessionPart) -> Option<String>| l.session.as_ref().and_then(f);
-        append(
+        let before = self.generation(&ns, QA_LOG);
+        let after = appended(
             &*self.catalog(),
             &table,
             vec![
@@ -1069,7 +1071,9 @@ impl StoreQaLog for Store {
             OnConflict::Recommit,
         )
         .await?;
-        self.invalidate(&ns, QA_LOG);
+        // The session log is read at every session's step: the rows just written are cached here, not read back
+        // from the catalog by the next step.
+        self.wrote(&ns, QA_LOG, after, before).await;
         self.append_ledger(
             &id,
             scope,

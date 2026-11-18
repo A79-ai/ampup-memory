@@ -37,6 +37,10 @@
 //!   there it is refused with no restart and never imported again; the others stay the file's, reported by id;
 //! - sign-in discovery names the server's configured URL, never the request's `Host`, and a server with
 //!   sign-in won't start beyond this machine without one.
+//! - a provisioner key (a sign-up service's) creates an org, binds it to its Auth0 Organization once, mints it an
+//!   ingest key, sets any org's limits and reads back the orgs it created, and does nothing else: no deleting,
+//!   no other org, no existing name, no other key role, no members, settings or schema, and no route but
+//!   `/admin`; an org's own admin can't set its limits.
 
 use std::time::{Duration, Instant};
 
@@ -57,6 +61,10 @@ const BOB_FILE_KEY: &str = "msk_file_key_in_bobs_name_for_the_review";
 const CAROL_FILE_KEY: &str = "msk_file_key_in_carols_name_for_the_review";
 const DAN_FILE_KEY: &str = "msk_file_key_in_dans_name_for_the_review";
 const ERIN_FILE_KEY: &str = "msk_file_key_in_erins_name_for_the_review";
+/// The keys file's provisioner key: a sign-up service creating orgs for the people who sign up.
+const PROVISIONER_KEY: &str = "msk_provisioner_key_for_the_security_review";
+/// Another sign-up service's provisioner key.
+const OTHER_PROVISIONER_KEY: &str = "msk_another_provisioner_key_for_the_review";
 /// The app's JWTs (`AMPUP_MEMORY_JWT_SECRET`): its users' identity, passed on.
 const APP_SECRET: &str = "the-app-jwt-secret-for-the-security-review";
 const APP_ISSUER: &str = "https://app.example";
@@ -228,6 +236,8 @@ fn keys_file_rows() -> Value {
         {"id": "carolfile", "sha256": sha(CAROL_FILE_KEY), "user": "carol@acme.com"},
         {"id": "danfile", "sha256": sha(DAN_FILE_KEY), "user": "dan@acme.com"},
         {"id": "erinfile", "sha256": sha(ERIN_FILE_KEY), "user": "erin@acme.com"},
+        {"id": "signup", "sha256": sha(PROVISIONER_KEY), "user": "svc:signup", "provisioner": true},
+        {"id": "signup2", "sha256": sha(OTHER_PROVISIONER_KEY), "user": "svc:signup2", "provisioner": true},
     ])
 }
 
@@ -414,6 +424,172 @@ async fn a_file_key_in_an_org_admin_s_name_reads_and_manages_nothing_of_the_org(
 
     // Alice herself, signed in as a person, still runs her org.
     let (status, body) = post(&s, "/admin", &alice, &changes[0]).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provisioner_key_sets_up_only_the_orgs_it_creates() {
+    let (s, issuer, _dir) = start().await;
+    let admin = |change: Value| {
+        let s = s.clone();
+        async move { post(&s, "/admin", PROVISIONER_KEY, &change).await }
+    };
+    let ingest = format!("msk_{}signup", uuid::Uuid::new_v4().simple());
+
+    // What it is for: a new org for someone who signed up, bound to their Auth0 Organization, an ingest key,
+    // limits, and the org read back.
+    for change in [
+        json!({"op": "create_org", "org": "trial", "admin": "pat@example.com"}),
+        json!({"op": "set_auth0_org", "org": "trial", "auth0_org": "org_trial"}),
+        json!({"op": "create_key", "org": "trial", "name": "ingest", "role": "ingest", "key": ingest}),
+        json!({"op": "set_limits", "org": "trial", "max_episodes": 1000,
+               "monthly_model_tokens": 2000000, "expires_at": "2099-01-01T00:00:00Z"}),
+    ] {
+        let (status, body) = admin(change.clone()).await;
+        assert_eq!(status, 200, "{change}: {body}");
+    }
+    let (status, shown) = admin(json!({"op": "show", "org": "trial"})).await;
+    assert_eq!(status, 200, "{shown}");
+    assert_eq!(shown["view"]["created_by"], "provisioner:signup", "{shown}");
+    assert_eq!(
+        shown["limits"],
+        json!({"monthly_model_tokens": 2000000, "max_episodes": 1000, "expires_at": "2099-01-01T00:00:00Z"}),
+        "{shown}"
+    );
+    assert_eq!(shown["usage"]["model_tokens"], 0, "{shown}");
+    // An omitted limit is unchanged, a null one removed.
+    let (status, body) =
+        admin(json!({"op": "set_limits", "org": "trial", "expires_at": null})).await;
+    assert_eq!(status, 200, "{body}");
+    let (_, shown) = admin(json!({"op": "show", "org": "trial"})).await;
+    assert_eq!(shown["limits"]["expires_at"], Value::Null, "{shown}");
+    assert_eq!(shown["limits"]["max_episodes"], 1000, "{shown}");
+    // An org bound to its Auth0 Organization as it is created is the provisioner's too.
+    let (status, body) = admin(json!({"op": "create_org", "org": "trial2",
+        "admin": "sam@example.com", "auth0_org": "org_trial2"}))
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, shown) = admin(json!({"op": "show", "org": "trial2"})).await;
+    assert_eq!(status, 200, "{shown}");
+    assert_eq!(shown["view"]["created_by"], "provisioner:signup", "{shown}");
+    assert_eq!(shown["view"]["auth0_org"], "org_trial2", "{shown}");
+    // It sets any org's limits (moving an org between plans), not only its own.
+    let (status, body) =
+        admin(json!({"op": "set_limits", "org": "acme", "max_episodes": 50})).await;
+    assert_eq!(status, 200, "{body}");
+
+    // Everything else is refused. Each would let a sign-up service reach beyond the orgs it set up: an org that
+    // exists already, another org's keys or binding, a key that reads or writes, people, settings, the schema,
+    // an org gone.
+    let other = format!("msk_{}other", uuid::Uuid::new_v4().simple());
+    for change in [
+        json!({"op": "create_org", "org": "acme", "admin": "mallory@evil.com"}),
+        json!({"op": "delete_org", "org": "trial"}),
+        json!({"op": "set_auth0_org", "org": "trial", "auth0_org": "org_other"}),
+        json!({"op": "set_auth0_org", "org": "trial", "auth0_org": null}),
+        json!({"op": "set_auth0_org", "org": "acme", "auth0_org": "org_acme"}),
+        json!({"op": "create_key", "org": "acme", "name": "ingest", "role": "ingest", "key": other}),
+        json!({"op": "create_key", "org": "trial", "name": "w", "role": "writer", "key": other}),
+        json!({"op": "create_key", "org": "trial", "name": "r", "role": "reader", "key": other}),
+        json!({"op": "create_key", "org": "trial", "name": "d", "role": "directory", "key": other}),
+        json!({"op": "revoke_key", "org": "trial", "name": "ingest"}),
+        json!({"op": "invite", "org": "trial", "members": [{"user": "mallory@evil.com", "role": "admin"}]}),
+        json!({"op": "add_member", "org": "trial", "user": "mallory@evil.com", "role": "admin"}),
+        json!({"op": "remove_member", "org": "trial", "user": "pat@example.com"}),
+        json!({"op": "set_settings", "org": "trial", "settings": {}}),
+        json!({"op": "set_schema", "org": "trial", "schema": "sales"}),
+        json!({"op": "set_provider", "org": "trial", "provider": {"kind": "oidc", "issuer": issuer,
+               "client_ids": ["evil-cli"], "required": true}}),
+        json!({"op": "show", "org": "acme"}),
+        json!({"op": "show"}),
+    ] {
+        let (status, body) = admin(change.clone()).await;
+        assert_eq!(status, 403, "{change}: {body}");
+    }
+    // Another provisioner key sets up only its own orgs, not this one's; it sets limits, as on any org.
+    let (status, body) =
+        admin(json!({"op": "create_org", "org": "trial4", "admin": "kim@example.com"})).await;
+    assert_eq!(status, 200, "{body}");
+    for change in [
+        json!({"op": "set_auth0_org", "org": "trial4", "auth0_org": "org_theirs"}),
+        json!({"op": "create_key", "org": "trial", "name": "theirs", "role": "ingest", "key": other}),
+        json!({"op": "show", "org": "trial"}),
+    ] {
+        let (status, body) = post(&s, "/admin", OTHER_PROVISIONER_KEY, &change).await;
+        assert_eq!(status, 403, "{change}: {body}");
+    }
+    let (status, body) = post(
+        &s,
+        "/admin",
+        OTHER_PROVISIONER_KEY,
+        &json!({"op": "set_limits", "org": "trial", "max_episodes": 1000}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // Nothing of the default org's, limits included.
+    let (status, body) =
+        admin(json!({"op": "set_limits", "org": "default", "max_episodes": 1})).await;
+    assert_eq!(status, 403, "{body}");
+    // A provisioner key's row is never imported as an org's key, even by the operator.
+    let signup = keys_file_rows()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "signup")
+        .unwrap()
+        .clone();
+    let (status, body) = post(
+        &s,
+        "/admin",
+        ADMIN_KEY,
+        &json!({"op": "import_keys", "org": "trial", "role": "ingest", "keys": [signup]}),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("provisioner key"),
+        "{body}"
+    );
+    // An org's admin must be a person's plain email.
+    let (status, body) = admin(json!({"op": "create_org", "org": "trial3"})).await;
+    assert_eq!(status, 400, "{body}");
+    // No route but /admin.
+    for path in ["/me", "/search", "/ingest?org=trial", "/mcp"] {
+        let (status, body) = post(&s, path, PROVISIONER_KEY, &json!({})).await;
+        assert_eq!(status, 403, "{path}: {body}");
+    }
+    let (_, view) = post(
+        &s,
+        "/admin",
+        ADMIN_KEY,
+        &json!({"op": "show", "org": "trial"}),
+    )
+    .await;
+    let view = view["view"].clone();
+    assert_eq!(view["auth0_org"], "org_trial", "{view}");
+    assert!(view["members"].get("mallory@evil.com").is_none(), "{view}");
+    assert!(view["keys"].get("w").is_none(), "{view}");
+
+    // An org's own admin doesn't set its limits, nor does a file key in their name; the operator does.
+    let alice = id_token(&issuer, "alice@acme.com");
+    let limit = json!({"op": "set_limits", "org": "acme", "max_episodes": null});
+    for bearer in [alice.as_str(), ALICE_FILE_KEY] {
+        let (status, body) = post(&s, "/admin", bearer, &limit).await;
+        assert_eq!(status, 403, "{body}");
+    }
+    // Nor through its settings, which share the change limits are written as.
+    let lift = json!({"op": "set_settings", "org": "acme",
+        "settings": {"limits": {"max_episodes": null}}});
+    let _ = post(&s, "/admin", &alice, &lift).await;
+    let (_, shown) = post(
+        &s,
+        "/admin",
+        ADMIN_KEY,
+        &json!({"op": "show", "org": "acme"}),
+    )
+    .await;
+    assert_eq!(shown["limits"]["max_episodes"], 50, "{shown}");
+    let (status, body) = post(&s, "/admin", ADMIN_KEY, &limit).await;
     assert_eq!(status, 200, "{body}");
 }
 

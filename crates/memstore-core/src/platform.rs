@@ -1268,6 +1268,10 @@ pub async fn bigquery_dml(sql: &str, params: &[(&str, &str, serde_json::Value)])
 
 /// GCP: one Gemini completion through Vertex AI, as the engine's service account (roles/aiplatform.user).
 pub async fn gemini(model: &str, prompt: &str) -> Result<String> {
+    // Not for an org past its model allowance or its expiry (`crate::limits`).
+    if let Some(l) = crate::limits::model_gate(crate::log_org::current().as_deref()) {
+        return Err(l.into());
+    }
     let project = env("GCP_PROJECT")?;
     let resp = reqwest::Client::new()
         .post(format!(
@@ -1283,6 +1287,11 @@ pub async fn gemini(model: &str, prompt: &str) -> Result<String> {
         status.is_success(),
         "Vertex AI: HTTP {status} {}",
         out["error"]["message"]
+    );
+    crate::limits::count(
+        out["usageMetadata"]["totalTokenCount"]
+            .as_u64()
+            .unwrap_or(0),
     );
     Ok(out["candidates"][0]["content"]["parts"]
         .as_array()

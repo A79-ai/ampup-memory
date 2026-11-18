@@ -373,7 +373,7 @@ async fn read_scope(
             };
             if !fresh.is_empty() {
                 let (store, scope) = (store.clone(), session.scope().clone());
-                tokio::spawn(async move { read_bodies(store, scope, fresh).await });
+                crate::log_org::spawn(async move { read_bodies(store, scope, fresh).await });
             }
             continue;
         }

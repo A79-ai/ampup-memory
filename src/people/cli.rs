@@ -74,6 +74,9 @@ pub enum PeopleCmd {
         /// Sign in to the org's own Auth0 Organization (its enterprise connection) rather than as yourself
         #[arg(long)]
         sso: bool,
+        /// In no org yet: make your own, where the server offers sign-up, without asking first
+        #[arg(long)]
+        create_org: bool,
     },
     /// Set this machine up for a team's memory in one go: sign in (as `join`, unless already signed in to that
     /// org there), then install memstore in every coding agent found here (Claude Code's plugin; the hooks and
@@ -991,7 +994,18 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             team,
             no_browser,
             sso,
-        } => join(server, org.as_deref(), team.as_deref(), *no_browser, *sso).await?,
+            create_org,
+        } => {
+            join(
+                server,
+                org.as_deref(),
+                team.as_deref(),
+                *no_browser,
+                *sso,
+                *create_org,
+            )
+            .await?
+        }
         PeopleCmd::Setup {
             server,
             org,
@@ -1239,6 +1253,9 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 auto_review: *auto_review,
                 pii: *pii,
                 digest: *digest,
+                // Which sign-ins the org takes: the control plane's to set, with its own (`/admin set_settings`).
+                require_mfa: None,
+                require_sso: None,
             };
             if settings.is_empty() {
                 let view = to.view(Some(org)).await?;
@@ -2068,8 +2085,9 @@ async fn join(
     team: Option<&str>,
     no_browser: bool,
     sso: bool,
+    create_org: bool,
 ) -> Result<()> {
-    client::join(server, org, team, no_browser, sso).await
+    client::join(server, org, team, no_browser, sso, create_org).await
 }
 
 /// `memstore setup`: sign in unless already signed in to `org` on `server`, install memstore in each coding agent
@@ -2118,7 +2136,7 @@ async fn set_up_machine(
             config.save()?;
             println!("Signed in to {server} already; switched to context {name}");
         }
-        (false, false) => join(server, org, team, no_browser, false).await?,
+        (false, false) => join(server, org, team, no_browser, false, false).await?,
     }
     let lead = if dry { "would change" } else { "changed" };
     for h in &agents {

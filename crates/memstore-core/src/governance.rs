@@ -633,13 +633,56 @@ pub(crate) fn table_schema() -> Result<Schema> {
     ])
 }
 
+/// The tables one publication check has read, by namespace and name ([`Store::governance_rows`]).
+type CheckRows = std::sync::Mutex<HashMap<(String, String), Arc<Vec<RecordBatch>>>>;
+
+tokio::task_local! {
+    /// Set for the length of one publication check ([`Store::publications_untouched`],
+    /// [`Store::authorize_publication`]).
+    static CHECK_ROWS: CheckRows;
+}
+
 impl Store {
-    /// Publication checks cannot use an eventually refreshed table or a cached "missing" result.
+    /// Publication checks cannot use an eventually refreshed table or a cached "missing" result: each reads the
+    /// table as the catalog holds it now ([`Store::side_rows_now`]), while other readers keep the cached rows.
+    /// Within one check a table is read once: the open proposals' check (`moved_past`) and the commits' own
+    /// (`governance_impact`) share it, rather than each paying a catalog round trip inside the ledger's
+    /// compare-and-set. A check tried again after a lost compare-and-set reads them all again.
     async fn governance_rows(&self, scope: &Scope, name: &str) -> Result<Arc<Vec<RecordBatch>>> {
-        let ns = scope.namespace();
-        self.forget_missing(&ns, name);
-        self.invalidate(&ns, name);
-        self.side_rows(&ns, name).await
+        let key = (scope.namespace(), name.to_string());
+        let read = CHECK_ROWS
+            .try_with(|m| m.lock().unwrap().get(&key).cloned())
+            .ok()
+            .flatten();
+        if let Some(rows) = read {
+            return Ok(rows);
+        }
+        let rows = self.side_rows_now(&key.0, name).await?;
+        let _ = CHECK_ROWS.try_with(|m| m.lock().unwrap().insert(key, rows.clone()));
+        Ok(rows)
+    }
+
+    /// A publication check's state ([`Store::governance_state`]), with every table the check reads loaded at once:
+    /// the governance events first, then, when the scope has owners, the rest together, so the open proposals'
+    /// check and the commits' own read them from this one round trip. Without owners nothing more is loaded.
+    async fn check_state(&self, scope: &Scope, ledger: &Ledger) -> Result<State> {
+        let rows = self.governance_rows(scope, TABLE).await?;
+        if !fold(&rows, ledger)?.owners.is_empty() {
+            futures::future::try_join_all(
+                [
+                    EPISODES,
+                    CLOSURES,
+                    AGGREGATES,
+                    QUOTES,
+                    RETRACTIONS,
+                    SCHEMAS,
+                    FACTS,
+                ]
+                .map(|t| self.governance_rows(scope, t)),
+            )
+            .await?;
+        }
+        self.governance_state(scope, ledger).await
     }
 
     async fn governance_state(&self, scope: &Scope, ledger: &Ledger) -> Result<State> {
@@ -683,11 +726,16 @@ impl Store {
         };
         // Read on the columns as stored, never decoded whole: a busy scope's facts table is hundreds of thousands
         // of rows, read on every list of proposals.
-        let facts = self.governance_rows(scope, FACTS).await?;
-        let mut side = Vec::new();
-        for table in [CLOSURES, QUOTES, RETRACTIONS, EPISODES, SCHEMAS] {
-            side.push((table, self.governance_rows(scope, table).await?));
-        }
+        // All at once, as `governance_impact` reads them: each is a catalog round trip, inside the ledger's
+        // compare-and-set.
+        let (facts, side) = futures::try_join!(
+            self.governance_rows(scope, FACTS),
+            futures::future::try_join_all([CLOSURES, QUOTES, RETRACTIONS, EPISODES, SCHEMAS].map(
+                |table| async move {
+                    Ok::<_, anyhow::Error>((table, self.governance_rows(scope, table).await?))
+                }
+            )),
+        )?;
         let text = |b: &RecordBatch, name: &str| -> Option<StringArray> {
             b.column_by_name(name)
                 .and_then(|c| c.as_string_opt::<i32>())
@@ -2979,7 +3027,21 @@ impl Store {
         ids: &[String],
         ledger: &Ledger,
     ) -> Result<bool> {
-        let state = self.governance_state(scope, ledger).await?;
+        CHECK_ROWS
+            .scope(
+                CheckRows::default(),
+                self.publications_untouched_once(scope, ids, ledger),
+            )
+            .await
+    }
+
+    async fn publications_untouched_once(
+        &self,
+        scope: &Scope,
+        ids: &[String],
+        ledger: &Ledger,
+    ) -> Result<bool> {
+        let state = self.check_state(scope, ledger).await?;
         if state.owners.is_empty() {
             return Ok(true);
         }
@@ -3005,7 +3067,22 @@ impl Store {
         parents: &[String],
         ledger: &Ledger,
     ) -> Result<()> {
-        let state = self.governance_state(scope, ledger).await?;
+        CHECK_ROWS
+            .scope(
+                CheckRows::default(),
+                self.authorize_publication_once(scope, commit, parents, ledger),
+            )
+            .await
+    }
+
+    async fn authorize_publication_once(
+        &self,
+        scope: &Scope,
+        commit: &str,
+        parents: &[String],
+        ledger: &Ledger,
+    ) -> Result<()> {
+        let state = self.check_state(scope, ledger).await?;
         if state.owners.is_empty() {
             return Ok(());
         }

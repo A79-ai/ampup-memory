@@ -857,7 +857,8 @@ async fn standing(
 /// After `author` wrote a note in `scope`: their profile is folded once [`FOLD_AT`] notes are new to it. Runs on
 /// after the write answers (a moment later, so the note is in what the store reads), never failing it.
 pub fn noted(store: Store, scope: Scope, author: String, one_caller: bool) {
-    tokio::spawn(async move {
+    let org = scope.org_name().map(str::to_string);
+    tokio::spawn(crate::log_org::with(org.as_deref(), async move {
         tokio::time::sleep(Duration::from_secs(2)).await;
         if !on(&store, &scope).await {
             return;
@@ -880,7 +881,7 @@ pub fn noted(store: Store, scope: Scope, author: String, one_caller: bool) {
             Ok(false) => {}
             Err(e) => eprintln!("profile {scope}: reading what is new to a profile failed: {e:#}"),
         }
-    });
+    }));
 }
 
 /// The profiles in `scope` that are due, folded (at most [`SWEEP_FOLDS`] per pass; the server's session sweep makes

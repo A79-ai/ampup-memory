@@ -45,6 +45,7 @@ mod purpose;
 pub mod ratelimit;
 mod reads;
 mod reports;
+pub(crate) use reports::standalone;
 mod routing;
 mod signin;
 pub mod studio;
@@ -216,11 +217,37 @@ impl State {
         name: &'static str,
         work: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
-        let task = tokio::spawn(crate::loads::by(name, work));
+        // In an org scope of its own, so a round can say which org it works for ([`LogOrg`]): to start with, the org
+        // the task starting it works for (a request's, whose model work it goes on with), none for a server's loop.
+        let task = crate::log_org::spawn(crate::loads::by(name, work));
         let mut tasks = self.background.lock().unwrap();
         tasks.retain(|t| !t.is_finished());
         tasks.push(task.abort_handle());
     }
+}
+
+/// While held, the org this task works for is `scope`'s ([`crate::log_org`]): its log lines name it and its model
+/// calls count against it ([`crate::limits`]). The org before comes back when it drops. Only in a task that runs one
+/// scope at a time ([`State::background`]'s); work run side by side in one task takes [`crate::log_org::with`] each.
+struct LogOrg(Option<String>);
+
+impl LogOrg {
+    fn of(scope: &Scope) -> LogOrg {
+        let was = crate::log_org::current();
+        crate::log_org::set(scope.org_name());
+        LogOrg(was)
+    }
+}
+
+impl Drop for LogOrg {
+    fn drop(&mut self) {
+        crate::log_org::set(self.0.as_deref());
+    }
+}
+
+/// The status an org's limit answers with ([`crate::limits::LimitReached::status`]).
+fn limit_status(l: &crate::limits::LimitReached) -> StatusCode {
+    StatusCode::from_u16(l.status()).unwrap_or(StatusCode::PAYMENT_REQUIRED)
 }
 
 /// A service key's last use, as one server saw it.
@@ -555,6 +582,7 @@ pub async fn serve_with(
     let metrics = Arc::new(metrics::Metrics::new());
     metrics.register_dir(store.directory_metrics());
     metrics.register(Box::new(crate::extract::MODEL_TOKENS.clone()));
+    metrics.register(Box::new(crate::limits::UNATTRIBUTED.clone()));
     metrics.register(Box::new(crate::extract::REFUSED_FACTS.clone()));
     metrics.register(Box::new(crate::search::embed_cache::LOOKUPS.clone()));
     metrics.register(Box::new(crate::extract::cache::CALLS.clone()));
@@ -834,6 +862,12 @@ pub async fn serve_with(
                     if !st.writer.holds() {
                         break;
                     }
+                    // An org past its model allowance or its expiry: its sessions are judged, its profiles folded
+                    // and its advice learned once it may ask a model again (`crate::limits`), not before.
+                    if crate::limits::paused(scope.org_name()) {
+                        continue;
+                    }
+                    let _org = LogOrg::of(&scope);
                     let learning = crate::advice_loop::judging()
                         && ((st.fixed() && scope == st.scope)
                             || dir.as_ref().is_some_and(|d| d.learns_advice(&scope)));
@@ -875,7 +909,8 @@ pub async fn serve_with(
                     {
                         let (store, scope, cx) = (store.clone(), scope.clone(), cx.clone());
                         st.background("advice_personal", async move {
-                            match crate::advice_loop::personal_soon(&store, &scope, &cx).await {
+                            let soon = crate::advice_loop::personal_soon(&store, &scope, &cx);
+                            match crate::log_org::with(scope.org_name(), soon).await {
                                 Ok(0) => {}
                                 Ok(n) => eprintln!(
                                     "advice {scope}: learned {n} people's own advice after their sessions (a note of \
@@ -887,6 +922,7 @@ pub async fn serve_with(
                     }
                     // People's notes due a dream (`crate::notes_dream`): looked at hourly, a pass in the background.
                     crate::notes_dream::sweep(&store, &scope, st.fixed());
+                    drop(_org);
                 }
             }
         });
@@ -1015,18 +1051,26 @@ pub async fn serve_with(
                         if !lease.holds() {
                             return Some(scope);
                         }
+                        // Not while its org may ask no model (`crate::limits`): summarised at a later pass.
+                        if crate::limits::paused(scope.org_name()) {
+                            return Some(scope);
+                        }
+                        let org = scope.org_name().map(String::from);
                         // What enough people each said in their own memory, shared with everyone in it.
                         if crate::keep::on()
-                            && let Err(e) = crate::keep::share(store, &scope, agg).await
+                            && let Err(e) = crate::log_org::with(
+                                org.as_deref(),
+                                crate::keep::share(store, &scope, agg),
+                            )
+                            .await
                         {
                             eprintln!("sharing what people said in {scope} failed: {e:#}");
                         }
                         let due = crate::aggregate::When::Due;
-                        match crate::aggregate::run_unless_running(
+                        let run = crate::aggregate::run_unless_running(
                             store, &scope, agg, due, None, None,
-                        )
-                        .await
-                        {
+                        );
+                        match crate::log_org::with(org.as_deref(), run).await {
                             None => return Some(scope),
                             Some(Ok(r)) if r.subjects + r.failed > 0 => eprintln!(
                                 "aggregated {scope}: {} subjects, {} rows, {} failed",
@@ -1091,6 +1135,9 @@ pub async fn serve_with(
                         for scope in scopes {
                             if !dst.writer.holds() {
                                 break;
+                            }
+                            if crate::limits::paused(scope.org_name()) {
+                                continue;
                             }
                             let tick = crate::dream::tick(&store, &scope, &dx, &gate);
                             match crate::log_org::with(scope.org_name(), tick).await {
@@ -1162,7 +1209,11 @@ pub async fn serve_with(
                     }
                     let dir = crate::people::directory::Directory::load(&store).await.ok();
                     for scope in scopes.iter().filter(|s| added.contains(&s.namespace())) {
-                        if !cell::mine(scope) || !st.writer.holds() {
+                        // An org that may ask no model now (`crate::limits`): the extraction round reads it later.
+                        if !cell::mine(scope)
+                            || !st.writer.holds()
+                            || crate::limits::paused(scope.org_name())
+                        {
                             continue;
                         }
                         let ex = match dir.as_ref().and_then(|d| d.model(scope, |s| s.extract_model.as_ref())) {
@@ -1208,6 +1259,11 @@ pub async fn serve_with(
                     .map(|scope| async move {
                         let (mut read, mut down, mut waiting) = (0, 0, 0);
                         if !lease.holds() {
+                            return (read, down, waiting);
+                        }
+                        // Its org past its model allowance or its expiry (`crate::limits`): its episodes wait,
+                        // unread and not given up, for the month to turn or the allowance to be raised.
+                        if crate::limits::paused(scope.org_name()) {
                             return (read, down, waiting);
                         }
                         // What was just added there is being read: this round comes back to it next time.
@@ -1257,7 +1313,8 @@ pub async fn serve_with(
                         if scope.org_name().is_some_and(|o| {
                             dir.as_ref().is_some_and(|d| d.session_branches(o))
                         }) {
-                            match crate::sessions::tend_branches(store, &scope, ex).await {
+                            let tend = crate::sessions::tend_branches(store, &scope, ex);
+                            match crate::log_org::with(scope.org_name(), tend).await {
                                 Ok(t) => {
                                     if t.extracted > 0 || !t.merged.is_empty() {
                                         eprintln!(
@@ -1343,6 +1400,11 @@ pub async fn serve_with(
                     if !st.writer.holds() {
                         break;
                     }
+                    // Not while its org may ask no model (`crate::limits`): its sources wait.
+                    if crate::limits::paused(scope.org_name()) {
+                        continue;
+                    }
+                    let _org = LogOrg::of(&scope);
                     // The org's (or team's) models, where the operator chose them (`set_settings`).
                     let cx = scoped_models(&cx, dir.as_ref(), &scope);
                     // Its batch size and what its sources are, where its admins said (`set_settings`): a group
@@ -1434,10 +1496,15 @@ pub async fn serve_with(
                     if !st.writer.holds() {
                         break;
                     }
+                    // Not while its org may ask no model (`crate::limits`): its runs wait.
+                    if crate::limits::paused(scope.org_name()) {
+                        continue;
+                    }
                     // The admin op may be learning here already: this round leaves the scope to it.
                     let Some(_claim) = crate::advice_loop::claim(&scope) else {
                         continue;
                     };
+                    let _org = LogOrg::of(&scope);
                     let tried = tried.entry(scope.clone()).or_default();
                     match crate::advice_loop::round(&store, &scope, &cx, judge.as_ref(), tried)
                         .await
@@ -1500,6 +1567,12 @@ pub async fn serve_with(
                     if !cell::mine(scope) {
                         continue;
                     }
+                    // Its org may ask no model now (`crate::limits`): its requests wait, queued.
+                    if crate::limits::paused(scope.org_name()) {
+                        all = false;
+                        continue;
+                    }
+                    let _org = LogOrg::of(scope);
                     // A learn already running here (the timer's, or the admin op's on this server) goes first.
                     let Some(_claim) = crate::advice_loop::claim(scope) else {
                         all = false;
@@ -1546,8 +1619,12 @@ pub async fn serve_with(
                         if !st.writer.holds() {
                             break;
                         }
+                        if crate::limits::paused(scope.org_name()) {
+                            continue;
+                        }
                         let asked = asked.entry(scope.clone()).or_default();
-                        match crate::auto_review::round(&store, &scope, &d, asked).await {
+                        let round = crate::auto_review::round(&store, &scope, &d, asked);
+                        match crate::log_org::with(scope.org_name(), round).await {
                             Ok(r) if r.approved + r.rejected + r.unanswered + r.renewed > 0 => {
                                 eprintln!("auto review {scope}: {r:?}")
                             }
@@ -2079,11 +2156,23 @@ async fn listen(
                                     Ok(studio::route(req.method(), req.uri().path()))
                                 }
                                 Err(req) => {
-                                    crate::loads::by(
+                                    let (r, limit) = crate::limits::watching(crate::loads::by(
                                         "request",
                                         handle(state.clone(), req, internal),
-                                    )
-                                    .await
+                                    ))
+                                    .await;
+                                    // A write or a model call an org's limits refused, which the handler
+                                    // answered as a failure: answered as the refusal it is.
+                                    match (r, limit) {
+                                        (Ok(r), Some(l)) if r.status().is_server_error() => {
+                                            Ok(Response::builder()
+                                                .status(limit_status(&l))
+                                                .header("content-type", "application/json")
+                                                .body(Full::new(Bytes::from(l.body().to_string())))
+                                                .unwrap())
+                                        }
+                                        (r, _) => r,
+                                    }
                                 }
                             }
                         }))
@@ -2479,8 +2568,15 @@ async fn request_principal(
                 false => None,
             };
             let mut bound_to_none = false;
+            // A provisioner key is named by its keys-file row: the orgs it creates are its own.
+            let provisioner_id = file_key
+                .as_ref()
+                .and_then(|f| f.as_ref())
+                .filter(|k| k.provisioner)
+                .map(|k| k.id.clone());
+            // A provisioner key is the keys file's alone too, as an admin key is, and binds to no org.
             let c = if let Some(file_key) = file_key
-                && file_key.as_ref().is_none_or(|k| !k.admin)
+                && file_key.as_ref().is_none_or(|k| !k.admin && !k.provisioner)
             {
                 let d = directory_auth(state).await?;
                 match file_key {
@@ -2508,17 +2604,23 @@ async fn request_principal(
             if let Some(k) = &c.key {
                 state.key_used(k);
             }
+            let provisioner = match c.provisioner {
+                true => Some(provisioner_id.unwrap_or_else(|| c.user.clone())),
+                false => None,
+            };
             let via = SignIn {
                 person: c.person,
-                orgs: match bound_to_none {
+                orgs: match bound_to_none || c.provisioner {
                     true => Some(Default::default()),
                     false => c.orgs,
                 },
+                provisioner,
                 groups: c.idp_groups,
                 verified_email: c.email_verified,
                 key: c.key,
                 auth0: c.auth0,
                 auth0_org: c.auth0_org,
+                mfa: c.mfa,
                 operator: c.operator,
                 unverified: c.unverified,
                 recorded: false,
@@ -2967,7 +3069,7 @@ pub async fn identity_check() -> Vec<Check> {
                             Some(p) if admins == 0 => Err(anyhow::anyhow!(
                                 "{p}: {keys} keys, none admin: /closure, /acl, /team and creating orgs have no caller"
                             )),
-                            Some(p) => Ok(format!("{p}: {keys} keys, {admins} admin")),
+                            Some(p) => Ok(format!("{p}: {keys} keys, {admins} admin or provisioner")),
                         },
                     );
                     check(
@@ -3955,7 +4057,15 @@ async fn ingest_episodes(
     // cite it, waits for those owners (`governance::private_episodes`): left out, and named in the answer, so
     // the rest of the batch still lands (a connector drops a batch it gets a 4xx for).
     let mut held: Vec<Episode> = Vec::new();
-    if let Err(e) = store.commit(scope, actor, &episodes, &[]).await {
+    // What main holds already just as sent (a connector sending its records again) isn't written again: taken,
+    // with nothing to write. Each write of one would make the next read look again at what it holds.
+    let as_is = store.held_as_is(scope, &episodes, &replaces).await?;
+    let (same, mut episodes): (Vec<Episode>, Vec<Episode>) = episodes
+        .into_iter()
+        .partition(|e| as_is.same.contains(&e.episode_id));
+    if !episodes.is_empty()
+        && let Err(e) = store.commit(scope, actor, &episodes, &[]).await
+    {
         if !crate::governance::OwnerApprovalRequired::refused(&e) {
             return Err(refused(e));
         }
@@ -3976,13 +4086,14 @@ async fn ingest_episodes(
         }
     }
     eprintln!(
-        "ingest by {actor} into {scope}: {} episodes",
-        episodes.len()
+        "ingest by {actor} into {scope}: {} episodes, {} held already as sent",
+        episodes.len(),
+        same.len()
     );
     crate::usage::METER.ingested(sizes);
     let mut out = json!({
-        "committed": episodes.len(),
-        "episode_ids": episodes.iter().map(|e| e.episode_id.as_str()).collect::<Vec<_>>(),
+        "committed": episodes.len() + same.len(),
+        "episode_ids": episodes.iter().chain(&same).map(|e| e.episode_id.as_str()).collect::<Vec<_>>(),
     });
     if redacted.total() > 0 {
         out["redacted"] = json!(redacted.0);
@@ -4002,6 +4113,27 @@ async fn ingest_episodes(
                 .collect::<Vec<_>>()
         );
     }
+    // A source whose every version in the batch main held already as sent, and that has no other version current
+    // there, has nothing to retire.
+    let asked_to_retire = !replaces.is_empty();
+    replaces.retain(|source| {
+        let sent: std::collections::HashSet<&String> = episodes
+            .iter()
+            .chain(&held)
+            .chain(&same)
+            .filter(|e| &e.source == source)
+            .map(|e| &e.episode_id)
+            .collect();
+        let all_same = episodes.iter().chain(&held).all(|e| &e.source != source);
+        !all_same
+            || as_is
+                .current
+                .get(source)
+                .is_none_or(|c| c.iter().any(|e| !sent.contains(e)))
+    });
+    if asked_to_retire && replaces.is_empty() {
+        out["retired"] = json!(0);
+    }
     if !replaces.is_empty() {
         // Each source was checked above (the key's prefixes, the server's own families), and the scope is
         // the batch's: retiring its older versions retires nothing the batch couldn't have written. Every
@@ -4010,10 +4142,12 @@ async fn ingest_episodes(
         let targets: Vec<crate::AclTarget> = replaces
             .iter()
             .map(|source| crate::AclTarget::SourceExcept {
-                // A held version is current still: it is kept too, not retired by its own batch.
+                // A held version is current still, and one main held already as sent stays so: each is kept
+                // too, not retired by its own batch.
                 keep: episodes
                     .iter()
                     .chain(&held)
+                    .chain(&same)
                     .filter(|e| &e.source == source)
                     .map(|e| e.episode_id.clone())
                     .collect(),
@@ -4220,13 +4354,15 @@ async fn warm_needed(st: &State) -> Result<()> {
 
 /// Load what the first reads after a start would otherwise load in a caller's request: what a sign-in needs
 /// ([`warm_needed`], tried until it loads; `needed` hears when it has), then the served scope's indexes and
-/// every scope in the directory whose memory was written in the last [`warm_days`], a few at a time (an
+/// every scope in the directory whose memory was written in the last [`warm_days`] and not named in [`warm_skip`],
+/// [`warm_concurrency`] at a time (an
 /// idle one is loaded by its first read instead). A scope that fails to warm is logged and left to the
 /// reads, as before.
 async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
     let mut wait = Duration::from_secs(1);
     loop {
-        match warm_needed(&st).await {
+        // Not held to the background read rate: the server takes no sign-ins until it has this.
+        match crate::loads::by("start", warm_needed(&st)).await {
             Ok(()) => break,
             Err(e) => {
                 // Catalog and storage errors may name a signed URL: its query string stays out of the log.
@@ -4283,7 +4419,10 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
         scopes.extend(Scope::org(name));
         scopes.extend(org.teams.keys().filter_map(|t| Scope::team(name, t).ok()));
     }
-    scopes.retain(|s| *s != st.scope && cell::mine(s));
+    let skip = warm_skip();
+    scopes.retain(|s| {
+        *s != st.scope && cell::mine(s) && !s.org_name().is_some_and(|o| skipped(&skip, o))
+    });
     use futures::StreamExt;
     let store = &store;
     let read_at = &st.read_at;
@@ -4305,7 +4444,7 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
         .checked_sub(keep_warm_idle().saturating_sub(warm_grace()))
         .unwrap_or_else(Instant::now);
     futures::stream::iter(scopes)
-        .for_each_concurrent(4, |scope| async move {
+        .for_each_concurrent(warm_concurrency(), |scope| async move {
             let t = Instant::now();
             match search::warm(store, &scope).await {
                 Ok(()) => {
@@ -4329,6 +4468,36 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
             }
         })
         .await;
+}
+
+/// How many scopes the start warms at once (`AMPUP_MEMORY_WARM_CONCURRENCY`, default 1): each loads every one
+/// of its tables, and the servers on a catalog share its read quota, so a rolling deploy's new servers each
+/// warming several scopes at once spent it beside the old servers' reads.
+fn warm_concurrency() -> usize {
+    std::env::var("AMPUP_MEMORY_WARM_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1usize)
+        .max(1)
+}
+
+/// Orgs the start never warms (`AMPUP_MEMORY_WARM_SKIP`): comma-separated names, a trailing `*` matching any
+/// name that starts with what precedes it (`e2e_*`). For orgs written often but rarely read, such as test or
+/// benchmark orgs: their first read loads them instead.
+fn warm_skip() -> Vec<String> {
+    std::env::var("AMPUP_MEMORY_WARM_SKIP")
+        .unwrap_or_default()
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+fn skipped(skip: &[String], org: &str) -> bool {
+    skip.iter().any(|p| match p.strip_suffix('*') {
+        Some(prefix) => org.starts_with(prefix),
+        None => org == p,
+    })
 }
 
 /// How often a server touches the scopes it serves so that a read never finds them cold (`AMPUP_MEMORY_KEEP_WARM_SECS`,
@@ -4418,7 +4587,8 @@ async fn keep_warm(st: Arc<State>) {
 /// embedded lines) or failed. A scope with no advice has no lines.
 async fn warm_advice(store: &Store, scope: &Scope) {
     let t = Instant::now();
-    match crate::advice::warm_lines(store, scope).await {
+    // A remote embedding of the lines is the scope's org's to count.
+    match crate::log_org::with(scope.org_name(), crate::advice::warm_lines(store, scope)).await {
         Ok(n) if t.elapsed() > Duration::from_millis(500) => eprintln!(
             "warmed {scope}'s {n} advice lines in {} ms",
             t.elapsed().as_millis()
@@ -4839,6 +5009,9 @@ fn ingest_reply(done: Result<Value>) -> (StatusCode, Value) {
     match done {
         Ok(v) => (StatusCode::OK, v),
         // Not retried: a connector that resends gets the same answer until the cap moves.
+        Err(ref e) if let Some(l) = crate::limits::LimitReached::of(e) => {
+            (limit_status(l), l.body())
+        }
         Err(ref e) if let Some(c) = e.downcast_ref::<crate::workspace::CapReached>() => (
             StatusCode::FORBIDDEN,
             json!({"error": c.0, "cap_reached": true}),
@@ -5962,6 +6135,15 @@ async fn handle(
             json!({"error": format!("a personal key reaches {} only", PERSONAL_KEY_ROUTES.join(", "))}),
         ));
     }
+    // A provisioner key (a sign-up service's) reaches `/admin` alone: it reads and writes no memory.
+    if via.provisioner.is_some() && path != "/admin" {
+        let w = who.as_ref().map_or("-", |w| w.user());
+        refused(None, w, 403, audit::Reason::AdminDenied);
+        return Ok(reply(
+            StatusCode::FORBIDDEN,
+            json!({"error": "a provisioner key reaches /admin only"}),
+        ));
+    }
     if admin {
         let who = who.expect("public port");
         // An `/admin` request is about the org it names (else the one selected): the audit's only if the
@@ -6000,6 +6182,10 @@ async fn handle(
                             .signin(Some((&o, i)), who.user(), provider_of(&via));
                     }
                     reply(StatusCode::OK, v)
+                }
+                // A dream job asked for an org past its limits (`dream_jobs::handle`).
+                Err(ref e) if let Some(l) = crate::limits::LimitReached::of(e) => {
+                    reply(limit_status(l), l.body())
                 }
                 Err(e) => {
                     eprintln!("directory change by {} refused: {e:#}", who.user());
@@ -6485,6 +6671,10 @@ async fn handle(
         if let Some(r) = stopped(&state, "ingest") {
             return Ok(r);
         }
+        // The org's own limits (`crate::limits`): past its expiry it takes no new memory.
+        if let Some(l) = crate::limits::write_gate(scope.org_name()) {
+            return Ok(reply(limit_status(&l), l.body()));
+        }
         let (status, v) =
             ingest_reply(ingest_episodes(&state, &scope, &who, &body, via.key.as_ref()).await);
         return Ok(reply(status, v));
@@ -6540,6 +6730,10 @@ async fn handle(
             ));
         }
         if facts_route {
+            // Facts written by hand are new memory, which an expired org takes no more of.
+            if let Some(l) = crate::limits::write_gate(scope.org_name()) {
+                return Ok(reply(limit_status(&l), l.body()));
+            }
             let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let store = state.store.read().unwrap().clone();
             return Ok(match writes {
@@ -6626,9 +6820,12 @@ async fn handle(
                 ),
             });
         }
-        // A turn remembered is new memory: it stops with ingestion.
+        // A turn remembered is new memory: it stops with ingestion, and past its org's expiry (`crate::limits`).
         if let Some(r) = stopped(&state, "ingest") {
             return Ok(r);
+        }
+        if let Some(l) = crate::limits::write_gate(scope.org_name()) {
+            return Ok(reply(limit_status(&l), l.body()));
         }
         if learn_route {
             let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -6638,6 +6835,9 @@ async fn handle(
                     Ok(v) => {
                         crate::usage::METER.op(crate::usage::Op::Turn, who.user());
                         reply(StatusCode::OK, v)
+                    }
+                    Err(ref e) if let Some(l) = crate::limits::LimitReached::of(e) => {
+                        reply(limit_status(l), l.body())
                     }
                     Err(ref e)
                         if let Some(c) = e.downcast_ref::<crate::workspace::CapReached>() =>
@@ -6689,6 +6889,9 @@ async fn handle(
             Ok(v) => {
                 crate::usage::METER.op(crate::usage::Op::Turn, who.user());
                 reply(StatusCode::OK, v)
+            }
+            Err(ref e) if let Some(l) = crate::limits::LimitReached::of(e) => {
+                reply(limit_status(l), l.body())
             }
             Err(ref e) if let Some(c) = e.downcast_ref::<crate::workspace::CapReached>() => reply(
                 StatusCode::FORBIDDEN,
@@ -6831,6 +7034,10 @@ async fn handle(
         // A run asks a model on the server's account, as ask_memory does: stopped with asking, and metered as one.
         if let Some(why) = stopped_why(&state, "ask") {
             return Ok(reply(StatusCode::TOO_MANY_REQUESTS, json!({"error": why})));
+        }
+        // And past its org's month's model allowance or its expiry (`crate::limits`).
+        if let Some(l) = crate::limits::model_gate(scope.org_name()) {
+            return Ok(reply(limit_status(&l), l.body()));
         }
         crate::usage::METER.op(crate::usage::Op::Ask { byok: state.byok }, who.user());
         // Its tools read the scopes this one's `reads` setting names, as search_memory and get_episode do.
@@ -7030,14 +7237,17 @@ async fn handle(
                     Ok(Some(cx)) if !kept.sources.is_empty() && (kept.rewrite || !has) => {
                         state.background(
                             "repo_advice",
-                            crate::repo_advice::write_notes(
-                                store.clone(),
-                                scope.clone(),
-                                who.clone(),
-                                acl,
-                                kept.repo.clone(),
-                                kept.sources.clone(),
-                                cx,
+                            crate::log_org::with(
+                                scope.org_name(),
+                                crate::repo_advice::write_notes(
+                                    store.clone(),
+                                    scope.clone(),
+                                    who.clone(),
+                                    acl,
+                                    kept.repo.clone(),
+                                    kept.sources.clone(),
+                                    cx,
+                                ),
                             ),
                         );
                         true
@@ -7194,6 +7404,10 @@ async fn handle(
                 StatusCode::FORBIDDEN,
                 json!({"error": format!("feedback on {scope} isn't taken here: give it where its memory is read and written, on main")}),
             ));
+        }
+        // Feedback is kept memory too: an expired org takes none until it is renewed.
+        if let Some(l) = crate::limits::write_gate(scope.org_name()) {
+            return Ok(reply(limit_status(&l), l.body()));
         }
         let store = state.store.read().unwrap().clone();
         let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -7881,6 +8095,11 @@ async fn protected_resource(state: &State, base: &str, org: Option<&str>) -> Opt
             var("AMPUP_MEMORY_AUTH0_CLI_CLIENT_ID").or_else(|| a.client_ids().first().cloned());
         let mut m = meta(a.issuer(), client_id, None, org.map(|(o, _)| o));
         m["memstore_auth0_organization"] = json!(org.map(|(_, id)| id));
+        // Where a person this tenant signed in, in no org yet, makes their own (`POST` with the sign-in's ID
+        // token): a sign-up service beside this server. Unset, there is none and the field is left out.
+        if let Some(url) = signup_url() {
+            m["memstore_signup_url"] = json!(url);
+        }
         if let Some(port) =
             var("AMPUP_MEMORY_AUTH0_CLI_CALLBACK_PORT").and_then(|p| p.parse::<u16>().ok())
         {
@@ -7947,6 +8166,15 @@ async fn protected_resource(state: &State, base: &str, org: Option<&str>) -> Opt
         m["memstore_cli_callback_port"] = json!(port);
     }
     Some(m)
+}
+
+/// Where a person signed in through the platform's Auth0 tenant, in no org yet, makes their own org
+/// (`AMPUP_MEMORY_SIGNUP_URL`): an https URL, or http on this machine. Anything else is left out.
+fn signup_url() -> Option<String> {
+    let v = std::env::var("AMPUP_MEMORY_SIGNUP_URL").ok()?;
+    let u = reqwest::Url::parse(v.trim()).ok()?;
+    let local = matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    (u.scheme() == "https" || (u.scheme() == "http" && local)).then(|| u.to_string())
 }
 
 /// How a person signed in, for the audit log.
@@ -8430,6 +8658,42 @@ const LOCAL_ADMIN_OPS: [&str; 40] = [
     "retention",
 ];
 
+/// The `/admin` ops a provisioner key may send ([`SignIn::provisioner`]).
+const PROVISIONER_OPS: [&str; 5] = [
+    "create_org",
+    "set_auth0_org",
+    "create_key",
+    "set_limits",
+    "show",
+];
+
+/// `show {org}`'s limits and usage: `"limits"` (each one, null where unset) and `"usage"` (this month's model tokens,
+/// every server's, and the episodes the org holds), beside its view and in it.
+async fn with_limits(
+    store: &Store,
+    name: &str,
+    org: &crate::people::directory::Org,
+    v: &mut Value,
+) {
+    let month = crate::limits::month_of(chrono::Utc::now());
+    let episodes = match crate::workspace::org_episodes(store, name).await {
+        Ok(n) => json!(n),
+        Err(e) => {
+            eprintln!("show {name}: its episodes uncounted: {e:#}");
+            Value::Null
+        }
+    };
+    let limits = crate::limits::limits_json(&org.limits);
+    let usage = json!({"month": month, "model_tokens": crate::limits::used(name, &month),
+                       "episodes": episodes});
+    v["limits"] = limits.clone();
+    v["usage"] = usage.clone();
+    if let Some(view) = v["view"].as_object_mut() {
+        view.insert("limits".into(), limits);
+        view.insert("usage".into(), usage);
+    }
+}
+
 /// 421 for a request about `org`, which isn't this cell's: its own cell's servers answer it.
 fn misdirected(org: &str) -> Reply {
     json_reply(
@@ -8527,6 +8791,34 @@ async fn directory_change(
     }
     let mut req: Value =
         serde_json::from_slice(body).map_err(|_| Invalid("body is not JSON".into()))?;
+    // A provisioner key's ops, and nothing else, whatever comes below: what each may change is
+    // `directory::provisioner_may`'s, and `show` only an org it created.
+    if let Some(key) = &via.provisioner {
+        let op = req["op"].as_str().unwrap_or_default();
+        if !PROVISIONER_OPS.contains(&op) {
+            return Err(Refused(format!(
+                "a provisioner key may {} only, not {op:?}",
+                PROVISIONER_OPS.join(", ")
+            ))
+            .into());
+        }
+        if op == "show" {
+            let org = req["org"].as_str().unwrap_or_default();
+            let store = state.store.read().unwrap().clone();
+            let dir = Directory::load(&store).await?;
+            return match dir.orgs.get(org) {
+                Some(o) if crate::people::directory::created_by(o, key) => {
+                    let mut v = json!({"view": o});
+                    with_limits(&store, org, o, &mut v).await;
+                    Ok(v)
+                }
+                _ => Err(Refused(format!(
+                    "a provisioner key reads only the orgs it created, and {org:?} is not one"
+                ))
+                .into()),
+            };
+        }
+    }
     if let Some(local) = &via.local_admin {
         // An op names the local org, or none, which is the local org.
         if let Some(m) = req.as_object_mut()
@@ -8757,7 +9049,13 @@ async fn directory_change(
         };
         return Ok(match req["org"].as_str() {
             None => json!({"view": dir.orgs.keys().filter(|o| mine(o)).collect::<Vec<_>>()}),
-            Some(o) if whole(o) => json!({"view": dir.orgs.get(o)}),
+            Some(o) if whole(o) => {
+                let mut v = json!({"view": dir.orgs.get(o)});
+                if let Some(org) = dir.orgs.get(o) {
+                    with_limits(&store, o, org, &mut v).await;
+                }
+                v
+            }
             Some(o) if mine(o) => match (dir.orgs.get(o), access.get(o)) {
                 (Some(org), Some(a)) => json!({"view": org.member_view(who.user(), a)}),
                 _ => json!({"view": null}),
@@ -9420,7 +9718,10 @@ async fn directory_change(
     ) {
         return dream_jobs::handle(state, who, via, superuser, &req)
             .await
-            .map_err(|e| Refused(format!("{e:#}")).into());
+            .map_err(|e| match crate::limits::LimitReached::of(&e) {
+                Some(_) => e,
+                None => Refused(format!("{e:#}")).into(),
+            });
     }
     if req["op"] == "learn_advice" {
         // Learning reads every rewarded run in the scope, traces kept to their recorders included, so only the
@@ -9514,7 +9815,8 @@ async fn directory_change(
                 rewrite,
                 force,
             };
-            let done = crate::advice::learn_with(&store, &s, &cx, &acl, min_wrong, &pass).await;
+            let learn = crate::advice::learn_with(&store, &s, &cx, &acl, min_wrong, &pass);
+            let done = crate::log_org::with(s.org_name(), learn).await;
             match done {
                 Ok(done) => eprintln!("advice {s:?}: {}", json!(done)),
                 Err(e) => eprintln!("advice {s:?}: failed: {e:#}"),
@@ -9629,6 +9931,7 @@ async fn directory_change(
                 user: h.user.clone(),
                 groups: h.groups.clone(),
                 admin: h.admin,
+                provisioner: h.provisioner,
             };
         }
     }
@@ -11554,8 +11857,25 @@ async fn mcp(
                 eprintln!("mcp {name} refused for {}: {why}", who.user());
                 return ok(text(why, true));
             }
+            // And the org's own limits (`crate::limits`): past its expiry nothing new is kept, and past it or its
+            // month's model allowance nothing is asked.
+            let limited = match gate {
+                Some("ingest") => crate::limits::write_gate(scope.org_name()),
+                Some(_) => crate::limits::model_gate(scope.org_name()),
+                None => None,
+            };
+            if let Some(l) = limited {
+                eprintln!("mcp {name} refused for {}: {}", who.user(), l.message);
+                return ok(text(l.message, true));
+            }
             let started = Instant::now();
-            crate::phases::mark("tool");
+            // Which tool: the slow-request line is the route's, and every tool is `/mcp`.
+            crate::phases::mark(
+                MCP_TOOL_MARKS
+                    .iter()
+                    .find(|(t, _)| *t == name)
+                    .map_or("tool", |(_, m)| m),
+            );
             let result = match name {
                 "search_memory" => {
                     let json_format = match args["format"].as_str() {
@@ -12058,10 +12378,12 @@ async fn mcp(
                     let msg = match (
                         e.downcast_ref::<ToolError>(),
                         e.downcast_ref::<crate::workspace::CapReached>(),
+                        crate::limits::LimitReached::of(&e),
                     ) {
-                        (Some(m), _) => m.0.clone(),
-                        (None, Some(c)) => c.0.clone(),
-                        (None, None) => "tool failed".into(),
+                        (Some(m), _, _) => m.0.clone(),
+                        (None, Some(c), _) => c.0.clone(),
+                        (None, None, Some(l)) => l.message.clone(),
+                        (None, None, None) => "tool failed".into(),
                     };
                     ok(text(msg, true))
                 }
@@ -12222,6 +12544,30 @@ const DEFAULT_TOOLS: [&str; 9] = [
     "forget_memory",
     "get_brief",
     "list_briefs",
+];
+
+/// The mark each tool's call sets in a slow request's steps (`crate::phases`, which takes static names).
+const MCP_TOOL_MARKS: [(&str, &str); 20] = [
+    ("search_memory", "tool search_memory"),
+    ("get_episode", "tool get_episode"),
+    ("query_memory", "tool query_memory"),
+    ("list_facts", "tool list_facts"),
+    ("list_advice", "tool list_advice"),
+    ("get_entity", "tool get_entity"),
+    ("remember_memory", "tool remember_memory"),
+    ("forget_memory", "tool forget_memory"),
+    ("close_memory", "tool close_memory"),
+    ("ask_memory", "tool ask_memory"),
+    ("skills", "tool skills"),
+    ("record_run", "tool record_run"),
+    ("reward_run", "tool reward_run"),
+    ("feedback_memory", "tool feedback_memory"),
+    ("log_answer", "tool log_answer"),
+    ("start_session", "tool start_session"),
+    ("end_session", "tool end_session"),
+    ("get_advice", "tool get_advice"),
+    ("list_briefs", "tool list_briefs"),
+    ("get_brief", "tool get_brief"),
 ];
 
 /// What a recorder key may call over `/mcp` for the member it names in `x-memstore-as`: the session loop,
@@ -13581,6 +13927,7 @@ async fn session_moment(
         );
     }
     let l = Box::pin(crate::sessions::active(store, session.scope(), who, id)).await?;
+    crate::phases::mark("session active");
     recorder_writes(via, &l)?;
     // A hook's step (`decide`): the lines of the served notes that fit the step, not the note again.
     if let Some(step) = step {
@@ -13598,7 +13945,8 @@ async fn session_moment(
                 id,
                 &end,
             ))
-            .await?
+            .await
+            .inspect(|_| crate::phases::mark("step advice"))?
             {
                 crate::sessions::StepAdvice::NoNote => None,
                 crate::sessions::StepAdvice::Nothing => {
@@ -13621,7 +13969,8 @@ async fn session_moment(
                             &t,
                             (when.as_ref(), &asked),
                         ))
-                        .await?,
+                        .await
+                        .inspect(|_| crate::phases::mark("handed on"))?,
                     )
                 }
             },
@@ -13638,6 +13987,7 @@ async fn session_moment(
         conversation,
     ))
     .await?;
+    crate::phases::mark("revisited");
     use crate::advice_lookups::{finish, outcome};
     Ok(match cut {
         Some(r) => {
@@ -13985,6 +14335,7 @@ async fn get_advice_step(
         _ => None,
     };
     resolved_out.clone_from(&resolved);
+    crate::phases::mark("session resolved");
     let id = resolved.as_deref().or(id);
     if let Err(e) = event {
         Err(e)
@@ -14050,6 +14401,7 @@ async fn get_advice_step(
         }
         if writes == Writes::Scope {
             let also = advice_reads(state, store, session).await;
+            crate::phases::mark("advice reads");
             let (served, leads) = tokio::join!(
                 session_advice(
                     session,
@@ -14103,6 +14455,7 @@ async fn get_advice_step(
             opening["procedures"] = json!(p);
         }
         let also = advice_reads(state, store, session).await;
+        crate::phases::mark("advice reads");
         let (started, leads) = tokio::join!(
             start_session(
                 state,
@@ -14133,6 +14486,7 @@ async fn get_advice_step(
             procedures.unwrap_or_default(),
         );
         let also = advice_reads(state, store, session).await;
+        crate::phases::mark("advice reads");
         let (found, leads) = tokio::join!(
             advice(session, store, who, question, asked, true, &also, None),
             error_leads(session, store, who, question, &also),

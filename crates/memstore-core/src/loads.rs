@@ -9,6 +9,13 @@
 //! When the catalog says its quota is spent (429), every server loop's load here waits a few seconds before it
 //! asks ([`throttled`]): a request's loads go on, so what someone is waiting for gets the quota that is left,
 //! rather than every loop asking again at once and spending the next minute's.
+//!
+//! Loops' table reads can also be held to a rate, `AMPUP_MEMORY_BACKGROUND_CATALOG_READS_PER_MIN` a minute per
+//! process (default 0, no limit): where several servers share one quota, a rolling deploy's new servers warming
+//! every recent scope at once, beside the old ones, otherwise spend it before anything says 429. A loop takes its
+//! turn ([`turn`]) before it takes a table's load lock, never while holding one, so a request that needs the
+//! table never queues behind the wait. Requests, and what a starting server needs before it takes sign-ins
+//! (caller `start`), never wait for it.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -59,6 +66,72 @@ async fn wait_turn() {
         tokio::time::sleep_until(t.into()).await;
     }
 }
+
+/// A loop's turn to read a table, within the rate: waited for (and out of any pause) before the table's load lock
+/// is taken. A request, or a starting server's `start` reads, go at once.
+pub async fn turn() {
+    if is_request() || caller() == "start" {
+        return;
+    }
+    wait_turn().await;
+    loop {
+        let wait = RATE.lock().unwrap().take(Instant::now());
+        match wait {
+            Some(w) => tokio::time::sleep(w).await,
+            None => return,
+        }
+    }
+}
+
+/// Loops' loads a second ([`RATE`]), as a token bucket holding at most [`BURST_SECS`] of them.
+struct Rate {
+    per_sec: f64,
+    tokens: f64,
+    at: Instant,
+}
+
+/// The most loops may load at once after an idle while, in seconds of their rate.
+const BURST_SECS: f64 = 5.0;
+
+impl Rate {
+    fn refill(&mut self, now: Instant) {
+        let cap = (self.per_sec * BURST_SECS).max(1.0);
+        self.tokens = (self.tokens
+            + now.saturating_duration_since(self.at).as_secs_f64() * self.per_sec)
+            .min(cap);
+        self.at = now;
+    }
+
+    /// Take a turn: None when taken (or there is no limit), else how long until one is free.
+    fn take(&mut self, now: Instant) -> Option<Duration> {
+        if self.per_sec <= 0.0 {
+            return None;
+        }
+        self.refill(now);
+        if self.tokens < 1.0 {
+            return Some(Duration::from_secs_f64((1.0 - self.tokens) / self.per_sec));
+        }
+        self.tokens -= 1.0;
+        None
+    }
+}
+
+static RATE: LazyLock<Mutex<Rate>> = LazyLock::new(|| {
+    let per_min = std::env::var("AMPUP_MEMORY_BACKGROUND_CATALOG_READS_PER_MIN")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0)
+        .max(0.0);
+    let per_sec = per_min / 60.0;
+    if per_sec > 0.0 {
+        eprintln!("memstore: background catalog loads held to {per_min} a minute");
+    }
+    Mutex::new(Rate {
+        per_sec,
+        tokens: (per_sec * BURST_SECS).max(1.0),
+        at: Instant::now(),
+    })
+});
 
 /// The catalog said its quota is spent: loops' loads wait what it asked (`Retry-After`), or 5 s, give or take a
 /// second, so servers sharing the quota don't all ask again at the same instant.

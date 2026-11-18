@@ -3344,7 +3344,10 @@ pub async fn warm(store: &Store, scope: &Scope) -> Result<()> {
     store.pin(scope, crate::MAIN).await?;
     let query = "warm up";
     // Without the embedding model (not fetched, and offline), the rest still warms: searches rank by keyword.
-    let q = embed_query(query).await.map(Float32Array::from);
+    // A remote embedding is the scope's org's to count.
+    let q = crate::log_org::with(scope.org_name(), embed_query(query))
+        .await
+        .map(Float32Array::from);
     let index = open_cached(store, scope).await?;
     store.fact_files(scope, &index.held).await?;
     let keyword = keyword_queries(&fact_terms(query), false, None)?;

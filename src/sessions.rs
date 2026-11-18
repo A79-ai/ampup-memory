@@ -1015,6 +1015,11 @@ pub fn keep_later(store: &Store, scope: &Scope, l: &Logged, signed: &str, text: 
     if !crate::keep::on() || recorded(l) || automated(l) || text.trim().is_empty() {
         return;
     }
+    // Not for an org past its limits (`crate::limits`): its messages stay unread, and are read by a later call once
+    // the allowance resets or is raised.
+    if crate::limits::paused(scope.org_name()) {
+        return;
+    }
     let typed: Vec<crate::keep::Typed> = {
         let mut read = KEEP_READ.lock().unwrap();
         if read.len() >= KEEP_SESSIONS && !read.contains_key(&l.answer_id) {
@@ -1037,14 +1042,22 @@ pub fn keep_later(store: &Store, scope: &Scope, l: &Logged, signed: &str, text: 
         return;
     }
     let (store, scope, l, signed) = (store.clone(), scope.clone(), l.clone(), signed.to_string());
-    tokio::spawn(async move {
+    let org = scope.org_name().map(str::to_string);
+    tokio::spawn(crate::log_org::with(org.as_deref(), async move {
         let theirs = |dir: &Directory| still_theirs(dir, &scope, &l);
+        let said: Vec<_> = typed.iter().map(|t| words_of(&t.said)).collect();
         if let Err(e) =
             crate::keep::from_user(&store, &scope, &l.asker, &signed, typed, theirs).await
         {
             eprintln!("keep: {scope}: {e:#}");
+            // Refused by the org's limits: unread still, so a later call reads them.
+            if crate::limits::LimitReached::of(&e).is_some()
+                && let Some(seen) = KEEP_READ.lock().unwrap().get_mut(&l.answer_id)
+            {
+                seen.retain(|s| !said.iter().any(|w| same_message(s, w)));
+            }
         }
-    });
+    }));
 }
 
 /// Flushes the held session rows every [`flush_interval`], or sooner when many are held.
@@ -1645,10 +1658,14 @@ async fn keep_conversation(
         &acl,
     )
     .version_of(&conversation_key(id));
-    store
-        .commit_record(scope, who.user(), std::slice::from_ref(&ep))
-        .await?;
-    s.conversation = Some(ep.episode_id);
+    // The same conversation as last kept (a hook sending it again with nothing said since) is kept already: a
+    // write of it again would only make the next read look at what main holds.
+    if s.conversation.as_deref() != Some(ep.episode_id.as_str()) {
+        store
+            .commit_record(scope, who.user(), std::slice::from_ref(&ep))
+            .await?;
+        s.conversation = Some(ep.episode_id);
+    }
     // The PRs it opened or pushed to so far, so what becomes of one finds the session while it is still open.
     crate::session_prs::merge(&mut s.prs, crate::session_prs::links_in(&body));
     Ok(true)

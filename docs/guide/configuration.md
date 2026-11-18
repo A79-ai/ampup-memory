@@ -181,6 +181,7 @@ Opting out:
 | `AMPUP_MEMORY_JWT_JWKS_URL`, `AMPUP_MEMORY_JWT_PUBLIC_KEY`, `AMPUP_MEMORY_JWT_SECRET`, `AMPUP_MEMORY_JWT_ISSUER`, `AMPUP_MEMORY_JWT_AUDIENCE`, `AMPUP_MEMORY_JWT_ORG_CLAIM`, `AMPUP_MEMORY_JWT_GROUPS_CLAIM`, `AMPUP_MEMORY_JWT_USER_CLAIMS` | JWT callers. |
 | `AMPUP_MEMORY_OIDC_ISSUER`, `AMPUP_MEMORY_OIDC_AUDIENCE`, `AMPUP_MEMORY_OIDC_CLI_CLIENT_ID`, `AMPUP_MEMORY_OIDC_CLI_CLIENT_SECRET`, `AMPUP_MEMORY_OIDC_CLI_CALLBACK_PORT` | People's sign-in through the server's identity provider. Serve a client secret only for a public client. |
 | `AMPUP_MEMORY_IAP_AUDIENCE` | People through Google's Identity-Aware Proxy. |
+| `AMPUP_MEMORY_SIGNUP_URL` | A sign-up service beside the server (https, or http on this machine), named in the sign-in metadata (`memstore_signup_url`) when the sign-in is the platform's Auth0 tenant: a person signed in there in no org makes their own org with `join --create-org`, which sends it their ID token. Unset: no sign-up is offered. |
 | `AMPUP_MEMORY_SECRET_KEY` | 32 bytes (base64 or hex) that seal identity-provider secrets and directory snapshots. Same on every server. Without it every snapshot is checked against the directory log on load. |
 | `AMPUP_MEMORY_DIRECTORY=required` | Every caller must select an org. |
 | `AMPUP_MEMORY_DISABLED_FILE`, `AMPUP_MEMORY_TEAM_CSV` | A server's own disabled-users list and team csv. |

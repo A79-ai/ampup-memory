@@ -423,16 +423,24 @@ async fn a_channel_going_private_removes_its_history_from_non_members() {
         env.can_read(&ben, &other.episode_id).await,
         "another channel is untouched"
     );
-    let ben_facts = env
-        .store
-        .read(&Scope::Org, &Principal::new("ben@x.com", &[ORG]), None)
-        .await
-        .unwrap();
-    assert_eq!(
-        ben_facts.len(),
-        1,
-        "only the other channel's fact is left for a non-member"
-    );
+    // The facts, read through this test's own store: the server made the change, so this store sees it once its
+    // cached tables catch up with the server's commit, as the server's own view did above.
+    let t = Instant::now();
+    loop {
+        let ben_facts = env
+            .store
+            .read(&Scope::Org, &Principal::new("ben@x.com", &[ORG]), None)
+            .await
+            .unwrap();
+        if ben_facts.len() == 1 {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "only the other channel's fact is left for a non-member: {ben_facts:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     // Replaying the feed changes nothing; the text and sources survive the change.
     let (_, body) = feed(Some(OPS_KEY), change).await;

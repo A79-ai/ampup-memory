@@ -141,10 +141,10 @@ pub const INSTRUCTIONS: &[&str] = &["", "default", "purpose"];
 /// version: an older reader that meets it stops folding there (it serves the directory as of the change
 /// before, signs no one in, refuses directory writes, and raises `memstore_directory_blocked`). Only a
 /// change that needs it is written at it ([`SOURCES_VERSION`], [`PURGE_VERSION`], [`USERS_VERSION`],
-/// [`PERSONAL_VERSION`]); every
+/// [`PERSONAL_VERSION`], [`SIGNIN_VERSION`]); every
 /// other change stays at 1, so an older reader folds on until a change it would get wrong. An op this
 /// engine doesn't know stops the fold too, whatever its version ([`OPS`]).
-pub const EVENT_VERSION: i64 = 5;
+pub const EVENT_VERSION: i64 = 6;
 
 /// The version of a change whose op is newer than this engine ([`OPS_VERSION`] and up). From this engine on,
 /// every engine stops folding at an op it doesn't know, at any version; an engine before it reads at most
@@ -188,6 +188,21 @@ pub const OPS: &[&str] = &[
     "team.csv",
 ];
 
+/// The key an org's limits (`set_limits`) are written under, in an org-wide `org.settings` change. They ride on
+/// that op, not one of their own, so an engine from before limits folds the change as settings that set nothing
+/// (it reads no such setting) and folds on: a limit only holds spending back, so an engine that doesn't know it
+/// serves everything else right, where an op it doesn't know would stop its fold ([`OPS`]). Settings are
+/// written from [`Settings`], which has no field of this name, so an org's admins can't write limits.
+const LIMITS_KEY: &str = "limits";
+
+/// The limits an `org.settings` change's detail sets, if it is a `set_limits` change: `Some(None)` for limits
+/// that don't read (none, then: the planner only writes ones that read).
+fn limits_in(detail: Option<&str>) -> Option<Option<crate::limits::OrgLimits>> {
+    let v: Value = serde_json::from_str(detail?).ok()?;
+    let l = v.get(LIMITS_KEY)?;
+    Some(serde_json::from_value(l.clone()).ok())
+}
+
 /// Whether this engine folds `e`: a version it reads, of an op it knows.
 pub fn readable(e: &Event) -> bool {
     e.version <= EVENT_VERSION && OPS.contains(&e.op.as_str())
@@ -223,6 +238,10 @@ pub const USERS_VERSION: i64 = 3;
 /// would fold it as a service key of the org, reading as the key rather than as its owner, and keep it after
 /// the owner is removed.
 pub const PERSONAL_VERSION: i64 = 5;
+
+/// The version of an `org.settings` change that sets which sign-ins an org takes (`require_mfa`, `require_sso`):
+/// an engine before it would fold the change as settings that set nothing, and let a sign-in that names no org in.
+pub const SIGNIN_VERSION: i64 = 6;
 
 /// The longest a personal key may live, in seconds: it is a person's bearer, so it always expires.
 pub const PERSONAL_KEY_MAX_SECS: i64 = 365 * 24 * 3600;
@@ -305,6 +324,16 @@ impl Event {
             "team.add" => format!("add {user} to {org}/{team}"),
             "team.remove" => format!("remove {user} from {org}/{team}"),
             "org.profile" => format!("set the memory profile of {org}"),
+            "org.settings" if team.is_empty() && limits_in(self.detail.as_deref()).is_some() => {
+                format!(
+                    "set {org}'s limits: {}",
+                    crate::limits::limits_json(
+                        &limits_in(self.detail.as_deref())
+                            .flatten()
+                            .unwrap_or_default()
+                    )
+                )
+            }
             "org.settings" => format!(
                 "set {org}{} settings: {}",
                 if team.is_empty() {
@@ -526,6 +555,13 @@ pub struct Org {
     /// Unverified sign-ins an admin turned away, with when (µs): asked again after [`ASK_AGAIN_AFTER`].
     #[serde(skip)]
     signin_declined: BTreeMap<String, i64>,
+    /// Who made it, where that matters: `provisioner` for an org a provisioner key created (a sign-up service's),
+    /// which that key may go on setting up (`provisioner_may`). None for any other.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    /// What it is held to (`set_limits`, [`crate::limits`]): none by default.
+    #[serde(skip_serializing_if = "crate::limits::OrgLimits::is_empty")]
+    pub limits: crate::limits::OrgLimits,
     /// Which org of this name it is: the time (µs) the directory's log stamped on its `org.create` (0: the
     /// default org, or one created before the log). A name taken again after a delete is another org, with
     /// another incarnation; audit rows carry the one they were recorded for ([`crate::audit`]).
@@ -655,6 +691,22 @@ pub struct ServiceKey {
     /// revokes it. None: a service key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// A personal key's: the sign-in that made it was into the org (what `require_sso` takes), and passed a
+    /// second factor there too (what `require_mfa` takes) ([`Directory::signed_in_to`]). An org that requires
+    /// it takes no personal key made without it ([`Directory::access`]).
+    #[serde(skip)]
+    pub minted: KeySignIn,
+}
+
+/// How the sign-in that made a personal key signed in to its org ([`ServiceKey::minted`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct KeySignIn {
+    /// Into the org: its Auth0 Organization's token, or its own provider's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub into_org: bool,
+    /// And with a second factor (through its own provider: its sign-in).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mfa: bool,
 }
 
 /// A `key.create` event's detail.
@@ -680,6 +732,9 @@ pub struct KeyDetail {
     /// A personal key's member ([`ServiceKey::owner`]); written at [`PERSONAL_VERSION`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// A personal key's minting sign-in ([`ServiceKey::minted`]).
+    #[serde(default, flatten)]
+    pub minted: KeySignIn,
 }
 
 impl KeyDetail {
@@ -713,6 +768,9 @@ pub struct FileKey {
     pub groups: Vec<String>,
     #[serde(default)]
     pub admin: bool,
+    /// A provisioner key's row (`"provisioner": true`): never imported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provisioner: bool,
 }
 
 /// A keys file's rows: a JSON list of `{id, sha256, user, groups, admin}` (the keys file and
@@ -854,6 +912,9 @@ pub struct SignIn {
     pub auth0: bool,
     /// That Organization (the token's `org_id`).
     pub auth0_org: Option<String>,
+    /// Signed in through the platform's Auth0 tenant with a second factor, as the token says (its `amr` names
+    /// `mfa`, or the tenant's Action stamped it): what an org that sets `require_mfa` takes.
+    pub mfa: bool,
     /// Signed in through the platform's Auth0 tenant with a password account whose email it hasn't
     /// verified: that account's `sub`. It counts only in an org whose admins approved that very account
     /// for this email (`approve_signin`), and nowhere else ([`Directory::access`]).
@@ -870,6 +931,10 @@ pub struct SignIn {
     /// local store has no people to list, so its settings stay the defaults and nobody else is a member. Only
     /// the server sets it, for its fixed caller on a loopback-only server; nothing a request says sets it.
     pub local_admin: Option<String>,
+    /// Signed in with a provisioner key (the keys file's `"provisioner": true`): a sign-up service's, named by its
+    /// keys-file row's id. It creates orgs, finishes setting up those it created, and sets orgs' limits, and nothing
+    /// else ([`provisioner_may`]).
+    pub provisioner: Option<String>,
 }
 
 impl SignIn {
@@ -1176,6 +1241,20 @@ pub struct Settings {
     /// false. Each person can still unsubscribe themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<bool>,
+    /// Whether the org takes only sign-ins into it that passed a second factor: through the platform's Auth0
+    /// tenant, a token bound to the org's Auth0 Organization that says it did MFA; through the org's own
+    /// provider, its sign-in. A sign-in that names no org (one through the tenant as the person themselves, the
+    /// server's own provider, a gateway) counts here no more, wherever the directory lists the person, and
+    /// neither does a token from before it was set. The org's keys are unchanged. An org setting (a team's is
+    /// refused); off unless set true. The control plane sets it with its own (`PUT /orgs/:org/mfa`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_mfa: Option<bool>,
+    /// Whether the org takes only sign-ins into it, as `require_mfa` does without asking for the second factor:
+    /// an org that requires its single sign-on, whose tenant's Action checks the connection of each sign-in into
+    /// it (and can't check one into no org). An org setting (a team's is refused); off unless set true. The control
+    /// plane sets it with its own (`PUT /orgs/:org/sso-policy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_sso: Option<bool>,
 }
 
 impl Settings {
@@ -1213,7 +1292,13 @@ impl Settings {
             && self.auto_review.is_none()
             && self.pii.is_none()
             && self.digest.is_none()
+            && self.require_mfa.is_none()
+            && self.require_sso.is_none()
             && !self.sets_models()
+    }
+    /// Whether the org takes only sign-ins into it ([`Self::require_mfa`], [`Self::require_sso`]).
+    pub fn signin_into_org(&self) -> bool {
+        self.require_mfa == Some(true) || self.require_sso == Some(true)
     }
     /// Whether it names a model (the operator's to set).
     pub fn sets_models(&self) -> bool {
@@ -1253,6 +1338,12 @@ impl Settings {
         }
         if other.digest.is_some() {
             self.digest = other.digest;
+        }
+        if other.require_mfa.is_some() {
+            self.require_mfa = other.require_mfa;
+        }
+        if other.require_sso.is_some() {
+            self.require_sso = other.require_sso;
         }
         if other.advice_procedures.is_some() {
             self.advice_procedures = other.advice_procedures;
@@ -1409,6 +1500,10 @@ struct SnapOrg {
     signin_declined: BTreeMap<String, i64>,
     created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_by: Option<String>,
+    #[serde(default, skip_serializing_if = "crate::limits::OrgLimits::is_empty")]
+    limits: crate::limits::OrgLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace: Option<crate::workspace::Spec>,
     #[serde(default, skip_serializing_if = "Settings::is_empty")]
     settings: Settings,
@@ -1431,6 +1526,8 @@ struct SnapKey {
     imported_user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner: Option<String>,
+    #[serde(default, flatten)]
+    minted: KeySignIn,
 }
 
 /// The directory folded from its log, and how much of the log that is.
@@ -1502,7 +1599,7 @@ fn chain(prev: &str, e: &Event) -> String {
 
 /// What a snapshot's state means changes when the fold does: a snapshot of another format is never
 /// loaded (the log is replayed instead). Bump it with any change to what [`Directory::apply_events`] does.
-pub const SNAPSHOT_FORMAT: i64 = 12;
+pub const SNAPSHOT_FORMAT: i64 = 14;
 
 /// A folded snapshot of the directory log (`memory_system.directory_snapshot`): the state after the log's
 /// first `events` changes, the last of them at `at`.
@@ -1759,8 +1856,15 @@ impl Directory {
                 if purging.contains(&e.org) {
                     continue;
                 }
+                // Who made it, where the change says (a provisioner key's org).
+                let created_by = e
+                    .detail
+                    .as_deref()
+                    .and_then(|d| serde_json::from_str::<Value>(d).ok())
+                    .and_then(|v| v["created_by"].as_str().map(String::from));
                 orgs.entry(e.org.clone()).or_insert_with(|| Org {
                     created_at: e.at,
+                    created_by,
                     ..Default::default()
                 });
                 purged.remove(&e.org);
@@ -1864,6 +1968,12 @@ impl Directory {
                         .and_then(|d| serde_json::from_str(d).ok());
                 }
                 ("org.settings", t, _) => {
+                    // An org's limits ride on its settings' op ([`limits_in`]).
+                    if t.is_none()
+                        && let Some(l) = limits_in(e.detail.as_deref())
+                    {
+                        org.limits = l.unwrap_or_default();
+                    }
                     if let Some(set) = e
                         .detail
                         .as_deref()
@@ -1929,6 +2039,7 @@ impl Directory {
                                 last_used_at: None,
                                 imported_user,
                                 owner: k.owner.map(|u| user_id(&u)),
+                                minted: k.minted,
                             },
                         );
                     }
@@ -1991,6 +2102,7 @@ impl Directory {
                             sha256: k.sha256.clone(),
                             imported_user: k.imported_user.clone(),
                             owner: k.owner.clone(),
+                            minted: k.minted,
                         };
                         (n.clone(), key)
                     })
@@ -2011,6 +2123,8 @@ impl Directory {
                     signin_approved: o.signin_approved.clone(),
                     signin_declined: o.signin_declined.clone(),
                     created_at: o.created_at,
+                    created_by: o.created_by.clone(),
+                    limits: o.limits.clone(),
                     workspace: o.workspace.clone(),
                     settings: o.settings.clone(),
                     team_settings: o.team_settings.clone(),
@@ -2060,6 +2174,7 @@ impl Directory {
                             last_used_at: None,
                             imported_user: k.imported_user,
                             owner: k.owner,
+                            minted: k.minted,
                         };
                         (n, key)
                     })
@@ -2080,6 +2195,8 @@ impl Directory {
                     signin_approved: o.signin_approved,
                     signin_declined: o.signin_declined,
                     created_at: o.created_at,
+                    created_by: o.created_by,
+                    limits: o.limits,
                     workspace: o.workspace,
                     settings: o.settings,
                     team_settings: o.team_settings,
@@ -2142,9 +2259,10 @@ impl Directory {
             }
             // A personal key holds what its member holds through the directory (never what a domain or a
             // provider's group would give them: the key proves nothing about those), as a member, never an
-            // admin, and nothing once they are out.
+            // admin, and nothing once they are out, or once the org requires a sign-in the one that made the
+            // key wasn't (`require_sso`, `require_mfa`).
             if let Some(u) = &held.owner {
-                if !self.holds_member(u, &k.org, None) {
+                if !self.holds_member(u, &k.org, None) || !Self::key_meets(org, held) {
                     return out;
                 }
                 let teams = org
@@ -2226,20 +2344,51 @@ impl Directory {
         out
     }
 
+    /// How `via` signed in to `org`, whatever the org requires now: into it (its Auth0 Organization's token, as the
+    /// fold binds it, or its own provider's), and with a second factor there. What a personal key records of the
+    /// sign-in that made it ([`ServiceKey::minted`]).
+    pub fn signed_in_to(&self, org: &str, via: &SignIn) -> KeySignIn {
+        let bound = via.orgs.as_ref().is_some_and(|b| b.contains(org));
+        if via.auth0 {
+            let into_org = bound && self.auth0_bound(via.auth0_org.as_deref()) == Some(org);
+            return KeySignIn {
+                into_org,
+                mfa: into_org && via.mfa,
+            };
+        }
+        KeySignIn {
+            into_org: bound,
+            mfa: bound,
+        }
+    }
+
+    /// Whether `org` still takes personal key `k`: one made from a sign-in its `require_sso` / `require_mfa`
+    /// wouldn't take now is refused, as that sign-in would be.
+    fn key_meets(org: &Org, k: &ServiceKey) -> bool {
+        (!org.settings.signin_into_org() || k.minted.into_org)
+            && (org.settings.require_mfa != Some(true) || k.minted.mfa)
+    }
+
     /// Whether a sign-in counts in `org`: an org's own provider vouches for that org only, and an org
     /// that requires its provider takes no other sign-in, a person's or a service's (its own keys are
     /// held to it before this). A sign-in through the platform's
     /// Auth0 tenant counts only in the one org that recorded its Auth0 Organization, as this fold has it
     /// (the server's 5 s view of the bindings, `via.orgs`, can only narrow that), and never in an org
-    /// that requires its own provider.
+    /// that requires its own provider. An org that requires a second factor or its single sign-on
+    /// ([`Settings::signin_into_org`]) takes only a sign-in into it: no sign-in that names no org, and through
+    /// the tenant, with `require_mfa`, only one that says it passed a second factor.
     fn vouched(&self, org: &str, via: &SignIn) -> bool {
+        let into_only = self
+            .orgs
+            .get(org)
+            .is_some_and(|o| o.settings.signin_into_org());
         if via.auth0 {
             return via.orgs.as_ref().is_some_and(|b| b.contains(org))
                 && self.auth0_bound(via.auth0_org.as_deref()) == Some(org)
-                && self
-                    .orgs
-                    .get(org)
-                    .is_some_and(|o| o.provider.as_ref().is_none_or(|p| !p.required));
+                && self.orgs.get(org).is_some_and(|o| {
+                    o.provider.as_ref().is_none_or(|p| !p.required)
+                        && (via.mfa || o.settings.require_mfa != Some(true))
+                });
         }
         // Bound to orgs (their own provider): those orgs alone; a keys-file key is bound to none of them. Not
         // bound: any org that doesn't require its own provider. That is every other way in, a person's or not:
@@ -2248,11 +2397,14 @@ impl Directory {
         // make them, so they are how a service reaches an org that requires its provider.
         match &via.orgs {
             Some(bound) => bound.contains(org),
-            None => !self
-                .orgs
-                .get(org)
-                .and_then(|o| o.provider.as_ref())
-                .is_some_and(|p| p.required),
+            None => {
+                !into_only
+                    && !self
+                        .orgs
+                        .get(org)
+                        .and_then(|o| o.provider.as_ref())
+                        .is_some_and(|p| p.required)
+            }
         }
     }
 
@@ -2773,6 +2925,39 @@ impl Directory {
             },
         };
         let Some(a) = access.get(&org) else {
+            if let Some(k) = &via.key
+                && let Some(o) = self.orgs.get(&org)
+                && let Some(held) = o.keys.get(&k.name).filter(|h| h.sha256 == k.sha256)
+                && held.owner.is_some()
+                && !Self::key_meets(o, held)
+            {
+                anyhow::bail!(
+                    "personal key {} was made from a sign-in org {org} no longer takes: sign in to org {org} and make a new personal key",
+                    k.name
+                );
+            }
+            if let Some(o) = self.orgs.get(&org)
+                && o.settings.signin_into_org()
+                && via.key.is_none()
+                && !self.vouched(&org, via)
+            {
+                // Told to its members only: anyone else learns no more than of an org that doesn't exist.
+                anyhow::ensure!(
+                    self.holds_member(&user, &org, None),
+                    "{user} is not a member of org {org}"
+                );
+                let mfa = match o.settings.require_mfa == Some(true) {
+                    true => " with a second factor",
+                    false => "",
+                };
+                let sso = match o.settings.require_sso == Some(true) {
+                    true => format!(", or ampup-memory join <server> --org {org} --sso"),
+                    false => String::new(),
+                };
+                anyhow::bail!(
+                    "org {org} takes only sign-ins into it{mfa}: sign in to org {org} (the console's sign-in for it{sso}); a service uses one of the org's keys"
+                );
+            }
             if via.auth0 && self.orgs.contains_key(&org) && !self.vouched(&org, via) {
                 anyhow::bail!(
                     "this Auth0 sign-in is for {}, not org {org}'s: sign in through org {org}'s Auth0 organization",
@@ -3007,6 +3192,30 @@ pub enum Change {
         #[serde(default)]
         personal: bool,
     },
+    /// Set what an org is held to ([`crate::limits`]): a field left out stays as it is, and null removes that limit.
+    /// The operator's alone (an admin key, an operator, a provisioner key), never the org's own admins.
+    SetLimits {
+        org: String,
+        #[serde(
+            default,
+            deserialize_with = "given",
+            skip_serializing_if = "Option::is_none"
+        )]
+        monthly_model_tokens: Option<Option<u64>>,
+        #[serde(
+            default,
+            deserialize_with = "given",
+            skip_serializing_if = "Option::is_none"
+        )]
+        max_episodes: Option<Option<u64>>,
+        /// RFC 3339.
+        #[serde(
+            default,
+            deserialize_with = "given",
+            skip_serializing_if = "Option::is_none"
+        )]
+        expires_at: Option<Option<String>>,
+    },
     /// Set an ingest key's source prefixes (an empty list: any source again). The list must be there: a
     /// change that leaves it out (or misspells it) is refused, never taken for "any source".
     SetKeySources {
@@ -3045,6 +3254,13 @@ fn writer() -> KeyRole {
     KeyRole::Writer
 }
 
+/// A field that may be left out (None), given as null (`Some(None)`) or given a value.
+fn given<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
+}
+
 /// A field that must be given, though it may be null.
 fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     Option::deserialize(d)
@@ -3073,14 +3289,17 @@ impl Change {
             | Change::Invite { .. }
             | Change::Decline { .. }
             | Change::ApproveSignIn { .. }
-            | Change::DeclineSignIn { .. } => true,
-            // An org's models, its training log and which scopes its readers also search, and nothing else of
-            // its settings.
+            | Change::DeclineSignIn { .. }
+            | Change::SetLimits { .. } => true,
+            // An org's models, its training log, which scopes its readers also search and which sign-ins it
+            // takes (as binding it to Auth0 is theirs), and nothing else of its settings.
             Change::SetSettings { settings, .. } => {
                 (settings.sets_models()
                     || settings.train_log.is_some()
                     || settings.advice_traces.is_some()
-                    || settings.reads.is_some())
+                    || settings.reads.is_some()
+                    || settings.require_mfa.is_some()
+                    || settings.require_sso.is_some())
                     && settings.compile.is_none()
                     && settings.advice.is_none()
                     && settings.advice_procedures.is_none()
@@ -3147,6 +3366,7 @@ impl Change {
             | Change::CreateKey { org, .. }
             | Change::RevokeKey { org, .. }
             | Change::SetKeySources { org, .. }
+            | Change::SetLimits { org, .. }
             | Change::ImportKeys { org, .. } => org,
         }
     }
@@ -3362,6 +3582,90 @@ fn directory_key_may(
 }
 
 /// The events that make `change`, checked against `dir` and what `actor` may do. Nothing is written.
+/// What a provisioner key ([`SignIn::provisioner`]) may change, and nothing else: create an org that doesn't exist
+/// (its first admin a plain email), and in an org it created (`created_by`), bind it to its Auth0 Organization
+/// while it is bound to none and make its ingest keys; and set any org's limits. What it may then do is an admin
+/// key's, as planned below.
+pub fn provisioner_may(dir: &Directory, key: &str, change: &Change) -> Result<()> {
+    let org_name = change.org();
+    if org_name == DEFAULT_ORG {
+        refuse!("a provisioner key never reaches the default org");
+    }
+    let created = || -> Result<&Org> {
+        match dir.orgs.get(org_name) {
+            Some(o) if created_by(o, key) => Ok(o),
+            Some(_) => refuse!(
+                "a provisioner key may not change org {org_name}: it sets up only the orgs it created"
+            ),
+            None => refuse!("no org {org_name}"),
+        }
+    };
+    match change {
+        Change::CreateOrg { admin, .. } => {
+            if dir.orgs.contains_key(org_name) || dir.purging.contains(org_name) {
+                refuse!("org {org_name} already exists");
+            }
+            match admin {
+                Some(a) if plain_email(a) => Ok(()),
+                _ => invalid!("a provisioner key's org needs its first admin: an email (admin)"),
+            }
+        }
+        Change::SetAuth0Org { auth0_org, .. } => {
+            let org = created()?;
+            if auth0_org.is_none() {
+                refuse!(
+                    "a provisioner key binds an org to an Auth0 organization, never unbinds one"
+                );
+            }
+            if org.auth0_org.is_some() {
+                refuse!(
+                    "org {org_name} is bound to an Auth0 organization already: only the operator rebinds it"
+                );
+            }
+            Ok(())
+        }
+        Change::CreateKey {
+            role,
+            team,
+            personal,
+            ..
+        } => {
+            created()?;
+            if *role != KeyRole::Ingest || team.is_some() || *personal {
+                refuse!(
+                    "a provisioner key makes an org's ingest keys only (role ingest, for the whole org)"
+                );
+            }
+            Ok(())
+        }
+        Change::SetLimits { .. } => match dir.orgs.contains_key(org_name) {
+            true => Ok(()),
+            false => refuse!("no org {org_name}"),
+        },
+        _ => refuse!(
+            "a provisioner key creates orgs, sets up those it created, and sets orgs' limits: it may not {}",
+            serde_json::to_value(change)
+                .ok()
+                .and_then(|v| v["op"].as_str().map(String::from))
+                .unwrap_or_default()
+        ),
+    }
+}
+
+/// What a provisioner key's org says made it (`Org::created_by`).
+pub const PROVISIONER: &str = "provisioner";
+
+/// What an org a provisioner key created records of it (`created_by`): `provisioner:` and the key's keys-file id, so
+/// a sign-up service's key sets up only its own orgs, never another provisioner key's.
+pub fn provisioner_mark(key: &str) -> String {
+    format!("{PROVISIONER}:{key}")
+}
+
+/// Whether provisioner key `key` created `org`.
+pub fn created_by(org: &Org, key: &str) -> bool {
+    org.created_by.as_deref() == Some(provisioner_mark(key).as_str())
+}
+
 pub fn plan(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Event>> {
     let mut out = plan_change(dir, actor, change)?;
     out.extend(import_revokes(dir, &actor.user, &out));
@@ -3415,8 +3719,14 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         );
     }
     let me = actor.user.as_str();
+    // A provisioner key makes the changes that are its own (and none other) as an admin key would.
+    if let Some(key) = &actor.via.provisioner {
+        provisioner_may(dir, key, change)?;
+    }
     // An operator makes the changes that are theirs as an admin key would, and no other.
-    let superuser = actor.superuser || (actor.via.operator && change.operators(dir));
+    let superuser = actor.superuser
+        || (actor.via.operator && change.operators(dir))
+        || actor.via.provisioner.is_some();
     // Creating and deleting orgs is the catalog owner's; the rest is the org's admins'.
     // A file key is the operator's to import, never an org admin's: the rows are the keys file's own, as the
     // server holding it reads them (`directory_change` takes them from its file by id), or the catalog owner's.
@@ -3425,13 +3735,15 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             "{me} may not import file keys: only the operator (an admin key, or the catalog's owner with --direct) may"
         );
     }
-    // Binding an org to Auth0 decides who signs in to it: never its own admins' to choose.
+    // Binding an org to Auth0 decides who signs in to it, and its limits what it may use: never its own admins'
+    // to choose.
     let owner_only = matches!(
         change,
         Change::CreateOrg { .. }
             | Change::CreateWorkspace { .. }
             | Change::DeleteOrg { .. }
             | Change::SetAuth0Org { .. }
+            | Change::SetLimits { .. }
     );
     let imports = matches!(change, Change::ImportKeys { .. });
     // Asking to join is the asker's own: checked below, where the org is known.
@@ -3468,7 +3780,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         refuse!(
             "{me} may not change org {org_name}{}",
             if owner_only {
-                " (creating and deleting orgs, and binding them to Auth0, needs the catalog owner or an admin key)"
+                " (creating and deleting orgs, binding them to Auth0 and setting their limits needs the catalog owner or an admin key)"
             } else {
                 " (only its admins may)"
             }
@@ -3516,7 +3828,13 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 "org {org_name} was deleted and its memory isn't purged yet: finish that first (ampup-memory org delete {org_name} --confirm {org_name})"
             );
         }
-        let mut out = vec![ev("org.create")];
+        // A provisioner key's org says so: the key goes on setting it up (`provisioner_may`).
+        let mut out = vec![match &actor.via.provisioner {
+            Some(key) => {
+                ev("org.create").detail(&json!({"created_by": provisioner_mark(key)}).to_string())
+            }
+            None => ev("org.create"),
+        }];
         if let Some(id) = auth0_org {
             auth0_free(id)?;
             out.push(ev("org.auth0").detail(id));
@@ -3806,9 +4124,24 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             if team.is_some() && settings.digest.is_some() {
                 invalid!("digest is the org's setting, not a team's: set it without a team");
             }
+            let sets_signin = settings.require_mfa.is_some() || settings.require_sso.is_some();
+            if team.is_some() && sets_signin {
+                invalid!(
+                    "require_mfa and require_sso are the org's settings, not a team's: set them without a team"
+                );
+            }
+            // Only a sign-in into the org would count there: an org with no way in of its own would let no one in.
+            if (settings.require_mfa == Some(true) || settings.require_sso == Some(true))
+                && org.auth0_org.is_none()
+                && org.provider.is_none()
+            {
+                invalid!(
+                    "org {org_name} has no sign-in of its own (an Auth0 organization or its own provider): requiring sign-ins into it would let no one in"
+                );
+            }
             if settings.is_empty() {
                 invalid!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"compile_kind_sources\": [\"<source prefix>\"], \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"digest\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"compile_kind_sources\": [\"<source prefix>\"], \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"digest\": true|false, \"require_mfa\": true|false, \"require_sso\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             if let Some(sources) = &settings.compile_sources {
@@ -3951,6 +4284,9 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 }
             }
             let mut e = ev("org.settings").detail(&serde_json::to_string(settings)?);
+            if sets_signin {
+                e.version = SIGNIN_VERSION;
+            }
             if let Some(t) = team {
                 has_team(t)?;
                 e = e.team(t);
@@ -3999,6 +4335,34 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             let mut p = p.clone();
             p.issuer = issuer.to_string();
             vec![ev("auth.provider").detail(&serde_json::to_string(&p)?)]
+        }
+        Change::SetLimits {
+            monthly_model_tokens,
+            max_episodes,
+            expires_at,
+            ..
+        } => {
+            let mut l = org.limits.clone();
+            if let Some(n) = monthly_model_tokens {
+                l.monthly_model_tokens = *n;
+            }
+            if let Some(n) = max_episodes {
+                l.max_episodes = *n;
+            }
+            if let Some(t) = expires_at {
+                l.expires_at = match t {
+                    None => None,
+                    Some(t) => match chrono::DateTime::parse_from_rfc3339(t) {
+                        Ok(t) => Some(t.with_timezone(&chrono::Utc)),
+                        Err(_) => invalid!("expires_at is an RFC 3339 time, not {t:?}"),
+                    },
+                };
+            }
+            match l == org.limits {
+                true => vec![],
+                // As an org-wide settings change ([`limits_in`]), written at version 1.
+                false => vec![ev("org.settings").detail(&json!({LIMITS_KEY: l}).to_string())],
+            }
         }
         Change::SetAuth0Org { auth0_org, .. } => match auth0_org {
             Some(id) if org.auth0_org.as_deref() == Some(id.as_str()) => vec![],
@@ -4188,6 +4552,10 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 created_by: user_id(me),
                 imported_from: None,
                 imported_user: None,
+                minted: match owner {
+                    Some(_) => dir.signed_in_to(org_name, &actor.via),
+                    None => KeySignIn::default(),
+                },
                 owner,
             };
             let mut e = ev("key.create").detail(&serde_json::to_string(&detail)?);
@@ -4253,6 +4621,12 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
                     invalid!("file key {id}: its sha256 is not 64 hex characters");
                 }
+                // A provisioner key is a deployment's, never an org's: it would lose what makes it one.
+                if k.provisioner {
+                    refuse!(
+                        "file key {id} is a provisioner key: it stays in the keys file (leave it out with --only)"
+                    );
+                }
                 // A directory key can't administer anything: an admin key would lose what it holds.
                 if k.admin {
                     refuse!(
@@ -4317,6 +4691,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                     imported_from: None,
                     imported_user: Some(user.clone()),
                     owner: None,
+                    minted: KeySignIn::default(),
                 };
                 let mut e = ev("key.create").detail(&serde_json::to_string(&detail)?);
                 e.team = team.clone();
@@ -4407,7 +4782,9 @@ pub async fn apply(store: &Store, actor: &Actor, change: &Change) -> Result<Vec<
     // A purged org's name taken again: whatever a lagging server wrote to the old org after its purge
     // goes first, so the new org starts with nothing of the old one's. Only the operator creates orgs.
     if let Change::CreateOrg { org, .. } | Change::CreateWorkspace { org, .. } = change
-        && (actor.superuser || (actor.via.operator && matches!(change, Change::CreateOrg { .. })))
+        && (actor.superuser
+            || ((actor.via.operator || actor.via.provisioner.is_some())
+                && matches!(change, Change::CreateOrg { .. })))
         && Directory::load(store).await?.purged.contains(org)
     {
         crate::offboard::purge_memory(store, org).await?;

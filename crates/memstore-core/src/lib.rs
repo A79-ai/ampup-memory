@@ -23,6 +23,7 @@ pub mod corroboration;
 pub mod episode_types;
 pub mod freshness;
 pub mod governance;
+pub mod limits;
 pub mod loads;
 pub mod log_org;
 pub mod metrics;
@@ -743,6 +744,24 @@ impl Ledger {
     }
 }
 
+/// Logs a read that waited on the catalog for a second or more: why it waited ([`Store::rows`]), how long for the
+/// reader ahead of it (`waited`), and how long its own load took, if it made one.
+fn slow_table_read(key: &str, why: &str, waited: Duration, loaded: Option<Duration>) {
+    let total = waited + loaded.unwrap_or_default();
+    if total < Duration::from_secs(1) {
+        return;
+    }
+    eprintln!(
+        "slow table read: {key} in {} ms ({why}; {} ms waiting for the load ahead, {})",
+        total.as_millis(),
+        waited.as_millis(),
+        match loaded {
+            Some(l) => format!("{} ms loading", l.as_millis()),
+            None => "served what it loaded".into(),
+        }
+    );
+}
+
 /// A table as last read: its metadata and decoded rows, kept per data file so a new
 /// snapshot only costs reading the files it added.
 #[derive(Clone)]
@@ -972,6 +991,17 @@ pub struct Added {
     episodes: HashMap<String, Vec<String>>,
     /// When the first of `episodes` ages out (microseconds): past it, what was added is looked at again.
     fresh_until: Option<i64>,
+    /// Episodes the state holds that were written again exactly as it holds them: nothing of them changed.
+    rewritten: HashSet<String>,
+}
+
+/// What main holds already of a write ([`Store::held_as_is`]).
+#[derive(Default)]
+pub struct HeldAsIs {
+    /// The episodes main holds current, their newest row saying just what the write's would.
+    pub same: HashSet<String>,
+    /// For each source asked about, every episode of it current on main.
+    pub current: HashMap<String, HashSet<String>>,
 }
 
 /// A visibility state with what was added since it was built ([`Store::lagging_view`]): for a read that asks
@@ -1309,14 +1339,17 @@ impl Vis {
         }
         // An episode readers have written again: a forget, a narrowed ACL or a new version, which its commit may
         // take away. Rows of a new commit are looked for in every file: one written before its commit lands
-        // counts with it. Any such row counts, even one that seems to say again what the state holds: its ACL,
-        // time or document can each take memory away in ways the state alone can't rule out.
+        // counts with it. Such a row is let through only when its episode is current here and the row says what
+        // the state's newest row of it says ([`RowSays`]: readers, time, document, source, subjects): a writer
+        // sending again what it sent before. Any other difference can take memory away in ways the state alone
+        // can't rule out.
         let known = |e: &str| {
             self.acls.contains_key(e)
                 || self.retracted.contains(e)
                 || self.documents.of.contains_key(e)
         };
-        let written_again = |b: &RecordBatch, all: bool| {
+        let mut again: Vec<(&RecordBatch, usize)> = vec![];
+        let look = |b: &'_ RecordBatch, all: bool| {
             let (commit, id) = (
                 b.column_by_name("commit_id")
                     .expect("commit_id")
@@ -1326,18 +1359,49 @@ impl Vis {
                     .as_string::<i32>(),
             );
             (0..b.num_rows())
-                .any(|i| (all || commits.contains(commit.value(i))) && known(id.value(i)))
+                .filter(|&i| (all || commits.contains(commit.value(i))) && known(id.value(i)))
+                .collect::<Vec<_>>()
         };
+        for &b in &episodes {
+            again.extend(look(b, true).into_iter().map(|i| (b, i)));
+        }
+        if !commits.is_empty() {
+            for b in now[1].iter() {
+                again.extend(look(b, false).into_iter().map(|i| (b, i)));
+            }
+        }
+        let mut rewritten: HashSet<String> = HashSet::new();
+        if !again.is_empty() {
+            let id_of = |b: &RecordBatch, i: usize| {
+                b.column_by_name("episode_id")
+                    .expect("episode_id")
+                    .as_string::<i32>()
+                    .value(i)
+                    .to_string()
+            };
+            let ids: Vec<String> = again.iter().map(|(b, i)| id_of(b, *i)).collect();
+            if ids.iter().any(|e| !self.acls.contains_key(e)) {
+                return Err("an episode written again");
+            }
+            let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+            let held = newest_rows(&built_from[1], &self.committed, &wanted);
+            for ((b, i), e) in again.iter().zip(&ids) {
+                if held.get(e).and_then(Option::as_ref) != Some(&RowSays::at(b, *i)) {
+                    return Err("an episode written again");
+                }
+            }
+            rewritten.extend(ids);
+        }
         let deleted_sources: HashSet<&str> = self
             .retraction_targets
             .iter()
             .filter_map(|t| t.strip_prefix("source:"))
             .collect();
         let now_us = now_micros();
-        if episodes.iter().any(|b| written_again(b, true)) {
-            return Err("an episode written again");
-        }
-        let mut added = Added::default();
+        let mut added = Added {
+            rewritten,
+            ..Added::default()
+        };
         if commits.is_empty() {
             return Ok(added);
         }
@@ -1348,9 +1412,6 @@ impl Vis {
         // costs a lookup a row.
         let mut new_ids: HashSet<&str> = HashSet::new();
         for b in now[1].iter() {
-            if written_again(b, false) {
-                return Err("an episode written again");
-            }
             let (commit, id) = (
                 b.column_by_name("commit_id")
                     .expect("commit_id")
@@ -1360,7 +1421,7 @@ impl Vis {
                     .as_string::<i32>(),
             );
             for i in 0..b.num_rows() {
-                if commits.contains(commit.value(i)) {
+                if commits.contains(commit.value(i)) && !added.rewritten.contains(id.value(i)) {
                     new_ids.insert(id.value(i));
                 }
             }
@@ -1505,7 +1566,8 @@ impl Vis {
         let mut hidden: HashSet<String> = HashSet::new();
         let mut fresh_until = self.fresh_until;
         // The committed rows among those, in table order: the new commits' wherever they are, and a new file's rows of
-        // a commit main already held (written after it). Each is a new episode's (`only_added` refuses any other).
+        // a commit main already held (written after it). Each is a new episode's (`only_added` refuses any other,
+        // but one written again just as the state holds it, which changes nothing and is passed over).
         // Episode, source, document, occurred_at, recorded_at, ACL.
         type NewRow = (
             String,
@@ -1539,6 +1601,10 @@ impl Vis {
                     continue;
                 }
                 let (e, s) = (id.value(i), source.value(i));
+                // Written again as the state holds it: nothing of it changed.
+                if added.rewritten.contains(e) {
+                    continue;
+                }
                 let at = (!occurred.is_null(i)).then(|| occurred.value(i));
                 if deleted_sources.contains(s) {
                     hidden.insert(e.to_string());
@@ -2198,6 +2264,107 @@ impl Vis {
                 .iter()
                 .all(|id| self.index.ordinal(id).is_some_and(|o| seen.contains(o)))
     }
+}
+
+/// What a stored row of an episode says that readers' memory rests on: its source, when it occurred, its document,
+/// its subjects, whether its text is searched, and who may read it. A row written again that says the same as
+/// the episode's newest row changes nothing a reader is served.
+#[derive(Debug, PartialEq, Eq)]
+struct RowSays {
+    source: String,
+    occurred_at: Option<i64>,
+    document: Option<String>,
+    about: Vec<String>,
+    index_text: bool,
+    acl: BTreeSet<String>,
+}
+
+impl RowSays {
+    fn of(e: &Episode) -> Self {
+        RowSays {
+            source: e.source.clone(),
+            occurred_at: Some(e.occurred_at),
+            document: e.document.clone(),
+            about: e.about.clone(),
+            index_text: e.index_text,
+            acl: e.acl.iter().cloned().collect(),
+        }
+    }
+
+    /// Row `i` of an episodes batch (columns older files lack read as a new row of them would).
+    fn at(b: &RecordBatch, i: usize) -> Self {
+        let text = |c: &str| {
+            b.column_by_name(c)
+                .map(|a| a.as_string::<i32>())
+                .filter(|a| !a.is_null(i))
+                .map(|a| a.value(i).to_string())
+        };
+        let occurred = b
+            .column_by_name("occurred_at")
+            .map(|a| a.as_primitive::<TimestampMicrosecondType>())
+            .filter(|a| !a.is_null(i))
+            .map(|a| a.value(i));
+        let index_text = b
+            .column_by_name("index_text")
+            .map(|a| a.as_boolean())
+            .filter(|a| !a.is_null(i))
+            .is_none_or(|a| a.value(i));
+        RowSays {
+            source: text("source").unwrap_or_default(),
+            occurred_at: occurred,
+            document: text("document"),
+            about: text("about").as_deref().map(split_list).unwrap_or_default(),
+            index_text,
+            acl: split_list(&text("acl").unwrap_or_default())
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+/// The newest committed row of each of `ids` in `episodes`, as a build ranks rows (the newest recorded wins; rows
+/// recorded at once are one state, their readers joined). `None` for one whose rows recorded at once say
+/// different things but their readers: a build's pick among them isn't one a rewrite can be said to match.
+fn newest_rows(
+    episodes: &[RecordBatch],
+    committed: &HashSet<String>,
+    ids: &HashSet<&str>,
+) -> HashMap<String, Option<RowSays>> {
+    let mut newest: HashMap<String, (i64, Option<RowSays>)> = HashMap::new();
+    for b in episodes {
+        let text = |c: &str| b.column_by_name(c).expect(c).as_string::<i32>();
+        let (commit, id) = (text("commit_id"), text("episode_id"));
+        let recorded = b
+            .column_by_name("recorded_at")
+            .expect("recorded_at")
+            .as_primitive::<TimestampMicrosecondType>();
+        for i in 0..b.num_rows() {
+            if !ids.contains(id.value(i)) || !committed.contains(commit.value(i)) {
+                continue;
+            }
+            let at = if recorded.is_null(i) {
+                i64::MIN
+            } else {
+                recorded.value(i)
+            };
+            let row = RowSays::at(b, i);
+            match newest.get_mut(id.value(i)) {
+                Some((seen, _)) if *seen > at => {}
+                Some((seen, have)) if *seen == at => {
+                    *have = have.take().and_then(|mut h| {
+                        let mut row = row;
+                        let mut acl = std::mem::take(&mut h.acl);
+                        acl.append(&mut row.acl);
+                        (h == row).then_some(RowSays { acl, ..h })
+                    });
+                }
+                _ => {
+                    newest.insert(id.value(i).to_string(), (at, Some(row)));
+                }
+            }
+        }
+    }
+    newest.into_iter().map(|(id, (_, r))| (id, r)).collect()
 }
 
 type Plan = (Instant, Table, Vec<FileScanTask>);
@@ -3262,13 +3429,27 @@ impl Store {
         if let Some(snap) = self.cached_rows(ns, name, &key) {
             return Ok(snap);
         }
+        // Why this read waits, for its slow line: no rows yet, an own write since they were read, or older than
+        // the hard limit.
+        let why = match self.cache.entries.lock().unwrap().get(&key) {
+            None => "not cached",
+            Some(e) if e.fetched.is_none() => "written here since",
+            Some(_) => "past the hard staleness limit",
+        };
+        // A loop's read waits for its turn before it takes the load's lock, not holding it.
+        loads::turn().await;
+        let started = Instant::now();
         let loading = self.cache.loading(&key);
         let _turn = loading.lock().await;
+        let waited = started.elapsed();
         // The reader ahead may have just loaded it.
         if let Some(snap) = self.cached_rows(ns, name, &key) {
+            slow_table_read(&key, why, waited, None);
             return Ok(snap);
         }
+        let loading_at = Instant::now();
         let snap = refresh(&*self.catalog(), &self.cache, ns, name).await?;
+        slow_table_read(&key, why, waited, Some(loading_at.elapsed()));
         self.trim(ns);
         Ok(snap)
     }
@@ -3431,6 +3612,7 @@ impl Store {
             let (catalog, cache) = (self.catalog(), self.cache.clone());
             let (ns, name) = (ns.to_string(), name.to_string());
             tokio::spawn(loads::later(async move {
+                loads::turn().await;
                 // One load of a table at a time: a reader that finds the cache past the hard limit meanwhile
                 // waits for this one rather than reading the whole table again beside it.
                 let loading = cache.loading(&format!("{ns}.{name}"));
@@ -3501,6 +3683,61 @@ impl Store {
             e.fetched = None;
             e.generation = generation;
         }
+    }
+
+    /// How many own writes to `ns.name` this store has noted ([`Store::invalidate`]): read before an append and
+    /// handed to [`Store::wrote`] after it.
+    pub fn generation(&self, ns: &str, name: &str) -> u64 {
+        self.cache
+            .generations
+            .lock()
+            .unwrap()
+            .get(&format!("{ns}.{name}"))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// This store's own append to `ns.name` committed as `after`, with [`Store::generation`] read as `before`
+    /// just before it: the cached rows move to `after`, reading only the files appended since they were read, so
+    /// the next read doesn't wait for the catalog to load the table again. `after` is the catalog's table right
+    /// after the commit, so it holds every write committed before it; it is taken for fresh only when no other own
+    /// write was noted since `before` (one committed after it, or one committed before it but noted later), and
+    /// is otherwise left stale, as [`Store::invalidate`] leaves it, as it is when reading the new files fails.
+    pub async fn wrote(&self, ns: &str, name: &str, after: Table, before: u64) {
+        self.invalidate(ns, name);
+        let key = format!("{ns}.{name}");
+        // Not cached, or cached under another schema (the write evolved it): moving would read every file of the
+        // table here, in the writer's turn. The next read loads it, as before.
+        let prev = self.cache.entries.lock().unwrap().get(&key).cloned();
+        // Nor a table a rewrite has marked (`refresh_once` refuses the ledger's then): the next read waits it out.
+        if prev
+            .as_ref()
+            .is_none_or(|p| p.schema_id != after.metadata().current_schema_id())
+            || after
+                .metadata()
+                .properties()
+                .contains_key(offboard::REWRITE_PROP)
+        {
+            return;
+        }
+        if let Err(e) = install(&self.cache, key, prev, after, before + 1).await {
+            eprintln!("memstore: caching the rows written to {ns}.{name} failed: {e:#}");
+        }
+    }
+
+    /// [`append`] to `ns.name` by this store, the cached rows moved to what it committed ([`Store::wrote`]).
+    async fn append_own(
+        &self,
+        ns: &str,
+        name: &str,
+        table: &Table,
+        columns: Vec<(&str, ArrayRef)>,
+        on_conflict: OnConflict,
+    ) -> Result<()> {
+        let before = self.generation(ns, name);
+        let after = appended(&*self.catalog(), table, columns, on_conflict).await?;
+        self.wrote(ns, name, after, before).await;
+        Ok(())
     }
 
     /// A side table just created here: no longer taken for missing ([`Store::side_rows`]).
@@ -3587,8 +3824,9 @@ impl Store {
         let id = uuid::Uuid::new_v4().to_string();
         let table = self.write_target(&ns, SCHEMAS).await?;
         let s = |v: &str| -> ArrayRef { Arc::new(StringArray::from(vec![v])) };
-        append(
-            &*self.catalog(),
+        self.append_own(
+            &ns,
+            SCHEMAS,
             &table,
             vec![
                 ("commit_id", s(&id)),
@@ -3600,7 +3838,6 @@ impl Store {
             OnConflict::Recommit,
         )
         .await?;
-        self.invalidate(&ns, SCHEMAS);
         let branch_name = branch.to_string();
         self.append_ledger(&id, scope, branch, actor, &move |l: &Ledger| {
             Ok(l.heads(&branch_name))
@@ -3782,8 +4019,9 @@ impl Store {
         }
         let table = self.write_target(ns, CLOSURES).await?;
         let strs = |v: Vec<&str>| -> ArrayRef { Arc::new(StringArray::from(v)) };
-        append(
-            &*self.catalog(),
+        self.append_own(
+            ns,
+            CLOSURES,
             &table,
             vec![
                 ("commit_id", strs(rows.iter().map(|r| r.0).collect())),
@@ -3804,7 +4042,6 @@ impl Store {
             OnConflict::Recommit,
         )
         .await?;
-        self.invalidate(ns, CLOSURES);
         Ok(())
     }
 
@@ -4554,6 +4791,13 @@ impl Store {
     ) -> Result<String> {
         self.check_fence()?;
         validate_write(episodes, facts)?;
+        // An org past its expiry takes no new memory (`crate::limits`), whichever way it comes; what changes only
+        // what it holds (facts read from it, retractions) goes on.
+        if !episodes.is_empty()
+            && let Some(l) = crate::limits::write_gate(scope.org_name())
+        {
+            return Err(l.into());
+        }
         let capped = workspace::reserve(self, episodes.len()).await?;
         let _workspace = workspace::check_write(self, scope, episodes.len(), facts.len()).await?;
         let ends: Vec<(&str, i64)> = closures
@@ -4575,6 +4819,9 @@ impl Store {
                 "no branch {branch:?} in {}",
                 scope.namespace()
             );
+        }
+        if branch == MAIN {
+            self.say_written_again(scope, actor, episodes);
         }
         // Group commit: concurrent commits on this store share one data append per table and
         // one ledger append. The first caller in leads, committing whatever is queued (its own
@@ -4614,6 +4861,136 @@ impl Store {
                     false => anyhow::anyhow!(e),
                 },
             )
+    }
+
+    /// Says (at most once a minute a scope) who writes on main episodes its last state already holds: each such
+    /// write makes the next read look at what the new rows say ([`Vis::only_added`]), and one that changes
+    /// anything builds the state again.
+    fn say_written_again(&self, scope: &Scope, actor: &str, episodes: &[Episode]) {
+        let ns = scope.namespace();
+        let Some(vis) = self
+            .vis
+            .lock()
+            .unwrap()
+            .get(&(ns.clone(), MAIN.to_string()))
+            .map(|(_, v)| v.clone())
+        else {
+            return;
+        };
+        let again: Vec<&Episode> = episodes
+            .iter()
+            .filter(|e| {
+                vis.acls.contains_key(&e.episode_id)
+                    || vis.retracted.contains(&e.episode_id)
+                    || vis.documents.of.contains_key(&e.episode_id)
+            })
+            .collect();
+        if again.is_empty() {
+            return;
+        }
+        static SAID: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+            std::sync::LazyLock::new(Mutex::default);
+        {
+            let mut said = SAID.lock().unwrap();
+            if said
+                .get(&ns)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+            {
+                return;
+            }
+            said.insert(ns.clone(), Instant::now());
+        }
+        // A source's family, not its ids: `remember:…:conversation`, `linear:…`.
+        let family = |s: &str| match (s.split_once(':'), s.rsplit_once(':')) {
+            (Some((first, _)), Some((_, last))) if first != s && last != first => {
+                format!("{first}:…:{last}")
+            }
+            _ => s.chars().take(24).collect(),
+        };
+        let families: BTreeSet<String> = again.iter().map(|e| family(&e.source)).collect();
+        eprintln!(
+            "episodes written again on {ns} main by {actor}: {} of {} (sources {})",
+            again.len(),
+            episodes.len(),
+            families.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    /// Of `episodes`, about to be written on main, those main holds already just as they are: its last state
+    /// (built within [`VIS_LAG_LIMIT`], after this store's last write to the scope, and not aged) holds each one
+    /// current, its newest row saying the same ([`RowSays`]). With them, for each of `sources`, every episode of
+    /// it current in that state. Empty when there is no such state, or none is held: the write goes ahead as sent.
+    /// What another store wrote since the state was built is unknown to it: a version retired or an ACL narrowed
+    /// there in that time is not undone by an episode sent again here, which the next send, seen by a newer
+    /// state, writes.
+    pub async fn held_as_is(
+        &self,
+        scope: &Scope,
+        episodes: &[Episode],
+        sources: &BTreeSet<String>,
+    ) -> Result<HeldAsIs> {
+        let ns = scope.namespace();
+        let Some((stamp, vis)) = self
+            .vis
+            .lock()
+            .unwrap()
+            .get(&(ns.clone(), MAIN.to_string()))
+            .cloned()
+        else {
+            return Ok(HeldAsIs::default());
+        };
+        let written_since = self
+            .written
+            .lock()
+            .unwrap()
+            .get(&ns)
+            .is_some_and(|w| *w >= vis.built_at);
+        if vis.built_at.elapsed() >= VIS_LAG_LIMIT
+            || written_since
+            || vis.fresh_until.is_some_and(|t| now_micros() >= t)
+            || !episodes
+                .iter()
+                .any(|e| vis.acls.contains_key(&e.episode_id))
+        {
+            return Ok(HeldAsIs::default());
+        }
+        let (episodes, sources) = (episodes.to_vec(), sources.clone());
+        Ok(tokio::task::spawn_blocking(move || {
+            let ids: HashSet<&str> = episodes
+                .iter()
+                .map(|e| e.episode_id.as_str())
+                .filter(|e| vis.acls.contains_key(*e))
+                .collect();
+            let newest = newest_rows(&stamp[1], &vis.committed, &ids);
+            let same: HashSet<String> = episodes
+                .iter()
+                .filter(|e| {
+                    newest.get(&e.episode_id).and_then(Option::as_ref) == Some(&RowSays::of(e))
+                })
+                .map(|e| e.episode_id.clone())
+                .collect();
+            let mut current: HashMap<String, HashSet<String>> = HashMap::new();
+            if !same.is_empty() && !sources.is_empty() {
+                for b in stamp[1].iter() {
+                    let text = |c: &str| b.column_by_name(c).expect(c).as_string::<i32>();
+                    let (commit, id, source) =
+                        (text("commit_id"), text("episode_id"), text("source"));
+                    for i in 0..b.num_rows() {
+                        if sources.contains(source.value(i))
+                            && vis.committed.contains(commit.value(i))
+                            && vis.acls.contains_key(id.value(i))
+                        {
+                            current
+                                .entry(source.value(i).to_string())
+                                .or_default()
+                                .insert(id.value(i).to_string());
+                        }
+                    }
+                }
+            }
+            HeldAsIs { same, current }
+        })
+        .await?)
     }
 
     /// Commit whatever is queued, batch after batch, until the queue is empty.
@@ -4821,9 +5198,11 @@ impl Store {
                 ("recorded_at", ts(times)),
                 ("parents", s(parents)),
             ];
-            match append(&*self.catalog(), &snap.table, columns, OnConflict::Fail).await {
+            match self
+                .append_own(SYSTEM_NS, LEDGER, &snap.table, columns, OnConflict::Fail)
+                .await
+            {
                 Ok(()) => {
-                    self.invalidate(SYSTEM_NS, LEDGER);
                     note_ledger_wait(started);
                     return Ok(());
                 }
@@ -5325,8 +5704,8 @@ impl Store {
                     )),
                 ),
             ];
-            append(&*self.catalog(), &table, columns, OnConflict::Recommit).await?;
-            self.invalidate(ns, EPISODES);
+            self.append_own(ns, EPISODES, &table, columns, OnConflict::Recommit)
+                .await?;
         }
         Ok(())
     }
@@ -5368,8 +5747,8 @@ impl Store {
                 )),
             ),
         ];
-        append(&*self.catalog(), &table, columns, OnConflict::Recommit).await?;
-        self.invalidate(ns, EXTRACTIONS);
+        self.append_own(ns, EXTRACTIONS, &table, columns, OnConflict::Recommit)
+            .await?;
         Ok(())
     }
 
@@ -5418,8 +5797,8 @@ impl Store {
                 ("time_basis", opt(|f| f.time_basis.clone())),
                 ("tags", opt(|f| tags_column(&f.tags))),
             ];
-            append(&*self.catalog(), &table, columns, OnConflict::Recommit).await?;
-            self.invalidate(ns, FACTS);
+            self.append_own(ns, FACTS, &table, columns, OnConflict::Recommit)
+                .await?;
         }
         Ok(())
     }
@@ -5480,9 +5859,11 @@ impl Store {
                 ("recorded_at", ts([Some(recorded)])),
                 ("parents", s(&parents.join(","))),
             ];
-            match append(&*self.catalog(), &snap.table, columns, OnConflict::Fail).await {
+            match self
+                .append_own(SYSTEM_NS, LEDGER, &snap.table, columns, OnConflict::Fail)
+                .await
+            {
                 Ok(()) => {
-                    self.invalidate(SYSTEM_NS, LEDGER);
                     note_ledger_wait(started);
                     return Ok(());
                 }
@@ -6034,6 +6415,8 @@ impl Store {
             .as_ref()
             .and_then(|t| t.metadata().current_snapshot())
             .map(|s| s.snapshot_id());
+        // Each org's limits as this fold has them, for the checks that don't read the directory (a model call's).
+        crate::limits::observe(&f.dir);
         // Dated by when the read began, not when it ended: a caller asking for a load after some instant
         // never gets a fold that read the catalog before it, though it finished after.
         *held = Some((t0, sid, f.clone()));
@@ -6270,6 +6653,8 @@ impl Store {
                 .is_none_or(|(_, _, f)| f.events <= after.events)
             {
                 *held = Some((read_at, None, after.clone()));
+                // A change this server made holds here at once: an org's limits set now refuse its next write.
+                crate::limits::observe(&after.dir);
             }
         }
         let every = snapshot_every();
@@ -7403,6 +7788,48 @@ impl Store {
         Ok(self.rows(ns, name).await?.rows)
     }
 
+    /// A side table's rows as the catalog holds them now, as [`Store::side_rows`] gives them (none when the table
+    /// doesn't exist), for a check that must not act on rows another writer has moved past. Loaded here and cached
+    /// as fresh for every reader, without first marking the cached rows stale as [`Store::invalidate`] does: that
+    /// sends every other reader of the table to the catalog meanwhile, each waiting for its own load, and a check
+    /// that runs on every commit (the publication gate) then kept an org's tables from ever serving warm.
+    pub(crate) async fn side_rows_now(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> Result<Arc<Vec<RecordBatch>>> {
+        let key = format!("{ns}.{name}");
+        let known = self.cache.entries.lock().unwrap().contains_key(&key);
+        if !known {
+            let ident = TableIdent::new(NamespaceIdent::new(ns.into()), name.into());
+            if !self.has_table(&ident).await? {
+                self.no_side_table
+                    .lock()
+                    .unwrap()
+                    .insert(key, Instant::now());
+                return Ok(Arc::default());
+            }
+            self.forget_missing(ns, name);
+        }
+        self.touch(ns);
+        // As `rows`: a loop's read waits for its turn before it takes the load's lock, not holding it.
+        loads::turn().await;
+        let started = Instant::now();
+        let loading = self.cache.loading(&key);
+        let _turn = loading.lock().await;
+        let waited = started.elapsed();
+        let loading_at = Instant::now();
+        let snap = refresh(&*self.catalog(), &self.cache, ns, name).await?;
+        slow_table_read(
+            &key,
+            "read as it is now",
+            waited,
+            Some(loading_at.elapsed()),
+        );
+        self.trim(ns);
+        Ok(snap.rows)
+    }
+
     /// The facts table's plan for `ns`: its table and data files. Same policy as `rows`: the cached plan,
     /// refreshed in the background once older than the staleness window.
     async fn facts_plan(&self, ns: &str) -> Result<(Table, Vec<FileScanTask>)> {
@@ -8240,8 +8667,9 @@ impl Store {
             ))
         };
         let mark = superseded.then_some(true);
-        append(
-            &*self.catalog(),
+        self.append_own(
+            &ns,
+            RETRACTIONS,
             &table,
             vec![
                 (
@@ -8262,7 +8690,6 @@ impl Store {
             OnConflict::Recommit,
         )
         .await?;
-        self.invalidate(&ns, RETRACTIONS);
         self.append_ledger(&commit_id, scope, MAIN, actor, &|l: &Ledger| {
             Ok(l.heads(MAIN))
         })
@@ -8337,8 +8764,9 @@ impl Store {
         }
         let n = rows.len();
         let col = |vals: Vec<Option<&str>>| -> ArrayRef { Arc::new(StringArray::from(vals)) };
-        append(
-            &*self.catalog(),
+        self.append_own(
+            &ns,
+            RETRACTIONS,
             &table,
             vec![
                 (
@@ -8357,7 +8785,6 @@ impl Store {
             OnConflict::Recommit,
         )
         .await?;
-        self.invalidate(&ns, RETRACTIONS);
         self.append_ledger(&commit_id, scope, MAIN, actor, &|l: &Ledger| {
             Ok(l.heads(MAIN))
         })
@@ -8596,8 +9023,8 @@ impl Store {
                     ts(std::iter::repeat_n(Some(now_micros()), chunk.len())),
                 ),
             ];
-            append(&*self.catalog(), &table, columns, OnConflict::Recommit).await?;
-            self.invalidate(&ns, QUOTES);
+            self.append_own(&ns, QUOTES, &table, columns, OnConflict::Recommit)
+                .await?;
             self.append_ledger(&id, scope, MAIN, actor, &|l: &Ledger| Ok(l.heads(MAIN)))
                 .await?;
         }
@@ -9490,6 +9917,18 @@ pub async fn append(
     columns: Vec<(&str, ArrayRef)>,
     on_conflict: OnConflict,
 ) -> Result<()> {
+    appended(catalog, table, columns, on_conflict)
+        .await
+        .map(|_| ())
+}
+
+/// [`append`], answering the table as committed (for [`Store::wrote`]).
+pub async fn appended(
+    catalog: &dyn Catalog,
+    table: &Table,
+    columns: Vec<(&str, ArrayRef)>,
+    on_conflict: OnConflict,
+) -> Result<Table> {
     // A column the table gained after it was cached here (this process's evolution, or another's): the table
     // as the catalog has it now.
     let fresh;
@@ -9540,7 +9979,7 @@ pub async fn append(
         let e = match result {
             Ok(after) => {
                 trim_history(catalog, &table, &after).await;
-                return Ok(());
+                return Ok(after);
             }
             Err(e) => anyhow::Error::from(e),
         };
@@ -9555,7 +9994,7 @@ pub async fn append(
         let fresh =
             with_retries(|| async { Ok(catalog.load_table(table.identifier()).await?) }).await?;
         if tagged(&fresh, APPEND_ID_PROP, &append_id) {
-            return Ok(());
+            return Ok(fresh);
         }
         // Refused for sure (a 409 with no retry inside the transaction: the table turns them off), so nothing of
         // this try is referenced: its manifest goes.
@@ -10124,11 +10563,32 @@ async fn refresh_once(
     {
         return Err(Rewriting.into());
     }
+    install(cache, key, prev, table, started_generation).await
+}
+
+/// Caches `table`'s rows under `key`: from `prev`'s files, reading only the files appended since, as fresh when the
+/// table's generation is still `started_generation` (no own write noted since `table` was read).
+async fn install(
+    cache: &Cache,
+    key: String,
+    prev: Option<CacheEntry>,
+    table: Table,
+    started_generation: u64,
+) -> Result<Snapshot> {
+    let generation_now = || {
+        cache
+            .generations
+            .lock()
+            .unwrap()
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    };
     let snapshot_id = table.metadata().current_snapshot().map(|s| s.snapshot_id());
     let schema_id = table.metadata().current_schema_id();
     // Cached batches are only reusable under the schema they were decoded with.
     let reusable = prev.filter(|p| p.schema_id == schema_id);
-    let (rows, files, planned) = match &reusable {
+    let (mut rows, mut files, planned) = match &reusable {
         Some(p) if p.snapshot_id == snapshot_id => {
             (p.snap.rows.clone(), p.files.clone(), p.planned.clone())
         }
@@ -10145,9 +10605,38 @@ async fn refresh_once(
             (Arc::new(rows), files, planned)
         }
     };
-    let snap = Snapshot { table, rows };
+    // The generation is read under the entries' lock: an own write's [`Store::invalidate`] bumps it and then marks
+    // the entry stale under this lock, so read before taking it, a bump could land in between and this load's older
+    // rows be cached as fresh over the write.
     let mut entries = cache.entries.lock().unwrap();
     let generation = generation_now();
+    // A file the cached entry already holds keeps the batches it was decoded into there: an own write's install
+    // (`Store::wrote`) and a reload can each read the same new file, and a visibility state tells rows it was built
+    // from by their batches (`added_batches`), so two decodes of one file would look like the table rewritten.
+    if let Some(cur) = entries.get(&key).filter(|e| e.schema_id == schema_id) {
+        let mut same = false;
+        for (path, batches) in files.iter_mut() {
+            if let Some(held) = cur.files.get(path)
+                && !Arc::ptr_eq(held, batches)
+            {
+                *batches = held.clone();
+                same = true;
+            }
+        }
+        if same {
+            rows = Arc::new(files.values().flat_map(|b| b.iter().cloned()).collect());
+        }
+    }
+    let snap = Snapshot { table, rows };
+    // A load that began before an own write doesn't replace the fresh rows that write left (`Store::wrote`): fresh
+    // at this generation, they hold every own write so far.
+    if generation != started_generation
+        && entries
+            .get(&key)
+            .is_some_and(|e| e.generation == generation && e.fetched.is_some())
+    {
+        return Ok(snap);
+    }
     entries.insert(
         key,
         CacheEntry {

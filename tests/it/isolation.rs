@@ -82,16 +82,33 @@ pub(crate) fn tenant_token_verified(
     org_id: Option<&str>,
     verified: bool,
 ) -> String {
+    tenant_token_with(issuer, user, sub, org_id, verified, json!({}))
+}
+
+/// [`tenant_token_verified`] with `extra` claims too (`amr`, what the tenant's Action stamps).
+pub(crate) fn tenant_token_with(
+    issuer: &str,
+    user: &str,
+    sub: &str,
+    org_id: Option<&str>,
+    verified: bool,
+    extra: Value,
+) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some("k1".into());
+    let mut claims = json!({"iss": issuer, "aud": CLIENT_ID, "sub": sub, "email": user, "org_id": org_id,
+                            "email_verified": verified, "iat": now, "exp": now + 3600});
+    claims
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
     jsonwebtoken::encode(
         &header,
-        &json!({"iss": issuer, "aud": CLIENT_ID, "sub": sub, "email": user, "org_id": org_id,
-                "email_verified": verified, "iat": now, "exp": now + 3600}),
+        &claims,
         &jsonwebtoken::EncodingKey::from_rsa_pem(include_bytes!("../fixtures/idp_key.pem"))
             .unwrap(),
     )
@@ -610,9 +627,24 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
     assert!(!tool_text(&raw).1, "{raw}");
     // Session rows are held and committed in batches: what the log holds once they are.
     memstore::sessions::flush().await.unwrap();
-    let logged = memstore::qa_log::list(&store, &Scope::org("acme").unwrap(), None)
-        .await
-        .unwrap();
+    // The server committed them; this test's own store reads them once its cached tables catch up with the
+    // server's commit (as any other reader's would), not necessarily at once.
+    let start = Instant::now();
+    let logged = loop {
+        let logged = memstore::qa_log::list(&store, &Scope::org("acme").unwrap(), None)
+            .await
+            .unwrap();
+        let both = logged
+            .iter()
+            .any(|l| l.answer_id == sid && !l.episodes.is_empty())
+            && logged
+                .iter()
+                .any(|l| l.answer_id.starts_with(&format!("{named}.")));
+        if both || start.elapsed() > Duration::from_secs(30) {
+            break logged;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     let hers: Vec<_> = logged
         .iter()
         .filter(|l| l.answer_id.starts_with(&format!("{named}.")) && l.asker == "carol@acme.com")
@@ -1843,9 +1875,15 @@ async fn asking_to_join_grants_nothing_until_an_admin_approves() {
                 .unwrap(),
         )
         .with_auth0(
-            Auth0::discover(&tenant, vec![CLIENT_ID.into()], vec![], None, true)
-                .await
-                .unwrap(),
+            Auth0::discover(
+                &tenant,
+                vec![CLIENT_ID.into()],
+                vec![],
+                Some("org_ops".into()),
+                true,
+            )
+            .await
+            .unwrap(),
         )
         .unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2302,6 +2340,282 @@ async fn asking_to_join_grants_nothing_until_an_admin_approves() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    // An org that requires a second factor takes only sign-ins into it that passed one. A sign-in that names
+    // no org (bob through the tenant as himself, ann through the server's own provider) no longer counts
+    // there, though the directory lists them and still names acme to sign in to; nor does one into acme's
+    // Organization without MFA (made before it was required). One into acme with MFA does, by `amr` (the
+    // sign-in's ID token) or the tenant Action's stamp (a refreshed or access token). Beta, which requires
+    // nothing, still takes bob's sign-in as himself.
+    let bob_google = tenant_token(&tenant, "bob@acme.com", "google-oauth2|bob");
+    let into_acme = |extra: Value| {
+        tenant_token_with(
+            &tenant,
+            "bob@acme.com",
+            "google-oauth2|bob",
+            Some("org_acme"),
+            true,
+            extra,
+        )
+    };
+    let (acme_no_mfa, acme_amr, acme_stamped) = (
+        into_acme(json!({})),
+        into_acme(json!({"amr": ["pwd", "mfa"]})),
+        into_acme(json!({"https://memstore/mfa": true})),
+    );
+    let in_beta_mfa = tenant_token_with(
+        &tenant,
+        "bob@acme.com",
+        "google-oauth2|bob",
+        Some("org_beta"),
+        true,
+        json!({"amr": ["mfa"]}),
+    );
+    let reads_beta = async |t: &str| -> bool {
+        let (status, body) = mcp_call(
+            s,
+            "?org=beta",
+            t,
+            "search_memory",
+            json!({"query": "xbetaonly"}),
+        )
+        .await;
+        assert!(status == 200 || status == 403, "{status}: {body}");
+        status == 200
+    };
+    seed(&store, &Scope::org("beta").unwrap(), "xbetaonly").await;
+    for (who, t) in [("as himself", &bob_google), ("into acme", &acme_no_mfa)] {
+        assert!(reads_acme(t).await, "before: bob {who}");
+    }
+    assert!(reads_beta(&bob_google).await, "before: bob in beta");
+    // Bob's personal keys, one made signed in as himself, one signed in to acme with MFA: each records how.
+    let in_30_days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 30 * 24 * 3600;
+    let mut personal_keys = vec![];
+    for (name, t) in [("bob_orgless", &bob_google), ("bob_mfa", &acme_amr)] {
+        let k = format!("msk_{}{name}", uuid::Uuid::new_v4().simple());
+        let (status, b) = changes(
+            t,
+            json!({"op": "create_key", "org": "acme", "name": name, "role": "reader",
+                   "personal": true, "expires_at": in_30_days, "key": k}),
+        )
+        .await;
+        assert_eq!(status, 200, "{name}: {b}");
+        assert!(reads_acme(&k).await, "{name} before");
+        personal_keys.push(k);
+    }
+    let (orgless_key, mfa_key) = (personal_keys[0].clone(), personal_keys[1].clone());
+    // Only for an org with a sign-in of its own (an Auth0 Organization, its own provider): elsewhere no sign-in
+    // would be one into it, and no one would get in.
+    admin(
+        s,
+        json!({"op": "create_org", "org": "gamma", "admin": "ann@acme.com"}),
+    )
+    .await;
+    for setting in ["require_mfa", "require_sso"] {
+        let (status, b) = changes(
+            ADMIN_KEY,
+            json!({"op": "set_settings", "org": "gamma", "settings": {setting: true}}),
+        )
+        .await;
+        assert!(
+            status == 400 && b.to_string().contains("no sign-in of its own"),
+            "{setting} on an org with no sign-in of its own: {status} {b}"
+        );
+    }
+    // Only for the org: a team's is refused.
+    let (status, b) = changes(
+        &ann,
+        json!({"op": "create_team", "org": "acme", "team": "eng"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    let (status, b) = changes(
+        &ann,
+        json!({"op": "set_settings", "org": "acme", "team": "eng", "settings": {"require_mfa": true}}),
+    )
+    .await;
+    assert_eq!(status, 400, "a team's require_mfa: {b}");
+    // A member can't set it; the admin can.
+    let require =
+        |on: bool| json!({"op": "set_settings", "org": "acme", "settings": {"require_mfa": on}});
+    let (status, b) = changes(&bob_google, require(true)).await;
+    assert_eq!(status, 403, "a member required MFA: {b}");
+    let (status, b) = changes(&ann, require(true)).await;
+    assert_eq!(status, 200, "{b}");
+    let t = Instant::now();
+    while reads_acme(&bob_google).await {
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "a sign-in as himself still read an org that requires MFA"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for (who, t) in [
+        ("bob as himself, with Google", bob_google.clone()),
+        (
+            "bob as himself, with a password",
+            tenant_token(&tenant, "bob@acme.com", "auth0|bob"),
+        ),
+        ("bob into acme without MFA", acme_no_mfa.clone()),
+        ("bob into beta with MFA", in_beta_mfa.clone()),
+        ("ann through the server's provider", ann.clone()),
+    ] {
+        assert!(!reads_acme(&t).await, "{who} read acme");
+        let v = me(&t).await;
+        assert!(v["memberships"].get("acme").is_none(), "{who}: {v}");
+        let (status, b) = changes(&t, json!({"op": "show", "org": "acme"})).await;
+        assert_eq!(status, 403, "{who} saw acme: {b}");
+    }
+    // Still told where they belong, to sign in there.
+    let v = me(&bob_google).await;
+    assert!(
+        v["auth0_orgs"].as_array().unwrap().contains(&acme[0]),
+        "as himself: {v}"
+    );
+    let (status, body) = mcp_call(
+        s,
+        "?org=acme",
+        &bob_google,
+        "search_memory",
+        json!({"query": "xacmeonly"}),
+    )
+    .await;
+    assert!(
+        status == 403
+            && body.contains("sign-ins into it with a second factor")
+            && !body.contains("--sso"),
+        "{status}: {body}"
+    );
+    // Anyone else hears what they would of an org that doesn't exist.
+    let zed = id_token(&issuer, "zed@x.com");
+    for org in ["acme", "nosuch"] {
+        let (status, body) = mcp_call(
+            s,
+            &format!("?org={org}"),
+            &zed,
+            "search_memory",
+            json!({"query": "xacmeonly"}),
+        )
+        .await;
+        assert!(
+            status == 403
+                && body.contains(&format!("not a member of org {org}"))
+                && !body.contains("sign-ins into it"),
+            "a stranger in {org}: {status}: {body}"
+        );
+    }
+    // A personal key made from a sign-in acme no longer takes goes with it, told to make a new one; the one
+    // made in acme with MFA still reads.
+    assert!(
+        !reads_acme(&orgless_key).await,
+        "an org-less personal key read acme"
+    );
+    let (status, body) = mcp_call(
+        s,
+        "",
+        &orgless_key,
+        "search_memory",
+        json!({"query": "xacmeonly"}),
+    )
+    .await;
+    assert!(
+        status == 403 && body.contains("make a new personal key"),
+        "{status}: {body}"
+    );
+    assert!(reads_acme(&mfa_key).await, "a personal key made with MFA");
+    // The admin, signed in as herself, can't turn it off: that takes a sign-in into acme with MFA.
+    let (status, b) = changes(&ann, require(false)).await;
+    assert_eq!(status, 403, "an org-less sign-in turned MFA off: {b}");
+    for (who, t) in [("amr", &acme_amr), ("the Action's stamp", &acme_stamped)] {
+        assert!(reads_acme(t).await, "bob into acme with MFA ({who})");
+        let v = me(t).await;
+        assert_eq!(
+            v["memberships"]["acme"]["role"],
+            json!("member"),
+            "{who}: {v}"
+        );
+    }
+    assert!(
+        reads_beta(&bob_google).await,
+        "an org that requires nothing refused a sign-in as himself"
+    );
+
+    // An org that requires its single sign-on takes only sign-ins into it too, with or without MFA.
+    let ann_in_acme = tenant_token_with(
+        &tenant,
+        "ann@acme.com",
+        "google-oauth2|ann",
+        Some("org_acme"),
+        true,
+        json!({"amr": ["mfa"]}),
+    );
+    let (status, b) = changes(
+        &ann_in_acme,
+        json!({"op": "set_settings", "org": "acme", "settings": {"require_mfa": false, "require_sso": true}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    let t = Instant::now();
+    while !reads_acme(&acme_no_mfa).await {
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "a sign-in into acme without MFA refused once MFA was off"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for (who, t) in [
+        ("bob as himself", &bob_google),
+        ("ann through the server's provider", &ann),
+        ("bob's org-less personal key", &orgless_key),
+    ] {
+        assert!(!reads_acme(t).await, "{who} read an org that requires SSO");
+    }
+    assert!(reads_acme(&mfa_key).await, "a personal key made in acme");
+    let (_, body) = mcp_call(
+        s,
+        "?org=acme",
+        &bob_google,
+        "search_memory",
+        json!({"query": "xacmeonly"}),
+    )
+    .await;
+    assert!(
+        body.contains("--sso") && !body.contains("second factor"),
+        "{body}"
+    );
+    assert!(reads_beta(&bob_google).await);
+    // Which sign-ins an org takes is the operator's to set too (as binding it to Auth0 is), and nothing
+    // else of its settings with it.
+    let operator = tenant_token_for(&tenant, "olivia@ops.test", "auth0|olivia", Some("org_ops"));
+    let (status, b) = changes(
+        &operator,
+        json!({"op": "set_settings", "org": "acme", "settings": {"require_sso": false, "compile": false}}),
+    )
+    .await;
+    assert_eq!(status, 403, "an operator set another setting with it: {b}");
+    // Off again, by the operator: a sign-in as himself counts in acme again.
+    let (status, b) = changes(
+        &operator,
+        json!({"op": "set_settings", "org": "acme", "settings": {"require_sso": false}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    let t = Instant::now();
+    while !reads_acme(&bob_google).await {
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "still refused once acme required nothing"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        reads_acme(&orgless_key).await,
+        "an org-less personal key once acme required nothing"
+    );
 }
 
 /// `/agent/run` (the console's Ask, on its arms) answers with what the tools its caller names returned, run as

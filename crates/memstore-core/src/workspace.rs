@@ -611,6 +611,10 @@ impl Drop for WsReservation {
             p.episodes -= self.episodes;
             p.facts -= self.facts;
         }
+        // Landed (or failed: counted until the next count from the catalog, erring toward the cap).
+        if let Some((_, since, _)) = ORG_COUNT.lock().unwrap().get_mut(&self.ws) {
+            *since += self.episodes;
+        }
     }
 }
 
@@ -623,18 +627,22 @@ pub async fn check_write(
     let Some(ws) = scope.org_name().filter(|o| *o != DEFAULT_ORG) else {
         return Ok(None);
     };
-    let limits = match store.directory().await {
-        Ok(f) => match spec_of(&f.dir, ws) {
-            Some(s) => s.limits,
-            None => return Ok(None),
-        },
+    let (limits, org_cap) = match store.directory().await {
+        Ok(f) => (
+            spec_of(&f.dir, ws).map(|s| s.limits),
+            f.dir.orgs.get(ws).and_then(|o| o.limits.max_episodes),
+        ),
         // Caps guard resources, not access: a directory that can't be read doesn't stop writes.
         Err(e) => {
             eprintln!("memstore: workspace limits of {ws} unchecked: {e:#}");
             return Ok(None);
         }
     };
-    if limits.max_episodes.is_none() && limits.max_facts.is_none() {
+    // The org's own episode cap (`set_limits`), on a write that adds episodes: one that adds none (facts read from
+    // what it holds, a retraction) goes on whatever the org holds, as an org over a lowered cap still learns.
+    let org_cap = org_cap.filter(|_| episodes > 0);
+    let limits = limits.unwrap_or_default();
+    if limits.max_episodes.is_none() && limits.max_facts.is_none() && org_cap.is_none() {
         return Ok(None);
     }
     let check = WS_PENDING
@@ -645,26 +653,52 @@ pub async fn check_write(
         .check
         .clone();
     let _check = check.lock().await;
-    let (mut have_eps, mut have_facts) = {
+    let (pending_eps, pending_facts) = {
         let p = WS_PENDING.lock().unwrap();
         let p = &p[ws];
         (p.episodes, p.facts)
     };
-    for ns in store.org_namespaces(ws).await? {
-        have_eps += store.total_rows(&ns, EPISODES).await?;
-        have_facts += store.total_rows(&ns, FACTS).await?;
+    let (mut have_eps, mut have_facts) = (pending_eps, pending_facts);
+    if limits.max_episodes.is_some() || limits.max_facts.is_some() {
+        for ns in store.org_namespaces(ws).await? {
+            have_eps += store.total_rows(&ns, EPISODES).await?;
+            have_facts += store.total_rows(&ns, FACTS).await?;
+        }
+        for (what, have, adding, cap) in [
+            ("episodes", have_eps, episodes as u64, limits.max_episodes),
+            ("facts", have_facts, facts as u64, limits.max_facts),
+        ] {
+            if let Some(cap) = cap
+                && have + adding > cap
+            {
+                return Err(CapReached(format!(
+                    "workspace {ws} is capped at {cap} {what}: it has {have}, and this write adds {adding}"
+                ))
+                .into());
+            }
+        }
     }
-    for (what, have, adding, cap) in [
-        ("episodes", have_eps, episodes as u64, limits.max_episodes),
-        ("facts", have_facts, facts as u64, limits.max_facts),
-    ] {
-        if let Some(cap) = cap
-            && have + adding > cap
-        {
-            return Err(CapReached(format!(
-                "workspace {ws} is capped at {cap} {what}: it has {have}, and this write adds {adding}"
-            ))
-            .into());
+    if let Some(cap) = org_cap {
+        // Counted from the catalog every [`ORG_RECOUNT`]; in between, the writes that landed since are added (and
+        // those that failed, until the next count), and those in flight. Another server's writes show at its next
+        // count, so with several servers an org may go past its cap by what the others let through since theirs:
+        // at most the room it had then, on each of them.
+        let have = {
+            let counted = ORG_COUNT.lock().unwrap().get(ws).copied();
+            match counted {
+                Some((n, since, at)) if at.elapsed() < ORG_RECOUNT => n + since + pending_eps,
+                _ => {
+                    let n = org_episodes(store, ws).await?;
+                    ORG_COUNT
+                        .lock()
+                        .unwrap()
+                        .insert(ws.to_string(), (n, 0, std::time::Instant::now()));
+                    n + pending_eps
+                }
+            }
+        };
+        if have + episodes as u64 > cap {
+            return Err(crate::limits::episode_cap(ws, cap, have, episodes as u64).into());
         }
     }
     let mut p = WS_PENDING.lock().unwrap();
@@ -676,6 +710,25 @@ pub async fn check_write(
         episodes: episodes as u64,
         facts: facts as u64,
     }))
+}
+
+/// How often an org's episodes are counted again from the catalog for its cap.
+const ORG_RECOUNT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A capped org's episodes as last counted, those let through since, and when it was counted.
+type OrgCount = (u64, u64, std::time::Instant);
+
+/// Per capped org, its [`OrgCount`].
+static ORG_COUNT: std::sync::LazyLock<Mutex<HashMap<String, OrgCount>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The episodes `org` holds, over all its scopes, from their snapshots' summaries.
+pub async fn org_episodes(store: &Store, org: &str) -> Result<u64> {
+    let mut n = 0;
+    for ns in store.org_namespaces(org).await? {
+        n += store.total_rows(&ns, EPISODES).await?;
+    }
+    Ok(n)
 }
 
 /// Refuse an index update of a workspace scope whose workspace's indexes are at their byte cap already.

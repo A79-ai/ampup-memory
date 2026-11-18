@@ -30,11 +30,17 @@ impl Lobby {
     }
 }
 
+/// This server's public URL, as clients name it.
+fn public_url() -> String {
+    std::env::var("AMPUP_MEMORY_PUBLIC_URL")
+        .unwrap_or_else(|_| "https://<this AmpUp Memory server>".into())
+        .trim_end_matches('/')
+        .to_string()
+}
+
 /// How a client names an org, for `org` (or `<org>` when none is chosen yet).
 fn how_to_name(org: &str) -> String {
-    let server = std::env::var("AMPUP_MEMORY_PUBLIC_URL")
-        .unwrap_or_else(|_| "https://<this AmpUp Memory server>".into());
-    let server = server.trim_end_matches('/');
+    let server = public_url();
     format!(
         "Name the org in the MCP client's settings for this server: the header `x-memstore-org: {org}` \
         (or `?org={org}` on the server URL), then restart the client.\n\n\
@@ -54,10 +60,22 @@ fn instructions(lobby: &Lobby, user: &str) -> String {
             AmpUp Memory has nothing to search or remember.",
             orgs.join(", ")
         ),
-        Lobby::NoOrg => format!(
-            "AmpUp Memory: {user} belongs to no org yet, so no memory is open. If the user names the org they \
-            work in, call request_join with it: its admins are emailed to approve. Never guess an org."
-        ),
+        Lobby::NoOrg => {
+            let mut t = format!(
+                "AmpUp Memory: {user} belongs to no org yet, so no memory is open. If the user names the org they \
+                work in, call request_join with it: its admins are emailed to approve. Never guess an org."
+            );
+            // A sign-up service beside this server: the person can make an org of their own instead.
+            if super::signup_url().is_some() {
+                t.push_str(&format!(
+                    " If they'd rather have a memory of their own, with a free trial, they can make their own org: \
+                    in Claude Code, /ampup-memory:login --create-org; in a terminal, \
+                    ampup-memory-client join {} --create-org. Then restart this client.",
+                    public_url()
+                ));
+            }
+            t
+        }
     }
 }
 

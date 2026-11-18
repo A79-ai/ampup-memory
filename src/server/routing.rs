@@ -94,7 +94,7 @@ pub async fn within(
     }
     // Run on its own task as part of the lookup it was started in (`crate::advice_lookups`).
     let job = crate::advice_lookups::carry(job);
-    tokio::spawn(async move {
+    crate::log_org::spawn(async move {
         let outcome = job.await.map(Arc::new).map_err(|e| format!("{e:#}"));
         if let Err(e) = &outcome {
             eprintln!("advice: a session's advice step failed after its caller went on: {e}");

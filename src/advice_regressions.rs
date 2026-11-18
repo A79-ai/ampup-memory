@@ -213,7 +213,7 @@ async fn read_scope(
             };
             if !fresh.is_empty() {
                 let (store, scope) = (store.clone(), session.scope().clone());
-                tokio::spawn(async move { read_bodies(store, scope, fresh).await });
+                crate::log_org::spawn(async move { read_bodies(store, scope, fresh).await });
             }
             continue;
         }
@@ -530,7 +530,7 @@ async fn vectors(fixes: Vec<(String, String)>) -> Option<HashMap<String, Arc<Vec
                     .collect()
             };
             if !fresh.is_empty() {
-                tokio::spawn(embed_fixes(fresh));
+                crate::log_org::spawn(embed_fixes(fresh));
             }
             continue;
         }

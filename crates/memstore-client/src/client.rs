@@ -775,15 +775,17 @@ async fn call_as(
 
 /// `memstore join` (and `memstore-client join`): sign in to `server` as yourself, then add a context for `org`
 /// and `team` there and switch to it. With no org named, the one org the server says you're in; several, and
-/// a terminal asks which; none, and it asks which org to ask to join. Not a member of `org`: asks to join it
-/// (the org's admins are emailed to approve), and says so; run again once approved. `sso` signs in to the
-/// org's Auth0 Organization instead (an enterprise connection's people).
+/// a terminal asks which; none, and where the server names a sign-up service, it offers to make your own org
+/// (`create_org` makes it without asking), else asks which org to ask to join. Not a member of `org`: asks to
+/// join it (the org's admins are emailed to approve), and says so; run again once approved. `sso` signs in to
+/// the org's Auth0 Organization instead (an enterprise connection's people).
 pub async fn join(
     server: &str,
     org: Option<&str>,
     team: Option<&str>,
     no_browser: bool,
     sso: bool,
+    create_org: bool,
 ) -> Result<()> {
     let server = server.trim_end_matches('/');
     let opts = LoginOptions {
@@ -794,11 +796,20 @@ pub async fn join(
     };
     let creds = login(Some(server), &opts).await?;
     println!("Signed in as {}", creds.user);
-    let mut ctx = Context::default();
-    ctx.set("server", Some(server))?;
     // Through an org's own provider the sign-in is kept under that org (`<server>#<org>`), not the server.
     let signed_in = creds.org();
-    let me = call_as(server, signed_in, None, None, "GET", "/me", None).await?;
+    let me = match call_as(server, signed_in, None, None, "GET", "/me", None).await {
+        Ok(me) => me,
+        // The provider says it hasn't verified the email: the server takes such a sign-in nowhere but an org
+        // whose admins approved it. Say so, rather than the server's bare refusal.
+        Err(e) if creds.claims()["email_verified"] == Value::Bool(false) => anyhow::bail!(
+            "{server} doesn't take this sign-in: the identity provider hasn't verified {}'s email ({e:#}). \
+            Sign in with Google or GitHub (an account whose email the provider verified), or verify the email, \
+            and run this again; making an org of your own takes a Google or GitHub sign-in",
+            creds.user
+        ),
+        Err(e) => return Err(e),
+    };
     let member_of = |o: &str| me["memberships"].get(o).is_some();
     let org = match org {
         Some(o) if member_of(o) => o.to_string(),
@@ -811,14 +822,38 @@ pub async fn join(
             match orgs.as_slice() {
                 [one] => one.clone(),
                 [] => {
-                    // Nobody's yet: a terminal asks which org to ask to join; a hook or command says how.
+                    // Nobody's yet. Where the server names a sign-up service, the person can make an org of
+                    // their own: asked at a terminal, or straight away with --create-org.
+                    let signup = signup_url(server).await;
+                    if let Some(url) = &signup {
+                        let make = create_org
+                            || confirm(&format!(
+                                "{} isn't a member of any org on {server} yet. Make your own memory org now? [Y/n] ",
+                                creds.user
+                            ))?
+                            .unwrap_or(false);
+                        if make {
+                            let org = make_own_org(server, url, &creds, no_browser).await?;
+                            return use_context(server, &org, team);
+                        }
+                    } else if create_org {
+                        anyhow::bail!(
+                            "{server} offers no sign-up: ask an admin of your team's org to invite you, or name the org to ask to join (--org <org>)"
+                        );
+                    }
+                    // A terminal asks which org to ask to join; a hook or command says how.
                     let Some(o) = ask(&format!(
                         "{} isn't a member of any org on {server} yet. Which org do you want to join? (its name; an admin will be emailed to approve) ",
                         creds.user
                     ))?
                     else {
+                        let own = if signup.is_some() {
+                            " Or make your own memory org: --create-org (the plugin: /ampup-memory:login --create-org)."
+                        } else {
+                            ""
+                        };
                         anyhow::bail!(
-                            "{} isn't a member of any org on {server} yet: name the org to ask to join (--org <org>; the plugin: /ampup-memory:login --org <org>), and its admins are emailed to approve",
+                            "{} isn't a member of any org on {server} yet: name the org to ask to join (--org <org>; the plugin: /ampup-memory:login --org <org>), and its admins are emailed to approve.{own}",
                             creds.user
                         )
                     };
@@ -840,7 +875,20 @@ pub async fn join(
             }
         }
     };
-    ctx.set("org", Some(&org))?;
+    if create_org {
+        println!(
+            "{} is in {org} on {server} already: no new org made",
+            creds.user
+        );
+    }
+    use_context(server, &org, team)
+}
+
+/// Add a context for `org` (and `team`) on `server` and switch to it.
+fn use_context(server: &str, org: &str, team: Option<&str>) -> Result<()> {
+    let mut ctx = Context::default();
+    ctx.set("server", Some(server))?;
+    ctx.set("org", Some(org))?;
     ctx.set("team", team)?;
     let name = ctx.default_name();
     let mut config = Config::load()?;
@@ -848,6 +896,125 @@ pub async fn join(
     config.save()?;
     println!("Switched to context {name}");
     Ok(())
+}
+
+/// The sign-up service `server` names (`memstore_signup_url` in its protected-resource metadata): where a
+/// person it signed in, in no org yet, makes their own. Only an https URL, or http on this machine: it is sent
+/// the sign-in's ID token.
+async fn signup_url(server: &str) -> Option<String> {
+    let meta = get_json(&format!("{server}/.well-known/oauth-protected-resource"))
+        .await
+        .ok()?;
+    let url = reqwest::Url::parse(meta["memstore_signup_url"].as_str()?).ok()?;
+    let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    (url.scheme() == "https" || (url.scheme() == "http" && local)).then(|| url.to_string())
+}
+
+/// Make the signed-in person's own org at the sign-up service `url` (`POST` with their ID token), and leave
+/// them signed in to it. Returns its name.
+///
+/// The org is made with them as its admin, so the sign-in they have, which names no Auth0 Organization,
+/// already counts there: the directory lists them. Where the server doesn't say so within a few seconds,
+/// they sign in again for the org's own Organization, which counts there in any case.
+async fn make_own_org(
+    server: &str,
+    url: &str,
+    creds: &Credentials,
+    no_browser: bool,
+) -> Result<String> {
+    let mut held = creds.clone();
+    held.bearer().await?;
+    let token = held
+        .id_token
+        .clone()
+        .context("the sign-in gave no ID token, which making an org needs")?;
+    println!("Making your own memory org...");
+    let mut tries = 0;
+    let made = loop {
+        tries += 1;
+        let r = http()
+            .post(url)
+            .bearer_auth(&token)
+            .json(&json!({}))
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = r.status();
+        let wait = r
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        let body: Value = r.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            break body;
+        }
+        let why = body["error"].as_str().unwrap_or("no reason given");
+        // Still being made by another request, or a step that failed part way: asking again finishes it.
+        if (status.as_u16() == 503 || status.as_u16() == 502) && tries < 4 {
+            tokio::time::sleep(Duration::from_secs(wait.unwrap_or(3).min(10))).await;
+            continue;
+        }
+        anyhow::bail!("{} couldn't make an org of their own: {why}", creds.user);
+    };
+    let org = made["org"]
+        .as_str()
+        .context("the sign-up service answered no org")?
+        .to_string();
+    match made["expiresAt"].as_str() {
+        Some(end) => println!(
+            "Made {org} for {}: the {} plan, a trial until {end}",
+            creds.user,
+            made["plan"].as_str().unwrap_or("starter")
+        ),
+        None => println!("{org} is {}'s already", creds.user),
+    }
+    if let Some(at) = made["memstoreUrl"].as_str()
+        && at.trim_end_matches('/') != server
+    {
+        eprintln!("(the sign-up service says {org} is served at {at}, not {server})");
+    }
+
+    // The directory lists them in it now, or within a few seconds on another replica.
+    for _ in 0..10 {
+        if let Ok(me) = call_as(server, None, None, None, "GET", "/me", None).await
+            && me["memberships"].get(&org).is_some()
+        {
+            return Ok(org);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    println!("Signing in to {org} itself...");
+    let opts = LoginOptions {
+        no_browser,
+        org: Some(org.clone()),
+        sso: true,
+        ..Default::default()
+    };
+    let again = login(Some(server), &opts).await?;
+    let me = call_as(server, again.org(), Some(&org), None, "GET", "/me", None).await?;
+    anyhow::ensure!(
+        me["memberships"].get(&org).is_some(),
+        "{org} was made, but {server} doesn't count {} in it yet: run this again in a minute",
+        again.user
+    );
+    Ok(org)
+}
+
+/// A yes or no from the person at the terminal (an empty answer is yes), or None where there is no terminal.
+fn confirm(prompt: &str) -> Result<Option<bool>> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(None);
+    }
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(Some(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "" | "y" | "yes"
+    )))
 }
 
 /// A line from the person at the terminal, or None where there is no terminal (a hook, the plugin's command)

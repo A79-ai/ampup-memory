@@ -707,6 +707,14 @@ async fn embed_api_in(
                     body["dimensions"] = (*dims).into();
                 }
                 let out = post_json(&url, key, &body, label, openrouter).await?;
+                // A remote embedding is spend: counted against the org it is for (never refused, so search and
+                // indexing go on past an org's model allowance).
+                crate::limits::count(
+                    out["usage"]["total_tokens"]
+                        .as_u64()
+                        .or_else(|| out["usage"]["prompt_tokens"].as_u64())
+                        .unwrap_or(0),
+                );
                 let data = out["data"]
                     .as_array()
                     .with_context(|| format!("{label}: no data in the reply"))?;

@@ -233,6 +233,15 @@ async fn google_token() -> Result<String> {
 #[derive(Debug)]
 pub(crate) struct Refused(pub(crate) String);
 
+/// Refused when the org this task works for ([`crate::log_org`]) may not have a model called for it now
+/// ([`crate::limits::model_gate`]).
+pub(crate) fn model_gate() -> Result<()> {
+    match crate::limits::model_gate(crate::log_org::current().as_deref()) {
+        Some(l) => Err(l.into()),
+        None => Ok(()),
+    }
+}
+
 /// Tokens the extraction model read (`in`, and of those `in_cached`, read from the provider's prompt cache) and
 /// wrote (`out`) since the server started, from each reply's `usage` (extraction and aggregation; not
 /// `ask_memory`'s answers, which go through Vertex). Served on `/metrics` as `memstore_model_tokens_total`.
@@ -961,6 +970,7 @@ impl Extractor {
             _ => self.url.clone(),
         };
         body["model"] = json!(self.model);
+        model_gate()?;
         let key = match &self.auth {
             Auth::Key(k) => k.clone(),
             Auth::Google => Some(google_token().await?),
@@ -1277,6 +1287,9 @@ impl Extractor {
                 _ => replace = true,
             }
         }
+        // An org past its allowance or its expiry asks no model: what this call was for waits (the refusal isn't
+        // a `Refused`, so nothing is given up for it) until the month turns or the allowance is raised.
+        model_gate()?;
         let key = match &self.auth {
             Auth::Key(k) => k.clone(),
             // A token-fetch failure is the API being unreachable for now, not the episode's fault.
@@ -1503,8 +1516,9 @@ impl Extractor {
         MODEL_TOKENS
             .with_label_values(&["in_cached"])
             .inc_by(self.prompt_cache_read(v));
-        // And the hour's usage, by the model's family (`crate::usage`).
+        // And the hour's usage, by the model's family (`crate::usage`), and the org's month (`crate::limits`).
         crate::usage::METER.tokens(&self.model, read + wrote);
+        crate::limits::count(read + wrote);
         // And this extractor's own count, for what one run (a backfill) spends.
         self.usage.add(read, wrote);
         let _ = CALL_TOKENS.try_with(|t| {

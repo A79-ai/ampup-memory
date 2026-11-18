@@ -44,6 +44,9 @@ enum Cmd {
         /// Sign in to the org's own Auth0 Organization (its enterprise connection) rather than as yourself
         #[arg(long)]
         sso: bool,
+        /// In no org yet: make your own, where the server offers sign-up, without asking first
+        #[arg(long)]
+        create_org: bool,
     },
     /// A coding agent's hook: session-start, prompt, stop, session-end or status, reading the hook's JSON on stdin;
     /// `outcome good|bad [why]` rates the session's run. Never fails the session: errors go to stderr and it exits 0
@@ -107,9 +110,18 @@ async fn run() -> Result<()> {
             team,
             no_browser,
             sso,
+            create_org,
         } => {
             update::before_sign_in(VERSION).await;
-            client::join(&server, org.as_deref(), team.as_deref(), no_browser, sso).await
+            client::join(
+                &server,
+                org.as_deref(),
+                team.as_deref(),
+                no_browser,
+                sso,
+                create_org,
+            )
+            .await
         }
         Cmd::Hook {
             event,

@@ -24,6 +24,11 @@ struct ApiKeyRow {
     /// May push closure changes (`/closure`).
     #[serde(default)]
     admin: bool,
+    /// A provisioner key: a sign-up service's. It reaches `/admin` alone, and there only creates orgs, binds a
+    /// new one to its Auth0 Organization, makes a new one's ingest key, sets orgs' limits and reads back the
+    /// orgs it created (`directory::provisioner_may`). Never an admin key too.
+    #[serde(default)]
+    provisioner: bool,
 }
 
 /// A verified API key's caller.
@@ -33,6 +38,8 @@ pub struct KeyCaller {
     pub user: String,
     pub groups: Vec<String>,
     pub admin: bool,
+    /// A provisioner key ([`ApiKeyRow::provisioner`]).
+    pub provisioner: bool,
     /// The key's sha256, hex.
     pub sha256: String,
 }
@@ -325,6 +332,8 @@ pub struct Caller {
     pub user: String,
     pub groups: Vec<String>,
     pub admin: bool,
+    /// Holds a provisioner key ([`KeyCaller::provisioner`]).
+    pub provisioner: bool,
     /// Every id the credential names them by (a JWT's `sub` and email, `key:<id>` for an API key).
     pub aliases: Vec<String>,
     /// Signed in through an identity provider (a person).
@@ -342,6 +351,8 @@ pub struct Caller {
     pub auth0: bool,
     /// The Auth0 Organization that token was issued for (its `org_id`), if any.
     pub auth0_org: Option<String>,
+    /// That sign-in passed a second factor, as the token says ([`passed_mfa`]).
+    pub mfa: bool,
     /// Signed in through the platform's Auth0 tenant for the operators' Organization.
     pub operator: bool,
     /// Signed in through the platform's Auth0 tenant with a password account (`auth0|…`) whose email it
@@ -617,6 +628,7 @@ impl Auth0 {
             orgs: if by_directory { None } else { Some(orgs) },
             auth0: !by_directory,
             auth0_org: org_id,
+            mfa: passed_mfa(&claims),
             operator,
             unverified,
             ..Default::default()
@@ -641,6 +653,19 @@ fn audiences_of(claims: &serde_json::Value) -> Vec<String> {
 /// The claims the tenant's post-login Action stamps on an access token for this deployment: the
 /// holder's email and whether the tenant verified it (third-party clients get no OIDC scopes).
 const STAMPED_EMAIL: &str = "https://memstore/email";
+/// The tenant's post-login Action stamps this (`true`) on a sign-in that passed a second factor, on its ID and
+/// access tokens and on those a refresh issues: Auth0 names `mfa` in `amr` only on the ID token of the sign-in
+/// itself, never on an access token or a refreshed ID token.
+const STAMPED_MFA: &str = "https://memstore/mfa";
+
+/// Whether a token from the tenant says its sign-in passed a second factor: `amr` names `mfa` (what Auth0 sets),
+/// or the tenant's Action stamped [`STAMPED_MFA`]. Read only from a token whose signature checked out.
+fn passed_mfa(claims: &serde_json::Value) -> bool {
+    claims["amr"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|m| m == "mfa"))
+        || claims[STAMPED_MFA] == serde_json::Value::Bool(true)
+}
 const STAMPED_EMAIL_VERIFIED: &str = "https://memstore/email_verified";
 
 const PLATFORM_CONNECTIONS: [&str; 6] = [
@@ -684,6 +709,11 @@ fn parse_keys(json: &str) -> Result<Vec<ApiKeyRow>> {
             k.id
         );
         anyhow::ensure!(seen.insert(&k.id), "duplicate api key id {}", k.id);
+        anyhow::ensure!(
+            !(k.admin && k.provisioner),
+            "api key {}: a key is an admin key or a provisioner key, not both",
+            k.id
+        );
     }
     Ok(keys)
 }
@@ -829,6 +859,7 @@ impl TokenAuth {
                 user: k.user.clone(),
                 groups: k.groups.clone(),
                 admin: k.admin,
+                provisioner: k.provisioner,
                 sha256: k.sha256.to_ascii_lowercase(),
             })
             .collect()
@@ -925,10 +956,14 @@ impl TokenAuth {
         self.oidc.as_ref()
     }
 
-    /// How many API keys there are, and how many of them are admin keys.
+    /// How many API keys there are, and how many of them are deployment keys (admin or provisioner), which read
+    /// no scope of their own.
     pub fn key_counts(&self) -> (usize, usize) {
         let keys = self.file_keys();
-        (keys.len(), keys.iter().filter(|k| k.admin).count())
+        (
+            keys.len(),
+            keys.iter().filter(|k| k.admin || k.provisioner).count(),
+        )
     }
 
     /// Whether a bearer is one this source takes: an API key, or a JWT from its JWT or OIDC issuer. Used to
@@ -970,6 +1005,7 @@ impl TokenAuth {
                     user: k.user.clone(),
                     groups: k.groups.clone(),
                     admin: k.admin,
+                    provisioner: k.provisioner,
                     sha256: digest.clone(),
                 });
             }
@@ -988,6 +1024,7 @@ impl TokenAuth {
                 user: k.user,
                 groups: k.groups,
                 admin: k.admin,
+                provisioner: k.provisioner,
                 ..Default::default()
             });
         }

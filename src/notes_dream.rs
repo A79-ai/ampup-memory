@@ -1638,6 +1638,10 @@ static LOOKED: LazyLock<Mutex<HashMap<String, (Instant, bool)>>> = LazyLock::new
 /// model, at most once an hour (or once per `AMPUP_MEMORY_NOTES_DREAM_SECS` where that is shorter), a gated pass
 /// ([`pass`]: releases, and the people due) runs in the background, one at a time per scope. Never fails the sweep.
 pub fn sweep(store: &Store, scope: &Scope, one_caller: bool) {
+    // Not while its org may ask no model (`crate::limits`): looked at again on a later sweep.
+    if crate::limits::paused(scope.org_name()) {
+        return;
+    }
     let key = scope.to_string();
     let every = Budget::from_env().map_or(LOOK_EVERY, |b| b.every.min(LOOK_EVERY));
     {
@@ -1650,7 +1654,8 @@ pub fn sweep(store: &Store, scope: &Scope, one_caller: bool) {
         looked.insert(key.clone(), (Instant::now(), true));
     }
     let (store, scope) = (store.clone(), scope.clone());
-    tokio::spawn(async move {
+    let org = scope.org_name().map(str::to_string);
+    tokio::spawn(crate::log_org::with(org.as_deref(), async move {
         let run = async {
             if !on(&store, &scope).await {
                 return anyhow::Ok(None);
@@ -1684,5 +1689,5 @@ pub fn sweep(store: &Store, scope: &Scope, one_caller: bool) {
         if let Some(l) = LOOKED.lock().unwrap().get_mut(&scope.to_string()) {
             l.1 = false;
         }
-    });
+    }));
 }

@@ -138,6 +138,12 @@ pub(super) async fn handle(
         )
         .into());
     }
+    // A dream is model work for the org: not started or resumed past its limits (`crate::limits`). Cancelling is.
+    if matches!(req["op"].as_str(), Some("create_dream" | "run_dream"))
+        && let Some(l) = crate::limits::model_gate(scope.org_name())
+    {
+        return Err(l.into());
+    }
     let launcher = if req["op"] == "cancel_dream" {
         None
     } else {

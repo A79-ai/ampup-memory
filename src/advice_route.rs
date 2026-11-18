@@ -768,7 +768,7 @@ async fn vectors(question: &str, texts: &[String]) -> Option<(Vec<f32>, Vec<Vec<
         return None;
     }
     let (q, texts) = (question.to_string(), texts.to_vec());
-    let job = tokio::spawn(async move {
+    let job = crate::log_org::spawn(async move {
         let got = async {
             let q = crate::search::embed_text(&q).await?;
             let vs = line_vectors(&texts).await?;

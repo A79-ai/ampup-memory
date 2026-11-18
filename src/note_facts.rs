@@ -443,7 +443,8 @@ pub async fn renote(
         answer.sessions, answer.people, answer.old_notes
     );
     let (store, scope, actor) = (store.clone(), scope.clone(), actor.to_string());
-    tokio::spawn(async move {
+    let org = scope.org_name().map(str::to_string);
+    tokio::spawn(crate::log_org::with(org.as_deref(), async move {
         use futures::StreamExt;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let total = answer.sessions;
@@ -522,6 +523,6 @@ pub async fn renote(
             ),
             Err(e) => eprintln!("renote: {scope}: the replaced notes not deleted: {e:#}"),
         }
-    });
+    }));
     Ok(answer)
 }

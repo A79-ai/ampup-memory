@@ -752,6 +752,20 @@ where
         who,
         id,
         |prompt| async move {
+            // An org past its limits asks no model (`crate::limits`). A fact pass ends having changed nothing, so the
+            // next one after the allowance resets or is raised weighs what this one would have; a synthesis fails
+            // with the reason and is resumed then.
+            if let Some(l) = crate::limits::model_gate(scope.org_name()) {
+                eprintln!("dream {}: paused: {l}", scope);
+                let paused = match mode {
+                    Mode::Reconcile => Ok(
+                        json!({"result": "paused_by_org_limits", "limit": l.limit.as_str()})
+                            .to_string(),
+                    ),
+                    _ => Err(l.into()),
+                };
+                return (paused, Usage::default());
+            }
             let response = if mode == Mode::Reconcile {
                 let pass = if scheduled {
                     match crate::dream::Gate::from_env() {

@@ -21,6 +21,16 @@ pub fn set(org: Option<&str>) {
     let _ = ORG.try_with(|o| *o.borrow_mut() = valid(org));
 }
 
+/// `tokio::spawn`, the new task working for the org this one works for: its model calls count against that org and
+/// are held to its limits (`crate::limits`), as the task's that spawned it are. A task spawned plainly works for none.
+pub fn spawn<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(with(current().as_deref(), fut))
+}
+
 /// The org this task's lines name now.
 pub fn current() -> Option<String> {
     ORG.try_with(|o| o.borrow().clone()).ok().flatten()

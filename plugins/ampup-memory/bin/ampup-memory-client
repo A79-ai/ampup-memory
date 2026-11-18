@@ -11,13 +11,14 @@
 # session's start has installed ampup-memory-client in the background.
 #
 #   ampup-memory-client <args>   as ampup-memory-client would run them
-#   ampup-memory-client login [<server>] [--org <org>]
+#   ampup-memory-client login [<server>] [--org <org>] [--create-org]
 #                                signs in as you (Google, a password): the server defaults to AMPUP_MEMORY_URL,
 #                                else the plugin's own (default_server below; with none, the memory is a local
 #                                server, ampup-memory serve --local on http://127.0.0.1:8080, which needs no
 #                                sign-in). The org defaults to AMPUP_MEMORY_ORG, else the one org holding you
-#                                (several: name one; none: name the one to ask to join). Not a member of the org
-#                                yet: asks to join it, and its admins are emailed to approve
+#                                (several: name one; none: name the one to ask to join, or with --create-org,
+#                                where the server offers sign-up, make your own). Not a member of the org yet:
+#                                asks to join it, and its admins are emailed to approve
 #
 # Each AMPUP_MEMORY_* variable is also read under its old name (MEMSTORE_*) when the new one isn't set.
 default_server=
@@ -133,7 +134,8 @@ if [ "$1" = login ]; then
     exit 0
   fi
   case " $* " in
-    *" --org "*) exec "$bin" join "$server" "$@" ;;
+    # An org named, or the person's own to make: AMPUP_MEMORY_ORG doesn't apply.
+    *" --org "* | *" --create-org "*) exec "$bin" join "$server" "$@" ;;
   esac
   org=${AMPUP_MEMORY_ORG:-${MEMSTORE_ORG:-}}
   if [ -n "$org" ]; then
