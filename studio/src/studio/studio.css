@@ -4,17 +4,17 @@
 .studio {
   --paper: #fdfcf7;
   --sheet: #ffffff;
-  --ink: #232428;
+  --ink: #232323;
   --ink-2: #4c4c4a;
   --faint: #7f7e7c;
   --rule: #e4e3de;
   --rule-soft: #efede8;
-  --band: #f3e4db;
+  --band: #ebe8e1;
   --hover: #f5f2ec;
   --out: #b04a3a;
   --watch: #b07a2e;
   --within: #5e7a52;
-  --focus: #437dc6;
+  --focus: #232323;
   --sans:
     "NeuMontreal", "Inter", "Atkinson Hyperlegible Next", ui-sans-serif, system-ui, -apple-system,
     "Segoe UI", sans-serif;
@@ -1260,5 +1260,69 @@ button.st-step-n:hover {
   }
   .st-tree-acts {
     margin-left: 0;
+  }
+}
+
+/* With the host drawing the sections, an admin page (People, Not answered, Owners, Branches, Serving) opens as the
+   host's other pages do: its title at page size with its window on the right, its figures as tiles under it, and
+   what follows aligned to the page, not inset in a bar. */
+.memory-studio[data-navigation="host"] .studio.st-admin {
+  background: none;
+  .st-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 16px 12px;
+    padding: 0 0 20px;
+    border: 0;
+    background: none;
+  }
+  .st-banner-who {
+    flex: 1 1 auto;
+    margin: 0;
+  }
+  .st-banner-who h1 {
+    font-size: 22px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+  }
+  /* The figures take a row of their own under the title and its controls. */
+  .st-banner-facts {
+    order: 1;
+    flex: 1 0 100%;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+  }
+  .st-banner-facts div {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 14px 16px;
+    background: var(--sheet);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    white-space: normal;
+  }
+  .st-banner-facts dt {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+  .st-banner-facts dd {
+    font-size: 22px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+  }
+  .st-lede,
+  .st-pad,
+  .st-pad-x {
+    margin-left: 0;
+    margin-right: 0;
+  }
+  .st-lede {
+    margin-top: 0;
   }
 }

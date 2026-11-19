@@ -15,8 +15,9 @@ Apache Iceberg tables in a catalog and bucket you run.
 
 ## Install
 
-AmpUp also runs it for you: [hosted AmpUp Memory](https://www.ampup.ai/ampup-memory) needs no install beyond the
-plugin. To run it yourself:
+AmpUp also runs it for you: [hosted AmpUp Memory](https://memory.ampup.ai/?utm_source=github&utm_medium=readme) needs no install beyond the plugin, and
+its Starter plan is free for 30 days ([hosted quickstart](https://docs.ampup.ai/ampup-memory/quickstart#hosted)). To
+run it yourself:
 
 ```bash
 uv tool install ampup-memory-cli      # or: pipx install ampup-memory-cli, or pip install ampup-memory-cli

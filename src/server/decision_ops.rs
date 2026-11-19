@@ -46,7 +46,8 @@ pub(super) async fn handle(
         req["team"].as_str().filter(|t| !t.is_empty()),
     )?;
     let reader = as_member(who, org);
-    let approvals = store.approvals(&scope).await?;
+    // The log only shows them: governance as this server holds it.
+    let approvals = store.held(store.approvals(&scope)).await?;
     // The reads so far, this server's unwritten ones too.
     if let Err(e) = state.audit.flush_for_read(store).await {
         eprintln!("audit: events not written yet (kept, retried): {e:#}");

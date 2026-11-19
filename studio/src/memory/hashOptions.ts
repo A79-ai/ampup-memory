@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 
 // A view's options (a tab, a window, a row opened, a filter) ride in the link after the view, as a query in the
-// hash: `#/u/?days=7&open=<entry>`. The view's own segments are URI-encoded, so a bare `?` only ever starts the
+// hash: `#/not-answered?days=7&open=<entry>`. The view's own segments are URI-encoded, so a bare `?` only ever starts the
 // options. A view's options are its own: moving to another view starts from its defaults.
 
 /** Fired when the link changes without a `hashchange` (pushState and replaceState fire none). */
@@ -96,9 +96,9 @@ export function useSetOption(key: string): [Set<string>, (v: Set<string>) => voi
 
 /**
  * The Explorer's link to what the memory learned from one source, or from one person (an org admin's), as a hash:
- * `#/f/entities?from=<source prefix>`, `#/f/entities?by=<person>`, both narrowing together when both are given, and
- * `#/f/entities/<type>?from=…` within one entity type. A host links to it after the path its Studio is on
- * (`/memory#/f/entities?from=slack%3AC0123%3A`). The prefix is what the source's episodes' sources start with, as
+ * `#/explorer/entities?from=<source prefix>`, `#/explorer/entities?by=<person>`, both narrowing together when both are given, and
+ * `#/explorer/entities/<type>?from=…` within one entity type. A host links to it after the path its Studio is on
+ * (`/memory#/explorer/entities?from=slack%3AC0123%3A`). The prefix is what the source's episodes' sources start with, as
  * `/browse {op: "sources"}` names it.
  */
 export function learnedLink(narrow: { from?: string; by?: string }, type?: string): string {
@@ -107,5 +107,5 @@ export function learnedLink(narrow: { from?: string; by?: string }, type?: strin
   if (narrow.from) p.set("from", narrow.from);
   p.sort();
   const at = ["entities", ...(type ? [type] : [])].map(encodeURIComponent).join("/");
-  return `#/f/${at}${p.size ? `?${p}` : ""}`;
+  return `#/explorer/${at}${p.size ? `?${p}` : ""}`;
 }

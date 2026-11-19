@@ -133,7 +133,7 @@ const valuesOf = (d: Predicate) =>
       ? `→ ${d.to.join(", ")}`
       : (d.description ?? "");
 
-/** `#/m/<type>`: the types the org's memory holds, and what each records. */
+/** `#/schema/<type>`: the types the org's memory holds, and what each records. */
 export function SchemaView({
   schema,
   retry,

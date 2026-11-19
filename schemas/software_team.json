@@ -1,0 +1,163 @@
+{
+  "name": "software_team",
+  "version": 2,
+  "description": "A software team's working memory: the services it builds and runs, the changes that ship to them, the incidents and errors they have, the decisions taken and the procedures that fix things, from pull requests, error reports, chat threads, meeting notes and tickets.",
+  "default_type": "topic",
+  "types": {
+    "service": {
+      "description": "A service, app, component, package or other part of the system the team builds or runs, named in lower case by what the team calls it (service:checkout_api, service:billing_worker).",
+      "predicates": {
+        "purpose": {"type": "text", "description": "what it does, in a sentence"},
+        "owner": {"type": "ref", "to": ["person"], "card": "many", "freshness_days": 180, "description": "who owns or maintains it"},
+        "depends_on": {"type": "ref", "to": ["service"], "card": "many", "list": true, "description": "a service, database, queue or vendor it calls or needs"}
+      }
+    },
+    "change": {
+      "description": "A change that isn't a pull request: a deploy, rollback, migration, config change, commit or release, named by what it changes (change:checkout_api_rollback). A pull request is a pr.",
+      "predicates": {
+        "author": {"type": "ref", "to": ["person"], "description": "who made it"},
+        "service": {"type": "ref", "to": ["service"], "card": "many", "description": "a service it changes"},
+        "fixes": {"type": "ref", "to": ["incident"], "card": "many", "description": "an incident or error it fixes"},
+        "released_in": {"type": "string", "description": "the release or version it shipped in"}
+      }
+    },
+    "pr": {
+      "description": "A pull request, by the id its connector gives it (pr:acme/api#412): what it changes and why, what its reviewers raised, and what it fixed.",
+      "predicates": {
+        "repo": {"type": "ref", "to": ["repo"]},
+        "author": {"type": "ref", "to": ["person"], "description": "who opened it"},
+        "reviewer": {"type": "ref", "to": ["person"], "card": "many", "description": "who reviewed or approved it"},
+        "service": {"type": "ref", "to": ["service"], "card": "many", "description": "a service it changes"},
+        "fixes": {"type": "ref", "to": ["incident"], "card": "many", "description": "an incident or error it fixes"},
+        "merged_at": {"type": "timestamp", "description": "when it was merged"},
+        "released_in": {"type": "string", "description": "the release or version it shipped in"}
+      }
+    },
+    "incident": {
+      "description": "Something that went wrong: an outage, an error, a regression, a flaky test or a bug, by the id its tracker gives it (an error tracker's issue is incident:<org>/<project>/issues/<id>), else named by what goes wrong (incident:checkout_timeout).",
+      "predicates": {
+        "error": {"type": "text", "card": "many", "description": "the exception type and message, or the error text, verbatim"},
+        "service": {"type": "ref", "to": ["service"], "card": "many", "description": "a service it happens in"},
+        "severity": {"type": "enum", "values": ["critical", "high", "medium", "low"], "aliases": {"fatal": "critical", "error": "high", "warning": "medium", "info": "low"}, "description": "how bad it is, as the text or the error level says"},
+        "assignee": {"type": "ref", "to": ["person"], "description": "who is fixing it"},
+        "fixed_by": {"type": "ref", "to": ["pr", "change"], "card": "many", "description": "the pull request or change that fixed it"}
+      }
+    },
+    "decision": {
+      "description": "Something the team decided or agreed: a design, a convention, a trade-off, a rollout or a policy, named for what it decides (decision:retry_payments_in_gateway_client).",
+      "predicates": {
+        "decided_by": {"type": "ref", "to": ["person"], "card": "many"},
+        "concerns": {"type": "ref", "to": ["service", "pr", "change", "incident"], "card": "many", "description": "what it is about"},
+        "decided_on": {"type": "date"}
+      }
+    },
+    "procedure": {
+      "description": "How to do something the team repeats: a runbook, a deploy or rollback, a fix for a known error, a setup, named for the task (procedure:rollback_checkout_api).",
+      "predicates": {
+        "step": {"type": "text", "card": "many", "list": true, "description": "one step, with the exact command, setting or check, in the order given"},
+        "service": {"type": "ref", "to": ["service"], "card": "many"},
+        "owner": {"type": "ref", "to": ["person"]}
+      }
+    },
+    "repo": {
+      "description": "A code repository, as repo:<owner>/<name>.",
+      "predicates": {
+        "service": {"type": "ref", "to": ["service"], "card": "many", "description": "a service built from it"}
+      }
+    },
+    "issue": {
+      "description": "An issue or ticket, by the id its connector gives it (issue:acme/api#88): a bug report, a feature request, a task or a question. An error seen in production is an incident, which an issue may report.",
+      "predicates": {
+        "repo": {"type": "ref", "to": ["repo"]},
+        "service": {"type": "ref", "to": ["service"], "card": "many", "description": "a service it is about"}
+      }
+    },
+    "person": {
+      "description": "Someone on the team or someone it works with, named as the text names them: a full name (person:dana_kim), or a login when that is all there is (person:dana_k).",
+      "predicates": {
+        "role": {"type": "string", "freshness_days": 365, "description": "their role or team, as stated"},
+        "works_on": {"type": "ref", "to": ["service"], "card": "many", "freshness_days": 180}
+      }
+    },
+    "meeting": {
+      "description": "A meeting or call, by the id its source gives it (meeting:granola:<id>, meeting:<id>)."
+    },
+    "channel": {
+      "description": "A chat channel, by its id (channel:C024BE91L)."
+    },
+    "thread": {
+      "description": "A chat thread, as thread:<channel>:<ts>."
+    },
+    "slack_user": {
+      "description": "A chat account, by its id (slack_user:U024BE7LH); the person behind it is a person."
+    },
+    "account": {
+      "description": "A company the team deals with: a customer, a partner or a vendor, by its CRM id (account:hs-8801) or its name (account:contoso).",
+      "predicates": {
+        "domain": {"type": "string"},
+        "industry": {"type": "string"},
+        "owner": {"type": "ref", "to": ["rep"], "description": "who owns it in the CRM"},
+        "status": {"type": "enum", "description": "its status in the CRM (open enum)"},
+        "account_type": {"type": "enum", "description": "the CRM's type for it: customer, partner, prospect (open enum)"},
+        "website": {"type": "string"},
+        "city": {"type": "string"},
+        "country": {"type": "string"}
+      }
+    },
+    "deal": {
+      "description": "A sale or renewal in the CRM, by its id (deal:hs-42).",
+      "predicates": {
+        "stage": {"type": "enum", "description": "the pipeline stage (open enum)"},
+        "amount": {"type": "money", "unit": "USD"},
+        "close_date": {"type": "date", "plan": true},
+        "owner": {"type": "ref", "to": ["rep"], "description": "who owns it in the CRM"},
+        "account": {"type": "ref", "to": ["account"], "part_of": true},
+        "deal_type": {"type": "enum", "description": "new business, renewal, upsell (open enum)"},
+        "next_step": {"type": "text"},
+        "lead_source": {"type": "string"},
+        "forecast_category": {"type": "enum", "description": "the CRM's forecast category (open enum)"},
+        "probability": {"type": "number", "description": "the CRM's chance of closing, in percent"},
+        "description": {"type": "text"}
+      }
+    },
+    "contact": {
+      "description": "Someone outside the team, as contact:<email>, or contact:hs-<id> for a CRM contact record.",
+      "predicates": {
+        "email": {"type": "string"},
+        "title": {"type": "string", "freshness_days": 365},
+        "account": {"type": "ref", "to": ["account"], "part_of": true},
+        "company": {"type": "string", "description": "the company name on the CRM record, which may name a company that has no account"},
+        "owner": {"type": "ref", "to": ["rep"], "description": "who owns it in the CRM"},
+        "lifecycle_stage": {"type": "enum", "description": "the CRM's lifecycle stage (open enum)"}
+      }
+    },
+    "lead": {
+      "description": "A CRM lead, by its id (lead:hs-00Q5e).",
+      "predicates": {
+        "email": {"type": "string"},
+        "title": {"type": "string", "freshness_days": 365},
+        "company": {"type": "string"},
+        "status": {"type": "enum", "description": "its status in the CRM (open enum)"},
+        "lead_source": {"type": "string"},
+        "owner": {"type": "ref", "to": ["rep"], "description": "who owns it in the CRM"}
+      }
+    },
+    "rep": {
+      "description": "One of the team's own people on an email or a deal, as rep:<email>, or rep:hs-<id> for a CRM record's owner by their CRM user id."
+    },
+    "topic": {
+      "description": "Anything else a colleague would look up by name: a process, a policy, a vendor's product, a customer request (topic:sso_rollout)."
+    }
+  },
+  "guidance": [
+    "Facts read from pull requests, error reports, chat, meeting notes and tickets are statements: one sentence each, under the service, pull request (pr), issue, change, incident, decision, procedure or person it is about, its kind as the predicate (problem, cause, fix, decision, commitment, plan, update, requirement, question, note). Filter by type and kind, and rank by text. Facts from calendar events, emails and CRM records keep the predicates their types declare.",
+    "What broke and why: find type incident by text (the error message, the service, the release) and read its problem, cause and fix statements; the pull requests and changes that name it say what shipped.",
+    "Before changing a service: read its statements, then the decisions and incidents whose text names it.",
+    "A procedure's statements quote commands as the team wrote them: read the evidence (include: [\"evidence\"]) before running one. One person may be two subjects, by login and by name."
+  ],
+  "extract": {
+    "sources": {"prefixes": ["github:", "sentry:", "slack:", "granola:", "linear:", "hubspot:", "salesforce:", "dynamicsCRM:", "email:", "gong:", "fireflies:", "fathom:"]},
+    "style": "statements",
+    "facts_per_episode": 15
+  }
+}

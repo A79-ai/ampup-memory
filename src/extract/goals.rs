@@ -233,28 +233,34 @@ impl Offer {
     /// both declare a predicate, the schema's stands, as the commit will check it). An episode about nothing (a
     /// note) may name subjects of any of its types that aren't items, by what they are ([`discovered`]): with no
     /// contract to say what to read, the schema is still what says what to find. Facts it finds are typed, not refused one by one.
+    /// Written in the style the schema's `extract` asks (`statements`), as what its contract reads is, and with its
+    /// facts per episode: the schema's guidance, which the prompt carries, describes facts in that style, so an
+    /// offer of the catalog's predicates beside it had the model write statements its checks then refused.
     pub(super) fn of_schema(
         ex: &Extractor,
         base: &Schema,
         kind: &'static dyn EpisodeType,
     ) -> Result<Self> {
+        let x = base.extract.as_ref();
         let contract = Contract {
             version: 0,
             statement: format!("What schema {} records.", base.name),
             sources: Default::default(),
-            facts_per_episode: None,
+            facts_per_episode: x.and_then(|x| x.facts_per_episode),
             aggregates: None,
             outcomes: Default::default(),
-            style: None,
+            style: x.and_then(|x| x.style.clone()),
             writer: None,
         };
-        let actor = format!(
-            "extract:{}@{PROMPT_VERSION}/schema:{}/{}",
+        let mut o = Self::schema_offer(base, kind, contract, String::new())?;
+        o.actor = format!(
+            "extract:{}@{}/schema:{}/{}",
             ex.model,
+            o.prompt_version(),
             base.name,
             kind.name()
         );
-        Self::schema_offer(base, kind, contract, actor)
+        Ok(o)
     }
 
     /// The schema with `kind`'s catalog added, the schema's own types first (where both declare a predicate, the

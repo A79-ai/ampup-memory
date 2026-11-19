@@ -23,129 +23,166 @@ import "../base.css";
 import "./memory.css";
 import "../theme.css";
 
-// The focus lives in the address bar's hash, so a view can be linked to and survives a reload:
-//   #/w/                    Home (what changed, what it answered, what needs you)
-//   #/f/sources/slack/C09   a folder      #/e/entities/deal/42   an entity
-//   #/f/sessions/…          the reader's sessions (Answers › Sessions)
-//   #/x/<episode id>        an episode    #/q/<text>             a search (Search › Facts)
-//   #/s/skills/<goal>/<slug> a compiled skill (or its goal's index)
-//   #/t/<tool>              the Tools, a tool picked
-//   #/m/<type>              the Schema, a type picked
-//   #/g/                    the Goals
-//   #/a/<parts>/<question>  Search › Look up: a question, and which of facts (f), advice (a), episodes (e) it uses
-//   #/n/                    Ask: an agent answers on arms (its conversation isn't in the link)
-//   #/h/                    Handover        #/p/<person>  People (a person's activity, or everyone's)
-//   #/v/                    Advice's trail  #/b/          Branches       #/o/  Owners
-//   #/k/<lesson>            Learned (what it learned, a lesson picked: studio/Learned.tsx's `lessonId`)
-//   #/l/                    Serving (when advice is served, and why not)
-//   #/u/                    Not answered    #/c/<entry>/<view>  a conversation's trace, its filter
-//   #/r/<proposal>          Review (owner review: the inbox, or one proposal)
-//   #/d/<entity>            Graph (the entities and their links, one picked)
-//                           (People onwards: the org's admins')
-// After the view, its options as a query (`#/u/?days=7&open=<entry>`: hashOptions.ts): its window, the tab, the
-// row opened, the filters, so every one of them can be linked to.
+// The focus lives in the address bar's hash, named for the page it opens, so a view can be linked to, read at a
+// glance and survives a reload:
+//   #/home                      Home (what changed, what it answered, what needs you)
+//   #/explorer/sources/slack/C09  a folder    #/entity/entities/deal/42  an entity
+//   #/sessions/…                the reader's sessions     #/skills/<goal>/<slug>  compiled skills (a folder)
+//   #/episode/<episode id>      an episode    #/search/<text>  a search (Search › Facts)
+//   #/skill/skills/<goal>/<slug>  a compiled skill read as a note (or its goal's index)
+//   #/tools/<tool>              the Tools, a tool picked
+//   #/schema/<type>             the Schema, a type picked
+//   #/goals                     the Goals
+//   #/ask/<parts>/<question>    Search › Look up: a question, and which of facts (f), advice (a), episodes (e) it uses
+//   #/playground                Ask: an agent answers on arms (its conversation isn't in the link)
+//   #/handover                  Handover      #/people/<person>  People (a person's activity, or everyone's)
+//   #/advice                    Advice's trail  #/branches  Branches  #/owners  Owners
+//   #/learned/<lesson>          Learned (what it learned, a lesson picked: studio/Learned.tsx's `lessonId`)
+//   #/serving                   Serving (when advice is served, and why not)
+//   #/not-answered              Not answered  #/conversation/<entry>/<view>  a conversation's trace, its filter
+//   #/review/<proposal>         Review (owner review: the inbox, or one proposal)
+//   #/graph/<entity>            Graph (the entities and their links, one picked)
+//                               (People onwards: the org's admins')
+// After the view, its options as a query (`#/not-answered?days=7&open=<entry>`: hashOptions.ts): its window, the
+// tab, the row opened, the filters, so every one of them can be linked to.
 // Each segment is URI-encoded, so one may hold `/`. The org is the host's (`org`); `?team=` picks one of its
 // teams' memory and `?branch=` the branch read (main by default).
+// Links from before the names (`#/v/`, `#/f/sessions`, …: one letter each) still open the same page.
+const LETTERS: Record<string, string> = {
+  w: "home",
+  f: "explorer",
+  e: "entity",
+  s: "skill",
+  x: "episode",
+  q: "search",
+  t: "tools",
+  m: "schema",
+  g: "goals",
+  h: "handover",
+  p: "people",
+  v: "advice",
+  k: "learned",
+  l: "serving",
+  b: "branches",
+  o: "owners",
+  u: "not-answered",
+  c: "conversation",
+  a: "ask",
+  n: "playground",
+  r: "review",
+  d: "graph",
+};
+
+/** `#/<name>`, and `/<rest>` after it when there's more to say. */
+const at = (name: string, rest = "") => `#/${name}${rest ? `/${rest}` : ""}`;
+
 function toHash(f: Focus | null): string {
   if (!f) return "";
   const enc = (p: string[]) => p.map(encodeURIComponent).join("/");
   switch (f.kind) {
     case "home":
-      return "#/w/";
+      return at("home");
     case "folder":
-      return `#/f/${enc(f.path)}`;
+      // Sessions and Skills are pages of their own: their folders are linked by their names.
+      if (f.path[0] === "sessions" || f.path[0] === "skills")
+        return at(f.path[0], enc(f.path.slice(1)));
+      return at("explorer", enc(f.path));
     case "entity":
-      return `#/e/${enc(f.path)}`;
+      return at("entity", enc(f.path));
     case "skill":
-      return `#/s/${enc(f.path)}`;
+      return at("skill", enc(f.path));
     case "episode":
-      return `#/x/${encodeURIComponent(f.id)}`;
+      return at("episode", encodeURIComponent(f.id));
     case "search":
-      return `#/q/${encodeURIComponent(f.query)}`;
+      return at("search", encodeURIComponent(f.query));
     case "tools":
-      return `#/t/${encodeURIComponent(f.tool ?? "")}`;
+      return at("tools", encodeURIComponent(f.tool ?? ""));
     case "schema":
-      return `#/m/${encodeURIComponent(f.type ?? "")}`;
+      return at("schema", encodeURIComponent(f.type ?? ""));
     case "goals":
-      return "#/g/";
+      return at("goals");
     case "handover":
-      return "#/h/";
+      return at("handover");
     case "people":
-      return `#/p/${encodeURIComponent(f.user ?? "")}`;
+      return at("people", encodeURIComponent(f.user ?? ""));
     case "advice":
-      return "#/v/";
+      return at("advice");
     case "learned":
-      return `#/k/${encodeURIComponent(f.lesson ?? "")}`;
+      return at("learned", encodeURIComponent(f.lesson ?? ""));
     case "serving":
-      return "#/l/";
+      return at("serving");
     case "branches":
-      return "#/b/";
+      return at("branches");
     case "owners":
-      return "#/o/";
+      return at("owners");
     case "gaps":
-      return "#/u/";
+      return at("not-answered");
     case "conversation":
-      return `#/c/${encodeURIComponent(f.id)}`;
+      return at("conversation", encodeURIComponent(f.id));
     case "ask":
-      return `#/a/${encodeURIComponent(f.parts ?? "fae")}/${encodeURIComponent(f.question)}`;
+      return at("ask", `${encodeURIComponent(f.parts ?? "fae")}/${encodeURIComponent(f.question)}`);
     case "agent":
-      return "#/n/";
+      return at("playground");
     case "review":
-      return `#/r/${encodeURIComponent(f.proposal ?? "")}`;
+      return at("review", encodeURIComponent(f.proposal ?? ""));
     case "graph":
-      return `#/d/${encodeURIComponent(f.entity ?? "")}`;
+      return at("graph", encodeURIComponent(f.entity ?? ""));
   }
 }
 
 function fromHash(hash: string): Focus | null {
   const h = viewOf(hash);
-  const m = /^#\/([wfesxqtmganhpvkbourcdl])\/(.*)$/.exec(h);
+  const m = /^#\/([a-z][a-z-]*)(?:\/(.*))?$/.exec(h);
   if (!m) return null;
+  const name = LETTERS[m[1]!] ?? m[1]!;
   const rest = m[2] ?? "";
   const segs = rest ? rest.split("/").map(decodeURIComponent) : [];
-  switch (m[1]) {
-    case "w":
+  switch (name) {
+    case "home":
       return { kind: "home" };
-    case "f":
+    case "explorer":
       return { kind: "folder", path: segs };
-    case "e":
+    case "sessions":
+    case "skills":
+      return { kind: "folder", path: [name, ...segs] };
+    case "entity":
       return { kind: "entity", path: segs };
-    case "s":
+    case "skill":
       return { kind: "skill", path: segs };
-    case "x":
+    case "episode":
       return { kind: "episode", id: decodeURIComponent(rest) };
-    case "t":
+    case "tools":
       return { kind: "tools", tool: decodeURIComponent(rest) || undefined };
-    case "m":
+    case "schema":
       return { kind: "schema", type: decodeURIComponent(rest) || undefined };
-    case "g":
+    case "goals":
       return { kind: "goals" };
-    case "h":
+    case "handover":
       return { kind: "handover" };
-    case "p":
+    case "people":
       return { kind: "people", user: decodeURIComponent(rest) || undefined };
-    case "v":
+    case "advice":
       return { kind: "advice" };
-    case "k":
+    case "learned":
       return { kind: "learned", lesson: decodeURIComponent(rest) || undefined };
-    case "l":
+    case "serving":
       return { kind: "serving" };
-    case "b":
+    case "branches":
       return { kind: "branches" };
-    case "o":
+    case "owners":
       return { kind: "owners" };
-    case "u":
+    case "not-answered":
       return { kind: "gaps" };
-    case "c":
+    case "conversation":
       // What follows the entry is the trace's filter, which Trace keeps in the link itself.
       return { kind: "conversation", id: segs[0] ?? "" };
-    case "n":
+    case "playground":
       return { kind: "agent" };
-    case "r":
+    case "review":
       return { kind: "review", proposal: decodeURIComponent(rest) || undefined };
-    case "d":
+    case "graph":
       return { kind: "graph", entity: decodeURIComponent(rest) || undefined };
-    case "a": {
+    case "ask": {
       const i = rest.indexOf("/");
       return i < 0
         ? { kind: "ask", question: "", parts: decodeURIComponent(rest) || "fae" }
@@ -155,8 +192,10 @@ function fromHash(hash: string): Focus | null {
             question: decodeURIComponent(rest.slice(i + 1)),
           };
     }
-    default:
+    case "search":
       return { kind: "search", query: decodeURIComponent(rest) };
+    default:
+      return null;
   }
 }
 
@@ -371,6 +410,34 @@ export interface MemoryStudioProps {
    * actions and a new memory's guide. Without them, Home says how instead.
    */
   connect?: { sources?: string; agents?: string };
+  /**
+   * Who draws the sections' sidebar: the pages (`sidebar`, the default), or the host (`host`), which is then told
+   * the sections through `onNavigation` and draws them in its own navigation. With `host` the pages keep the memory
+   * and branch pickers in a bar above the section, and leave ⌘K to the host (`/` still opens Search).
+   */
+  navigation?: "sidebar" | "host";
+  /** The sections this person has, and the one open, each time they change (for a host that draws them). */
+  onNavigation?: (nav: StudioNavigation) => void;
+}
+
+/** A section the host may draw: its link is the hash to set on the page that shows the studio. */
+export interface StudioNavItem {
+  id: string;
+  label: string;
+  /** The view's hash (`#/…`), to put after the host page's path. */
+  hash: string;
+  /** The section open now. */
+  current: boolean;
+  /** A count to show beside it (the Schema's types), when there is one. */
+  count?: number;
+}
+export interface StudioNavGroup {
+  /** The group's heading ("" for the first, ungrouped one). */
+  group: string;
+  items: StudioNavItem[];
+}
+export interface StudioNavigation {
+  groups: StudioNavGroup[];
 }
 
 /**
@@ -389,7 +456,10 @@ export function MemoryStudio({
   admin: isAdmin,
   theme = "light",
   connect,
+  navigation = "sidebar",
+  onNavigation,
 }: MemoryStudioProps) {
+  const hostNav = navigation === "host";
   // Every call the pages make below goes through it.
   setTransport(transport);
   // What the transport reaches: what it says it does at once, what it probes once the server answers.
@@ -403,7 +473,11 @@ export function MemoryStudio({
   }, [transport, org]);
   const can: Resolved = caps?.of === transport && caps.org === org ? caps.caps : given(transport);
   const admin = (isAdmin ?? true) && can.admin;
-  const root = { className: "memory-studio", "data-studio-theme": theme };
+  const root = {
+    className: "memory-studio",
+    "data-studio-theme": theme,
+    "data-navigation": hostNav ? "host" : undefined,
+  };
   const hash = useSyncExternalStore(subscribe, () => location.hash);
   const search = useSyncExternalStore(subscribe, () => location.search);
   // A view's options (`?…` after it) are read by the view itself: changing one doesn't move the focus.
@@ -494,7 +568,7 @@ export function MemoryStudio({
         e.target instanceof HTMLElement && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
       if (
         canBrowse &&
-        (((e.metaKey || e.ctrlKey) && e.key === "k") || (e.key === "/" && !typing))
+        ((!hostNav && (e.metaKey || e.ctrlKey) && e.key === "k") || (e.key === "/" && !typing))
       ) {
         e.preventDefault();
         if (fromHash(location.hash)?.kind !== "search") go({ kind: "search", query: "" });
@@ -506,7 +580,7 @@ export function MemoryStudio({
     };
     addEventListener("keydown", on);
     return () => removeEventListener("keydown", on);
-  }, [canBrowse, go]);
+  }, [canBrowse, go, hostNav]);
 
   const choose = (s: { team?: string; branch?: string }) => {
     const q = new URLSearchParams();
@@ -554,7 +628,8 @@ export function MemoryStudio({
             </option>
           ))}
         </select>
-      ) : (
+      ) : hostNav ? null : (
+        // A host names the org itself: the label says nothing more there.
         <div className="context-label mono" title="The memory you are reading">
           {me?.scope ?? `org:${org}`}
         </div>
@@ -576,7 +651,7 @@ export function MemoryStudio({
               </option>
             ))}
           </select>
-        ) : (
+        ) : hostNav ? null : (
           <div className="context-label" title="The branch you are reading">
             <Icon name="branch" size={14} />
             main
@@ -588,7 +663,37 @@ export function MemoryStudio({
     </div>
   );
 
-  const nav = (
+  // For a host that draws the sections: tell it what they are whenever that changes.
+  const typeCount = schema?.types?.size;
+  const navigationKey = JSON.stringify([
+    visible.map((g) => [g.group, g.items.map((i) => i.id)]),
+    section,
+    typeCount,
+  ]);
+  useEffect(() => {
+    if (!onNavigation) return;
+    onNavigation({
+      groups: visible.map((g) => ({
+        group: g.group,
+        items: g.items.map((i) => ({
+          id: i.id,
+          label: i.label,
+          hash: toHash(i.to),
+          current: section === i.id,
+          count: i.id === "schema" && typeCount ? typeCount : undefined,
+        })),
+      })),
+    });
+    // `visible` is rebuilt every render: its key says when it changed.
+  }, [navigationKey, onNavigation]);
+
+  const nav = hostNav ? (
+    pickers ? (
+      <div className="memory studio-bar" aria-label="Memory being read">
+        {pickers}
+      </div>
+    ) : null
+  ) : (
     <aside className="memory studio-nav" aria-label="Memory sections">
       {pickers}
       {visible.map((g) => (
@@ -801,7 +906,7 @@ export function MemoryStudio({
   let body: React.ReactNode;
   if (section === "explorer") {
     body = (
-      <div className={`app ${drawer ? "drawer-open" : ""}`}>
+      <div className={`app ${hostNav ? "hosted" : ""} ${drawer ? "drawer-open" : ""}`}>
         <header className="bar">
           <button
             className="icon-btn menu-btn"
@@ -809,12 +914,14 @@ export function MemoryStudio({
             onClick={() => setDrawer((d) => !d)}
           >
             <Icon name={drawer ? "close" : "menu"} />
+            {hostNav && <span className="menu-label">Folders</span>}
           </button>
           <div className="bar-title">
             <Icon name="explorer" size={16} /> Context tree
           </div>
           <button
             className="search-box search-open"
+            hidden={hostNav}
             onClick={() => {
               go({ kind: "search", query: "" });
               requestAnimationFrame(() => searchRef.current?.focus());
@@ -852,7 +959,7 @@ export function MemoryStudio({
     );
   } else if (section === "tools") {
     body = (
-      <div className="app app-page">
+      <div className={`app app-page app-tools ${hostNav ? "hosted" : ""}`}>
         {banners}
         <main className="main">
           <Tools

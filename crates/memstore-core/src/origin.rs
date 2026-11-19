@@ -20,7 +20,8 @@
 //!   person added themselves as an org admin (`add_fact`: Studio's "Add a fact" and "This is wrong") or stated
 //!   in settling a conflict (`resolve_conflict` with a value), or text they pasted or uploaded in Studio's "Add to
 //!   memory" (`/learn`), which they typed or chose, value and all, so it is their statement, not an agent's
-//!   conclusion. Not a service key's: a key is a program, whatever it adds.
+//!   conclusion. Not a service key's: a key is a program, whatever it adds. A recording added there is a call's
+//!   transcript ([`RECORDED`]): stated by its speakers, whoever added it.
 //! - **observed**: a record a system keeps (a CRM change, an issue tracker's ticket, an error report, a pull
 //!   request) and a document loaded; anything else a connector delivers.
 //!
@@ -54,6 +55,12 @@ pub const ADDED: &str = "memstore:fact";
 /// or uploaded), before what it was: `mcp:remember_memory:<them>:memstore:learn:paste:<first words>`. Under
 /// `memstore:` too, so no agent's note passes for it.
 pub const LEARNED: &str = "memstore:learn";
+/// What follows a person in the source of a recording they added in Studio's "Add to memory" (`/learn`), its
+/// transcript filed as a call: `mcp:remember_memory:<them>:memstore:recording:<digest>`. Not under
+/// [`LEARNED`]: what its speakers said, not the statement of whoever added it, so it is stated as any call's
+/// transcript is, and its speakers, not that person, said it ([`sayer`]). Under `memstore:` too, so only the server
+/// files it.
+pub const RECORDED: &str = "memstore:recording";
 
 impl Origin {
     /// Its name, as JSON answers carry it.
@@ -68,6 +75,10 @@ impl Origin {
     /// The origin of an episode from `source`, as the source alone says.
     pub fn of_source(source: &str) -> Origin {
         if let Some(rest) = remembered(source) {
+            // A recording's transcript: what its speakers said, whoever added it.
+            if recorded(rest) {
+                return Origin::Stated;
+            }
             let kept = rest == KEPT || rest.strip_prefix(KEPT).is_some_and(|r| r.starts_with(':'));
             let shared = source
                 .strip_prefix(crate::REMEMBER_SOURCE)
@@ -84,9 +95,7 @@ impl Origin {
         }
         match crate::episode_types::name_of_source(source) {
             Some("sales_call" | "email" | "slack_thread") => Origin::Stated,
-            Some("doc") if ["granola:", "note:"].iter().any(|p| source.starts_with(p)) => {
-                Origin::Stated
-            }
+            Some("doc") if source.starts_with("note:") => Origin::Stated,
             _ => Origin::Observed,
         }
     }
@@ -160,6 +169,16 @@ pub fn learned(rest: &str) -> bool {
     under(rest, LEARNED)
 }
 
+/// Whether `rest`, what follows a person in a source, is a recording they added in Studio ([`RECORDED`]).
+pub fn recorded(rest: &str) -> bool {
+    under(rest, RECORDED)
+}
+
+/// Whether `source` is a recording someone added in Studio ([`RECORDED`]): a call, though filed under their name.
+pub fn recording(source: &str) -> bool {
+    remembered(source).is_some_and(recorded)
+}
+
 /// Whether `rest` is `tail`, or starts with it and a `:`.
 fn under(rest: &str, tail: &str) -> bool {
     rest.strip_prefix(tail)
@@ -176,9 +195,11 @@ fn author_is_key(source: &str) -> bool {
 
 /// Who said what an episode from `source` holds, as one source is told from another where who supports a fact is
 /// counted ([`crate::corroboration`]): a note's author (each note they remember is theirs, whatever they label it),
-/// else the source itself (a ticket, a thread, a call, a document).
+/// else the source itself (a ticket, a thread, a call, a document). A recording someone added is its own
+/// (`memstore:recording:<digest>`), whoever added it: the same media added by two people is one meeting, one sayer.
 pub fn sayer(source: &str) -> &str {
     match remembered(source) {
+        Some(rest) if recorded(rest) => rest,
         Some(rest) => &source[..source.len() - rest.len() - 1],
         None => source,
     }

@@ -1,8 +1,10 @@
-//! A recorded sales call. The body is the call's transcript, as JSON from the recorder (turns with speaker,
-//! start and text, and the meeting's id, title and participants) or as `[mm:ss] Speaker: text` lines. Facts cite
-//! a turn: its number, when it starts and who spoke. The engine writes the meeting's name (its title) and time,
-//! who was invited (from the participants), who attended (from who spoke) and the full name a participant listed
-//! only by their address speaks under; the model writes the rest, from `catalog.json`.
+//! A recorded call or meeting: a sales call, a team's meeting, a note-taker's notes of one. The body is the
+//! transcript, as JSON from the recorder (turns with speaker, start and text, and the meeting's id, title and
+//! participants, and its notes' summary) or as `[mm:ss] Speaker: text` lines. A meeting with notes and no
+//! transcript is its summary alone. Facts cite a turn (its number, when it starts and who spoke) or a line of the
+//! summary (a span of it, under its heading). The engine writes the meeting's name (its title) and time, who was
+//! invited (from the participants), who attended (from who spoke) and the full name a participant listed only by
+//! their address speaks under; the model writes the rest, from `catalog.json`.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -14,7 +16,8 @@ use crate::Episode;
 pub struct SalesCall;
 
 /// The recorder's JSON: `turns` with `speaker` (or `speaker_id`), `start_ms` (or `start_time` in seconds) and
-/// `text`; `meeting` (`meeting:<id>`), `title` and `participants` (`{id, name}`) when known.
+/// `text`; `meeting` (`meeting:<id>`), `title`, `participants` (`{id, name}`) and `summary` (the notes' summary
+/// as Markdown, also read as `notes` or `summary_markdown`) when known. Turns, a summary, or both.
 #[derive(Deserialize)]
 struct Body {
     #[serde(default)]
@@ -23,7 +26,48 @@ struct Body {
     title: Option<String>,
     #[serde(default)]
     participants: Vec<Participant>,
+    #[serde(default)]
     turns: Vec<Turn>,
+    #[serde(default, alias = "notes", alias = "summary_markdown")]
+    summary: Option<String>,
+}
+
+/// A summary's lines as units, numbered on from `first`: each line that isn't a heading, a list's marker left out,
+/// citing its span of the summary under the heading above it.
+fn summary_units(summary: &str, first: usize) -> Vec<Unit> {
+    let mut out = vec![];
+    let mut heading: Option<String> = None;
+    let mut offset = 0;
+    for raw in summary.split_inclusive('\n') {
+        let start = offset;
+        offset += raw.len();
+        let line = raw.trim_end_matches(['\n', '\r']);
+        let lead = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            heading = Some(trimmed.trim_start_matches('#').trim().to_string());
+            continue;
+        }
+        let text = ["- ", "* ", "• "]
+            .iter()
+            .find_map(|m| trimmed.strip_prefix(m))
+            .map_or(trimmed, str::trim_start);
+        let at = start + lead + (trimmed.len() - text.len());
+        out.push(Unit {
+            index: first + out.len(),
+            speaker: None,
+            text: text.to_string(),
+            cite: Cite::Span {
+                offset: at,
+                len: text.len(),
+                heading: heading.clone(),
+            },
+        });
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -45,7 +89,16 @@ impl EpisodeType for SalesCall {
         Format::Transcript
     }
     fn source_prefixes(&self) -> &'static [&'static str] {
-        &["meeting:", "gong:", "zoom:", "recall:", "ampup:meeting:"]
+        &[
+            "meeting:",
+            "gong:",
+            "zoom:",
+            "recall:",
+            "ampup:meeting:",
+            "granola:",
+            "fireflies:",
+            "fathom:",
+        ]
     }
     fn catalog_json(&self) -> &'static str {
         include_str!("catalog.json")
@@ -63,15 +116,22 @@ impl EpisodeType for SalesCall {
         ]
     }
     fn instructions(&self) -> &'static str {
-        "A recorded sales call between our reps (internal) and a prospect (external). Write simple statements the \
-         call makes, each citing the turn it is said in. Never judge status or progress: that is worked out later \
-         from many episodes."
+        "A recorded call or meeting, as its transcript, its notes' summary, or both. On a sales call our reps \
+         (internal) talk with a prospect (external). Write simple statements the meeting makes, each citing the \
+         turn or summary line it is said in. Never judge status or progress: that is worked out later from many \
+         episodes."
     }
     fn units(&self, ep: &Episode) -> Result<Vec<Unit>> {
         let text = String::from_utf8_lossy(&ep.body);
         if text.trim_start().starts_with('{') {
             let b: Body =
                 serde_json::from_str(&text).context("sales_call body: not a transcript")?;
+            let turns = b.turns.len();
+            let summary = b
+                .summary
+                .as_deref()
+                .map(|s| summary_units(s, turns))
+                .unwrap_or_default();
             return Ok(b
                 .turns
                 .into_iter()
@@ -89,6 +149,7 @@ impl EpisodeType for SalesCall {
                         },
                     }
                 })
+                .chain(summary)
                 .collect());
         }
         Ok(speaker_lines(&text)

@@ -1884,7 +1884,8 @@ pub(crate) fn item_tallies(
 /// The team's advice categories, by name: what a picker offers (an owner's area), from the map alone, without
 /// reading the answer log the trail reads.
 pub async fn categories(store: &Store, scope: &Scope, who: &Principal) -> Result<Value> {
-    let session = store.pin(scope, crate::MAIN).await?;
+    // Shown only, as the trail is: main's last state while the next is built.
+    let session = store.pin_lagging(scope, crate::MAIN).await?;
     let map = read_map(&session, store, who, &Space::team()).await?;
     let names: Vec<&String> = map.iter().flat_map(|m| m.categories.keys()).collect();
     Ok(json!({"categories": names}))
@@ -6259,7 +6260,8 @@ pub(crate) async fn served_procedures(
     if answer.contains('#') || answer.starts_with(MINE_KEY) {
         return Ok(vec![]);
     }
-    let session = store.pin(scope, crate::MAIN).await?;
+    // Read only: main's last state while the next is built, never one holding what was taken away.
+    let session = store.pin_lagging(scope, crate::MAIN).await?;
     let slugs: Vec<String> = match answer.strip_prefix(SKILL) {
         Some(slug) => vec![slug.to_string()],
         None => read_map(&session, store, who, &Space::team())

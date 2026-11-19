@@ -262,7 +262,7 @@ export function mentions(all: Step[], key: string): number[] {
   return out;
 }
 
-/** A trace's view as its link keeps it (`#/c/<entry>/<view>`): `show=advice,error&ctx=1&q=…`. */
+/** A trace's view as its link keeps it (`#/conversation/<entry>/<view>`): `show=advice,error&ctx=1&q=…`. */
 export interface View {
   only: Set<Kind>;
   context: number;

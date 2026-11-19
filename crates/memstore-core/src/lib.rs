@@ -6245,6 +6245,22 @@ impl Store {
         Ok(Ledger::from_batches(&snap.rows, &scope.namespace()).reachable(heads))
     }
 
+    /// [`Store::branch_heads`] from the ledger as this server holds it (at most `AMPUP_MEMORY_MAX_STALENESS_MS`
+    /// behind, refreshed in the background): for a page that lists the branches, never to decide whether one
+    /// exists before writing to it.
+    pub async fn branch_heads_held(&self, scope: &Scope) -> Result<BTreeMap<String, Vec<String>>> {
+        let ledger = self.ledger(scope).await?;
+        let branches: BTreeSet<&str> = ledger.rows.iter().map(|r| r.branch.as_str()).collect();
+        Ok(branches
+            .into_iter()
+            .map(|b| {
+                let mut heads = ledger.heads(b);
+                heads.sort();
+                (b.to_string(), heads)
+            })
+            .collect())
+    }
+
     /// Every branch of the scope with its heads, read from the catalog now (main has none before its first
     /// commit).
     pub async fn branch_heads(&self, scope: &Scope) -> Result<BTreeMap<String, Vec<String>>> {
@@ -6585,7 +6601,8 @@ impl Store {
             if let Some((after, events)) = tried.take() {
                 let since = directory_rows(&table, Some(after)).await?;
                 if events.iter().all(|e| since.contains(e)) {
-                    return self.directory_written(read_at, base, events).await;
+                    let sid = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+                    return self.directory_written(read_at, sid, base, events).await;
                 }
             }
             // Fail closed: a change planned against a directory that stops short of the log could
@@ -6604,7 +6621,7 @@ impl Store {
             for (i, e) in events.iter_mut().enumerate() {
                 e.at = start + i as i64;
             }
-            match append(
+            match appended(
                 &*self.catalog(),
                 &table,
                 directory_columns(&events),
@@ -6612,11 +6629,20 @@ impl Store {
             )
             .await
             {
-                Ok(()) => {
+                Ok(committed) => {
                     let mut after = (*base).clone();
                     after.apply(&events);
+                    // The snapshot these events made, only where it is the table's current one and sits right on the
+                    // one they were planned against: a commit whose answer was lost comes back as the table found
+                    // holding it, maybe with another server's change (or a compaction) on top, which `after` lacks.
+                    let planned = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+                    let sid = committed
+                        .metadata()
+                        .current_snapshot()
+                        .filter(|s| s.parent_snapshot_id() == planned)
+                        .map(|s| s.snapshot_id());
                     return self
-                        .directory_written(read_at, Arc::new(after), events)
+                        .directory_written(read_at, sid, Arc::new(after), events)
                         .await;
                 }
                 Err(e) if is_commit_conflict(&e) => {
@@ -6638,10 +6664,13 @@ impl Store {
     /// `events` landed and `after` is the directory with them: keep it (this server reads its own
     /// changes at once), and write a snapshot if one is due. `read_at`: when the read `after` was planned
     /// against began (the compare-and-set let nothing else commit between that read and these events), which
-    /// dates the fold kept: another server's change committed since isn't in it.
+    /// dates the fold kept: another server's change committed since isn't in it. `sid`: the table's snapshot that
+    /// holds them, kept with the fold, so the next load finds the table where this server left it and folds nothing
+    /// again (without it, every change made here was followed by a scan of the whole table for the changes after it).
     async fn directory_written(
         &self,
         read_at: Instant,
+        sid: Option<i64>,
         after: Arc<directory::Folded>,
         events: Vec<directory::Event>,
     ) -> Result<Vec<directory::Event>> {
@@ -6652,7 +6681,7 @@ impl Store {
                 .as_ref()
                 .is_none_or(|(_, _, f)| f.events <= after.events)
             {
-                *held = Some((read_at, None, after.clone()));
+                *held = Some((read_at, sid, after.clone()));
                 // A change this server made holds here at once: an org's limits set now refuse its next write.
                 crate::limits::observe(&after.dir);
             }

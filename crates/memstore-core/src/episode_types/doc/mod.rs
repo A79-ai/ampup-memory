@@ -20,16 +20,12 @@ impl EpisodeType for Doc {
     /// Running text, by where it comes from: an agent's note (`/remember`, MCP `remember_memory` and
     /// `close_memory`, all signed `mcp:remember_memory:<who>:…`), a GitHub issue or pull request, a Linear
     /// issue (`linear:<workspace>/<KEY-123>`: title, metadata, description, comments and linked pull requests
-    /// as markdown), a Sentry issue (`sentry:https://<org>.sentry.io/issues/<id>/`: title, status, culprit, stack
-    /// frames and the pull requests that fixed it, as markdown), a Granola meeting note (summary and transcript as
-    /// markdown), a document, a note.
+    /// as markdown), a document, a note. An error tracker's issue is an `incident`, a meeting's notes a call.
     fn source_prefixes(&self) -> &'static [&'static str] {
         &[
             "mcp:remember_memory:",
             "github:",
             "linear:",
-            "sentry:",
-            "granola:",
             "doc:",
             "note:",
         ]

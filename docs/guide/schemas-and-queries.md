@@ -21,7 +21,7 @@ default, where a newer value replaces the older; or `many`, where values accumul
 - `guidance` lines tell agents how the domain's questions map onto the types; they appear in `query_memory`'s
   description.
 - `metrics` name stored `count` queries an agent can run by name.
-- Three ship built in: `sales`, `engineering`, `corpus` (`schemas/`). Any JSON file in the same shape works.
+- Four ship built in: `sales`, `engineering`, `corpus` and `software_team` (`schemas/`). Any JSON file in the same shape works.
 
 ```bash
 ampup-memory schema list                                      # the built-in schemas

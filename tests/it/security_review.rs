@@ -477,10 +477,30 @@ async fn a_provisioner_key_sets_up_only_the_orgs_it_creates() {
     let (status, body) =
         admin(json!({"op": "set_limits", "org": "acme", "max_episodes": 50})).await;
     assert_eq!(status, 200, "{body}");
+    // It gives an org it created a built-in schema while the org has none; sent again, or another one, the org
+    // keeps the first and nothing is committed.
+    let (status, body) =
+        admin(json!({"op": "set_schema", "org": "trial", "schema": "software_team"})).await;
+    assert_eq!(status, 200, "{body}");
+    for again in ["software_team", "sales"] {
+        let (status, body) =
+            admin(json!({"op": "set_schema", "org": "trial", "schema": again})).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["changes"], json!([]), "{body}");
+    }
+    let (_, got) = post(
+        &s,
+        "/admin",
+        ADMIN_KEY,
+        &json!({"op": "get_schema", "org": "trial", "history": true}),
+    )
+    .await;
+    assert_eq!(got["schema"]["name"], "software_team", "{got}");
+    assert_eq!(got["history"].as_array().map(Vec::len), Some(1), "{got}");
 
     // Everything else is refused. Each would let a sign-up service reach beyond the orgs it set up: an org that
-    // exists already, another org's keys or binding, a key that reads or writes, people, settings, the schema,
-    // an org gone.
+    // exists already, another org's keys or binding, a key that reads or writes, people, settings, another org's
+    // schema or one it wrote itself or proposed, an org gone.
     let other = format!("msk_{}other", uuid::Uuid::new_v4().simple());
     for change in [
         json!({"op": "create_org", "org": "acme", "admin": "mallory@evil.com"}),
@@ -497,7 +517,9 @@ async fn a_provisioner_key_sets_up_only_the_orgs_it_creates() {
         json!({"op": "add_member", "org": "trial", "user": "mallory@evil.com", "role": "admin"}),
         json!({"op": "remove_member", "org": "trial", "user": "pat@example.com"}),
         json!({"op": "set_settings", "org": "trial", "settings": {}}),
-        json!({"op": "set_schema", "org": "trial", "schema": "sales"}),
+        json!({"op": "set_schema", "org": "acme", "schema": "software_team"}),
+        json!({"op": "set_schema", "org": "trial2", "schema": {"name": "mine", "types": {"x": {}}}}),
+        json!({"op": "set_schema", "org": "trial2", "schema": "sales", "propose": true}),
         json!({"op": "set_provider", "org": "trial", "provider": {"kind": "oidc", "issuer": issuer,
                "client_ids": ["evil-cli"], "required": true}}),
         json!({"op": "show", "org": "acme"}),
@@ -513,6 +535,7 @@ async fn a_provisioner_key_sets_up_only_the_orgs_it_creates() {
     for change in [
         json!({"op": "set_auth0_org", "org": "trial4", "auth0_org": "org_theirs"}),
         json!({"op": "create_key", "org": "trial", "name": "theirs", "role": "ingest", "key": other}),
+        json!({"op": "set_schema", "org": "trial2", "schema": "sales"}),
         json!({"op": "show", "org": "trial"}),
     ] {
         let (status, body) = post(&s, "/admin", OTHER_PROVISIONER_KEY, &change).await;

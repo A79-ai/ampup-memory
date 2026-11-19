@@ -46,11 +46,12 @@ An episode is one source record: a note, a call transcript, a Slack thread, an e
 
 | Type | Sources |
 |---|---|
-| `sales_call` | `meeting:`, `gong:`, `zoom:`, `recall:`, `ampup:meeting:` |
+| `sales_call` | `meeting:`, `gong:`, `zoom:`, `recall:`, `ampup:meeting:`, `granola:`, `fireflies:`, `fathom:` |
 | `slack_thread` | `slack:` |
 | `email` | `gmail:`, `outlook:`, `email:` |
 | `crm_update` | `hubspot:`, `salesforce:`, `dynamicsCRM:`, `crm:` |
-| `doc` | `mcp:remember_memory:` (notes), `github:`, `linear:`, `sentry:`, `granola:`, `doc:`, `note:` |
+| `incident` | `sentry:` |
+| `doc` | `mcp:remember_memory:` (notes), `github:`, `linear:`, `doc:`, `note:` |
 
 A write whose source no type claims is refused. A corpus loaded with `ampup-memory load` may use any source; unclaimed
 ones read as `doc`. Each type says how its body splits into the units facts cite (a call's turn, a message, a
@@ -124,8 +125,8 @@ The index is derived. It lives at `AMPUP_MEMORY_INDEX_URI` and can be rebuilt fr
 ## Schemas
 
 A schema types a scope: entity types, their attributes, value types (`string`, `text`, `enum`, `number`, `money`,
-`date`, `timestamp`, `bool`, `ref`) and cardinality. Schemas are JSON data, committed through the ledger. Three
-ship built in: `sales`, `engineering` and `corpus` (in `schemas/`). A schema's `extract` section says which
+`date`, `timestamp`, `bool`, `ref`) and cardinality. Schemas are JSON data, committed through the ledger. Four
+ship built in: `sales`, `engineering`, `corpus` and `software_team` (in `schemas/`). A schema's `extract` section says which
 episodes a model reads into typed facts. See [schemas-and-queries.md](schemas-and-queries.md).
 
 ## Advice

@@ -6,15 +6,15 @@
   :where(.memory-studio) {
     --bg: #fdfcf7;
     --surface: #ffffff;
-    --ink: #232428;
+    --ink: #232323;
     --muted: #7f7e7c;
     --line: #e4e3de;
-    --accent: #232428;
+    --accent: #232323;
     --accent-ink: #fefdfb;
-    --accent-soft: #f3e4db;
-    --accent-text: #6e3a26;
-    --gold: #c15f3c;
-    --link: #3c71b2;
+    --accent-soft: #ebe8e1;
+    --accent-text: #232323;
+    --gold: #232323;
+    --link: #232323;
     --error: #b04a3a;
     --ok: #5e7a52;
     --warn-bg: #f6ebd4;
@@ -43,6 +43,11 @@
     grid-template-columns: 224px minmax(0, 1fr);
     gap: 16px;
     align-items: start;
+  }
+  /* The host draws the sections (`navigation="host"`): the pickers' bar above the section, one column. */
+  :where(.memory-studio[data-navigation="host"]) {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
   }
   :where(.memory-studio) > :where(.studio-goals) {
     min-width: 0;

@@ -30,7 +30,7 @@ import { isSearch, searchArgs, Why } from "../memory/why";
 // opens the next for the same conversation) as its parts, each person's message heading the turn it led to, and
 // the turn's replies and tool calls beneath it. Steps are filtered by kind (advice, memory read or written,
 // errors, …) with context kept around each match, a strip of lanes shows the whole run at once, and the filter
-// and the step linked to are kept in the link (`#/c/<entry>/<view>`).
+// and the step linked to are kept in the link (`#/conversation/<entry>/<view>`).
 
 interface Conversation {
   id: string;
@@ -86,9 +86,9 @@ const ROLE_LABEL: Partial<Record<Kind, string>> = {
   error: "Error",
 };
 
-/** The view in the link: what follows the entry in `#/c/<entry>/<view>`. */
+/** The view in the link: what follows the entry in `#/conversation/<entry>/<view>`. */
 const viewInHash = () => {
-  const m = /^#\/c\/[^/]*\/(.*)$/.exec(location.hash);
+  const m = /^#\/(?:conversation|c)\/[^/]*\/(.*)$/.exec(location.hash);
   return decodeURIComponent(m?.[1] ?? "");
 };
 
@@ -466,8 +466,12 @@ export function Trace({
   // The view is kept in the link without a new history entry for each change, while the link is still this
   // trace's: once it has moved on (back, or a link pasted), it is never written over.
   useEffect(() => {
-    const here = `#/c/${encodeURIComponent(id)}`;
-    if (location.hash !== here && !location.hash.startsWith(`${here}/`)) return;
+    const here = `#/conversation/${encodeURIComponent(id)}`;
+    // A link from before the names (`#/c/…`) is still this trace's: it is written over in the new form.
+    const ours = [here, `#/c/${encodeURIComponent(id)}`].some(
+      (p) => location.hash === p || location.hash.startsWith(`${p}/`),
+    );
+    if (!ours) return;
     const v = writeView(view);
     const h = `${here}${v ? `/${encodeURIComponent(v)}` : ""}`;
     if (h !== location.hash) history.replaceState(history.state, "", h);

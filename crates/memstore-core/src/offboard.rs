@@ -85,6 +85,8 @@ pub const SCOPE_TABLES: [&str; 15] = [
 ];
 /// The system ledger's table name, in `memory_system`.
 pub const LEDGER_TABLE: &str = LEDGER;
+/// The directory's table name, in `memory_system`.
+pub const DIRECTORY_TABLE: &str = DIRECTORY;
 /// Every table of the system namespace (`memory_system`), the ledger first.
 pub const SYSTEM_TABLES: [&str; 7] = [
     LEDGER,

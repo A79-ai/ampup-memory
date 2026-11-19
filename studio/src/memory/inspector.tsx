@@ -141,7 +141,7 @@ export function Inspector({
         />
       );
     case "skill":
-      // A skill is `skills/<goal>/<slug>`: a shorter path (`#/s/skills`, `#/s/skills/<goal>`) is a folder, opened as
+      // A skill is `skills/<goal>/<slug>`: a shorter path (`#/skill/skills`, `#/skill/skills/<goal>`) is a folder, opened as
       // one, not read as a skill.
       if (focus.path[0] === "skills" && focus.path.length < 3)
         return (
@@ -153,7 +153,7 @@ export function Inspector({
             admin={admin}
           />
         );
-      // A piece of advice opens as a skill does (`#/s/advice/…`): a note to read.
+      // A piece of advice opens as a skill does (`#/skill/advice/…`): a note to read.
       return focus.path[0] === "advice" ? (
         <AdvicePane
           key={JSON.stringify(focus.path)}
@@ -941,7 +941,7 @@ function AdvicePane({
   return (
     <Loading s={s} retry={retry} rows={6}>
       {({ advice: a }) =>
-        // A folder of advice (`#/s/advice`), or anything else that isn't one piece: say so rather than read it.
+        // A folder of advice (`#/skill/advice`), or anything else that isn't one piece: say so rather than read it.
         !a ? (
           <EmptyState icon="skill" title="No advice here">
             <span className="mono">{path.join("/")}</span> isn't a piece of advice.{" "}

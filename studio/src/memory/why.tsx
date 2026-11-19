@@ -107,7 +107,7 @@ const go = (hash: string) => {
 };
 const entityHash = (entity: string) => {
   const f = entityFocus(entity);
-  return `#/e/${f.path.map(encodeURIComponent).join("/")}`;
+  return `#/entity/${f.path.map(encodeURIComponent).join("/")}`;
 };
 
 async function explained(sel: Selection, args: Record<string, unknown>): Promise<Answer> {
@@ -313,7 +313,7 @@ function Provenance({ f }: { f: WhyFact }) {
   return (
     <span className="why-prov why-small">
       {ep ? (
-        <a href={`#/x/${encodeURIComponent(ep)}`} title={f.source?.source ?? ep}>
+        <a href={`#/episode/${encodeURIComponent(ep)}`} title={f.source?.source ?? ep}>
           {f.source ? sourceTitle(f.source.source) : `episode ${ep.slice(0, 10)}`}
         </a>
       ) : (
@@ -530,7 +530,7 @@ function Correct({ sel, f }: { sel: Selection; f: WhyFact }) {
         step.proposal ? (
           <p className="why-small">
             Added; it waits for the entity's owners.{" "}
-            <a href={`#/r/${encodeURIComponent(step.proposal)}`}>Open its review</a>
+            <a href={`#/review/${encodeURIComponent(step.proposal)}`}>Open its review</a>
           </p>
         ) : step.pair ? (
           <div className="why-fix-row">
@@ -544,14 +544,14 @@ function Correct({ sel, f }: { sel: Selection; f: WhyFact }) {
             >
               Use this value
             </button>
-            <button className="why-btn why-quiet" type="button" onClick={() => go("#/r/")}>
+            <button className="why-btn why-quiet" type="button" onClick={() => go("#/review")}>
               Settle it in Review
             </button>
           </div>
         ) : (
           <p className="why-small">
             Added beside it. This attribute isn't one answer two sources disagree on, so nothing was
-            ended: <a href="#/r/">open Review</a> to settle what stays.
+            ended: <a href="#/review">open Review</a> to settle what stays.
           </p>
         )
       ) : (

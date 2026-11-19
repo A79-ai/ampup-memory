@@ -87,7 +87,10 @@ impl Reads {
         if scopes.is_empty() {
             return Reads::alone(own);
         }
-        let pinned = futures::future::join_all(scopes.iter().map(|s| store.pin(s, MAIN))).await;
+        // As the caller's own session is pinned (`workspace::read_session`): main's last state while the next is
+        // built, never one holding what was taken away, so a read never waits on another scope's build.
+        let pinned =
+            futures::future::join_all(scopes.iter().map(|s| store.pin_lagging(s, MAIN))).await;
         let mut also = vec![];
         for (scope, p) in scopes.into_iter().zip(pinned) {
             match p {

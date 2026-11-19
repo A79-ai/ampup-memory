@@ -1184,9 +1184,13 @@ pub async fn own_matching(
         for i in 0..ids.len() {
             // Their profile (`crate::profile`) and their notes dream's records (`crate::notes_dream`) aren't notes
             // of theirs to forget: they are drawn from them (`memstore:`). A fact they added themselves, or text
-            // they pasted or uploaded in Studio (`crate::origin::added`), is what they said, so it is theirs to forget.
+            // they pasted or uploaded in Studio (`crate::origin::added`), is what they said, so it is theirs to forget,
+            // as a recording they added there is (`crate::origin::recorded`).
             let theirs = sources[i].strip_prefix(&own).is_some_and(|s| {
-                !s.starts_with("run:") && (!s.starts_with("memstore:") || crate::origin::added(s))
+                !s.starts_with("run:")
+                    && (!s.starts_with("memstore:")
+                        || crate::origin::added(s)
+                        || crate::origin::recorded(s))
             });
             if theirs && vis.committed.contains(&commits[i]) && vis.can_see_episode(&ids[i], who) {
                 found.insert(ids[i].clone(), at[i].unwrap_or_default());

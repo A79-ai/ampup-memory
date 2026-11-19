@@ -181,17 +181,18 @@ pub async fn run(
 /// The scope's branches, main first, each with the compiled skills the caller may read on it: a memory build
 /// often compiles on a branch of its own, so a reader on main learns where to look.
 async fn branches(store: &Store, scope: &Scope, who: &Principal) -> Result<Value> {
-    let mut names: Vec<String> = store.branch_heads(scope).await?.into_keys().collect();
+    // Listed only: the ledger as this server holds it, and each branch's skills read at once.
+    let mut names: Vec<String> = store.branch_heads_held(scope).await?.into_keys().collect();
     names.sort_by_key(|b| (b.as_str() != crate::MAIN, b.clone()));
     if names.is_empty() {
         names.push(crate::MAIN.to_string());
     }
-    let mut out = vec![];
-    for b in names {
-        let session = store.pin(scope, &b).await?;
-        let skills = skill_keys(&session, who).len();
-        out.push(json!({"name": b, "skills": skills}));
-    }
+    let pinned = futures::future::try_join_all(names.iter().map(|b| store.pin(scope, b))).await?;
+    let out: Vec<Value> = names
+        .into_iter()
+        .zip(pinned)
+        .map(|(b, session)| json!({"name": b, "skills": skill_keys(&session, who).len()}))
+        .collect();
     Ok(json!({"branches": out}))
 }
 
@@ -287,15 +288,19 @@ async fn ls(
     };
     match path.first().map(String::as_str) {
         None => {
-            let counts = root_counts(store, session, who).await?;
-            let mut children: Vec<Value> = counts
-                .iter()
-                .map(
-                    |(name, n)| json!({"name": name, "kind": "folder", "path": [name], "count": n}),
-                )
-                .collect();
-            children
-                .retain(|c| c["name"] == "entities" || c["name"] == "sources" || c["count"] != 0);
+            // Until the caller's counts are worked out every folder shows, without a count: one that turns out
+            // empty drops from a later listing.
+            let children: Vec<Value> = match root_counts(store, session, who) {
+                Some(counts) => counts
+                    .iter()
+                    .filter(|(name, n)| *n != 0 || matches!(*name, "entities" | "sources"))
+                    .map(|(name, n)| json!({"name": name, "kind": "folder", "path": [name], "count": n}))
+                    .collect(),
+                None => ROOT_FOLDERS
+                    .iter()
+                    .map(|name| json!({"name": name, "kind": "folder", "path": [name]}))
+                    .collect(),
+            };
             Ok(page(children))
         }
         Some("skills") => skills(store, session, who, path, page).await,
@@ -768,28 +773,36 @@ async fn advice(store: &Store, session: &Session, who: &Principal) -> Result<Vec
 /// The root's folders and how many each holds as the caller reads them, by name.
 type Counts = Vec<(&'static str, usize)>;
 
-/// How old a root's counts may be and still be answered while the memory moved on: they answer at once, and
-/// newer ones are worked out meanwhile for the next read.
+/// The root's folders, by name, as [`count_root`] lists them.
+const ROOT_FOLDERS: [&str; 6] = [
+    "advice", "entities", "notes", "sessions", "skills", "sources",
+];
+
+/// How long a reader's counts are kept for certain once there are [`MAX_ROOTS`] readers: older ones go first.
 const ROOT_STALE: std::time::Duration = std::time::Duration::from_secs(600);
 /// Readers whose counts are kept, at most.
 const MAX_ROOTS: usize = 1000;
 
 struct RootCounts {
-    /// The ledger state they were counted at.
+    /// The ledger state they were counted at (or, while none are kept yet, are being counted at).
     heads: Vec<String>,
     at: std::time::Instant,
-    counts: Counts,
+    /// None until the reader's first count is done.
+    counts: Option<Counts>,
     refreshing: bool,
 }
 
-/// Each reader's last root counts, by scope, whether read on main as it is now, and the reader's closure.
+/// Each reader's last root counts, by scope, whether read on main as it is now, and the reader's closure: never
+/// shared between readers.
 static ROOTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, RootCounts>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// The root's counts for the caller. Counting reads every fact the caller may read, so the counts are kept: at
-/// the same ledger state they are the same. On main as it is now, counts from an earlier state up to
-/// [`ROOT_STALE`] old answer at once while the new state's are counted in the background.
-async fn root_counts(store: &Store, session: &Session, who: &Principal) -> Result<Counts> {
+/// The root's counts for the caller, if they are known yet. Counting reads every fact the caller may read, which
+/// takes long in a large org, so it never runs on the request: the counts are kept by reader, and at the same
+/// ledger state they are the same. On main as it is now, counts from an earlier state answer, however old, while
+/// the new state's are counted in the background. With none kept for the caller (a first visit, a restart, or a
+/// read off main whose state moved) this answers None and counts in the background for a later read.
+fn root_counts(store: &Store, session: &Session, who: &Principal) -> Option<Counts> {
     let heads = session.vis().heads().to_vec();
     let now_main = session.on_main_now();
     let key = format!(
@@ -798,47 +811,58 @@ async fn root_counts(store: &Store, session: &Session, who: &Principal) -> Resul
         who.user(),
         who.tokens().join(",")
     );
-    {
-        let mut kept = ROOTS.lock().unwrap();
-        if let Some(c) = kept.get_mut(&key) {
-            if c.heads == heads {
-                return Ok(c.counts.clone());
+    let mut kept = ROOTS.lock().unwrap();
+    let (answer, refresh) = match kept.get_mut(&key) {
+        Some(c) => {
+            let current = c.heads == heads;
+            let answer = if current || now_main {
+                c.counts.clone()
+            } else {
+                None
+            };
+            let refresh = !c.refreshing && !(current && c.counts.is_some());
+            if refresh {
+                c.refreshing = true;
             }
-            if now_main && c.at.elapsed() < ROOT_STALE {
-                if !c.refreshing {
-                    c.refreshing = true;
-                    let (store, session, who, key) =
-                        (store.clone(), session.clone(), who.clone(), key.clone());
-                    tokio::spawn(async move {
-                        let got = count_root(&store, &session, &who).await;
-                        let mut kept = ROOTS.lock().unwrap();
-                        match got {
-                            Ok(counts) => keep_root(&mut kept, key, heads, counts),
-                            Err(e) => {
-                                eprintln!("root counts: {}: {e:#}", session.scope().namespace());
-                                if let Some(c) = kept.get_mut(&key) {
-                                    c.refreshing = false;
-                                }
-                            }
-                        }
-                    });
-                }
-                return Ok(c.counts.clone());
-            }
+            (answer, refresh)
         }
+        None => {
+            keep_root(&mut kept, key.clone(), heads.clone(), None, true);
+            (None, true)
+        }
+    };
+    drop(kept);
+    if refresh {
+        let (store, session, who) = (store.clone(), session.clone(), who.clone());
+        tokio::spawn(async move {
+            let got = count_root(&store, &session, &who).await;
+            let mut kept = ROOTS.lock().unwrap();
+            match got {
+                Ok(counts) => keep_root(&mut kept, key, heads, Some(counts), false),
+                Err(e) => {
+                    eprintln!("root counts: {}: {e:#}", session.scope().namespace());
+                    // Counts kept from before still answer; a first count that failed is tried again on the
+                    // next read.
+                    match kept.get(&key).map(|c| c.counts.is_some()) {
+                        Some(true) => kept.get_mut(&key).unwrap().refreshing = false,
+                        Some(false) => drop(kept.remove(&key)),
+                        None => {}
+                    }
+                }
+            }
+        });
     }
-    let counts = count_root(store, session, who).await?;
-    keep_root(&mut ROOTS.lock().unwrap(), key, heads, counts.clone());
-    Ok(counts)
+    answer
 }
 
 fn keep_root(
     kept: &mut std::collections::HashMap<String, RootCounts>,
     key: String,
     heads: Vec<String>,
-    counts: Counts,
+    counts: Option<Counts>,
+    refreshing: bool,
 ) {
-    if kept.len() >= MAX_ROOTS {
+    if kept.len() >= MAX_ROOTS && !kept.contains_key(&key) {
         kept.retain(|_, c| c.at.elapsed() < ROOT_STALE);
         if kept.len() >= MAX_ROOTS {
             kept.clear();
@@ -851,7 +875,7 @@ fn keep_root(
             heads,
             at,
             counts,
-            refreshing: false,
+            refreshing,
         },
     );
 }

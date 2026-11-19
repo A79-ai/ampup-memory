@@ -8,19 +8,19 @@
   --surface: #ffffff;
   --surface-2: #fefdfb;
   --sunken: #f5f2ec;
-  --ink: #19191c;
-  --ink-2: #232428;
+  --ink: #232323;
+  --ink-2: #333231;
   --muted: #656669;
   --faint: #7f7e7c;
   --line: #e4e3de;
   --line-strong: #b1b0ad;
-  --accent: #c15f3c;
-  --accent-hover: #a94f30;
+  --accent: #232323;
+  --accent-hover: #3a3a38;
   --accent-ink: #fdfcf7;
-  --accent-soft: #f3e4db;
-  --accent-text: #6e3a26;
-  --select: #f3e4db;
-  --link: #3c71b2;
+  --accent-soft: #ebe8e1;
+  --accent-text: #232323;
+  --select: #ebe8e1;
+  --link: #232323;
   --ok: #5e7a52;
   --ok-soft: #e9ede3;
   --warn: #b07a2e;
@@ -28,7 +28,7 @@
   --error: #b04a3a;
   --error-soft: #f4e1dc;
   --code-bg: #f5f2ec;
-  --focus: 0 0 0 3px rgb(67 125 198 / 0.3);
+  --focus: 0 0 0 3px rgb(35 35 35 / 0.2);
   --shadow-sm: 0 1px 2px rgba(10, 13, 18, 0.05);
   --shadow: 0 1px 3px rgba(10, 13, 18, 0.08), 0 1px 2px rgba(10, 13, 18, 0.04);
   --shadow-lg: 0 12px 16px -4px rgba(10, 13, 18, 0.08), 0 4px 6px -2px rgba(10, 13, 18, 0.03);
@@ -520,9 +520,25 @@
     background: var(--error-soft);
     color: var(--error);
   }
+  /* A note says how to read the page (what Sessions holds, what Learned is narrowed to): quiet, in the page's
+     own ink, with its links underlined. Only errors are colored. */
   .banner-note {
-    background: var(--warn-soft);
-    color: var(--warn);
+    background: var(--sunken);
+    color: var(--ink-2);
+  }
+  .banner-note > .icon {
+    color: var(--muted);
+    flex: none;
+  }
+  .banner-note .link {
+    color: var(--ink);
+    font-weight: 550;
+    text-decoration: underline;
+    text-decoration-color: var(--line-strong);
+    text-underline-offset: 3px;
+  }
+  .banner-note .link:hover {
+    text-decoration-color: currentColor;
   }
 
   .main {
@@ -1377,6 +1393,24 @@
     border: 1px solid var(--line);
     border-radius: var(--r-lg);
     background: var(--surface-2);
+  }
+  /* With the host drawing the sections: the memory and branch pickers in a bar above the section. */
+  &.studio-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    flex-wrap: wrap;
+  }
+  &.studio-bar .studio-pickers {
+    flex-direction: row;
+    align-items: center;
+    padding-bottom: 0;
+    border-bottom: 0;
+  }
+  &.studio-bar .studio-pickers .field,
+  &.studio-bar .studio-pickers .context-label {
+    width: auto;
+    max-width: 280px;
   }
   .studio-pickers {
     display: flex;
@@ -2342,4 +2376,146 @@
 }
 .md-table th {
   font-weight: 600;
+}
+
+/* With the host drawing the sections (`navigation="host"`), no page keeps a sidebar of its own: the Explorer's
+   tree is a column the "Folders" button shows and hides (hidden at first), and Tools lists its tools in a row
+   above the one picked. The host's search replaces the Explorer's search box. */
+.memory .app.hosted:not(.app-tools) {
+  .menu-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    width: auto;
+    padding: 0 10px;
+  }
+  .menu-label {
+    font-size: var(--t-sm);
+    font-weight: 600;
+  }
+  .search-open[hidden] {
+    display: none;
+  }
+  /* Below 900px the tree is already a drawer over the page (above); wider, a column beside it. */
+  @media (min-width: 901px) {
+    .main {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .main > .side {
+      display: none;
+    }
+    &.drawer-open .main {
+      grid-template-columns: 280px minmax(0, 1fr);
+    }
+    &.drawer-open .main > .side {
+      display: flex;
+    }
+  }
+}
+.memory .app.app-tools.hosted {
+  .main {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .main > aside.side {
+    position: static;
+    transform: none;
+    width: auto;
+    box-shadow: none;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface-2);
+  }
+  .main > aside.side .side-scroll {
+    padding: var(--s2) var(--s3);
+    overflow: visible;
+  }
+  .main > aside.side .side-section,
+  .main > aside.side .side-note {
+    display: none;
+  }
+  .main > aside.side .tree {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: var(--s1);
+  }
+  .main > aside.side .tree-row {
+    width: auto;
+    padding: 4px 10px !important;
+    border-radius: 999px;
+  }
+}
+
+/* With the host drawing the sections, a page sits on the host's own page: no frame of its own, no fixed
+   height scrolling inside it, and no bar when there's nothing to pick (one memory, one branch). */
+.memory-studio[data-navigation="host"] {
+  .memory.studio-bar:not(:has(select, input)) {
+    display: none;
+  }
+  .memory .app {
+    height: auto;
+    border: 0;
+    border-radius: 0;
+    overflow: visible;
+    grid-template-rows: auto auto auto;
+  }
+  .memory .app-page {
+    grid-template-rows: auto auto;
+  }
+  .memory .bar {
+    background: none;
+    padding-left: 0;
+    padding-right: 0;
+  }
+  .memory .pane {
+    overflow: visible;
+  }
+  .memory .pane-inner {
+    max-width: none;
+    margin: 0;
+    padding: var(--s5) 0 var(--s8);
+  }
+  .memory .app.drawer-open .pane-inner {
+    padding-left: var(--s5);
+  }
+  .memory.rv-shell {
+    border: 0;
+    border-radius: 0;
+    background: none;
+    padding: 0 0 var(--s8);
+    min-height: 0;
+  }
+  .panel.studio-goals {
+    border: 0;
+    border-radius: 0;
+    background: none;
+    padding: 0;
+  }
+}
+
+/* With the host drawing the sections, a banner is a rounded note above the page, apart from what follows. */
+.memory-studio[data-navigation="host"] .memory {
+  .banners:not(:empty) {
+    display: grid;
+    gap: var(--s2);
+    margin-bottom: var(--s4);
+  }
+  .banner {
+    padding: var(--s3) var(--s4);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    line-height: 1.5;
+  }
+  .banner-note {
+    align-items: flex-start;
+    flex-wrap: nowrap;
+  }
+  .banner-note > .icon {
+    margin-top: 3px;
+  }
+  .pane-inner > .banner,
+  .learned-summary > .banner {
+    margin-bottom: var(--s4);
+  }
 }

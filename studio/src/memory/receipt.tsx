@@ -67,8 +67,8 @@ export function entityFocus(entity: string): Focus {
 }
 
 function hashOf(f: Focus): string {
-  if (f.kind === "entity") return `#/e/${f.path.map(encodeURIComponent).join("/")}`;
-  if (f.kind === "episode") return `#/x/${encodeURIComponent(f.id)}`;
+  if (f.kind === "entity") return `#/entity/${f.path.map(encodeURIComponent).join("/")}`;
+  if (f.kind === "episode") return `#/episode/${encodeURIComponent(f.id)}`;
   return "";
 }
 

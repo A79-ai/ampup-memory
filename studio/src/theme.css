@@ -11,10 +11,10 @@
   --line: #37373b;
   --accent: #ecebe6;
   --accent-ink: #18181a;
-  --accent-soft: #3d2b22;
-  --accent-text: #f0b79c;
-  --gold: #e08a64;
-  --link: #8ab8f0;
+  --accent-soft: #2f2f33;
+  --accent-text: #dddcd7;
+  --gold: #ecebe6;
+  --link: #dddcd7;
   --error: #ec9483;
   --ok: #a3c293;
   --warn-bg: #3b3020;
@@ -32,13 +32,13 @@
   --faint: #8f8e8a;
   --line: #34343a;
   --line-strong: #5c5c62;
-  --accent: #e08a64;
-  --accent-hover: #ea9e7d;
+  --accent: #ecebe6;
+  --accent-hover: #ffffff;
   --accent-ink: #18181a;
-  --accent-soft: #3d2b22;
-  --accent-text: #f0b79c;
-  --select: #3d2b22;
-  --link: #8ab8f0;
+  --accent-soft: #2f2f33;
+  --accent-text: #dddcd7;
+  --select: #2f2f33;
+  --link: #dddcd7;
   --ok: #a3c293;
   --ok-soft: #263020;
   --warn: #dcaa60;
@@ -46,7 +46,7 @@
   --error: #ec9483;
   --error-soft: #3f2520;
   --code-bg: #2a2a2e;
-  --focus: 0 0 0 3px rgb(138 184 240 / 0.4);
+  --focus: 0 0 0 3px rgb(77 156 147 / 0.45);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-lg: 0 12px 16px -4px rgba(0, 0, 0, 0.45), 0 4px 6px -2px rgba(0, 0, 0, 0.3);
@@ -75,12 +75,12 @@
   --faint: #8f8e8a;
   --rule: #37373b;
   --rule-soft: #2c2c30;
-  --band: #3d2b22;
+  --band: #2f2f33;
   --hover: #2a2a2e;
   --out: #ec9483;
   --watch: #dcaa60;
   --within: #a3c293;
-  --focus: #8ab8f0;
+  --focus: #dddcd7;
   color-scheme: dark;
 }
 [data-studio-theme="dark"] .memory .status-done {
@@ -96,10 +96,10 @@
     --line: #37373b;
     --accent: #ecebe6;
     --accent-ink: #18181a;
-    --accent-soft: #3d2b22;
-    --accent-text: #f0b79c;
-    --gold: #e08a64;
-    --link: #8ab8f0;
+    --accent-soft: #2f2f33;
+    --accent-text: #dddcd7;
+    --gold: #ecebe6;
+    --link: #dddcd7;
     --error: #ec9483;
     --ok: #a3c293;
     --warn-bg: #3b3020;
@@ -117,13 +117,13 @@
     --faint: #8f8e8a;
     --line: #34343a;
     --line-strong: #5c5c62;
-    --accent: #e08a64;
-    --accent-hover: #ea9e7d;
+    --accent: #ecebe6;
+    --accent-hover: #ffffff;
     --accent-ink: #18181a;
-    --accent-soft: #3d2b22;
-    --accent-text: #f0b79c;
-    --select: #3d2b22;
-    --link: #8ab8f0;
+    --accent-soft: #2f2f33;
+    --accent-text: #dddcd7;
+    --select: #2f2f33;
+    --link: #dddcd7;
     --ok: #a3c293;
     --ok-soft: #263020;
     --warn: #dcaa60;
@@ -131,7 +131,7 @@
     --error: #ec9483;
     --error-soft: #3f2520;
     --code-bg: #2a2a2e;
-    --focus: 0 0 0 3px rgb(138 184 240 / 0.4);
+    --focus: 0 0 0 3px rgb(77 156 147 / 0.45);
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow-lg: 0 12px 16px -4px rgba(0, 0, 0, 0.45), 0 4px 6px -2px rgba(0, 0, 0, 0.3);
@@ -160,12 +160,12 @@
     --faint: #8f8e8a;
     --rule: #37373b;
     --rule-soft: #2c2c30;
-    --band: #3d2b22;
+    --band: #2f2f33;
     --hover: #2a2a2e;
     --out: #ec9483;
     --watch: #dcaa60;
     --within: #a3c293;
-    --focus: #8ab8f0;
+    --focus: #dddcd7;
     color-scheme: dark;
   }
   [data-studio-theme="system"] .memory .status-done {

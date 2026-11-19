@@ -7,7 +7,13 @@
 // installed: the host loads it (`@fontsource/atkinson-hyperlegible-next` 400/600/700 and `-mono` 400, as local.tsx
 // does), so a library stylesheet doesn't carry the fonts inlined.
 
-export { MemoryStudio, type MemoryStudioProps } from "./memory/Memory";
+export {
+  MemoryStudio,
+  type MemoryStudioProps,
+  type StudioNavGroup,
+  type StudioNavigation,
+  type StudioNavItem,
+} from "./memory/Memory";
 export {
   ApiError,
   errorText,

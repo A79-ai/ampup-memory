@@ -42,7 +42,7 @@ function Local() {
   return (
     <div className="local-shell">
       <header className="local-top">
-        <a className="local-brand" href="#/w/">
+        <a className="local-brand" href="#/home">
           <Logo size={22} />
           <span>AmpUp Memory</span>
           <span className="local-where">this machine</span>

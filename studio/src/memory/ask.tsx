@@ -53,7 +53,7 @@ type Part<T> =
   | { status: "error"; message: string };
 
 /**
- * `#/a/<question>`: a question asked of the memory through its MCP tools, as an agent asks it. Facts are
+ * `#/ask/<parts>/<question>`: a question asked of the memory through its MCP tools, as an agent asks it. Facts are
  * search_memory's; episodes are the ones those facts cite; advice is get_advice's (which opens a session for
  * the question and answers once the advice is looked up). memstore writes no answer here: each part is what
  * the tools return, with links to the entities and episodes in the Explorer.

@@ -316,9 +316,7 @@ impl EpisodeKind {
         if crate::episode_types::engine_source(source) {
             return EpisodeKind::Engine;
         }
-        crate::episode_types::all()
-            .iter()
-            .find(|t| t.source_prefixes().iter().any(|p| source.starts_with(p)))
+        crate::episode_types::claiming(source)
             .and_then(|t| serde_json::from_value(serde_json::Value::String(t.name().into())).ok())
             .unwrap_or(EpisodeKind::Untyped)
     }

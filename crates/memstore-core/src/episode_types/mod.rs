@@ -1,5 +1,5 @@
-//! Episode types: what kind of record an episode is (a sales call, a Slack thread, an email, a CRM change, a
-//! document), and everything that depends on it. Each type lives in its own folder and implements
+//! Episode types: what kind of record an episode is (a recorded call or meeting, a Slack thread, an email, a CRM
+//! change, an error tracker's issue, a document), and everything that depends on it. Each type lives in its own folder and implements
 //! [`EpisodeType`]:
 //!
 //! - which episodes it claims (by source prefix);
@@ -25,6 +25,7 @@ use crate::query::schema::Schema;
 pub mod crm_update;
 pub mod doc;
 pub mod email;
+pub mod incident;
 pub mod participants;
 pub mod sales_call;
 pub mod slack_thread;
@@ -148,11 +149,9 @@ pub trait EpisodeType: Send + Sync {
     fn format(&self) -> Format;
     /// Sources of this type start with one of these.
     fn source_prefixes(&self) -> &'static [&'static str];
-    /// Whether an episode is of this type. By default, by its source.
+    /// Whether an episode is of this type. By default, by its source ([`claiming`]).
     fn claims(&self, ep: &Episode) -> bool {
-        self.source_prefixes()
-            .iter()
-            .any(|p| ep.source.starts_with(p))
+        claiming(&ep.source).is_some_and(|t| t.name() == self.name())
     }
     /// The catalog's JSON (a schema): what can be extracted from this type, and how each value is typed.
     fn catalog_json(&self) -> &'static str;
@@ -204,6 +203,7 @@ static ALL: LazyLock<Vec<&'static dyn EpisodeType>> = LazyLock::new(|| {
         &slack_thread::SlackThread,
         &email::Email,
         &crm_update::CrmUpdate,
+        &incident::Incident,
         &doc::Doc,
     ]
 });
@@ -230,7 +230,20 @@ pub fn by_name(name: &str) -> Result<&'static dyn EpisodeType> {
 /// The type that claims an episode's source by its prefix, if one does. What a caller writing episodes
 /// (`/ingest`, `remember_memory`) must name ([`check`]).
 pub fn claimed(ep: &Episode) -> Option<&'static dyn EpisodeType> {
-    all().iter().find(|t| t.claims(ep)).copied()
+    claiming(&ep.source)
+}
+
+/// The type that claims `source`, if one does: the first whose prefix it starts with, but for a recording someone
+/// added in Studio ([`crate::origin::recording`]), which is a call though it is filed under their name, as what
+/// they paste is. That tail alone is looked past the name: nothing else they add, whatever it is called, is a call.
+pub fn claiming(source: &str) -> Option<&'static dyn EpisodeType> {
+    if crate::origin::recording(source) {
+        return Some(&sales_call::SalesCall);
+    }
+    all()
+        .iter()
+        .find(|t| t.source_prefixes().iter().any(|p| source.starts_with(p)))
+        .copied()
 }
 
 /// The type an episode is: the one that claims its source, else a document. A corpus an operator loads
@@ -243,9 +256,7 @@ pub fn of(ep: &Episode) -> Option<&'static dyn EpisodeType> {
 /// The name of the type an episode from `source` is, as [`of`] decides it: the type claiming its prefix, else
 /// `doc`; None for the engine's own documents.
 pub fn name_of_source(source: &str) -> Option<&'static str> {
-    all()
-        .iter()
-        .find(|t| t.source_prefixes().iter().any(|p| source.starts_with(p)))
+    claiming(source)
         .map(|t| t.name())
         .or_else(|| (!engine_source(source)).then_some("doc"))
 }

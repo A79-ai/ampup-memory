@@ -298,6 +298,18 @@ pub(super) fn prompts(f: &Frame, units: &[Unit]) -> Vec<String> {
     };
     let mut people = people;
     cut(&mut people, CONTEXT_CHARS);
+    // A transcriber's speakers (`speaker_0`, `Speaker 2`) are labels, not people: said so where any speaks, so the
+    // model doesn't file what one said or will do under a person made of the label.
+    let labelled = if units
+        .iter()
+        .filter_map(|u| u.speaker.as_deref())
+        .any(|s| s.chars().any(|c| c.is_ascii_digit()))
+    {
+        " A speaker known only by a numbered label (speaker_0, Speaker 2) is no one's id and never a subject: \
+         write the fact under what it is about, and keep the label in the sentence as the text gives it."
+    } else {
+        ""
+    };
     let ws = windows(units);
     let n = ws.len();
     // What is left of [`MAX_RENDER`] for the windows still to come: a unit longer than a window (or than the
@@ -359,7 +371,7 @@ pub(super) fn prompts(f: &Frame, units: &[Unit]) -> Vec<String> {
                  - subject: the one thing the fact is mostly about: an id from the list below, or `<type>:<name>` \
                  for a {nameable} the text talks about, named as it is usually written (`deal:northwind_traders`, \
                  `issue:gemini_flash_loop`, `feature:public_roleplay`), never our own company and never a record's \
-                 id. A fact about one of the people is about their id.\n\
+                 id. A fact about one of the people is about their id.{labelled}\n\
                  - kind: one of the kinds below; note when none fits.\n\
                  - quote: the exact words, 12 to 300 characters, from the numbered line given in \"at\".\n\
                  - valid_from / valid_to only when the text says when something starts or ends; time_basis is \

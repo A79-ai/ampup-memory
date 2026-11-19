@@ -930,6 +930,13 @@ pub async fn serve_with(
     // The weekly digest (`crate::digest`): last week's, from Monday at `AMPUP_MEMORY_DIGEST_HOUR` (UTC), sent by the
     // writer lease's holder alone and recorded per person, so each goes once. Checked every
     // `AMPUP_MEMORY_DIGEST_CHECK_SECS` (900).
+    // Speech to text for recordings people add (`crate::transcribe`): said once here, so a switch turned on without
+    // its key is seen at start rather than at the first upload.
+    match &*crate::transcribe::TRANSCRIBER {
+        Ok(None) => {}
+        Ok(Some(_)) => eprintln!("transcription is on: recordings added to memory are transcribed"),
+        Err(why) => eprintln!("transcription is off: {why}"),
+    }
     match crate::digest::Sender::from_env() {
         Err(why) => eprintln!("weekly digest is off: {why}"),
         Ok(sender) => {
@@ -1644,7 +1651,8 @@ pub async fn serve_with(
     // (default 600; 0: never), keeping the newest `AMPUP_MEMORY_MAINTAIN_KEEP` (default 10) of a table that
     // holds twice that. Each round also reads the ledger's status for its metrics. Nothing is rewritten here: the
     // ledger's and each scope's summaries' compaction run in the nightly maintenance window (`maintenance`,
-    // `AMPUP_MEMORY_MAINTAIN_WINDOW`), which this timer's rounds open.
+    // `AMPUP_MEMORY_MAINTAIN_WINDOW`), which this timer's rounds open; the directory's also during the day
+    // (`compaction::watch_directory`).
     let compact = compaction::Config::from_env()?;
     let window = maintenance::Config::from_env()?;
     let every = std::env::var("AMPUP_MEMORY_MAINTAIN_SECS")
@@ -1703,6 +1711,7 @@ pub async fn serve_with(
         }));
         // The window is looked at as often as the rounds run, at least every minute.
         maintenance::start(&state, window, Duration::from_secs(every.min(60)));
+        compaction::watch_directory(&state, compaction::Config::directory_from_env()?)?;
     }
     // What the first reads after a start need, loaded now rather than in a caller's request: the ledger every
     // scope's visibility reads (minutes to read cold where it holds thousands of files), the directory, and
@@ -5804,9 +5813,18 @@ async fn handle(
         .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
         .is_some_and(|n| n > max_body)
     {
+        // What `/learn` takes is said: a recording is sent whole, so a larger one can't be added this way.
+        let error = match learn_route {
+            true => format!(
+                "request too large: at most {} MB is added a request, and a recording is sent whole, so a larger \
+                 one can't be added this way yet",
+                MAX_INGEST_BODY >> 20
+            ),
+            false => "request too large".to_string(),
+        };
         return Ok(reply(
             StatusCode::PAYLOAD_TOO_LARGE,
-            json!({"error": "request too large"}),
+            json!({ "error": error }),
         ));
     }
     // Who the caller is, from the headers alone, before the body is read: a request no credential proves is
@@ -8658,12 +8676,14 @@ const LOCAL_ADMIN_OPS: [&str; 40] = [
     "retention",
 ];
 
-/// The `/admin` ops a provisioner key may send ([`SignIn::provisioner`]).
-const PROVISIONER_OPS: [&str; 5] = [
+/// The `/admin` ops a provisioner key may send ([`SignIn::provisioner`]). `set_schema` only as its handler
+/// allows one: a built-in by name, on an org it created that has no schema yet.
+const PROVISIONER_OPS: [&str; 6] = [
     "create_org",
     "set_auth0_org",
     "create_key",
     "set_limits",
+    "set_schema",
     "show",
 ];
 
@@ -8916,7 +8936,30 @@ async fn directory_change(
         // Type an org's memory with a built-in schema or one given inline; never a path on this server.
         let org = req["org"].as_str().unwrap_or_default();
         let dir = Directory::load(&store).await?;
-        if !superuser && !dir.is_admin(who.user(), via, org) {
+        if let Some(key) = &via.provisioner {
+            // A sign-up service gives the orgs it created a starting schema, as it gives them their limits: a
+            // built-in by name, never one written by the caller, never proposed, and never over a schema the
+            // org has (its admins' to change), which `if_unset` below keeps.
+            let refused =
+                |why: &str| -> anyhow::Error { Refused(format!("a provisioner key {why}")).into() };
+            if !dir
+                .orgs
+                .get(org)
+                .is_some_and(|o| crate::people::directory::created_by(o, key))
+            {
+                return Err(refused(&format!(
+                    "sets the schema of only the orgs it created, and {org:?} is not one"
+                )));
+            }
+            if !req["schema"].is_string() {
+                return Err(refused("sets a built-in schema, by name, only"));
+            }
+            if req["propose"] == true || req["breaking"] == true {
+                return Err(refused(
+                    "sets a new org's first schema, and proposes no change",
+                ));
+            }
+        } else if !superuser && !dir.is_admin(who.user(), via, org) {
             return Err(Refused(format!(
                 "{} may not change org {org} (only its admins may)",
                 who.user()
@@ -8938,6 +8981,15 @@ async fn directory_change(
         // the org's schema now) and commits nothing.
         let dry_run = req["dry_run"] == true;
         let named = |s: &crate::query::schema::Schema| format!("{} v{}", s.name, s.version);
+        // `if_unset` (always, for a provisioner key): an org that has a schema keeps it, and the answer says so.
+        // A default applied at sign-up, or to orgs made before it, then never replaces what an admin chose, and
+        // sending it again commits nothing (each set is a new version).
+        if (req["if_unset"] == true || via.provisioner.is_some())
+            && let Some(have) = store.schema(&scope, MAIN).await?
+        {
+            let kept = format!("{org} memory keeps schema {}", named(&have));
+            return Ok(json!({"changes": [], "kept": kept, "dry_run": dry_run}));
+        }
         let owned = crate::schema_change::owned(&store, &scope)
             .await
             .map_err(|e| Refused(format!("{e:#}")))?;
@@ -12777,7 +12829,7 @@ fn tools(schema: Option<&crate::query::schema::Schema>) -> Value {
                     episode_type, and the first page adds `passages`: matching source text from episodes no hit cites, \
                     and with dates `arrived`: {from, to, episodes, by_kind, unread, unread_episodes}; \
                     `left_out_contradicted` counts claims of absence left out). \
-                    Every fact comes from an episode of a type (sales_call, slack_thread, email, crm_update, doc): \
+                    Every fact comes from an episode of a type (sales_call, slack_thread, email, crm_update, incident, doc): \
                     episode_type narrows the search to one or more, and start_session says how many of each this \
                     memory holds (memory_holds).",
                 "inputSchema": {"type": "object", "properties": {
@@ -12795,7 +12847,7 @@ fn tools(schema: Option<&crate::query::schema::Schema>) -> Value {
                     "as_of": {"type": "string", "description": "A date (YYYY-MM-DD, the whole day) or RFC 3339 time: search the memory as it stood then (the values that held then, newer facts ranking higher as of then). Default: now, or the connection's as_of"},
                     "start_date": {"type": "string", "description": "A date or time: only facts first stated on or after it"},
                     "end_date": {"type": "string", "description": "A date (the whole day) or time: only facts first stated on or before it"},
-                    "episode_type": {"type": ["string", "array"], "items": {"type": "string"}, "description": "Only facts (and passages) from episodes of this type or these types (sales_call, email, slack_thread, crm_update, doc); start_session says how many of each this memory holds"},
+                    "episode_type": {"type": ["string", "array"], "items": {"type": "string"}, "description": "Only facts (and passages) from episodes of this type or these types (sales_call, email, slack_thread, crm_update, incident, doc); start_session says how many of each this memory holds"},
                 }, "required": ["query"]},
         }),
         json!({
@@ -15533,8 +15585,8 @@ fn remember_args(args: &Value) -> Result<(&str, &str)> {
     remember_args_as(args, false)
 }
 
-/// [`remember_args`], where `learned` (what a person added in Studio, which `/learn` files) lets the source be the
-/// one the server files that under ([`crate::origin::LEARNED`]): no caller's note may take it.
+/// [`remember_args`], where `learned` (what a person added in Studio, which `/learn` files) lets the source be one the
+/// server files that under ([`crate::origin::LEARNED`], [`crate::origin::RECORDED`]): no caller's note may take it.
 fn remember_args_as(args: &Value, learned: bool) -> Result<(&str, &str)> {
     let source = args["source"].as_str().unwrap_or_default().trim();
     let body = args["body"].as_str().unwrap_or_default();
@@ -15546,7 +15598,7 @@ fn remember_args_as(args: &Value, learned: bool) -> Result<(&str, &str)> {
     if source
         .get(..9)
         .is_some_and(|s| s.eq_ignore_ascii_case("memstore:"))
-        && !(learned && crate::origin::learned(source))
+        && !(learned && (crate::origin::learned(source) || crate::origin::recorded(source)))
     {
         return Err(ToolError(format!(
             "source {source:?}: sources under memstore: are AmpUp Memory's own"
@@ -15648,7 +15700,7 @@ async fn commit_remembered(
     who: &Principal,
     args: &Value,
 ) -> Result<(String, String)> {
-    commit_note(state, store, scope, who, args, false).await
+    commit_note(state, store, scope, who, args, false, None).await
 }
 
 /// [`commit_remembered`] of what a person added in Studio (`/learn`), filed under [`crate::origin::LEARNED`] so it
@@ -15660,7 +15712,20 @@ async fn commit_learned(
     who: &Principal,
     args: &Value,
 ) -> Result<(String, String)> {
-    commit_note(state, store, scope, who, args, true).await
+    commit_note(state, store, scope, who, args, true, None).await
+}
+
+/// [`commit_learned`] of a recording a person added in Studio, its transcript filed as a call
+/// ([`crate::origin::RECORDED`]), said at `at` (microseconds) when it is known when it was recorded.
+async fn commit_recorded(
+    state: &State,
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    args: &Value,
+    at: Option<i64>,
+) -> Result<(String, String)> {
+    commit_note(state, store, scope, who, args, true, at).await
 }
 
 async fn commit_note(
@@ -15670,6 +15735,7 @@ async fn commit_note(
     who: &Principal,
     args: &Value,
     learned: bool,
+    at: Option<i64>,
 ) -> Result<(String, String)> {
     let (source, body) = remember_args_as(args, learned)?;
     let (body, _) = redacted_for(store, scope, body).await?;
@@ -15717,6 +15783,9 @@ async fn commit_note(
     // episode, so nobody can re-ACL (hide or widen) or take over an episode another author wrote by
     // writing its body again. The newest ACL row of an id wins (`Store::episode_acls`).
     let mut ep = crate::Episode::sourced(&provenance(who, source), body.as_bytes(), &entries);
+    if let Some(at) = at {
+        ep.occurred_at = at;
+    }
     crate::episode_types::check(&ep).map_err(|e| ToolError(format!("{e:#}")))?;
     let readers = match entries.as_slice() {
         ["*"] => format!("everyone who reads {scope}"),

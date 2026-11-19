@@ -1,5 +1,5 @@
-//! Adding to memory by hand, and what it learned from it: the Studio's "Add to memory" (files dropped in, text pasted)
-//! and "Remember this" on an Ask answer, before any source is connected.
+//! Adding to memory by hand, and what it learned from it: the Studio's "Add to memory" (files dropped in, text pasted,
+//! a recording's transcript) and "Remember this" on an Ask answer, before any source is connected.
 //!
 //! - `POST /learn {items, for?}` writes each item as an episode through the path `/remember` takes
 //!   ([`super::commit_remembered`]: the caller's own memory by default, `for: "team"` everyone's who reads it; signed
@@ -8,6 +8,16 @@
 //!   an agent's note; an Ask answer kept stays a note (its words are the model's). Each is filed as a starter
 //!   document (`starter/added/...`), so extraction reads it wherever it reads anything ([`crate::extract::STARTER`]),
 //!   even where it reads nothing else no goal names. The same text added again is the same episode, not a new one.
+//!   Items are `file` (text, by its name), `paste`, `answer` (a question and its answer) and `recording`: a
+//!   recording's transcript (`turns` of `{speaker, start_ms?, text}`, the media file's `sha256`, `title?`,
+//!   `recorded_at?`), filed as one call or meeting ([`crate::episode_types::sales_call`]) whose facts cite its turns.
+//!   It is what its speakers said, not the person's own statement: filed under [`crate::origin::RECORDED`], not
+//!   [`crate::origin::LEARNED`]. Its speakers are as given (`speaker_0`), listed as no one: no person is made of a
+//!   label. It is keyed on the media's digest, so the same recording again is the episode it was ([`file_recording`],
+//!   which a transcriber calls with the turns it heard). A `file` that is a recording (`.m4a`, `.mp4` and the
+//!   like, at most [`MAX_MEDIA`]) is transcribed where the server is set to ([`crate::transcribe`]) and filed the
+//!   same way, keyed on the digest of its bytes, which is looked up before it is sent: the same file again is never
+//!   transcribed twice. Elsewhere it is refused, saying audio and video aren't read.
 //!   Answers each item's episode id (`added`), and each item refused with why (`refused`), then wakes extraction
 //!   through the ledger ([`crate::extract::ADDED_WAKE`]): it reads what was added within seconds.
 //! - `POST /learn/status {episode_ids}` answers what extraction made of them so far: a receipt, per episode,
@@ -41,6 +51,18 @@ const MAX_TEXT: usize = super::STARTER_MAX_BYTES;
 const TEXT_TYPES: [&str; 12] = [
     "txt", "text", "md", "markdown", "csv", "tsv", "json", "jsonl", "ndjson", "yaml", "yml", "log",
 ];
+/// What a file's name ends in where it is a recording, as Studio names them: transcribed where the server is set to
+/// ([`crate::transcribe`]) and its type is one [`TRANSCRIBED`] names, else refused, saying why.
+const MEDIA_TYPES: [&str; 14] = [
+    "mp4", "mov", "m4v", "webm", "mkv", "avi", "mp3", "wav", "m4a", "aac", "ogg", "oga", "opus",
+    "flac",
+];
+/// The recordings sent to be transcribed: the rest of [`MEDIA_TYPES`] are refused.
+const TRANSCRIBED: [&str; 12] = [
+    "mp4", "mov", "m4v", "webm", "mp3", "wav", "m4a", "aac", "ogg", "oga", "opus", "flac",
+];
+/// Largest recording one item may hold: what fits, as base64, in a request `/learn` takes.
+const MAX_MEDIA: usize = super::MAX_INGEST_BODY / 4 * 3;
 /// Where what is added is filed: a starter document per person (a hash of who added it) and item.
 const DOCUMENTS: &str = crate::extract::ADDED;
 
@@ -57,6 +79,42 @@ struct Item {
     kind: &'static str,
     name: String,
     text: String,
+    /// A recording's transcript (`recording`), filed as a call rather than as text.
+    recording: Option<Recording>,
+    /// A recording's file (its type, its bytes), transcribed and then filed as one ([`file_media`]).
+    media: Option<(String, Vec<u8>)>,
+}
+
+/// A recording's transcript: the media file it is of (its name, and its SHA-256 in hex, which keys it), who spoke
+/// when saying what, and its title and when it was recorded (microseconds) where they are known. The caller gives
+/// the turns; a transcriber fills them from the media and files it the same way ([`file_recording`]).
+pub(super) struct Recording {
+    pub name: String,
+    pub sha256: String,
+    pub title: Option<String>,
+    pub recorded_at: Option<i64>,
+    pub turns: Vec<Turn>,
+    /// The language its speakers speak, where a transcriber heard it (`eng`).
+    pub language: Option<String>,
+}
+
+/// One turn of a recording: who spoke (a transcriber's label, such as `speaker_0`, is kept as it is), when it
+/// starts in milliseconds, and what they said.
+pub(super) struct Turn {
+    pub speaker: String,
+    pub start_ms: Option<u64>,
+    pub text: String,
+}
+
+/// An item as filed: its episode, who reads it, whether it is new (not the episode the same item already was), its
+/// source and document, and the bytes stored.
+pub(super) struct Filed {
+    pub id: String,
+    pub readers: String,
+    pub new: bool,
+    pub source: String,
+    pub key: String,
+    pub bytes: usize,
 }
 
 /// `POST /learn`: add each item as an episode the caller wrote, in `scope`. Answers `{added: [{name, kind,
@@ -75,7 +133,8 @@ pub(super) async fn add(
         .filter(|a| !a.is_empty())
         .ok_or_else(|| {
             ToolError(
-                "body is {items: [{kind: file|paste|answer, name?, text? | base64? | question, answer}], for?}"
+                "body is {items: [{kind: file|paste|answer|recording, name?, text? | base64? | question, answer | \
+                 sha256, turns: [{speaker, start_ms?, text}], title?, recorded_at?}], for?}"
                     .into(),
             )
         })?;
@@ -103,27 +162,27 @@ pub(super) async fn add(
                 continue;
             }
         };
-        let (source, key) = filed(&item, &author);
-        // Already here, as this caller sees it: the same episode, said so rather than written again.
-        let before = store.document(scope, who, &key, None).await?;
-        let mut call = json!({"source": source, "body": item.text, "document": key, "for": whose});
-        call = super::remember_for(state, who, &call)?;
-        let commit = match item.kind {
-            "answer" => super::commit_remembered(state, store, scope, who, &call).await,
-            _ => super::commit_learned(state, store, scope, who, &call).await,
+        let commit = match (&item.recording, &item.media) {
+            (Some(rec), _) => file_recording(state, store, scope, who, whose, &author, rec).await,
+            (None, Some((ext, bytes))) => {
+                file_media(
+                    state, store, scope, who, whose, &author, &item.name, ext, bytes,
+                )
+                .await
+            }
+            (None, None) => file_text(state, store, scope, who, whose, &author, &item).await,
         };
         match commit {
-            Ok((id, r)) => {
-                let new = before.as_ref().is_none_or(|(b, _, _)| *b != id);
-                fresh |= new;
-                readers = r;
-                let mut ep = Episode::new(&super::provenance(who, &source), b"", &[]);
-                ep.episode_id = id.clone();
-                ep.document = Some(key.clone());
+            Ok(f) => {
+                fresh |= f.new;
+                readers = f.readers;
+                let mut ep = Episode::new(&super::provenance(who, &f.source), b"", &[]);
+                ep.episode_id = f.id.clone();
+                ep.document = Some(f.key);
                 kept.push(ep);
                 added.push(
-                    json!({"name": item.name, "kind": item.kind, "episode_id": id,
-                                  "source": source, "bytes": item.text.len(), "new": new}),
+                    json!({"name": item.name, "kind": item.kind, "episode_id": f.id,
+                                  "source": f.source, "bytes": f.bytes, "new": f.new}),
                 );
             }
             // What the item itself is refused for (a body no episode type reads, say): that item alone.
@@ -153,6 +212,232 @@ pub(super) async fn add(
         "scope": scope.to_string(),
         "readers": readers,
         "extraction": mode,
+    }))
+}
+
+/// File a text item (a file, a paste, an answer) as the person's starter document ([`filed`]).
+async fn file_text(
+    state: &State,
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    whose: &str,
+    author: &str,
+    item: &Item,
+) -> Result<Filed> {
+    let (source, key) = filed(item, author);
+    // Already here, as this caller sees it: the same episode, said so rather than written again.
+    let before = store.document(scope, who, &key, None).await?;
+    let call = json!({"source": source, "body": item.text, "document": key, "for": whose});
+    let call = super::remember_for(state, who, &call)?;
+    let (id, readers) = match item.kind {
+        "answer" => super::commit_remembered(state, store, scope, who, &call).await?,
+        _ => super::commit_learned(state, store, scope, who, &call).await?,
+    };
+    let new = before.as_ref().is_none_or(|(b, _, _)| *b != id);
+    Ok(Filed {
+        id,
+        readers,
+        new,
+        source,
+        key,
+        bytes: item.text.len(),
+    })
+}
+
+/// File a recording's transcript as one call or meeting ([`crate::episode_types::sales_call`]: its turns citable by
+/// number, time and speaker), by `who` for `whose` ("me" or "team"), as the starter document
+/// `starter/added/<author>/recording/<digest>` keyed on the media's SHA-256: a recording already here, as this caller
+/// sees it, is the episode it was (`new` false) whatever its transcript says this time, so a transcriber asks
+/// [`recorded`] before it transcribes. Its source is `memstore:recording:<digest>` under who added it
+/// ([`crate::origin::RECORDED`]): its speakers' words, not theirs. Its speakers are listed as no one, so the engine
+/// writes no person for a label, only the meeting (`meeting:recording-<digest>`), its title and when it was recorded
+/// (else added). Personal identifiers are redacted in each turn where the scope asks, before the transcript is laid
+/// out, so redaction can't touch its times. A transcript over [`MAX_TEXT`] is refused (a [`ToolError`]).
+pub(super) async fn file_recording(
+    state: &State,
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    whose: &str,
+    author: &str,
+    rec: &Recording,
+) -> Result<Filed> {
+    let (source, key) = recording_filed(rec, author);
+    if let Some(f) = recorded(state, store, scope, who, whose, author, rec).await? {
+        return Ok(f);
+    }
+    let redacts = store.directory().await?.dir.redacts_pii(scope);
+    let clean = |t: &str| -> String {
+        if !redacts {
+            return t.to_string();
+        }
+        let (out, found) = crate::pii::redact(t);
+        found.count();
+        out
+    };
+    let digest = &rec.sha256[..12];
+    let title = rec.title.clone().unwrap_or_else(|| {
+        let stem = rec
+            .name
+            .rsplit_once('.')
+            .map_or(rec.name.as_str(), |(s, _)| s);
+        if stem.trim().is_empty() {
+            "Recording".to_string()
+        } else {
+            stem.trim().to_string()
+        }
+    });
+    let turns: Vec<Value> = rec
+        .turns
+        .iter()
+        .map(|t| {
+            let mut v = json!({"speaker": clean(&t.speaker), "text": clean(&t.text)});
+            if let Some(ms) = t.start_ms {
+                v["start_ms"] = json!(ms);
+            }
+            v
+        })
+        .collect();
+    // The body sales_call reads: nothing in it changes from one sending to the next, so the same transcript is the
+    // same episode.
+    let mut body = json!({
+        "meeting": format!("meeting:recording-{digest}"),
+        "title": clean(&title),
+        "participants": [],
+        "turns": turns,
+        "recording": {"name": rec.name, "sha256": rec.sha256},
+    });
+    if let Some(l) = &rec.language {
+        body["language"] = json!(l);
+    }
+    let body = body.to_string();
+    if body.len() > MAX_TEXT {
+        return Err(ToolError(format!(
+            "it's {} KB of transcript: at most {} KB is added at a time",
+            body.len().div_ceil(1024),
+            MAX_TEXT / 1024
+        ))
+        .into());
+    }
+    let call = json!({"source": source, "body": body, "document": key, "for": whose});
+    let call = super::remember_for(state, who, &call)?;
+    let (id, readers) =
+        super::commit_recorded(state, store, scope, who, &call, rec.recorded_at).await?;
+    Ok(Filed {
+        id,
+        readers,
+        new: true,
+        source,
+        key,
+        bytes: body.len(),
+    })
+}
+
+/// Transcribe a recording's file and file it as [`file_recording`] does, keyed on the digest of its bytes (worked out
+/// here, never taken from the caller): one `who` added before is that episode (`new` false) and is not sent to be
+/// transcribed again. One line is logged per transcription (the scope, the file's bytes, the seconds of audio),
+/// and one where the file was already here. What the transcriber refuses, or a file it hears no speech in, is
+/// refused (a [`ToolError`]); a transcript over [`MAX_TEXT`] too, though it was paid for.
+#[allow(clippy::too_many_arguments)]
+async fn file_media(
+    state: &State,
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    whose: &str,
+    author: &str,
+    name: &str,
+    ext: &str,
+    bytes: &[u8],
+) -> Result<Filed> {
+    let mut rec = Recording {
+        name: name.to_string(),
+        sha256: hex(&sha2::Sha256::digest(bytes)),
+        title: None,
+        recorded_at: None,
+        turns: vec![],
+        language: None,
+    };
+    if let Some(f) = recorded(state, store, scope, who, whose, author, &rec).await? {
+        eprintln!(
+            "transcribe {scope}: {} bytes of .{ext} already here as episode {}: not transcribed again",
+            bytes.len(),
+            f.id
+        );
+        return Ok(f);
+    }
+    let Ok(Some(t)) = &*crate::transcribe::TRANSCRIBER else {
+        return Err(ToolError(NOT_TRANSCRIBED.into()).into());
+    };
+    let started = std::time::Instant::now();
+    let heard = t.transcribe(ext, bytes).await;
+    let took = started.elapsed().as_secs_f64();
+    let heard = match heard {
+        Ok(h) => h,
+        Err(why) => {
+            eprintln!(
+                "transcribe {scope}: {} bytes of .{ext} refused after {took:.1} s: {why}",
+                bytes.len()
+            );
+            return Err(ToolError(why).into());
+        }
+    };
+    eprintln!(
+        "transcribe {scope}: {} bytes of .{ext}, {} s of audio, {} turns, language {}, in {took:.1} s",
+        bytes.len(),
+        heard.seconds.map_or("?".to_string(), |s| format!("{s:.1}")),
+        heard.turns.len(),
+        heard.language.as_deref().unwrap_or("?"),
+    );
+    if heard.turns.is_empty() {
+        return Err(ToolError("no speech found in it".into()).into());
+    }
+    rec.language = heard.language;
+    rec.turns = heard
+        .turns
+        .into_iter()
+        .map(|t| Turn {
+            speaker: t.speaker,
+            start_ms: Some(t.start_ms),
+            text: t.text,
+        })
+        .collect();
+    file_recording(state, store, scope, who, whose, author, &rec).await
+}
+
+/// Why a recording's file isn't read where this server doesn't transcribe.
+const NOT_TRANSCRIBED: &str =
+    "audio and video aren't read yet: add a transcript of it as text instead";
+
+/// The recording `rec` is, if `who` added it here before (its media's digest, whatever its name or transcript):
+/// that episode, as [`file_recording`] answers it, `new` false. Nothing is written: its stored text is the version
+/// there, so committing it again only says who reads it.
+pub(super) async fn recorded(
+    state: &State,
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    whose: &str,
+    author: &str,
+    rec: &Recording,
+) -> Result<Option<Filed>> {
+    let (source, key) = recording_filed(rec, author);
+    let Some((id, _, body)) = store.document(scope, who, &key, None).await? else {
+        return Ok(None);
+    };
+    let bytes = body.len();
+    let body = String::from_utf8_lossy(&body).into_owned();
+    let call = json!({"source": source, "body": body, "document": key, "for": whose});
+    let call = super::remember_for(state, who, &call)?;
+    let (_, readers) = super::commit_recorded(state, store, scope, who, &call, None).await?;
+    Ok(Some(Filed {
+        id,
+        readers,
+        new: false,
+        source,
+        key,
+        bytes,
     }))
 }
 
@@ -442,9 +727,24 @@ fn read(v: &Value) -> std::result::Result<Item, String> {
         "file" => "file",
         "paste" => "paste",
         "answer" => "answer",
-        other => return Err(format!("kind is file, paste or answer, not {other:?}")),
+        "recording" => "recording",
+        other => {
+            return Err(format!(
+                "kind is file, paste, answer or recording, not {other:?}"
+            ));
+        }
     };
     let name = item_name(v);
+    if kind == "recording" {
+        let recording = read_recording(v, &name)?;
+        return Ok(Item {
+            kind,
+            name,
+            text: String::new(),
+            recording: Some(recording),
+            media: None,
+        });
+    }
     let text = match kind {
         "answer" => {
             let (q, a) = (
@@ -463,6 +763,16 @@ fn read(v: &Value) -> std::result::Result<Item, String> {
                 .unwrap_or_default();
             if ext == "pdf" {
                 return Err("PDFs aren't read here yet: copy its text and paste it instead".into());
+            }
+            if MEDIA_TYPES.contains(&ext.as_str()) {
+                let bytes = read_media(v, &ext)?;
+                return Ok(Item {
+                    kind: "recording",
+                    name,
+                    text: String::new(),
+                    recording: None,
+                    media: Some((ext, bytes)),
+                });
             }
             if !TEXT_TYPES.contains(&ext.as_str()) {
                 return Err(format!(
@@ -502,7 +812,135 @@ fn read(v: &Value) -> std::result::Result<Item, String> {
             MAX_TEXT / 1024
         ));
     }
-    Ok(Item { kind, name, text })
+    Ok(Item {
+        kind,
+        name,
+        text,
+        recording: None,
+        media: None,
+    })
+}
+
+/// A recording's file as sent (base64), if this server transcribes it: Err is why not.
+fn read_media(v: &Value, ext: &str) -> std::result::Result<Vec<u8>, String> {
+    match &*crate::transcribe::TRANSCRIBER {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(NOT_TRANSCRIBED.into()),
+        Err(_) => {
+            return Err(
+                "this server is set to transcribe audio and video but can't yet: add a transcript of it as text \
+                 instead"
+                    .into(),
+            );
+        }
+    }
+    if !TRANSCRIBED.contains(&ext) {
+        return Err(format!(
+            ".{ext} recordings aren't transcribed: {} are",
+            TRANSCRIBED.map(|t| format!(".{t}")).join(", ")
+        ));
+    }
+    let Some(b) = v["base64"].as_str().map(str::trim) else {
+        return Err("a recording's file is sent as base64".into());
+    };
+    let too_big = |n: usize| {
+        format!(
+            "it's {:.1} MB: a recording of at most {} MB is transcribed here for now; a larger one will be \
+             uploaded on its own, which isn't here yet",
+            n as f64 / (1 << 20) as f64,
+            MAX_MEDIA >> 20
+        )
+    };
+    if b.len() / 4 * 3 > MAX_MEDIA + 3 {
+        return Err(too_big(b.len() / 4 * 3));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b)
+        .map_err(|_| "its base64 doesn't decode".to_string())?;
+    if bytes.is_empty() {
+        return Err("it's empty".into());
+    }
+    if bytes.len() > MAX_MEDIA {
+        return Err(too_big(bytes.len()));
+    }
+    Ok(bytes)
+}
+
+/// A recording's transcript as sent: Err is why it is refused. Its turns that say nothing are left out; a turn's
+/// speaker may also be sent as `speaker_id`.
+fn read_recording(v: &Value, name: &str) -> std::result::Result<Recording, String> {
+    let sha256 = v["sha256"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if sha256.is_empty() {
+        return Err("a recording needs its media file's sha256, which keys it".into());
+    }
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(
+            "its sha256 isn't one: 64 hexadecimal characters, the media file's SHA-256".into(),
+        );
+    }
+    let Some(raw) = v["turns"].as_array().filter(|t| !t.is_empty()) else {
+        return Err("a recording needs its transcript: turns of {speaker, start_ms?, text}".into());
+    };
+    let mut turns = vec![];
+    for (i, t) in raw.iter().enumerate() {
+        let text = t["text"].as_str().unwrap_or_default().replace('\0', "");
+        if text.trim().is_empty() {
+            continue;
+        }
+        let speaker = t["speaker"]
+            .as_str()
+            .or(t["speaker_id"].as_str())
+            .map(|s| s.replace('\0', "").trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("turns[{i}] names no speaker"))?;
+        let start_ms = match &t["start_ms"] {
+            Value::Null => None,
+            ms => Some(
+                ms.as_u64()
+                    .ok_or_else(|| format!("turns[{i}].start_ms is milliseconds from the start"))?,
+            ),
+        };
+        turns.push(Turn {
+            speaker,
+            start_ms,
+            text: text.trim().to_string(),
+        });
+    }
+    if turns.is_empty() {
+        return Err("its turns hold no text".into());
+    }
+    let recorded_at = match v["recorded_at"].as_str().map(str::trim) {
+        None | Some("") => None,
+        Some(t) => Some(
+            chrono::DateTime::parse_from_rfc3339(t)
+                .map_err(|_| {
+                    format!("recorded_at is a time such as 2026-11-18T09:30:00Z, not {t:?}")
+                })?
+                .timestamp_micros(),
+        ),
+    };
+    let title = v["title"]
+        .as_str()
+        .map(|t| {
+            t.chars()
+                .filter(|c| !c.is_control())
+                .take(200)
+                .collect::<String>()
+        })
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    Ok(Recording {
+        name: name.to_string(),
+        sha256,
+        title,
+        recorded_at,
+        turns,
+        language: None,
+    })
 }
 
 /// An item's name as given (a file's, without its folders), else a name for its kind.
@@ -525,6 +963,7 @@ fn item_name(v: &Value) -> String {
             _ => "Ask answer".into(),
         },
         (true, Some("paste")) => "Pasted text".into(),
+        (true, Some("recording")) => "Recording".into(),
         _ => "Untitled".into(),
     }
 }
@@ -595,6 +1034,16 @@ fn filed(item: &Item, author: &str) -> (String, String) {
             )
         }
     }
+}
+
+/// Where a recording is filed: under [`crate::origin::RECORDED`] by its media's digest, not its name (two recordings
+/// named alike are two sources, one sent again under another name is the same), and as the document of that digest.
+fn recording_filed(rec: &Recording, author: &str) -> (String, String) {
+    let digest = &rec.sha256[..12];
+    (
+        format!("{}:{digest}", crate::origin::RECORDED),
+        format!("{DOCUMENTS}{author}/recording/{digest}"),
+    )
 }
 
 fn hex(b: &[u8]) -> String {

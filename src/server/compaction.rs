@@ -1,5 +1,7 @@
 //! Table compaction, in `serve`'s nightly maintenance window (`maintenance`): every table of every scope, and of
-//! the system namespace, merged once it holds too many data files.
+//! the system namespace, merged once it holds too many data files. The directory is also compacted during the day,
+//! past `AMPUP_MEMORY_DIRECTORY_COMPACT_FILES` (100) data files ([`watch_directory`]): every directory change is a
+//! file, and every read of a change another server made plans them all.
 //!
 //! Every commit appends a data file and a manifest to each table it writes, and a cold read reads them all: the
 //! ledger at each server's start (thousands of files made a start take minutes), a scope's summaries at every brief
@@ -217,6 +219,82 @@ pub(super) async fn observe(st: &Arc<State>, c: &Config) {
     }
     let plan = plan(c, &status, chrono::Utc::now().timestamp_millis());
     crate::metrics::LEDGER_COMPACTION_CLI_NEEDED.set(i64::from(plan == Plan::TooBig));
+}
+
+impl Config {
+    /// The directory's between windows: `AMPUP_MEMORY_DIRECTORY_COMPACT*` ([`watch_directory`]).
+    /// Off when every table's compaction is (`AMPUP_MEMORY_COMPACT=off`).
+    pub fn directory_from_env() -> Result<Self> {
+        let mut c = Self::read(
+            "AMPUP_MEMORY_DIRECTORY_COMPACT",
+            100,
+            None,
+            20_000,
+            Some(1 << 30),
+        )?;
+        c.on &= Self::tables_from_env()?.on;
+        Ok(c)
+    }
+}
+
+/// The directory compacted during the day too, not only in the nightly window. Every directory change (an org
+/// made, a key, a limit) is a commit of one file, and every server's next read of the directory after another's
+/// change plans the whole table, one manifest per file; so a day of sign-ups (three changes each) made every change
+/// slower than the one before. Every `AMPUP_MEMORY_DIRECTORY_COMPACT_SECS` (default 60; 0: never) the writer lease's
+/// holder, through its fenced store, looks at the directory's files (one table load) and compacts it once it holds
+/// more than `AMPUP_MEMORY_DIRECTORY_COMPACT_FILES` (100), as the window would: one compare-and-set swap, changes
+/// committed meanwhile carried over, every row kept. The table is small (a row per change), so a rewrite takes about
+/// a second, and a directory change racing it re-reads and re-plans as it does after any other server's change. Off with `AMPUP_MEMORY_DIRECTORY_COMPACT=off`, `AMPUP_MEMORY_COMPACT=off` or
+/// `AMPUP_MEMORY_MAINTAIN_SECS=0`; a `serve`-role server leaves it to its cell's worker, as every background rewrite.
+pub(super) fn watch_directory(st: &Arc<State>, c: Config) -> Result<()> {
+    let every = std::env::var("AMPUP_MEMORY_DIRECTORY_COMPACT_SECS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| {
+            v.trim().parse::<u64>().with_context(|| {
+                format!("AMPUP_MEMORY_DIRECTORY_COMPACT_SECS is a number, got {v:?}")
+            })
+        })
+        .transpose()?
+        .unwrap_or(60);
+    if !c.on || every == 0 || !crate::cell::is_default() {
+        return Ok(());
+    }
+    let st2 = st.clone();
+    st.background("directory_compaction", async move {
+        let st = st2;
+        let table = crate::offboard::DIRECTORY_TABLE;
+        let ident = iceberg::TableIdent::new(
+            iceberg::NamespaceIdent::new(crate::SYSTEM_NS.into()),
+            table.into(),
+        );
+        // Asked whether it exists only until it does (it is never dropped): no catalog read a minute for it after.
+        let mut exists = false;
+        loop {
+            tokio::time::sleep(Duration::from_secs(every)).await;
+            if !st.writer.holds() {
+                continue;
+            }
+            let store = st.writing_store();
+            if !exists {
+                match store.has_table(&ident).await {
+                    Ok(true) => exists = true,
+                    Ok(false) => continue,
+                    Err(e) => {
+                        eprintln!("directory compaction: {}", super::writer::redacted(&e));
+                        continue;
+                    }
+                }
+            }
+            let t = Target { scope: None, table };
+            let now = chrono::Utc::now().timestamp_millis();
+            // A run logs its own line and audit row; not due, it says nothing.
+            if let Err(e) = run(&store, t, &c, now, None).await {
+                eprintln!("directory compaction: {}", super::writer::redacted(&e));
+            }
+        }
+    });
+    Ok(())
 }
 
 /// A table the window compacts: a scope's (`scope`), or the system's (None).

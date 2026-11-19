@@ -11,7 +11,7 @@ import type { Selection } from "../memory/types";
 // went, and the sessions themselves (memstore's `/browse {op: "advice_usage"}`). Everyone sees the org's counts;
 // the sessions are the reader's own, or everyone's for the org's admins. Admins ratify a note for the whole team
 // (`/admin {op: "ratify_advice"}`), and find the evidence and lookup tables under "Diagnostics". The note picked
-// is in the link (`#/v/?note=<key>`); where a note was learned from, run by run, is on the Learned page.
+// is in the link (`#/advice?note=<key>`); where a note was learned from, run by run, is on the Learned page.
 
 interface Session {
   id: string;
@@ -491,32 +491,24 @@ function Detail({
                 : "None in this filter."}
             </p>
           ) : (
-            <table className="ap-table">
-              <thead>
-                <tr>
-                  <th>Session</th>
-                  {every && <th>Who</th>}
-                  <th>When</th>
-                  <th>Outcome</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sessions.map((s) => (
-                  <tr key={s.id}>
-                    <td>
-                      <button className="ap-link" onClick={() => onTrace(s.id)}>
-                        “{s.question || "(no request recorded)"}”
-                      </button>
-                    </td>
-                    {every && <td className="ap-muted">{s.user}</td>}
-                    <td className="ap-muted ap-nowrap">{when(s.at)}</td>
-                    <td className="ap-nowrap">
-                      <Outcome s={s} />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            // One row per session: what was asked (two lines at most), who and when under it, and how
+            // it went. A list rather than a table, so it fits the column at any width.
+            <ul className="ap-sessions">
+              {sessions.map((s) => (
+                <li key={s.id}>
+                  <button className="ap-session" onClick={() => onTrace(s.id)}>
+                    <span className="ap-session-q">“{s.question || "(no request recorded)"}”</span>
+                    <span className="ap-muted ap-small">
+                      {every ? `${s.user} · ` : ""}
+                      {when(s.at)}
+                    </span>
+                  </button>
+                  <span className="ap-session-out">
+                    <Outcome s={s} />
+                  </span>
+                </li>
+              ))}
+            </ul>
           )}
         </>
       )}

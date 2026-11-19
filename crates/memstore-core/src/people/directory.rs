@@ -932,8 +932,8 @@ pub struct SignIn {
     /// the server sets it, for its fixed caller on a loopback-only server; nothing a request says sets it.
     pub local_admin: Option<String>,
     /// Signed in with a provisioner key (the keys file's `"provisioner": true`): a sign-up service's, named by its
-    /// keys-file row's id. It creates orgs, finishes setting up those it created, and sets orgs' limits, and nothing
-    /// else ([`provisioner_may`]).
+    /// keys-file row's id. It creates orgs, finishes setting up those it created (a built-in schema too, while one
+    /// has none), and sets orgs' limits, and nothing else ([`provisioner_may`]).
     pub provisioner: Option<String>,
 }
 

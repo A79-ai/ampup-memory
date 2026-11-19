@@ -315,7 +315,7 @@ function EntityOwners({ sel }: { sel: Selection }) {
       </h2>
       <p className="st-lede st-quiet">
         A change to an owned entity waits in Review until its owner approves it. Owners are
-        assigned, handed on and removed in <a href="#/r/">Review</a> and on each entity&rsquo;s
+        assigned, handed on and removed in <a href="#/review">Review</a> and on each entity&rsquo;s
         page.
       </p>
       {error ? (
@@ -337,7 +337,7 @@ function EntityOwners({ sel }: { sel: Selection }) {
             <tbody>
               {owners.map((o) => {
                 const i = o.entity.indexOf(":");
-                const href = `#/e/entities/${encodeURIComponent(o.entity.slice(0, i))}/${encodeURIComponent(o.entity.slice(i + 1))}`;
+                const href = `#/entity/entities/${encodeURIComponent(o.entity.slice(0, i))}/${encodeURIComponent(o.entity.slice(i + 1))}`;
                 return (
                   <tr key={o.entity}>
                     <td className="mono">
@@ -934,7 +934,7 @@ function KeyTable({
   );
 }
 
-/** `#/l/`: when the memory serves advice and when it doesn't. Each time an agent asks (a session's start, a prompt
+/** `#/serving`: when the memory serves advice and when it doesn't. Each time an agent asks (a session's start, a prompt
  * a hook routes, a later moment, a hook's step) its session keeps what the ask came to; this is their sum over the
  * window, in all and by caller, moment, person and harness, with the lines served most and the ones that most often
  * served nothing. */

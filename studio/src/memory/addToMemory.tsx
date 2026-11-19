@@ -12,6 +12,25 @@ import "./learn.css";
 
 /** What memstore keeps at most of one item, in bytes. */
 const MAX_BYTES = 64 * 1024;
+/** The file types memstore reads (its `/learn` `TEXT_TYPES`); the picker offers these alone. */
+const TEXT_TYPES = [
+  "txt", "text", "md", "markdown", "csv", "tsv", "json", "jsonl", "ndjson", "yaml", "yml", "log",
+];
+const ACCEPT = TEXT_TYPES.map((t) => `.${t}`).join(",");
+/** Recordings: not read yet, and said so, rather than refused for their size. */
+const MEDIA_TYPES = new Set([
+  "mp4", "mov", "m4v", "webm", "mkv", "avi", "mp3", "wav", "m4a", "aac", "ogg", "oga", "opus", "flac",
+]);
+
+/** Why a file isn't sent at all, by its type, before its size: a recording is never "split it". */
+function unreadType(name: string): string | undefined {
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+  if (TEXT_TYPES.includes(ext)) return undefined;
+  if (MEDIA_TYPES.has(ext))
+    return "audio and video aren't read yet: add a transcript of it as text instead";
+  return `${ext ? `.${ext} files aren't` : "files without an extension aren't"} read: text, Markdown, CSV, JSON and YAML are`;
+}
 /** How often the receipt is read again while extraction runs, and for how long at most. */
 const POLL_MS = 1500;
 const POLL_FOR_MS = 3 * 60_000;
@@ -142,6 +161,8 @@ export function useReceipt(sel: Selection, added: Added | null) {
 
 /** A file as `/learn` takes it (its bytes in base64), or why it isn't sent at all. */
 function readFile(f: File): Promise<LearnItem | { refused: string; name: string }> {
+  const unread = unreadType(f.name);
+  if (unread) return Promise.resolve({ name: f.name, refused: unread });
   if (f.size > MAX_BYTES)
     return Promise.resolve({
       name: f.name,
@@ -265,6 +286,7 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
             ref={picker}
             type="file"
             multiple
+            accept={ACCEPT}
             className="learn-file"
             onChange={(e) => {
               take(e.target.files);

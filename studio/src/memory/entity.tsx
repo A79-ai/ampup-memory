@@ -494,7 +494,7 @@ export function Disputes({
     <>
       <div className="h-section">
         <Icon name="alert" size={14} /> In dispute <span className="count">{conflicts.length}</span>
-        <a className="link en-head-link" href="#/r/?tab=conflicts">
+        <a className="link en-head-link" href="#/review?tab=conflicts">
           Resolve in Review
         </a>
       </div>
@@ -572,7 +572,7 @@ export function DreamDecisions({
       <div className="h-section">
         <Icon name="moon" size={14} /> What the dream decided{" "}
         <span className="count">{list.total}</span>
-        <a className="link en-head-link" href="#/r/?tab=done">
+        <a className="link en-head-link" href="#/review?tab=done">
           {list.total > list.decisions.length ? `All ${list.total} in Review` : "Open in Review"}
         </a>
       </div>

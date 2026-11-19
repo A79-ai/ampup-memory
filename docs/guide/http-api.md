@@ -77,7 +77,9 @@ curl -s localhost:8080/search -d '{"data": [[0, "how do we deploy billing", 5]]}
 ```
 
 `/browse` operations: `ls` (a folder's children, paged with `limit` and `after`), `episode` (text and the facts
-citing it), `branches`, `schema`, `facts`, `advice`, `scopes`. A path is a JSON array of segments:
+citing it), `branches`, `schema`, `facts`, `advice`, `scopes`. The root's folders carry a `count` once the
+caller's counts are worked out, in the background: a first listing may show every folder without one, and after the
+memory moves on a listing answers the last counts while newer ones are counted. A path is a JSON array of segments:
 
 ```bash
 curl -s localhost:8080/browse -d '{"op": "ls", "path": ["sources"]}'

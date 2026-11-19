@@ -8,7 +8,7 @@ import type { Child, Focus, Listing, Selection } from "./types";
 import { EmptyState, Icon } from "./ui";
 import type { Resolved } from "../transport";
 
-// Studio's Home (`#/w/`): the memory being read (the org's, or the team picked) as its builders see it. What
+// Studio's Home (`#/home`): the memory being read (the org's, or the team picked) as its builders see it. What
 // changed this week, what was answered from it, and what waits on the reader, each number a link into the
 // section that holds it. Every number comes from a read another section already makes; one with no cheap read is
 // left out, and one the reader may not make (an admin's, a review's) is too.
@@ -18,7 +18,7 @@ const WEEK_US = WEEK_DAYS * 86_400_000_000;
 /** The newest facts read to say where this week's came from (`count` is the whole week's, whatever this is). */
 const FACT_SAMPLE = 200;
 
-/** A link into a section: the focus, and its options (`#/r/?tab=conflicts`). */
+/** A link into a section: the focus, and its options (`#/review?tab=conflicts`). */
 export type HrefOf = (f: Focus, options?: Record<string, string>) => string;
 
 export interface HomeProps {
@@ -99,33 +99,37 @@ export function Home({
   const since = useMemo(() => Date.now() * 1000 - WEEK_US, [key]);
 
   // What the memory holds: the Explorer's root, with each folder's count.
-  const root = useRead(key, true, () => browse<Listing>({ op: "ls", path: [] }, sel));
+  const rootGot = useGot(key, true, () => browse<Listing>({ op: "ls", path: [] }, sel));
+  const root = rootGot.data;
   // Each source and when it last brought something.
   const sources = useRead(key, true, () =>
     browse<Listing>({ op: "ls", path: ["sources"], limit: 200 }, sel),
   );
   // The facts that took effect this week: how many, on how many entities, and from where.
-  const facts = useRead(key, true, () =>
+  const factsGot = useGot(key, true, () =>
     browse<FactsPage>(
       { op: "facts", valid_from: { gte: since }, limit: FACT_SAMPLE, order: "newest" },
       sel,
     ),
   );
-  const lessons = useRead(key, can.lessons, () =>
+  const facts = factsGot.data;
+  const lessonsGot = useGot(key, can.lessons, () =>
     call<{ count: number }>(sel, "lessons", { since, count: true }),
   );
+  const lessons = lessonsGot.data;
   const adviceGot = useGot(key, true, () =>
     browse<AdviceUsage>({ op: "advice_usage", days: WEEK_DAYS }, sel),
   );
   const advice = adviceGot.data;
   // The admins' read of who asked what (the team read, never the branch, as People reads it).
-  const activity = useRead(key, admin, () =>
+  const activityGot = useGot(key, admin, () =>
     call<Activity>({ org: sel.org, team: sel.team }, "admin", {
       op: "activity",
       sinceDays: WEEK_DAYS,
       limit: 1,
     }),
   );
+  const activity = activityGot.data;
   const proposalsGot = useGot(key, can.review, () => review.proposals(sel));
   const proposals = proposalsGot.data;
   // Only the count: one conflict and the total.
@@ -193,7 +197,7 @@ export function Home({
       <a className="btn" href={href(ask)}>
         <Icon name="chat" size={14} /> Ask
       </a>
-      <a className="btn" href={href({ kind: "search", query: "" })}>
+      <a className="btn hm-search" href={href({ kind: "search", query: "" })}>
         <Icon name="search" size={14} /> Search
       </a>
     </div>
@@ -297,6 +301,9 @@ export function Home({
                   label="lessons from runs"
                 />
               )}
+              {/* Each tile's place holds while its read is out, so the page doesn't jump as they land. */}
+              {!factsGot.done && <TileSkeleton count={2} />}
+              {!lessonsGot.done && <TileSkeleton />}
             </div>
             {weekFacts && weekFacts.bySource.length > 0 && (
               <p className="hm-by">
@@ -351,6 +358,8 @@ export function Home({
                   note="all time"
                 />
               )}
+              {!activityGot.done && <TileSkeleton count={2} />}
+              {!adviceGot.done && <TileSkeleton />}
             </div>
             {admin && (
               <p className="hm-by">
@@ -362,12 +371,17 @@ export function Home({
             )}
           </section>
 
-          {(root || sources) && (
+          {
             <section className="hm-sec" aria-labelledby="hm-held">
               <h2 className="h-section" id="hm-held">
                 <Icon name="database" size={14} /> In memory
               </h2>
               {/* The counts read every fact the reader may: the sources below don't wait for them. */}
+              {!rootGot.done && (
+                <div className="hm-tiles hm-tiles-sm">
+                  <TileSkeleton count={4} />
+                </div>
+              )}
               {root && (
                 <div className="hm-tiles hm-tiles-sm">
                   {(
@@ -399,10 +413,24 @@ export function Home({
                 </ul>
               )}
             </section>
-          )}
+          }
         </>
       )}
     </div>
+  );
+}
+
+/** Where a tile will be, while its read is out: its shape, shimmering. */
+function TileSkeleton({ count = 1 }: { count?: number }) {
+  return (
+    <>
+      {Array.from({ length: count }, (_, i) => (
+        <div key={i} className="hm-tile hm-tile-sk" aria-hidden="true">
+          <span className="sk sk-n" />
+          <span className="sk sk-label" />
+        </div>
+      ))}
+    </>
   );
 }
 
@@ -433,13 +461,20 @@ interface NeedRow {
 function NeedsYou({ needs, settled }: { needs: (NeedRow | false | null | undefined)[]; settled: boolean }) {
   const rows = needs.filter((r): r is NeedRow => !!r && r.n > 0);
   const calls = rows.filter((r) => !r.quiet);
-  if (!calls.length && !settled) return null;
   return (
-    <section className="hm-sec" aria-labelledby="hm-needs">
+    <section className="hm-sec" aria-labelledby="hm-needs" aria-busy={!settled}>
       <h2 className="h-section" id="hm-needs">
         <Icon name="alert" size={14} /> Needs you
       </h2>
-      {!calls.length && (
+      {!calls.length && !settled && (
+        // Before every read has answered, a row may still come: the rows' places, shimmering.
+        <div className="hm-needs" aria-hidden="true">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="sk hm-need-sk" />
+          ))}
+        </div>
+      )}
+      {!calls.length && settled && (
         <p className="hm-calm">
           <Icon name="check" size={14} /> Nothing needs you
         </p>

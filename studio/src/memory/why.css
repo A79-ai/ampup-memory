@@ -8,8 +8,8 @@
   --why-line: var(--line, var(--rule, #e4e3de));
   --why-surface: var(--surface, var(--sheet, #ffffff));
   --why-sunken: var(--sunken, var(--rule-soft, #f5f2ec));
-  --why-accent: var(--accent, #c15f3c);
-  --why-kw: #c15f3c;
+  --why-accent: var(--accent, #232323);
+  --why-kw: #232323;
   --why-mn: #2e6fa8;
   --why-warn: var(--warn, #9a6b16);
   --why-error: var(--error, #b0412b);

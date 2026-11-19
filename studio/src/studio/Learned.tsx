@@ -600,7 +600,7 @@ function Empty({ filtered }: { filtered: boolean }) {
 
 /**
  * Every lesson the reader may read, filtered by whose (`?show=`: `team`, `mine`, or for an admin a person), a
- * lesson picked by the link (`#/k/<lessonId>`) scrolled to and marked.
+ * lesson picked by the link (`#/learned/<lessonId>`) scrolled to and marked.
  */
 export function Learned({
   sel,

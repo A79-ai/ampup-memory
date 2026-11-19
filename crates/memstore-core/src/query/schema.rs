@@ -389,11 +389,12 @@ pub fn builtin(name: &str) -> Option<&'static str> {
         "sales" => Some(include_str!("../../../../schemas/sales.json")),
         "engineering" => Some(include_str!("../../../../schemas/engineering.json")),
         "corpus" => Some(include_str!("../../../../schemas/corpus.json")),
+        "software_team" => Some(include_str!("../../../../schemas/software_team.json")),
         _ => None,
     }
 }
 
-pub const BUILTIN: &[&str] = &["sales", "engineering", "corpus"];
+pub const BUILTIN: &[&str] = &["sales", "engineering", "corpus", "software_team"];
 
 fn is_ident(s: &str) -> bool {
     !s.is_empty()

@@ -146,7 +146,7 @@ enum Cmd {
     /// Schemas: list the built-in ones, read or set a scope's
     #[command(subcommand)]
     Schema(SchemaCmd),
-    /// The episode types (sales_call, slack_thread, email, crm_update, doc): their catalogs and how they cite
+    /// The episode types (sales_call, slack_thread, email, crm_update, incident, doc): their catalogs and how they cite
     #[command(subcommand)]
     EpisodeType(EpisodeTypeCmd),
     /// What a deployment may send its control plane (the telemetry contract)

@@ -240,3 +240,52 @@
     }
   }
 }
+
+/* With the host drawing the sections, Home fills the host's page: no width caps, and from 1280px its
+   sections (what needs you, what it learned, what it answered, what it holds back) in two columns under the
+   title and the dream, which keep the whole width. */
+.memory-studio[data-navigation="host"] .memory {
+  .hm,
+  .hm-dream,
+  .hm-needs {
+    max-width: none;
+  }
+  @media (min-width: 1280px) {
+    .hm {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      column-gap: var(--s8);
+      align-items: start;
+    }
+    .hm > :not(.hm-sec) {
+      grid-column: 1 / -1;
+    }
+  }
+}
+
+/* While Home's reads are out: each tile's and each row's place, shimmering (the .sk shimmer is memory.css's). */
+.memory {
+  .hm-tile-sk {
+    gap: var(--s2);
+    box-shadow: none;
+    min-height: 86px;
+    justify-content: center;
+  }
+  .hm-tile-sk .sk-n {
+    height: 24px;
+    width: 42%;
+  }
+  .hm-tile-sk .sk-label {
+    height: 12px;
+    width: 70%;
+  }
+  .hm-need-sk {
+    height: 44px;
+    border-radius: var(--r);
+  }
+}
+
+/* A host that draws the sections has its own search box: Home doesn't offer a second. */
+.memory-studio[data-navigation="host"] .memory .hm-search {
+  display: none;
+}

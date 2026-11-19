@@ -255,7 +255,8 @@
      "type": "ref",
      "to": [
       "contact",
-      "rep"
+      "rep",
+      "person"
      ],
      "card": "many",
      "description": "Written by the engine, not the model: calendar metadata, not extraction."
@@ -264,7 +265,8 @@
      "type": "ref",
      "to": [
       "contact",
-      "rep"
+      "rep",
+      "person"
      ],
      "card": "many",
      "description": "Written by the engine, not the model: who spoke in the recording, not extraction."
@@ -283,6 +285,10 @@
      "description": "one of our reps' role or title as stated on the call"
     }
    }
+  },
+  "person": {
+   "description": "Someone on the meeting whom the recorder doesn't place on our side or theirs, by email: person:<email>.",
+   "predicates": {}
   }
  }
 }

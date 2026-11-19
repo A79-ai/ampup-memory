@@ -640,6 +640,10 @@ tokio::task_local! {
     /// Set for the length of one publication check ([`Store::publications_untouched`],
     /// [`Store::authorize_publication`]).
     static CHECK_ROWS: CheckRows;
+    /// Set for a read that only shows governance ([`Store::held`]): its ledger and tables are the ones this server
+    /// holds (each at most `AMPUP_MEMORY_MAX_STALENESS_MS` behind, refreshed in the background; a change made here
+    /// is seen at once), never reloaded from the catalog for it.
+    static HELD: ();
 }
 
 impl Store {
@@ -649,6 +653,9 @@ impl Store {
     /// (`governance_impact`) share it, rather than each paying a catalog round trip inside the ledger's
     /// compare-and-set. A check tried again after a lost compare-and-set reads them all again.
     async fn governance_rows(&self, scope: &Scope, name: &str) -> Result<Arc<Vec<RecordBatch>>> {
+        if HELD.try_with(|_| ()).is_ok() {
+            return self.side_rows(&scope.namespace(), name).await;
+        }
         let key = (scope.namespace(), name.to_string());
         let read = CHECK_ROWS
             .try_with(|m| m.lock().unwrap().get(&key).cloned())
@@ -836,6 +843,9 @@ impl Store {
     }
 
     async fn governance_ledger(&self, scope: &Scope) -> Result<Ledger> {
+        if HELD.try_with(|_| ()).is_ok() {
+            return self.ledger(scope).await;
+        }
         let snap = self.ledger_now().await?;
         Ok(Ledger::from_batches(&snap.rows, &scope.namespace()))
     }
@@ -1004,6 +1014,14 @@ impl Store {
         let ledger = self.governance_ledger(scope).await?;
         let rows = self.governance_rows(scope, TABLE).await?;
         Ok(fold(&rows, &ledger)?.owners.into_values().collect())
+    }
+
+    /// `read` with governance read as this server holds it ([`HELD`]): for a list or a page that shows proposals,
+    /// owners or decisions. Reloading the ledger and the governance tables from the catalog on every such read
+    /// took seconds in a busy org and made every reader here wait on the reload. What lets someone act (a review
+    /// decision, resolving a conflict, an owner's change, the publication check) reads them as they are now.
+    pub async fn held<T>(&self, read: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        HELD.scope((), read).await
     }
 
     /// Who owns what, from the ledger and governance table as this server holds them (each at most
@@ -2113,16 +2131,25 @@ impl Store {
     ) -> Result<Vec<ProposalSummary>> {
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
+        let wanted: Vec<&Proposal> = state
+            .proposals
+            .values()
+            .filter(|p| entity.is_none_or(|e| entities_of(p).iter().any(|x| x == e)))
+            .collect();
+        // A proposal whose evidence the reader can't read is not theirs to know about. Each check builds its
+        // branch's visibility: all at once.
+        let readable = futures::future::join_all(
+            wanted
+                .iter()
+                .map(|p| self.governance_readable(scope, p, who)),
+        )
+        .await;
         let mut out = Vec::new();
-        for p in state.proposals.values() {
+        for (p, readable) in wanted.into_iter().zip(readable) {
+            if readable.is_err() {
+                continue;
+            }
             let entities = entities_of(p);
-            if entity.is_some_and(|e| !entities.iter().any(|x| x == e)) {
-                continue;
-            }
-            // A proposal whose evidence the reader can't read is not theirs to know about.
-            if self.governance_readable(scope, p, who).await.is_err() {
-                continue;
-            }
             let s = Self::status_of(&ledger, &state, p)?;
             out.push(ProposalSummary {
                 id: p.id.clone(),
@@ -2184,7 +2211,9 @@ impl Store {
         let ns = scope.namespace();
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
-        let (vis, rows) = tokio::try_join!(self.visibility(scope, MAIN), self.rows(&ns, FACTS))?;
+        // Shown only: main's last state while the next is built, never one holding what was taken away since.
+        let (vis, rows) =
+            tokio::try_join!(self.lagging_visibility(scope, MAIN), self.rows(&ns, FACTS))?;
         // Every fact the reader may read, once each, as they see it.
         let mut seen = HashSet::new();
         let mut facts: Vec<Fact> = Vec::new();
@@ -2228,12 +2257,21 @@ impl Store {
         }
         // Open proposals the reader may see: what they change, and the links they would add.
         let mut pending: HashMap<String, Vec<String>> = HashMap::new();
+        let mut open = Vec::new();
         for p in state.proposals.values() {
-            if !matches!(
+            if matches!(
                 Self::status_of(&ledger, &state, p)?.status,
                 "pending_review" | "approved" | "stale"
-            ) || self.governance_readable(scope, p, who).await.is_err()
-            {
+            ) {
+                open.push(p);
+            }
+        }
+        // Each readability check builds its branch's visibility: all at once.
+        let readable =
+            futures::future::join_all(open.iter().map(|p| self.governance_readable(scope, p, who)))
+                .await;
+        for (p, readable) in open.into_iter().zip(readable) {
+            if readable.is_err() {
                 continue;
             }
             for e in entities_of(p) {

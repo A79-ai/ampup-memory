@@ -1,0 +1,120 @@
+{
+ "name": "incident",
+ "version": 1,
+ "description": "What an error tracker's issue can state: what fails and where, who it affects, what caused it, what fixed or resolved it and in which release, when it regressed, and who owns it. The engine writes what its header states: status, level, project, culprit, when it was first and last seen, how many events and users, and its first and last release.",
+ "mode": "strict",
+ "types": {
+  "incident": {
+   "description": "An error tracker's issue: one error grouped across its occurrences, by its source after the prefix (incident:<org>/<project>/issues/<id>).",
+   "predicates": {
+    "status": {
+     "type": "enum",
+     "values": [
+      "unresolved",
+      "resolved",
+      "ignored"
+     ],
+     "pending": [
+      "unresolved"
+     ],
+     "description": "the issue's status in the tracker, as of the episode"
+    },
+    "level": {
+     "type": "enum",
+     "description": "how severe the tracker rates it (open enum: fatal, error, warning, info, debug)"
+    },
+    "project": {
+     "type": "string",
+     "description": "the tracker's project the issue is in"
+    },
+    "culprit": {
+     "type": "string",
+     "description": "where the tracker says the error happens: a function, route or transaction"
+    },
+    "first_seen": {
+     "type": "timestamp",
+     "description": "when the error first happened"
+    },
+    "last_seen": {
+     "type": "timestamp",
+     "description": "when the error last happened, as of the episode"
+    },
+    "events": {
+     "type": "number",
+     "unit": "events",
+     "description": "how many times it has happened, as of the episode"
+    },
+    "users": {
+     "type": "number",
+     "unit": "users",
+     "description": "how many users it has affected, as of the episode"
+    },
+    "first_release": {
+     "type": "string",
+     "description": "the release it first happened in"
+    },
+    "last_release": {
+     "type": "string",
+     "description": "the release it last happened in"
+    },
+    "link": {
+     "type": "string",
+     "description": "the issue's page in the tracker"
+    },
+    "error": {
+     "type": "string",
+     "card": "many",
+     "description": "what fails: the exception type and its message, e.g. 'KeyError: org_id'"
+    },
+    "fails_in": {
+     "type": "string",
+     "card": "many",
+     "description": "where it fails, as file and function, e.g. 'api/orgs.py in get_org'; the innermost frame of our own code first"
+    },
+    "service": {
+     "type": "string",
+     "card": "many",
+     "description": "the service, job or component it happens in"
+    },
+    "affects": {
+     "type": "string",
+     "card": "many",
+     "description": "who or what it affects: users, customers, endpoints, jobs, with how many when stated"
+    },
+    "cause": {
+     "type": "string",
+     "card": "many",
+     "description": "what caused it, as the text states it"
+    },
+    "fixed_by": {
+     "type": "string",
+     "card": "many",
+     "description": "a change that fixed it: a pull request, commit or config change, with its id or link; the release it was resolved in is resolved_in"
+    },
+    "resolved_in": {
+     "type": "string",
+     "description": "the release it was resolved in, e.g. 'api@2026.11.5' from 'resolved in api@2026.11.5'"
+    },
+    "regressed": {
+     "type": "string",
+     "card": "many",
+     "description": "when it came back after being resolved: the day, with the release when stated, e.g. '2026-11-09'"
+    },
+    "owner": {
+     "type": "string",
+     "description": "who the issue is assigned to: a person or a team"
+    },
+    "workaround": {
+     "type": "string",
+     "card": "many",
+     "description": "a way around it someone gives until it is fixed"
+    },
+    "note": {
+     "type": "string",
+     "card": "many",
+     "description": "a diagnosis or decision someone states in a comment, e.g. 'only happens for orgs created before the migration'"
+    }
+   }
+  }
+ }
+}

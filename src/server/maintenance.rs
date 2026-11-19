@@ -1,4 +1,5 @@
-//! The nightly maintenance window: the only time `serve` rewrites storage.
+//! The nightly maintenance window: the only time `serve` rewrites storage, but for the directory, which is also
+//! compacted during the day once it holds too many files (`compaction::watch_directory`).
 //!
 //! A rewrite (a compaction of a table, `compaction`) reads a whole table and writes it again. Run on
 //! a timer at any hour, they landed in the working day (one org's summaries: 428 MB rewritten at 13:45 Pacific), and
@@ -294,7 +295,7 @@ impl Config {
         if self.window != Window::Off {
             line.push_str(&format!(
                 "; one scope at a time, {}s apart, budget {}, dream step up to {}s a scope; rewrites (table \
-                 compaction) run only then",
+                 compaction) run only then, but the directory's past its file count",
                 self.pace.as_secs_f64(),
                 self.budget
                     .map_or("until the window closes".into(), |b| format!("{}s", b.as_secs())),

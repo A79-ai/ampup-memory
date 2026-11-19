@@ -52,10 +52,10 @@ export function GraphSection({
   const [showPending, setShowPending] = useFlag("pending", true);
   const [q, setQ] = useOption("q");
   const [selected, setSelected] = useState<string | null>(focus ?? null);
-  // The node picked is the link's (`#/d/<entity>`): a pick replaces it, and a link moved under the graph
+  // The node picked is the link's (`#/graph/<entity>`): a pick replaces it, and a link moved under the graph
   // (back, or pasted) picks its node.
   useEffect(() => setSelected(focus ?? null), [focus]);
-  useEffect(() => replaceView(`#/d/${encodeURIComponent(selected ?? "")}`), [selected]);
+  useEffect(() => replaceView(`#/graph/${encodeURIComponent(selected ?? "")}`), [selected]);
   const [hover, setHover] = useState<string | null>(null);
 
   const box = useRef<HTMLDivElement>(null);
