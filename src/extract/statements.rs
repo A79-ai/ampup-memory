@@ -186,6 +186,7 @@ pub(super) fn schema(base: &Schema, kind: &dyn EpisodeType) -> anyhow::Result<Sc
                 plan: false,
                 pending: vec![],
                 list: false,
+                same_as: None,
             });
         }
     }

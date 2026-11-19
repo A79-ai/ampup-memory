@@ -46,6 +46,7 @@ over the server's variables where both exist; a team's setting wins over its org
 | `AMPUP_MEMORY_JUDGE`, `AMPUP_MEMORY_JUDGE_MODEL` | Judging sessions and runs. `AMPUP_MEMORY_JUDGE=off` judges nothing. |
 | `AMPUP_MEMORY_DREAM`, `AMPUP_MEMORY_AGGREGATE_MODEL`, `AMPUP_MEMORY_PROFILE_MODEL` | Dreaming, summaries, profiles. |
 | `AMPUP_MEMORY_DECIDE` | A decisions model (used for step advice relevance and public-capability suggestions). |
+| `AMPUP_MEMORY_DREAM_CHECK` | How likely the decisions model (on the extraction's route) must find an ending the dream proposed for it to apply; below it, the ending waits for a person. Default `0.6`; `off` applies what the dream decides unchecked. |
 | `AMPUP_MEMORY_MODEL_CACHE` | Where model replies are cached: a directory, `gs://`, `s3://`, `file://`, or `off`. |
 
 Backends and their defaults:

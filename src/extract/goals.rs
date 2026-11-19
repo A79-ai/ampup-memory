@@ -280,6 +280,22 @@ impl Offer {
         };
         let offered = overlay(Some(base), &catalog)
             .with_context(|| format!("episode type {} on schema {}", kind.name(), base.name))?;
+        // A catalog predicate the schema declares under another name (`same_as`) is offered alone, with the
+        // catalog's description, and stored under the schema's name ([`Offer::stored_as`]): one name per thing.
+        let checked = offered.clone();
+        let mut offered = offered;
+        for (ty, def) in &catalog.types {
+            for target in def.predicates.values().filter_map(|d| d.same_as.as_ref()) {
+                if base
+                    .types
+                    .get(ty)
+                    .is_some_and(|b| b.predicates.contains_key(target))
+                    && let Some(t) = offered.types.get_mut(ty)
+                {
+                    t.predicates.remove(target);
+                }
+            }
+        }
         let item_types: &[&str] = if statements { &[] } else { kind.items() };
         let items: HashSet<&str> = item_types.iter().copied().collect();
         let discover = offered
@@ -291,7 +307,7 @@ impl Offer {
         Ok(Offer {
             contract,
             kind,
-            checked: offered.clone(),
+            checked,
             offered,
             adds: catalog,
             actor,
@@ -299,6 +315,23 @@ impl Offer {
             discover,
             statements,
         })
+    }
+
+    /// The predicate a fact the model wrote as `predicate` on `ty` is stored as: the schema's, where the catalog
+    /// offered its own name for it (`same_as`), else `predicate`.
+    fn stored_as<'a>(&'a self, ty: &str, predicate: &'a str) -> &'a str {
+        self.adds
+            .types
+            .get(ty)
+            .and_then(|d| d.predicates.get(predicate))
+            .and_then(|d| d.same_as.as_deref())
+            .filter(|target| {
+                self.checked
+                    .types
+                    .get(ty)
+                    .is_some_and(|d| d.predicates.contains_key(*target))
+            })
+            .unwrap_or(predicate)
     }
 
     /// The item types the model may open: the catalog's, none for statements.
@@ -848,6 +881,35 @@ fn person_ref(pd: &schema::PredicateDef, value: &str, known: &[String]) -> Optio
     }
 }
 
+/// A ref value naming a subject by what it is (`table:mixpanel.mp_people`, or `mixpanel.mp_people` where the
+/// predicate refs one type), as the engine stores that subject ([`discovered`]): `table:mixpanel_mp_people`, where
+/// the facts about it are. Without this a link written as the text spells the name points at no entity. None for
+/// an id the episode is about or a person on it, an item, and a type the episode may not name by what it is.
+fn named_ref(
+    offer: &Offer,
+    named: &[String],
+    pd: &schema::PredicateDef,
+    value: &str,
+    known: &[String],
+) -> Option<String> {
+    if pd.value != ValueType::Ref || known.iter().any(|k| k == value) {
+        return None;
+    }
+    let typed = match (value.split_once(':'), &pd.to[..]) {
+        (Some(_), _) => value.to_string(),
+        (None, [t]) => format!("{t}:{value}"),
+        (None, _) => return None,
+    };
+    let (ty, _) = typed.split_once(':')?;
+    let fits = named.iter().any(|t| t == ty) && (pd.to.is_empty() || pd.to.iter().any(|t| t == ty));
+    if !fits {
+        return None;
+    }
+    discovered(offer, named, &typed, "")
+        .ok()
+        .filter(|v| v != value)
+}
+
 /// A subject the read discovers, named as the engine stores it: `<type>:<name>` with the name in lower case
 /// and its words joined by `_`, so every document that names one request type names the same entity. Its type is
 /// the one the model wrote, else the only one of `types` that declares the predicate, else the schema's
@@ -1173,19 +1235,27 @@ fn settle(
     };
     // Item ids are always the engine's. Whatever the model writes for an item is a label, local to this
     // reply: a handle (`C1`), a handle with its type in front (`commitment:C1`), or any id it made up or copied
-    // (`commitment:9ec42a3a#1`, `commitment:send-deck`). Each distinct label gets `<type>:<episode>#<n>`.
+    // (`commitment:9ec42a3a#1`, `commitment:send-deck`). Each distinct label gets `<type>:<episode>#<n>`. A label
+    // keeps the type it was written with: told to open items "under a handle like C1, C2", a model numbers each
+    // type from C1, so `objection:C1` and `commitment:C1` are two items, never one.
     let label_of = |s: &str| -> Option<String> {
         if is_handle(s) {
             return Some(s.to_string());
         }
         let (t, rest) = s.split_once(':')?;
-        if !items.contains(t) || rest.is_empty() {
-            return None;
-        }
-        Some(if is_handle(rest) {
-            rest.to_string()
-        } else {
-            s.to_string()
+        (items.contains(t) && !rest.is_empty()).then(|| s.to_string())
+    };
+    // A bare handle the model also wrote with its type in front (`objection:C1`, then `C1`) is that item, where
+    // only one type has it.
+    let resolve = |handles: &HashMap<String, String>, h: &str| -> Option<String> {
+        handles.get(h).cloned().or_else(|| {
+            let mut typed = handles
+                .iter()
+                .filter(|(k, _)| k.split_once(':').is_some_and(|(_, r)| r == h));
+            match (typed.next(), typed.next()) {
+                (Some((_, id)), None) => Some(id.clone()),
+                _ => None,
+            }
         })
     };
     // Items are named in the order the model opened them.
@@ -1199,7 +1269,7 @@ fn settle(
             r["predicate"].as_str().unwrap_or_default(),
         );
         if let Some(h) = label_of(s)
-            && !handles.contains_key(&h)
+            && resolve(&handles, &h).is_none()
             && let Some(ty) = s
                 .split_once(':')
                 .map(|(t, _)| t)
@@ -1243,7 +1313,7 @@ fn settle(
             Value::Null => String::new(),
             x => x.to_string(),
         };
-        let (mut subject, predicate, mut value, quote) = (
+        let (mut subject, mut predicate, mut value, quote) = (
             str_of("subject"),
             str_of("predicate"),
             str_of("value"),
@@ -1258,7 +1328,7 @@ fn settle(
             continue;
         }
         if let Some(h) = label_of(&subject) {
-            let Some(id) = handles.get(&h) else {
+            let Some(id) = resolve(&handles, &h) else {
                 dropped.push(drop(
                     "no_item",
                     format!("{subject} opens no item with {predicate}"),
@@ -1267,8 +1337,8 @@ fn settle(
             };
             subject = id.clone();
         }
-        if let Some(id) = label_of(&value).and_then(|h| handles.get(&h)) {
-            value = id.clone();
+        if let Some(id) = label_of(&value).and_then(|h| resolve(&handles, &h)) {
+            value = id;
         }
         // A doubled type prefix (account:account:hs-1) names the same subject.
         if let Some((a, rest)) = subject.split_once(':')
@@ -1323,11 +1393,22 @@ fn settle(
                 continue;
             }
         }
+        if let Some(ty) = offer.checked.entity_type(&subject) {
+            predicate = offer.stored_as(ty, &predicate).to_string();
+        }
         if let Some(v) = offer
             .checked
             .entity_type(&subject)
             .and_then(|t| offer.checked.predicate(t, &predicate))
             .and_then(|pd| person_ref(&pd, &value, known))
+        {
+            value = v;
+        }
+        if let Some(v) = offer
+            .checked
+            .entity_type(&subject)
+            .and_then(|t| offer.checked.predicate(t, &predicate))
+            .and_then(|pd| named_ref(offer, &named, &pd, &value, known))
         {
             value = v;
         }
@@ -1382,10 +1463,8 @@ fn settle(
         };
         let at = r["at"].as_u64().map(|n| n as usize);
         let Some(unit) = episode_types::locate(units, &quote, at) else {
-            dropped.push(drop(
-                "no_quote",
-                "the quote is in no unit of the episode".into(),
-            ));
+            let (code, why) = missed_quote(units, &quote);
+            dropped.push(drop(code, why.into()));
             continue;
         };
         // At most 300 characters, ending at a word's end.
@@ -1547,6 +1626,41 @@ fn items(value: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Why a quote is in no unit of the episode, in a word a log may carry (never the quote's text): too short to
+/// place (`no_quote_short`), its words in the episode but not as written (`no_quote_reworded`, a paraphrase or
+/// words from several places), or not there (`no_quote_absent`).
+fn missed_quote(units: &[Unit], quote: &str) -> (&'static str, &'static str) {
+    if quote.trim().len() < 12 {
+        return (
+            "no_quote_short",
+            "the quote is too short to place in the episode",
+        );
+    }
+    let said: HashSet<String> = units
+        .iter()
+        .flat_map(|u| {
+            episode_types::squash(&u.text)
+                .split(' ')
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let q = episode_types::squash(quote);
+    let words: Vec<&str> = q.split(' ').filter(|w| !w.is_empty()).collect();
+    let found = words.iter().filter(|w| said.contains(**w)).count();
+    if words.is_empty() || found * 5 < words.len() * 4 {
+        (
+            "no_quote_absent",
+            "the quote's words are not in the episode",
+        )
+    } else {
+        (
+            "no_quote_reworded",
+            "the quote's words are in the episode, but not as written",
+        )
+    }
 }
 
 /// A dropped row as a log names it ([`super::refusal_note`]): why in a word, the predicate, and the subject and

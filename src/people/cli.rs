@@ -338,9 +338,13 @@ pub enum OrgCmd {
         #[arg(long)]
         advice_curation: Option<bool>,
         /// Route advice for sessions a program runs (a harness named `:sdk`: `claude -p`, an SDK run) (default
-        /// false: advice is learned from people's sessions only, so a program's kind of task never has a note)
+        /// true: a program's sessions teach as people's do)
         #[arg(long)]
         advice_automated: Option<bool>,
+        /// Run evals: sessions may name a split (`train` teaches advice by its caller's reward, one run enough for a
+        /// note; `test` reads advice and teaches nothing), and both are routed advice (default false)
+        #[arg(long)]
+        advice_eval: Option<bool>,
         /// Fold each person's own notes into one deduplicated, capped profile that start_session hands them with
         /// their newest few notes, instead of their newest 20 alone (default: the server's AMPUP_MEMORY_PROFILE, off)
         #[arg(long)]
@@ -1187,6 +1191,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             conflicts,
             advice_curation,
             advice_automated,
+            advice_eval,
             profile,
             transcripts,
             instructions,
@@ -1235,6 +1240,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 conflicts: *conflicts,
                 advice_curation: *advice_curation,
                 advice_automated: *advice_automated,
+                advice_eval: *advice_eval,
                 profile: *profile,
                 transcripts: *transcripts,
                 instructions: instructions.clone(),

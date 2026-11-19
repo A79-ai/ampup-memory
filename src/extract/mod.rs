@@ -274,6 +274,20 @@ pub static REFUSED_FACTS: std::sync::LazyLock<prometheus::IntCounterVec> = std::
     },
 );
 
+/// Facts extraction committed, by org (as [`REFUSED_FACTS`] names it): with it, what share of what extraction found
+/// was dropped. Served on `/metrics` as `memstore_extraction_facts_total`.
+pub static EXTRACTED_FACTS: std::sync::LazyLock<prometheus::IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "memstore_extraction_facts_total",
+                "Facts extraction committed, by org",
+            ),
+            &["org"],
+        )
+        .unwrap()
+    });
+
 /// What extraction refused in one scope since the server started, as `/doctor` shows it.
 #[derive(Clone, Default, serde::Serialize)]
 pub struct Refusals {

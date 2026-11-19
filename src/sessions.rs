@@ -110,7 +110,7 @@ pub fn min_evidence(dir: Option<&Directory>, scope: &Scope) -> usize {
 
 /// The people whose runs a team note, and each of its items, is learned from in `scope`
 /// ([`crate::advice`]): its team's or org's `advice_learn_people` setting, else the server's
-/// `AMPUP_MEMORY_ADVICE_LEARN_PEOPLE`, default 3, never below 2. Apart from [`min_evidence`]: an org that serves every
+/// `AMPUP_MEMORY_ADVICE_LEARN_PEOPLE`, default 2, never below 2. Apart from [`min_evidence`]: an org that serves every
 /// note (0 there) still learns no team note from one person's traces.
 pub fn min_learn_people(dir: Option<&Directory>, scope: &Scope) -> usize {
     dir.and_then(|d| d.advice_learn_people(scope))
@@ -118,7 +118,7 @@ pub fn min_learn_people(dir: Option<&Directory>, scope: &Scope) -> usize {
             std::env::var("AMPUP_MEMORY_ADVICE_LEARN_PEOPLE")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(3)
+                .unwrap_or(2)
         })
         .max(2)
 }
@@ -398,6 +398,19 @@ pub async fn start(
         .collect();
     crate::phases::mark("sessions today");
     let harness = text(args, "harness").map(|h| head(h, 40));
+    // An eval's split: `test` anywhere (it only keeps the session from teaching), `train` where the scope runs evals.
+    let split = match text(args, "split").map(str::trim) {
+        None | Some("") => None,
+        Some(TEST) => Some(TEST),
+        Some(TRAIN) if crate::advice::evals(store, scope).await => Some(TRAIN),
+        Some(TRAIN) => {
+            return Err(refuse(format!(
+                "split train needs {scope} to run evals: its admin sets advice_eval to true \
+                 (set_settings {{settings: {{advice_eval: true}}}})"
+            )));
+        }
+        Some(other) => return Err(refuse(format!("split is train or test, not {other:?}"))),
+    };
     // The harness's own id for its conversation: the sessions it splits one conversation into share it.
     let thread = text(args, "thread").map(|t| head(t, MAX_THREAD));
     // The log is the catalog owner's to read: secret-looking words never reach it.
@@ -426,6 +439,7 @@ pub async fn start(
             arm: arm.into(),
             acl: acl.to_vec(),
             thread,
+            split: split.map(String::from),
             ..Default::default()
         }),
         ..Default::default()
@@ -2654,12 +2668,39 @@ pub fn recorded(l: &Logged) -> bool {
         .is_some_and(|h| h.ends_with(RECORDED))
 }
 
-/// Whether session `l` was an automated one ([`AUTOMATED`]): advice learns from people's sessions only.
+/// How the reason of a reward given at a session's end starts (`end_session`'s `reward`), outside an eval's training
+/// split: the agent's own reading of its work, which backs no note alone ([`crate::advice::given`]).
+pub const SAID: &str = "said at its end: ";
+
+/// An eval's training session (`start_session`'s `split`, where the scope runs evals): it teaches advice by the
+/// reward its caller gives at its end, a program's session too.
+pub const TRAIN: &str = "train";
+/// An eval's test session: it reads advice and teaches nothing, so what an eval measures on it is held out.
+pub const TEST: &str = "test";
+
+/// The eval split session `l` was started in ([`TRAIN`] or [`TEST`]), if any.
+pub fn split(l: &Logged) -> Option<&str> {
+    l.session.as_ref().and_then(|s| s.split.as_deref())
+}
+
+/// Whether session `l` teaches advice and is evidence of what a note does: an eval's test session never; any other,
+/// a program's ([`automated`]) as much as a person's. What filters noise is evidence (a reward an outcome or a person
+/// gave), not who ran it: a scheduled `claude -p` agent is the work, and learns as a person's session does.
+pub fn teaches(l: &Logged) -> bool {
+    split(l) != Some(TEST)
+}
+
+/// Whether session `l` was an automated one ([`AUTOMATED`]): a program's, whose words are no person's (nothing kept as
+/// their preferences, no next message of theirs grades it) and which the session judge doesn't read.
 pub fn automated(l: &Logged) -> bool {
     l.session
         .as_ref()
         .and_then(|s| s.harness.as_deref())
-        .is_some_and(|h| h.ends_with(AUTOMATED))
+        .is_some_and(|h| {
+            // Any part of it: a recorder key's session is marked after it (`claude-code:sdk:recorded`, [`RECORDED`]).
+            let mark = AUTOMATED.trim_start_matches(':');
+            h.split(':').skip(1).any(|t| t == mark)
+        })
 }
 
 /// Marks the sessions of `ids` in `scope` automated ([`AUTOMATED`]): ones that ran before their hook named them
@@ -2728,6 +2769,7 @@ pub async fn end(
     }
     // A long outcome never costs the session its end: the episode keeps it whole, the entry its start.
     let outcome = text(args, "outcome");
+    crate::qa_log::caller_reason(text(args, "reason"))?;
     let reward = match &args["reward"] {
         Value::Null => None,
         v => match v.as_f64() {
@@ -2735,6 +2777,18 @@ pub async fn end(
             _ => return Err(refuse("reward is a number from -1 to 1".into())),
         },
     };
+    // An eval's training session teaches by its caller's reward alone: one ended without it is said, not judged.
+    if s.split.as_deref() == Some(TRAIN) && reward.is_none() {
+        eprintln!(
+            "sessions {scope}: eval training session {id} ended {} with no reward: it teaches nothing (end_session \
+             takes the eval's reward, -1 to 1)",
+            if args.is_null() {
+                "idle"
+            } else {
+                "by its agent"
+            }
+        );
+    }
     // A run whose harness kept no transcript (`discard`) ends with nothing to keep, and out of the daily count.
     let discard = args["discard"].as_bool() == Some(true);
     // The transcript given, else the last conversation the session was sent (its episode).
@@ -2804,7 +2858,15 @@ pub async fn end(
     l.answer = outcome.map(|o| head(o, MAX_OUTCOME));
     if reward.is_some() {
         l.reward = reward;
-        l.reward_reason = text(args, "reason").map(|r| head(r, 500));
+        // What an agent says of its own session is its word, not an outcome ([`SAID`]): an eval's training session's
+        // reward is its grader's.
+        let said = if split(&l) == Some(TRAIN) { "" } else { SAID };
+        l.reward_reason = Some(format!(
+            "{said}{}",
+            text(args, "reason")
+                .map(|r| head(r, 500))
+                .unwrap_or_default()
+        ));
     }
     put(store, scope, asker, l.clone());
     Ok(l)
@@ -3723,9 +3785,12 @@ pub async fn sweep(
         // an admin turned learning off, only the sessions that were routed advice are (the evidence for that
         // advice), so a transcript goes to no model for a team that opted out.
         // One that kept nothing has nothing to judge.
-        // A program's session teaches nothing and is no evidence ([`automated`]): its transcript goes to no model.
+        // A program's session goes to no model ([`automated`]): the judge's reading is unchecked, and a program's runs
+        // teach by the rewards outcomes and their callers give. Nor does an eval's ([`split`]): a training session's
+        // caller rewards it, and a test session teaches nothing.
         if discarded(&l)
             || automated(&l)
+            || split(&l).is_some()
             || (!learning && s.served.is_empty() && s.withheld.is_empty())
         {
             continue;
@@ -4041,8 +4106,8 @@ pub async fn evidence(store: &Store, scope: &Scope) -> Result<BTreeMap<String, T
     let mut counted: std::collections::BTreeSet<(String, String)> = Default::default();
     // Newest first.
     for l in list(store, scope).await? {
-        // A program's session (a `claude -p` grader, a probe) is no evidence of what a note does for people.
-        let Some(s) = l.session.as_ref().filter(|_| !automated(&l)) else {
+        // An eval's test session is no evidence of what a note does, held out ([`teaches`]); any other session is.
+        let Some(s) = l.session.as_ref().filter(|_| teaches(&l)) else {
             continue;
         };
         let Some(v) = s

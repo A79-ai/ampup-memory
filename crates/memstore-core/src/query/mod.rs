@@ -954,6 +954,42 @@ impl Exec<'_> {
         Ok(())
     }
 
+    /// Ids as the store holds them. Extraction stores a subject named by what it is as `<type>:<name>`, the name's
+    /// words in lower case joined by `_` ([`schema::named_id`]), so `table:mixpanel_mp_people` holds the facts a
+    /// caller asks for as `table:mixpanel.mp_people`: an id the caller can see no fact about is read as that form
+    /// when the caller can see one there. An id with facts of its own (`contact:sam@acme.com`) is kept as given.
+    async fn as_stored(&self, ids: BTreeSet<String>, time: Time) -> Result<BTreeSet<String>> {
+        let named: Vec<(String, String)> = ids
+            .iter()
+            .filter_map(|id| {
+                schema::named_id(id)
+                    .filter(|n| n != id)
+                    .map(|n| (id.clone(), n))
+            })
+            .collect();
+        if named.is_empty() {
+            return Ok(ids);
+        }
+        let lits = named
+            .iter()
+            .flat_map(|(id, n)| [Lit::Str(id.clone()), Lit::Str(n.clone())])
+            .collect();
+        let held: BTreeSet<String> = self
+            .visible(&Filter::In(Col::Entity, lits), time)
+            .await?
+            .into_iter()
+            .map(|f| f.entity)
+            .collect();
+        let mut ids = ids;
+        for (id, n) in named {
+            if !held.contains(&id) && held.contains(&n) {
+                ids.remove(&id);
+                ids.insert(n);
+            }
+        }
+        Ok(ids)
+    }
+
     /// Facts matching `filter` that the caller may see under `time` (history read when the time
     /// needs it), with backfilled quotes filled in.
     async fn visible(&self, filter: &Filter, time: Time) -> Result<Vec<Fact>> {
@@ -1328,6 +1364,7 @@ impl Exec<'_> {
                 })
                 .cloned()
                 .collect();
+            let ids = self.as_stored(ids, q.time).await?;
             narrow(ids, &mut set);
         }
         if let Some(name) = &q.name {

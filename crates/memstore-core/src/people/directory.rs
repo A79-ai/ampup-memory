@@ -1157,11 +1157,17 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice_curation: Option<bool>,
     /// Whether advice is routed for sessions a program runs (a harness named `:sdk`: `claude -p`, an SDK run, a
-    /// review bot, an eval's generator). Off unless set true: advice is learned from people's sessions only, so a
-    /// program's own kind of task never has a note, and routing its lookups only costs model calls and seconds (on
-    /// a production deployment, over three days, 1,561 of them were served 6).
+    /// review bot, an eval's generator). On unless set false: a program's sessions teach as people's do, so a
+    /// scheduled agent's kind of task has notes of its own. An org whose programs only cost lookups (on a production
+    /// deployment, over three days, 1,561 of them were served 6 while programs taught nothing) turns it off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice_automated: Option<bool>,
+    /// Whether the scope runs evals: its sessions may name a split (`start_session`'s `split`). A `train` session,
+    /// a program's included, teaches advice by the reward its caller gives at its end, and one such run is enough
+    /// for a note, from one person; a `test` session reads advice and teaches nothing. Both are routed advice
+    /// whatever `advice_automated` says. Off unless set true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advice_eval: Option<bool>,
     /// Whether each person's own notes in the scope are folded into one deduplicated, capped profile (the newer
     /// note winning where two disagree), which `start_session` hands them with their newest few notes instead of
     /// only their newest 20 (`memstore::profile`). Unset, the server's `AMPUP_MEMORY_PROFILE` decides (off by default).
@@ -1280,6 +1286,7 @@ impl Settings {
             && self.conflicts.is_none()
             && self.advice_curation.is_none()
             && self.advice_automated.is_none()
+            && self.advice_eval.is_none()
             && self.profile.is_none()
             && self.transcripts.is_none()
             && self.instructions.is_none()
@@ -1389,6 +1396,9 @@ impl Settings {
         }
         if other.advice_automated.is_some() {
             self.advice_automated = other.advice_automated;
+        }
+        if other.advice_eval.is_some() {
+            self.advice_eval = other.advice_eval;
         }
         if other.profile.is_some() {
             self.profile = other.profile;
@@ -2698,9 +2708,15 @@ impl Directory {
     }
 
     /// Whether advice in `scope` is routed for sessions a program runs (`Settings::advice_automated`): its team's
-    /// setting, else its org's; off where neither sets it, and in a scope the directory doesn't hold.
+    /// setting, else its org's; on where neither sets it, and in a scope the directory doesn't hold.
     pub fn advises_automated(&self, scope: &crate::Scope) -> bool {
-        self.setting(scope, |s| s.advice_automated, false)
+        self.setting(scope, |s| s.advice_automated, true)
+    }
+
+    /// Whether `scope` runs evals (`Settings::advice_eval`): its team's setting, else its org's; off where neither
+    /// sets it, and in a scope the directory doesn't hold.
+    pub fn runs_evals(&self, scope: &crate::Scope) -> bool {
+        self.setting(scope, |s| s.advice_eval, false)
     }
 
     /// Whether `scope` folds each person's notes into a profile and hands it at a session's start
@@ -3314,6 +3330,7 @@ impl Change {
                     && settings.conflicts.is_none()
                     && settings.advice_curation.is_none()
                     && settings.advice_automated.is_none()
+                    && settings.advice_eval.is_none()
                     && settings.purge.is_none()
                     && settings.profile.is_none()
                     && settings.transcripts.is_none()
@@ -4141,7 +4158,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             if settings.is_empty() {
                 invalid!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"compile_kind_sources\": [\"<source prefix>\"], \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"digest\": true|false, \"require_mfa\": true|false, \"require_sso\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"compile_kind_sources\": [\"<source prefix>\"], \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"digest\": true|false, \"require_mfa\": true|false, \"require_sso\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"advice_eval\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             if let Some(sources) = &settings.compile_sources {

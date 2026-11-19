@@ -275,6 +275,9 @@ pub(crate) fn entry(l: &Logged) -> Value {
         if let Some(t) = &s.thread {
             v["session"]["thread"] = json!(t);
         }
+        if let Some(t) = &s.split {
+            v["session"]["split"] = json!(t);
+        }
     }
     v
 }

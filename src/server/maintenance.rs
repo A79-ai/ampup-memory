@@ -663,7 +663,10 @@ pub(super) fn start(st: &Arc<State>, c: Config, tick: Duration) {
     let st2 = st.clone();
     st.background("maintenance_window", async move {
         let st = st2;
-        let mut walk = ScopeWalk::default();
+        // A scope it finished with is left out of the next nights until something is committed there (its dream
+        // step waits a day after the last change), or a week has gone by; one with a scheduled purge never is.
+        let mut walk = ScopeWalk::waiting(Duration::from_secs(26 * 3600))
+            .rechecked(Duration::from_secs(7 * 86_400));
         // When the window last finished with each scope, as far as this server knows (read from the scope's
         // episodes table the first time).
         let mut maintained: HashMap<Scope, i64> = HashMap::new();
@@ -712,9 +715,6 @@ async fn pass(
         line(ended, &l);
         first = false;
     }
-    // This cell's scopes, least recently maintained first; those finished earlier tonight (before a restart, or a
-    // lost lease) are not done again.
-    let scopes = walk.next(st, &store).await;
     // Which orgs asked for the scheduled purge: none tonight if the directory can't be read.
     let dir = match crate::people::directory::Directory::load(&store).await {
         Ok(d) => Some(d),
@@ -733,6 +733,12 @@ async fn pass(
             incarnation: org.created_at,
         })
     };
+    // This cell's scopes, least recently maintained first; those finished earlier tonight (before a restart, or a
+    // lost lease) are not done again, nor those settled since nothing changed there (a scheduled purge runs by
+    // the clock: its scopes always are).
+    let scopes = walk
+        .next_keeping(st, &store, &|s: &Scope| purges(s).is_some())
+        .await;
     let mut queue = vec![];
     for scope in scopes {
         let at = match maintained.get(&scope) {
@@ -789,6 +795,7 @@ async fn pass(
                     l["mark_error"] = json!(super::writer::redacted(&e));
                 }
                 maintained.insert(scope.clone(), at);
+                walk.settled(&scope);
                 pause = c.pace;
             }
             // Backed off: the pause doubles, and the scope goes to the back of the queue.

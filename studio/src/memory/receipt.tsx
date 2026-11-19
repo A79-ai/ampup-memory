@@ -22,10 +22,11 @@ export type ReceiptItem = {
   /** The episode it is kept as, once kept: opened from the receipt. */
   episodeId?: string;
   /**
-   * `pending`: kept, still being read for facts. `read`: read. `failed`: the reader gave up on it. `not_read`:
+   * `transcribing`: a recording sent, being transcribed before it is kept. `pending`: kept, still being read for
+   * facts. `read`: read. `failed`: the reader gave up on it. `not_read`:
    * kept, but nothing here reads it for facts. `refused`: not kept at all. `unknown`: not found, or not yours to read.
    */
-  status: "pending" | "read" | "failed" | "not_read" | "refused" | "unknown";
+  status: "transcribing" | "pending" | "read" | "failed" | "not_read" | "refused" | "unknown";
   /** Why it was refused, failed or not read. */
   reason?: string;
   /** False when the same text was already in memory, so nothing new was kept. */
@@ -87,7 +88,8 @@ export function Receipt({
   onDismiss,
 }: ReceiptProps) {
   const kept = items.filter((i) => i.status !== "refused" && i.status !== "unknown");
-  const pending = items.some((i) => i.status === "pending");
+  const transcribing = items.some((i) => i.status === "transcribing");
+  const pending = transcribing || items.some((i) => i.status === "pending");
   // Read, or being read: then extraction is on for it, whatever the receipt was told before.
   const reading = items.some((i) => i.status === "read" || i.status === "pending");
   const unread = kept.length > 0 && kept.every((i) => i.status === "not_read" || i.status === "failed");
@@ -120,7 +122,9 @@ export function Receipt({
       </a>
     );
   const headline = pending
-    ? facts.length
+    ? transcribing && !facts.length
+      ? "Transcribing…"
+      : facts.length
       ? `Learning… ${plural(facts.length, "fact")} so far`
       : "Reading it for facts…"
     : kept.length === 0
@@ -220,7 +224,7 @@ export function Receipt({
               name={
                 i.status === "refused" || i.status === "failed" || i.status === "unknown"
                   ? "alert"
-                  : i.status === "pending"
+                  : i.status === "pending" || i.status === "transcribing"
                     ? "clock"
                     : "doc"
               }
@@ -263,6 +267,8 @@ function itemLine(i: ReceiptItem): string {
       return `not added: ${i.reason ?? "refused"}`;
     case "unknown":
       return "not found, or not yours to read";
+    case "transcribing":
+      return "uploaded; transcribing it…";
     case "pending":
       return i.new === false ? "already in memory; reading…" : "kept; reading it for facts…";
     case "failed":

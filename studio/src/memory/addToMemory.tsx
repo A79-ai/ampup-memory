@@ -16,30 +16,51 @@ const MAX_BYTES = 64 * 1024;
 const TEXT_TYPES = [
   "txt", "text", "md", "markdown", "csv", "tsv", "json", "jsonl", "ndjson", "yaml", "yml", "log",
 ];
-const ACCEPT = TEXT_TYPES.map((t) => `.${t}`).join(",");
-/** Recordings: not read yet, and said so, rather than refused for their size. */
-const MEDIA_TYPES = new Set([
-  "mp4", "mov", "m4v", "webm", "mkv", "avi", "mp3", "wav", "m4a", "aac", "ogg", "oga", "opus", "flac",
-]);
+/** Recordings: sent in parts and transcribed where memstore is set to (it says why not where it isn't). */
+const MEDIA_TYPES = [
+  "mp4", "mov", "m4v", "webm", "mp3", "wav", "m4a", "aac", "ogg", "oga", "opus", "flac",
+];
+const ACCEPT = [...TEXT_TYPES, ...MEDIA_TYPES].map((t) => `.${t}`).join(",");
+/** The bytes in each part of a recording but its last, as memstore's `/learn` takes them (`upload::PART`). */
+const PART = 3 * 1024 * 1024;
+
+const extOf = (name: string) => {
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+};
+const isRecording = (name: string) => MEDIA_TYPES.includes(extOf(name));
 
 /** Why a file isn't sent at all, by its type, before its size: a recording is never "split it". */
 function unreadType(name: string): string | undefined {
-  const dot = name.lastIndexOf(".");
-  const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
-  if (TEXT_TYPES.includes(ext)) return undefined;
-  if (MEDIA_TYPES.has(ext))
-    return "audio and video aren't read yet: add a transcript of it as text instead";
-  return `${ext ? `.${ext} files aren't` : "files without an extension aren't"} read: text, Markdown, CSV, JSON and YAML are`;
+  const ext = extOf(name);
+  if (TEXT_TYPES.includes(ext) || MEDIA_TYPES.includes(ext)) return undefined;
+  return `${ext ? `.${ext} files aren't` : "files without an extension aren't"} read: text, Markdown, CSV, JSON, YAML, audio and video are`;
 }
-/** How often the receipt is read again while extraction runs, and for how long at most. */
+/** How often the receipt is read again while extraction runs, and for how long at most; longer while a recording
+ * is transcribed. */
 const POLL_MS = 1500;
 const POLL_FOR_MS = 3 * 60_000;
+const TRANSCRIBE_POLL_MS = 3000;
+const TRANSCRIBE_FOR_MS = 35 * 60_000;
 
 /** One thing to add, as `/learn` takes it. */
 export type LearnItem =
   | { kind: "file"; name: string; base64: string }
   | { kind: "paste"; name?: string; text: string }
-  | { kind: "answer"; question: string; answer: string };
+  | { kind: "answer"; question: string; answer: string }
+  | { kind: "part"; name: string; size: number; n: number; base64: string; upload_id?: string };
+
+/** A recording sent in parts, as memstore answers its last: transcribing apart, under this id. */
+type Sent = { name: string; upload_id: string };
+
+/** How a recording sent in parts stands (`/learn/status` `uploads`). */
+type Upload = {
+  upload_id: string;
+  status: "transcribing" | "added" | "refused" | "unknown";
+  episode_id?: string;
+  new?: boolean;
+  reason?: string;
+};
 
 type Added = {
   added: {
@@ -53,6 +74,10 @@ type Added = {
     read?: boolean;
   }[];
   refused: { name: string; reason: string }[];
+  /** Parts of a recording taken, the last not yet sent. */
+  uploading?: (Sent & { n: number; parts: number })[];
+  /** Recordings all sent, being transcribed. */
+  transcribing?: Sent[];
   scope: string;
   readers: string;
   extraction: "on" | "off" | "none";
@@ -70,6 +95,7 @@ type Status = {
     known?: ReceiptFact[];
     refused?: { facts: number; why: string };
   }[];
+  uploads?: Upload[];
 };
 
 /** Whether the host's transport can add to the memory and read back what it learned. */
@@ -85,31 +111,56 @@ export const canLearn = () => {
 export const learn = (sel: Selection, items: LearnItem[], whose: "me" | "team" = "me") =>
   call<Added>(sel, "learn", { op: "add", items, for: whose });
 
-/** The receipt of what was added: kept with what has been learned from it so far, read again until it is all read. */
+/** The receipt of what was added: kept with what has been learned from it so far, read again until it is all read.
+ * A recording being transcribed shows as such until it is kept, then as any other item. */
 export function useReceipt(sel: Selection, added: Added | null) {
   const [status, setStatus] = useState<Status | null>(null);
+  const [uploads, setUploads] = useState<Map<string, Upload>>(new Map());
   const [stalled, setStalled] = useState(false);
   const ids = added?.added.map((a) => a.episode_id) ?? [];
-  const key = ids.join(",");
+  const sent = added?.transcribing ?? [];
+  const key = `${ids.join(",")}|${sent.map((t) => t.upload_id).join(",")}`;
   useEffect(() => {
     setStatus(null);
+    setUploads(new Map());
     setStalled(false);
-    if (!ids.length) return;
+    if (!ids.length && !sent.length) return;
     let live = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const started = Date.now();
-    const poll = () =>
-      call<Status>(sel, "learn", { op: "status", episode_ids: ids })
+    const ups = new Map<string, Upload>();
+    const limit = sent.length ? TRANSCRIBE_FOR_MS : POLL_FOR_MS;
+    const every = sent.length ? TRANSCRIBE_POLL_MS : POLL_MS;
+    const poll = () => {
+      const episodeIds = [
+        ...ids,
+        ...[...ups.values()].flatMap((u) => (u.status === "added" && u.episode_id ? [u.episode_id] : [])),
+      ];
+      const uploadIds = sent
+        .map((t) => t.upload_id)
+        .filter((id) => (ups.get(id)?.status ?? "transcribing") === "transcribing");
+      call<Status>(sel, "learn", {
+        op: "status",
+        ...(episodeIds.length ? { episode_ids: episodeIds } : {}),
+        ...(uploadIds.length ? { upload_ids: uploadIds } : {}),
+      })
         .then((s) => {
           if (!live) return;
+          for (const u of s.uploads ?? []) ups.set(u.upload_id, u);
+          setUploads(new Map(ups));
           setStatus(s);
-          if (s.done) return;
-          if (Date.now() - started > POLL_FOR_MS) return setStalled(true);
-          timer = setTimeout(poll, POLL_MS);
+          // A recording just kept: its episode is read about next time.
+          const justKept = (s.uploads ?? []).some(
+            (u) => u.status === "added" && u.episode_id && !episodeIds.includes(u.episode_id),
+          );
+          if (s.done && !justKept) return;
+          if (Date.now() - started > limit) return setStalled(true);
+          timer = setTimeout(poll, every);
         })
         .catch(() => {
-          if (live) timer = setTimeout(poll, POLL_MS * 2);
+          if (live) timer = setTimeout(poll, every * 2);
         });
+    };
     poll();
     return () => {
       live = false;
@@ -118,35 +169,47 @@ export function useReceipt(sel: Selection, added: Added | null) {
   }, [key, sel.org, sel.team]);
   if (!added) return null;
   const byId = new Map(status?.items.map((i) => [i.episode_id, i]));
+  const kept = (name: string, episodeId: string, isNew: boolean, read?: boolean): ReceiptItem => {
+    const s = byId.get(episodeId);
+    const pendingStill = !s || s.status === "pending";
+    return {
+      name,
+      episodeId,
+      new: isNew,
+      status: s ? s.status : (read ?? added.extraction === "on") ? "pending" : "not_read",
+      reason:
+        stalled && pendingStill ? "still waiting to be read: its receipt fills in once it is" : s?.reason,
+      facts: s?.facts ?? [],
+      entities: s?.entities ?? [],
+      known: s?.known ?? [],
+      dropped: s?.refused,
+    };
+  };
+  const refused = (name: string, reason: string): ReceiptItem => ({
+    name,
+    status: "refused",
+    reason,
+    facts: [],
+    entities: [],
+    known: [],
+  });
   const items: ReceiptItem[] = [
-    ...added.added.map((a): ReceiptItem => {
-      const s = byId.get(a.episode_id);
-      const pendingStill = !s || s.status === "pending";
+    ...added.added.map((a) => kept(a.name, a.episode_id, a.new, a.read)),
+    ...sent.map((t): ReceiptItem => {
+      const u = uploads.get(t.upload_id);
+      if (u?.status === "added" && u.episode_id) return kept(t.name, u.episode_id, u.new ?? true);
+      if (u?.status === "refused") return refused(t.name, u.reason ?? "it couldn't be transcribed");
+      if (u?.status === "unknown") return refused(t.name, "its transcription wasn't found: add it again");
       return {
-        name: a.name,
-        episodeId: a.episode_id,
-        new: a.new,
-        status: s ? s.status : (a.read ?? added.extraction === "on") ? "pending" : "not_read",
-        reason:
-          stalled && pendingStill
-            ? "still waiting to be read: its receipt fills in once it is"
-            : s?.reason,
-        facts: s?.facts ?? [],
-        entities: s?.entities ?? [],
-        known: s?.known ?? [],
-        dropped: s?.refused,
-      };
-    }),
-    ...added.refused.map(
-      (r): ReceiptItem => ({
-        name: r.name,
-        status: "refused",
-        reason: r.reason,
+        name: t.name,
+        status: "transcribing",
+        reason: stalled ? "still transcribing: add it again later if it doesn't show" : undefined,
         facts: [],
         entities: [],
         known: [],
-      }),
-    ),
+      };
+    }),
+    ...added.refused.map((r) => refused(r.name, r.reason)),
   ];
   // Stalled: shown as kept, not spinning forever.
   const shown = stalled
@@ -155,8 +218,56 @@ export function useReceipt(sel: Selection, added: Added | null) {
   return {
     items: shown,
     extraction: status?.extraction ?? added.extraction,
-    stalled: stalled && items.some((i) => i.status === "pending"),
+    stalled: stalled && items.some((i) => i.status === "pending" || i.status === "transcribing"),
   };
+}
+
+/** A blob's bytes in base64. */
+function base64Of(b: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const url = String(r.result ?? "");
+      resolve(url.slice(url.indexOf(",") + 1));
+    };
+    r.onerror = () => reject(new Error("it couldn't be read"));
+    r.readAsDataURL(b);
+  });
+}
+
+/** Send a recording in parts (each tried twice), saying how far it has got: answered with what it is transcribed
+ * as, or why it was refused. */
+async function sendRecording(
+  sel: Selection,
+  f: File,
+  whose: "me" | "team",
+  progress: (n: number, of: number) => void,
+): Promise<{ transcribing: Sent } | { refused: { name: string; reason: string } }> {
+  const parts = Math.max(1, Math.ceil(f.size / PART));
+  let uploadId: string | undefined;
+  for (let n = 0; n < parts; n++) {
+    progress(n + 1, parts);
+    let base64: string;
+    try {
+      base64 = await base64Of(f.slice(n * PART, (n + 1) * PART));
+    } catch {
+      return { refused: { name: f.name, reason: "it couldn't be read" } };
+    }
+    const item: LearnItem = {
+      kind: "part",
+      name: f.name,
+      size: f.size,
+      n,
+      base64,
+      ...(uploadId ? { upload_id: uploadId } : {}),
+    };
+    const a = await learn(sel, [item], whose).catch(() => learn(sel, [item], whose));
+    if (a.refused.length) return { refused: { name: f.name, reason: a.refused[0]!.reason } };
+    if (a.transcribing?.length) return { transcribing: a.transcribing[0]! };
+    uploadId = a.uploading?.[0]?.upload_id;
+    if (!uploadId) return { refused: { name: f.name, reason: "it wasn't taken: add it again" } };
+  }
+  return { refused: { name: f.name, reason: "it didn't finish uploading: add it again" } };
 }
 
 /** A file as `/learn` takes it (its bytes in base64), or why it isn't sent at all. */
@@ -199,6 +310,7 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
   const [whose, setWhose] = useState<"me" | "team">("me");
   const [over, setOver] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<string>();
   const [error, setError] = useState<string>();
   const [added, setAdded] = useState<Added | null>(null);
   const picker = useRef<HTMLInputElement>(null);
@@ -206,9 +318,11 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
 
   const take = (list: FileList | null) => {
     if (!list?.length) return;
+    // Copied now: the picker's list is emptied (to pick the same file again) before React runs the update.
+    const picked = [...list];
     setFiles((fs) => [
       ...fs,
-      ...[...list].filter((f) => !fs.some((g) => g.name === f.name && g.size === f.size)),
+      ...picked.filter((f) => !fs.some((g) => g.name === f.name && g.size === f.size)),
     ]);
   };
 
@@ -216,16 +330,26 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
     setBusy(true);
     setError(undefined);
     try {
-      const read = await Promise.all(files.map(readFile));
+      const read = await Promise.all(files.filter((f) => !isRecording(f.name)).map(readFile));
       const items: LearnItem[] = read.filter((r): r is LearnItem => "kind" in r);
       const refusedHere = read
         .filter((r): r is { refused: string; name: string } => "refused" in r)
         .map((r) => ({ name: r.name, reason: r.refused }));
+      // Recordings one at a time, in parts.
+      const transcribing: Sent[] = [];
+      for (const f of files.filter((f) => isRecording(f.name))) {
+        const r = await sendRecording(sel, f, whose, (n, of) =>
+          setProgress(of > 1 ? `Uploading ${f.name}: ${n} of ${of}…` : `Uploading ${f.name}…`),
+        );
+        if ("transcribing" in r) transcribing.push(r.transcribing);
+        else refusedHere.push(r.refused);
+      }
+      setProgress(undefined);
       if (text.trim()) items.push({ kind: "paste", text });
       const answer: Added = items.length
         ? await learn(sel, items, whose)
         : { added: [], refused: [], scope: "", readers: "", extraction: "on" };
-      setAdded({ ...answer, refused: [...answer.refused, ...refusedHere] });
+      setAdded({ ...answer, transcribing, refused: [...answer.refused, ...refusedHere] });
       setFiles([]);
       setText("");
       onAdded?.();
@@ -233,6 +357,7 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
       setError(errorText(e));
     } finally {
       setBusy(false);
+      setProgress(undefined);
     }
   };
 
@@ -247,8 +372,8 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
           <div>
             <div className="learn-title">{title}</div>
             <div className="muted learn-sub">
-              Drop in notes, docs or exports, or paste text. It is read for facts right away, and you
-              see what was learned.
+              Drop in notes, docs, exports or recordings, or paste text. It is read for facts right
+              away, and you see what was learned.
             </div>
           </div>
         </div>
@@ -280,7 +405,8 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
             <strong>Drop files here</strong> or click to choose
           </span>
           <span className="muted learn-types">
-            Text, Markdown, CSV, JSON or YAML, up to {MAX_BYTES / 1024} KB each
+            Text, Markdown, CSV, JSON or YAML, up to {MAX_BYTES / 1024} KB each, or an audio or
+            video recording to transcribe
           </span>
           <input
             ref={picker}
@@ -300,7 +426,11 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
               <li key={`${f.name}${f.size}`} className="chip">
                 <Icon name="doc" size={12} />
                 {f.name}
-                <span className="chip-type">{Math.max(1, Math.round(f.size / 1024))} KB</span>
+                <span className="chip-type">
+                  {f.size >= 1024 * 1024
+                    ? `${(f.size / (1024 * 1024)).toFixed(1)} MB`
+                    : `${Math.max(1, Math.round(f.size / 1024))} KB`}
+                </span>
                 <button
                   type="button"
                   className="learn-x"
@@ -351,7 +481,7 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
             disabled={empty || busy}
             onClick={submit}
           >
-            <Icon name="play" size={13} /> {busy ? "Adding…" : "Add to memory"}
+            <Icon name="play" size={13} /> {busy ? (progress ?? "Adding…") : "Add to memory"}
           </button>
         </div>
       </section>

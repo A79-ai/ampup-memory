@@ -460,6 +460,7 @@ fn reward_of(reward: &Value, reason: &Value) -> Result<(f64, Option<String>)> {
         return Err(refuse("reward is a number from -1 to 1".into()));
     };
     let reason = reason.as_str().map(str::trim).filter(|r| !r.is_empty());
+    crate::qa_log::caller_reason(reason)?;
     if reason.is_some_and(|r| r.chars().count() > MAX_REASON) {
         return Err(refuse(format!("reason is at most {MAX_REASON} characters")));
     }

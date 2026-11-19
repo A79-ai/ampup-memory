@@ -122,7 +122,7 @@ pub(super) struct Filed {
 /// the same text was already there (the same episode). Refuses the whole request (a [`ToolError`]) only when it
 /// isn't one: no items, too many, or `for` neither "me" nor "team".
 pub(super) async fn add(
-    state: &State,
+    state: &std::sync::Arc<State>,
     store: &Store,
     scope: &Scope,
     who: &Principal,
@@ -148,13 +148,26 @@ pub(super) async fn add(
             return Err(ToolError(format!("for is \"me\" or \"team\", not {other:?}")).into());
         }
     };
-    let author = hex(&sha2::Sha256::digest(who.user().as_bytes())[..4]);
+    let author = author_of(who);
     let (mut added, mut refused) = (vec![], vec![]);
+    let (mut uploading, mut transcribing) = (vec![], vec![]);
     // Each kept, as extraction will see it, to say whether anything reads it.
     let mut kept: Vec<Episode> = vec![];
     let mut readers = String::new();
     let mut fresh = false;
     for raw in items {
+        // A piece of a recording sent in parts ([`super::upload`]): kept until the last, then transcribed apart.
+        if raw["kind"].as_str() == Some("part") {
+            match super::upload::part(state, store, scope, who, whose, &author, raw).await {
+                Ok(super::upload::Part::Uploading(v)) => uploading.push(v),
+                Ok(super::upload::Part::Transcribing(v)) => transcribing.push(v),
+                Err(e) => match e.downcast_ref::<ToolError>() {
+                    Some(m) => refused.push(json!({"name": item_name(raw), "reason": m.0})),
+                    None => return Err(e),
+                },
+            }
+            continue;
+        }
         let item = match read(raw) {
             Ok(i) => i,
             Err(why) => {
@@ -166,7 +179,7 @@ pub(super) async fn add(
             (Some(rec), _) => file_recording(state, store, scope, who, whose, &author, rec).await,
             (None, Some((ext, bytes))) => {
                 file_media(
-                    state, store, scope, who, whose, &author, &item.name, ext, bytes,
+                    state, store, scope, who, whose, &author, &item.name, ext, bytes, None,
                 )
                 .await
             }
@@ -209,6 +222,8 @@ pub(super) async fn add(
     Ok(json!({
         "added": added,
         "refused": refused,
+        "uploading": uploading,
+        "transcribing": transcribing,
         "scope": scope.to_string(),
         "readers": readers,
         "extraction": mode,
@@ -340,7 +355,7 @@ pub(super) async fn file_recording(
 /// and one where the file was already here. What the transcriber refuses, or a file it hears no speech in, is
 /// refused (a [`ToolError`]); a transcript over [`MAX_TEXT`] too, though it was paid for.
 #[allow(clippy::too_many_arguments)]
-async fn file_media(
+pub(super) async fn file_media(
     state: &State,
     store: &Store,
     scope: &Scope,
@@ -350,6 +365,7 @@ async fn file_media(
     name: &str,
     ext: &str,
     bytes: &[u8],
+    within: Option<std::time::Duration>,
 ) -> Result<Filed> {
     let mut rec = Recording {
         name: name.to_string(),
@@ -371,7 +387,10 @@ async fn file_media(
         return Err(ToolError(NOT_TRANSCRIBED.into()).into());
     };
     let started = std::time::Instant::now();
-    let heard = t.transcribe(ext, bytes).await;
+    let heard = match within {
+        Some(w) => t.transcribe_within(ext, bytes, w).await,
+        None => t.transcribe(ext, bytes).await,
+    };
     let took = started.elapsed().as_secs_f64();
     let heard = match heard {
         Ok(h) => h,
@@ -459,13 +478,28 @@ pub(super) async fn status(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    if ids.is_empty() {
-        return Err(ToolError("body is {episode_ids: [...]}".into()).into());
+    let upload_ids: Vec<String> = args["upload_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+        .map(String::from)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if ids.is_empty() && upload_ids.is_empty() {
+        return Err(ToolError("body is {episode_ids: [...], upload_ids?: [...]}".into()).into());
     }
-    if ids.len() > MAX_STATUS {
+    if ids.len() > MAX_STATUS || upload_ids.len() > MAX_STATUS {
         return Err(ToolError(format!("at most {MAX_STATUS} episodes a request")).into());
     }
     let scope = session.scope().clone();
+    // Recordings sent in parts, as their transcription stands (an episode id once filed).
+    let uploads = super::upload::states(store, &scope, &author_of(who), &upload_ids).await?;
+    let uploads_done = uploads.iter().all(|u| u["status"] != "transcribing");
+    if ids.is_empty() {
+        return Ok(json!({"done": uploads_done, "items": [], "uploads": uploads}));
+    }
     let vis = session.vis();
     let seen: Vec<String> = ids
         .iter()
@@ -647,7 +681,9 @@ pub(super) async fn status(
     if pending && !state.writer.holds() {
         fresh(store, &scope);
     }
-    Ok(json!({"done": !pending, "extraction": mode, "items": items}))
+    Ok(
+        json!({"done": !pending && uploads_done, "extraction": mode, "items": items, "uploads": uploads}),
+    )
 }
 
 /// The current facts citing any of `ids` that `who` may read, notes' own facts aside: a column scan for each id,
@@ -823,30 +859,13 @@ fn read(v: &Value) -> std::result::Result<Item, String> {
 
 /// A recording's file as sent (base64), if this server transcribes it: Err is why not.
 fn read_media(v: &Value, ext: &str) -> std::result::Result<Vec<u8>, String> {
-    match &*crate::transcribe::TRANSCRIBER {
-        Ok(Some(_)) => {}
-        Ok(None) => return Err(NOT_TRANSCRIBED.into()),
-        Err(_) => {
-            return Err(
-                "this server is set to transcribe audio and video but can't yet: add a transcript of it as text \
-                 instead"
-                    .into(),
-            );
-        }
-    }
-    if !TRANSCRIBED.contains(&ext) {
-        return Err(format!(
-            ".{ext} recordings aren't transcribed: {} are",
-            TRANSCRIBED.map(|t| format!(".{t}")).join(", ")
-        ));
-    }
+    transcribes(ext)?;
     let Some(b) = v["base64"].as_str().map(str::trim) else {
         return Err("a recording's file is sent as base64".into());
     };
     let too_big = |n: usize| {
         format!(
-            "it's {:.1} MB: a recording of at most {} MB is transcribed here for now; a larger one will be \
-             uploaded on its own, which isn't here yet",
+            "it's {:.1} MB: a recording over {} MB is sent in parts (kind \"part\")",
             n as f64 / (1 << 20) as f64,
             MAX_MEDIA >> 20
         )
@@ -944,7 +963,7 @@ fn read_recording(v: &Value, name: &str) -> std::result::Result<Recording, Strin
 }
 
 /// An item's name as given (a file's, without its folders), else a name for its kind.
-fn item_name(v: &Value) -> String {
+pub(super) fn item_name(v: &Value) -> String {
     let given = v["name"].as_str().unwrap_or_default();
     let base = given.rsplit(['/', '\\']).next().unwrap_or_default();
     let clean: String = base
@@ -1044,6 +1063,65 @@ fn recording_filed(rec: &Recording, author: &str) -> (String, String) {
         format!("{}:{digest}", crate::origin::RECORDED),
         format!("{DOCUMENTS}{author}/recording/{digest}"),
     )
+}
+
+/// Who added something, as their documents are filed: a hash of who they are.
+pub(super) fn author_of(who: &Principal) -> String {
+    hex(&sha2::Sha256::digest(who.user().as_bytes())[..4])
+}
+
+/// Whether this server transcribes recordings of type `ext`: Err is why not, as the person adding one is told.
+pub(super) fn transcribes(ext: &str) -> std::result::Result<(), String> {
+    match &*crate::transcribe::TRANSCRIBER {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(NOT_TRANSCRIBED.into()),
+        Err(_) => {
+            return Err(
+                "this server is set to transcribe audio and video but can't yet: add a transcript of it as text \
+                 instead"
+                    .into(),
+            );
+        }
+    }
+    if !TRANSCRIBED.contains(&ext) {
+        return Err(format!(
+            ".{ext} recordings aren't transcribed: {} are",
+            TRANSCRIBED.map(|t| format!(".{t}")).join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Have extraction read `f`, filed after its request was answered (a recording transcribed apart), as `/learn`
+/// does for what it adds: said in the ledger where it is new and something reads it.
+pub(super) async fn wake_for(store: &Store, scope: &Scope, who: &Principal, f: &Filed) {
+    if !f.new {
+        return;
+    }
+    let mut ep = Episode::new(&super::provenance(who, &f.source), b"", &[]);
+    ep.episode_id = f.id.clone();
+    ep.document = Some(f.key.clone());
+    match to_read(store, scope, &[ep]).await {
+        Ok(r) if r.is_empty() => {}
+        Ok(_) => {
+            let actor = format!("{}{}", crate::extract::ADDED_WAKE, who.user());
+            match store.commit_record(scope, &actor, &[]).await {
+                Ok(_) => WAKE.notify_one(),
+                Err(e) => eprintln!("learn: {scope}'s extraction couldn't be woken: {e:#}"),
+            }
+        }
+        Err(e) => eprintln!(
+            "learn: whether {scope} reads {} couldn't be told: {e:#}",
+            f.id
+        ),
+    }
+}
+
+/// Extension of `name`, lowercased.
+pub(super) fn ext_of(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 fn hex(b: &[u8]) -> String {

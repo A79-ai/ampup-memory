@@ -241,6 +241,50 @@ Reply with JSON only:
 {"aliases":[{"names":["N1","N3"],"main":"N1","why":"..."}]}
 "#;
 
+/// The decisions model's check of an ending the sweep proposed, about a state of `thing`, `older` and `newer`, each
+/// `attribute`, `value` and `day`.
+pub const GATE_ENDS: &str = "The newer fact replaces the older one. Both answer the same question about this thing (the attribute may be named differently, or the question written into the value), they give different answers, and someone asking that question now should get only the newer answer: a new value, a moved date, a changed plan, setting or decision. Not so when the older is a record of something that happened on its day (a step taken, a result, an event), which stays true after a later one; when both are items of a list the thing keeps together (people, requirements, issues, steps, features); when the newer adds to the older; or when they answer different questions.";
+
+/// How likely the decisions model must find an ending ([`GATE_ENDS`]) for it to apply rather than wait for a person:
+/// `AMPUP_MEMORY_DREAM_CHECK` (default 0.6; `off` for none). On a production deployment's sales memory, checked
+/// against labels, 0.6 sent 15% of endings to a person, caught two thirds of the wrong ones and held back 5% of the
+/// right ones. Links aren't checked: on them the model told right from wrong little better than chance.
+const GATE_MIN: f64 = 0.6;
+
+/// The decisions model on the extraction's route ([`crate::decide::Decider::on_extraction_route`]: the memory goes
+/// nowhere extraction doesn't send it) and the bar an ending must clear, or none.
+fn ending_check() -> Option<(crate::decide::Decider, f64)> {
+    let min = match std::env::var("AMPUP_MEMORY_DREAM_CHECK")
+        .ok()
+        .map(|v| v.trim().to_string())
+    {
+        Some(v) if v.eq_ignore_ascii_case("off") => return None,
+        Some(v) if !v.is_empty() => match v.parse::<f64>() {
+            Ok(m) if (0.0..=1.0).contains(&m) => m,
+            _ => {
+                eprintln!(
+                    "dream: AMPUP_MEMORY_DREAM_CHECK is off or a number in [0, 1], not {v:?}; using {GATE_MIN}"
+                );
+                GATE_MIN
+            }
+        },
+        _ => GATE_MIN,
+    };
+    match crate::decide::Decider::on_extraction_route() {
+        Ok(Some(d)) => Some((d, min)),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("dream: no decisions model to check endings: {e:#}");
+            None
+        }
+    }
+}
+
+/// One fact as the decisions model sees it: its attribute, value and day.
+fn side(f: &Fact) -> Value {
+    json!({"attribute": f.predicate, "value": flat(&f.value, VALUE_CHARS), "day": day(f.valid_from)})
+}
+
 /// What one pass may spend.
 #[derive(Clone, Debug)]
 pub struct Budget {
@@ -415,6 +459,12 @@ pub struct Report {
     pub aliased: usize,
     /// Decisions the model was unsure of: recorded and waiting for a person, applied to no one yet ([`WAITING_ACL`]).
     pub waiting: usize,
+    /// Endings the decisions model checked ([`GATE_ENDS`]) and those it gave no answer for (they apply as the sweep
+    /// decided), and of the checked ones that passed the code's rules, those it didn't find likely enough: they wait
+    /// for a person, and count in `waiting`.
+    pub checked: usize,
+    pub gated: usize,
+    pub unchecked: usize,
     /// Records released: what they rest on is gone for their audience.
     pub released: usize,
     /// Parts of things and names recorded as weighed.
@@ -482,6 +532,7 @@ impl Report {
             "dreamer": self.dreamer, "new_facts": self.new_facts, "audiences": self.audiences.len(),
             "things": self.things, "clusters": self.clusters,
             "calls": self.calls, "failed": self.failed, "left": self.left, "ended": self.ended,
+            "checked": self.checked, "gated": self.gated, "unchecked": self.unchecked,
             "linked": self.linked, "aliased": self.aliased, "waiting": self.waiting, "refused": self.refused,
             "released": self.released,
             "recorded": self.recorded, "commits": self.commits,
@@ -1481,6 +1532,7 @@ async fn run_inner(
         audiences.truncate(budget.audiences);
     }
 
+    let gate_model = ending_check();
     // What each audience would weigh: its parts of things and its name clusters with a new fact, in calls.
     // The same facts are weighed once a pass: a wider audience's decision holds for the narrower one too.
     let mut judged: HashSet<Vec<&str>> = HashSet::new();
@@ -1502,6 +1554,7 @@ async fn run_inner(
             ids: &ids,
             now,
             disputed: &disputed,
+            gate: gate_model.as_ref(),
         };
         let weigh: Vec<&Fact> = open.iter().copied().filter(|f| v.weighable(f)).collect();
         let shown: Vec<&Fact> = weigh
@@ -1797,6 +1850,8 @@ struct Audience<'a> {
     now: i64,
     /// The facts recorded in conflict with another ([`crate::conflicts`]), by id.
     disputed: &'a HashMap<&'a str, &'a Fact>,
+    /// The decisions model that checks each ending, and how likely it must find one to let it apply ([`ending_check`]).
+    gate: Option<&'a (crate::decide::Decider, f64)>,
 }
 
 impl Audience<'_> {
@@ -2253,9 +2308,47 @@ async fn run_sweep<'a>(
             handles.get(n.checked_sub(1)?).copied()
         };
         let why = |x: &Value| flat(x["why"].as_str().unwrap_or_default(), 200);
+        // The decisions model checks each ending the sweep was sure of: one it doesn't find likely enough waits for
+        // a person. One it gives no answer for applies as the sweep decided.
+        let ends: Vec<&Value> = reply["ends"].as_array().into_iter().flatten().collect();
+        let mut checked: HashMap<usize, f64> = HashMap::new();
+        if let Some((decider, _)) = cx.gate {
+            let asks: Vec<(usize, Value)> = ends
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e["unsure"] != true)
+                .filter_map(|(i, e)| {
+                    let ((_, old), (_, by)) = (pick(&e["old"])?, pick(&e["by"])?);
+                    Some((i, json!({"thing": id_words(&by.entity), "older": side(old), "newer": side(by)})))
+                })
+                .collect();
+            let answers = futures::future::join_all(asks.iter().map(|(_, state)| {
+                decider.decide(
+                    state,
+                    vec![(
+                        "q".into(),
+                        crate::decide::Question::Likely(GATE_ENDS.into()),
+                    )],
+                )
+            }))
+            .await;
+            for ((i, _), a) in asks.iter().zip(answers) {
+                match a.map(|mut m| m.remove("q")) {
+                    Ok(Some(a)) => {
+                        checked.insert(*i, a.likely());
+                        report.checked += 1;
+                    }
+                    Ok(None) => report.unchecked += 1,
+                    Err(e) => {
+                        eprintln!("dream {}: an ending went unchecked: {e:#}", cx.scope);
+                        report.unchecked += 1;
+                    }
+                }
+            }
+        }
         // Units that hit the cap on endings: weighed again by the next pass, with what this one ended gone.
         let mut capped: HashSet<usize> = HashSet::new();
-        for e in reply["ends"].as_array().into_iter().flatten() {
+        for (i, e) in ends.iter().copied().enumerate() {
             let (Some((ta, old)), Some((tb, by))) = (pick(&e["old"]), pick(&e["by"])) else {
                 report.refused += 1;
                 continue;
@@ -2280,16 +2373,29 @@ async fn run_sweep<'a>(
             }
             *n += 1;
             writes.ended.insert(old.fact_id.clone());
-            let unsure = e["unsure"] == true;
-            let body = json!({"dream": cx.reader, "kind": "ends", "audience": cx.entry,
+            let check = checked.get(&i).copied();
+            let gated = check.is_some_and(|p| cx.gate.is_some_and(|(_, min)| p < *min));
+            let unsure = e["unsure"] == true || gated;
+            let mut body = json!({"dream": cx.reader, "kind": "ends", "audience": cx.entry,
                               "old": old.fact_id, "by": by.fact_id, "at": now_micros()});
+            let mut reason = why(e);
+            if let Some(p) = check {
+                body["check"] = json!(p);
+            }
+            if gated {
+                report.gated += 1;
+                reason = format!(
+                    "{reason} (a check found this {:.0}% likely, so a person decides)",
+                    check.unwrap_or_default() * 100.0
+                );
+            }
             let record = writes.record(
                 cx.entry,
                 key,
                 body,
                 by.valid_from,
                 unsure,
-                &why(e),
+                &reason,
                 &[old, by],
             );
             // A waiting decision's closure cites its record too: it applies to whoever may read that, no one until
@@ -2306,7 +2412,8 @@ async fn run_sweep<'a>(
             }
             report.decisions.push(json!({
                 "kind": "ends", "audience": cx.entry, "old": line(old), "by": line(by),
-                "valid_to": day(by.valid_from), "why": why(e), "record": record, "waiting": unsure,
+                "valid_to": day(by.valid_from), "why": reason, "record": record, "waiting": unsure,
+                "check": check,
             }));
         }
         for s in reply["same"].as_array().into_iter().flatten() {

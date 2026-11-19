@@ -174,6 +174,18 @@ impl Writer {
     }
 }
 
+/// `<type>:<name>` as extraction stores a subject named by what it is: the name's words in lower case, joined by
+/// `_` (`table:Mixpanel.MP_People` is `table:mixpanel_mp_people`). None for an id with no type or no words.
+pub fn named_id(id: &str) -> Option<String> {
+    let (ty, name) = id.trim().split_once(':')?;
+    let words: Vec<String> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    (!ty.is_empty() && !words.is_empty()).then(|| format!("{ty}:{}", words.join("_")))
+}
+
 /// `extract.outcomes`: every episode (`true`), none (`false`, the default), or the episodes whose source starts
 /// with one of the prefixes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -328,6 +340,12 @@ pub struct PredicateDef {
     /// (`memstore::dream`) never ends one; an item dropped is said by a fact of its own. It changes no read.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub list: bool,
+    /// In an episode type's catalog: the predicate this one means on a schema that declares its type (an
+    /// objection's `concern` is a schema's `text`). Where the scope's schema declares that predicate, extraction
+    /// offers the model this one only (its description is the catalog's guidance) and stores what it writes as
+    /// the schema's, so one thing is written once, under the schema's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_as: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -672,6 +690,7 @@ impl Schema {
             plan: false,
             pending: vec![],
             list: false,
+            same_as: None,
         };
         match predicate {
             NAME => Some(plain(Card::One)),

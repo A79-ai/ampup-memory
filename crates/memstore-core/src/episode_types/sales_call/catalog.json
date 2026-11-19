@@ -191,7 +191,8 @@
      "type": "ref",
      "to": [
       "deal"
-     ]
+     ],
+     "same_as": "about"
     }
    }
   },
@@ -200,7 +201,8 @@
    "predicates": {
     "concern": {
      "type": "string",
-     "description": "a concern or doubt the prospect raises, including doubts phrased as questions (setup effort, seat flexibility) and stated risks"
+     "description": "a concern or doubt the prospect raises, including doubts phrased as questions (setup effort, seat flexibility) and stated risks",
+     "same_as": "text"
     },
     "category": {
      "type": "enum",
@@ -223,7 +225,8 @@
      "type": "ref",
      "to": [
       "deal"
-     ]
+     ],
+     "same_as": "about"
     },
     "response": {
      "type": "string",

@@ -252,7 +252,8 @@
   .receipt-item.is-failed .icon {
     color: var(--error);
   }
-  .receipt-item.is-pending .icon {
+  .receipt-item.is-pending .icon,
+  .receipt-item.is-transcribing .icon {
     color: var(--warn);
   }
   .receipt-item-name {

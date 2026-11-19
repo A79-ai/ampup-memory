@@ -142,6 +142,10 @@ pub struct SessionPart {
     /// conversation was split into (at a compaction, or after it went idle) share it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
+    /// Where an eval runs it (`start_session`'s `split`): `train`, which teaches advice by the reward its caller
+    /// gives, or `test`, which reads advice and teaches nothing ([`crate::sessions::split`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<String>,
 }
 
 /// Records an answer, or (with `answer_id`) rates one `who` logged before. Returns its id.
@@ -507,7 +511,8 @@ pub async fn reward_all(
     label: Option<&str>,
 ) -> Result<()> {
     let refuse = |m: String| -> anyhow::Error { Refused(m).into() };
-    for (i, (_, r, _, person)) in rewards.iter().enumerate() {
+    for (i, (_, r, reason, person)) in rewards.iter().enumerate() {
+        caller_reason(*reason).map_err(|e| of_item(label, i, e))?;
         if !(-1.0..=1.0).contains(r) {
             return Err(of_item(
                 label,
@@ -566,6 +571,26 @@ pub async fn reward_all(
 /// How a reviewer's reward's reason starts ([`review`]): a person who read the trace graded it, neither its
 /// recorder nor a model.
 pub const REVIEWED: &str = "reviewed: ";
+
+/// Refuses a reason a caller gives a reward that starts as the server marks its own ([`REVIEWED`], [`JUDGED`],
+/// [`crate::sessions::SAID`]): what a reward's reason starts with says who gave it, so a caller writing one could pass
+/// its own reward off as a reviewer's.
+pub fn caller_reason(reason: Option<&str>) -> Result<()> {
+    match reason.map(str::trim_start) {
+        Some(r)
+            if [REVIEWED, JUDGED, crate::sessions::SAID]
+                .iter()
+                .any(|m| r.starts_with(m)) =>
+        {
+            Err(crate::runs::Refused(format!(
+                "a reason may not start with {:?}: the server marks its own so",
+                &r[..r.find(':').map_or(0, |i| i + 1)]
+            ))
+            .into())
+        }
+        _ => Ok(()),
+    }
+}
 /// Longest reason a reviewer gives, in characters.
 const REVIEW_REASON: usize = 500;
 
@@ -796,7 +821,7 @@ fn decode(rows: &[arrow_array::RecordBatch]) -> Vec<Row> {
         let (conversation, verdicts, acl) = (oo("conversation"), oo("verdicts"), oo("acl"));
         let (ended_by, fires, branch) = (oo("ended_by"), oo("fires"), oo("branch"));
         let (served_versions, lookups, prs) = (oo("served_versions"), oo("lookups"), oo("prs"));
-        let thread = oo("thread");
+        let (thread, split) = (oo("thread"), oo("split"));
         let ended = if has("ended_at") {
             timestamps(b, "ended_at")
         } else {
@@ -862,6 +887,7 @@ fn decode(rows: &[arrow_array::RecordBatch]) -> Vec<Row> {
                             .and_then(|v| serde_json::from_str(v).ok())
                             .unwrap_or_default(),
                         thread: thread[i].clone(),
+                        split: split[i].clone(),
                     }),
                 },
             });
@@ -1067,6 +1093,7 @@ impl StoreQaLog for Store {
                     }),
                 ),
                 ("thread", opt(&|l| sp(l, &|s| s.thread.clone()))),
+                ("split", opt(&|l| sp(l, &|s| s.split.clone()))),
             ],
             OnConflict::Recommit,
         )

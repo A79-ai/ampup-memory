@@ -87,6 +87,17 @@ impl Transcriber {
     /// `bytes`, a media file of type `ext` (its name's extension), as a transcript. Err is why it couldn't be, as a
     /// person adding it would be told.
     pub async fn transcribe(&self, ext: &str, bytes: &[u8]) -> Result<Transcript, String> {
+        self.transcribe_within(ext, bytes, self.timeout).await
+    }
+
+    /// [`Self::transcribe`], allowed `timeout` rather than the configured one: a recording transcribed after its
+    /// request was answered (`crate::server` `upload`) isn't held to a request's time.
+    pub async fn transcribe_within(
+        &self,
+        ext: &str,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> Result<Transcript, String> {
         // A multipart form by hand: the model, speakers told apart, and the file under a name of its type alone
         // (what the person called it isn't sent).
         let boundary = format!("memstore-{:016x}", rand::random::<u64>());
@@ -109,7 +120,7 @@ impl Transcriber {
         body.extend_from_slice(bytes);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let client = reqwest::Client::builder()
-            .timeout(self.timeout)
+            .timeout(timeout)
             .build()
             .map_err(|e| format!("transcription isn't available here: {e}"))?;
         let r = client
@@ -125,7 +136,7 @@ impl Transcriber {
             .map_err(|e| match e.is_timeout() {
                 true => format!(
                     "transcribing it took longer than {} s: try a shorter recording",
-                    self.timeout.as_secs()
+                    timeout.as_secs()
                 ),
                 false => format!("the transcription service couldn't be reached: {e}"),
             })?;

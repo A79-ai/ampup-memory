@@ -25,10 +25,13 @@ name: Release
 # Every archive carries LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt: the licenses of every crate linked into the
 # binaries, ONNX Runtime's and the embedding model's, kept current by .github/scripts/third-party-notices.sh.
 #
-# Platforms: Linux x86_64 and arm64 (glibc 2.39 or newer: built on Ubuntu 24.04), Apple Silicon macOS and Intel
-# macOS (13.4 or newer). The Intel build is cross-compiled on the Apple Silicon runner, its ONNX Runtime built from
-# source (.github/scripts/onnxruntime-x86_64-apple-darwin.sh, cached), as ort ships no prebuilt library for Intel
-# Macs; it is checked there under Rosetta, and installed on an Intel runner.
+# Platforms: Linux x86_64 and arm64 (glibc 2.39 or newer: built on Ubuntu 24.04) and Apple Silicon macOS. Intel
+# macOS (13.4 or newer) is built only when its ONNX Runtime can be: ort ships no prebuilt library for Intel Macs, so
+# .github/scripts/onnxruntime-x86_64-apple-darwin.sh builds one from github.com/microsoft/onnxruntime, and that
+# repository answers 404 since 2026-11-18, which failed every release (the publish job needs every build). The Intel
+# build is off until the source is reachable again: put its two matrix entries back (build, and macos-15-intel under
+# verify) and it is cross-compiled on the Apple Silicon runner, checked there under Rosetta and installed on an Intel
+# runner, as before. v0.2.3 is the last release with an Intel macOS build.
 #
 # macOS builds are signed with a Developer ID and notarized when the signing secrets are set
 # (.github/scripts/macos-sign.sh names them); without them they're unsigned, and install.sh clears the quarantine
@@ -64,7 +67,8 @@ jobs:
           - { target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
           - { target: aarch64-apple-darwin, runner: macos-15 }
-          - { target: x86_64-apple-darwin, runner: macos-15 }
+          # Intel macOS is off while ONNX Runtime's source is unreachable (the header says how to put it back):
+          # - { target: x86_64-apple-darwin, runner: macos-15 }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: What this release is
@@ -287,7 +291,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15] # and macos-15-intel with the Intel build (header)
     # As a stranger installs it: install.sh from this tag, downloading from this repository's public releases with
     # no token.
     env:

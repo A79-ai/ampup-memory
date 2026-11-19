@@ -86,11 +86,21 @@ struct Words {
 impl Words {
     fn of(query: &str, hits: &[search::Hit]) -> Self {
         let asked = search::stems(query);
+        // A type is named by a word of its own (`meetings`), never by a word inside an identifier: asking about
+        // `legacy.events_v1` or `fct_daily_events` is asking about a table, not for events first.
+        let plain = search::stems(
+            &query
+                .split_whitespace()
+                .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+                .filter(|w| !w.contains(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-'))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
         let mut type_stems = HashSet::new();
         let mut types = HashSet::new();
         for t in hits.iter().filter_map(|h| type_of(&h.fact.entity)) {
             let s = search::stems(&t.replace('_', " "));
-            if !s.is_empty() && s.is_subset(&asked) {
+            if !s.is_empty() && s.is_subset(&plain) {
                 types.insert(t.to_string());
             }
             type_stems.extend(s);

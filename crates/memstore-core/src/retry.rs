@@ -54,6 +54,15 @@ pub fn is_transient(e: &anyhow::Error) -> bool {
         .any(|m| text.contains(m))
 }
 
+/// A file of a table that is no longer there because a compaction deleted it: a rewrite's sweep deletes the files
+/// of the snapshots it replaced as soon as its swap lands, so a table loaded just before then (by another server)
+/// names manifest lists, manifests and data files that are gone. Loaded again, the table names the compacted ones.
+/// Object stores answer it as not found (opendal's `NotFound`, S3's `NoSuchKey`).
+pub fn is_swept(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}");
+    text.contains("NotFound (persistent)") || text.contains("NoSuchKey")
+}
+
 /// A rate limit or spent quota (BigLake's catalog answers a burst of calls with 429 RESOURCE_EXHAUSTED).
 pub fn is_throttled(e: &anyhow::Error) -> bool {
     is_throttled_text(&format!("{e:#}"))

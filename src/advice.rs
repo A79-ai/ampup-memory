@@ -808,6 +808,18 @@ fn min_right() -> usize {
         .max(2)
 }
 
+/// Runs of a situation an outcome or a person rewarded (not only the judge, nor the agent's own word) that are enough
+/// for a note, whichever way they went (`AMPUP_MEMORY_ADVICE_BACKED_RUNS`, default 2): two runs of a kind of task with
+/// a real reward teach, where runs only a model read wait for [`min_right`]. A team note still needs its people
+/// ([`crate::sessions::min_learn_people`]).
+fn backed_runs() -> usize {
+    std::env::var("AMPUP_MEMORY_ADVICE_BACKED_RUNS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
 /// Whether a written note is rewritten now: its procedures changed, or it has enough new backed runs or new backed
 /// wrong runs since it was last written. Runs only a model read never call for one ([`judged`]). `sooner`: a
 /// person's own note where their scope asks for fewer ([`personal_runs`]), which lowers both bars to it.
@@ -833,6 +845,15 @@ pub async fn personal_runs(store: &Store, scope: &Scope) -> Option<usize> {
         Ok(d) => d.dir.advice_personal_runs(scope, personal_runs_from_env()),
         Err(_) => personal_runs_from_env(),
     }
+}
+
+/// Whether `scope` runs evals (`advice_eval`): a `train` session's caller reward is its outcome, and one such run is
+/// enough for a note, the team's included ([`crate::sessions::split`]).
+pub async fn evals(store: &Store, scope: &Scope) -> bool {
+    store
+        .directory()
+        .await
+        .is_ok_and(|d| d.dir.runs_evals(scope))
 }
 
 /// The server's `AMPUP_MEMORY_ADVICE_PERSONAL_RUNS`, where no team or org setting says ([`personal_runs`]).
@@ -998,6 +1019,9 @@ struct Run {
     at: i64,
     /// Whether someone gave it its reward ([`given`]), not only a model's reading of it.
     given: bool,
+    /// Whether it is an eval's training session ([`crate::sessions::TRAIN`]): only a situation whose runs all are
+    /// takes an eval's bars ([`evals`]).
+    train: bool,
 }
 
 /// A rewarded run's reward and the advice it was served, for what later came of a note
@@ -1401,6 +1425,7 @@ async fn runs_and_overrides(
             // What became of the PRs a session opened, the surest reward it can have: it teaches as a whole.
             let pr = pr_outcome(&l);
             let given = given(&l);
+            let train = crate::sessions::split(&l) == Some(crate::sessions::TRAIN);
             // A person who read the whole trace graded it (`crate::qa_log::review`): it teaches as a whole too.
             let reviewed = crate::qa_log::reviewed(&l);
             // A session graded request by request teaches by each request the person's next move graded, in
@@ -1461,6 +1486,12 @@ async fn runs_and_overrides(
                 }
                 (_, Some(r), _) if reviewed => (r, Source::Person, l.reward_reason),
                 (Some("run"), Some(r), _) if !judged => (r, Source::Outcome, l.reward_reason),
+                // An eval's training session: its caller's reward is the eval's grader, not the agent's word.
+                (_, Some(r), _)
+                    if !judged && crate::sessions::split(&l) == Some(crate::sessions::TRAIN) =>
+                {
+                    (r, Source::Outcome, l.reward_reason)
+                }
                 (_, _, Some(rating)) => {
                     // The words they rated it with (`reward_run` with `by: "person"`), where they gave some.
                     let why = l
@@ -1496,6 +1527,7 @@ async fn runs_and_overrides(
                 advice,
                 at: l.asked_at,
                 given,
+                train,
             }]
         })
         .collect();
@@ -1504,18 +1536,32 @@ async fn runs_and_overrides(
 
 /// Whether a learn sorts `l` ([`runs`]): rewarded, rated or graded request by request, and not a session with no
 /// task or no transcript (one ended before its task was kept, or with nothing asked), which would be sorted by
-/// nothing and teach nothing, or an automated one (a `claude -p` reviewer, a probe, an eval's generator), no
-/// person's work.
+/// nothing and teach nothing, or an eval's test session, held out ([`crate::sessions::teaches`]). A program's session
+/// sorts once an outcome or a person backs its reward ([`program_backed`]): what it teaches rests on that evidence,
+/// never on the program's word for itself.
 pub(crate) fn sorts(l: &crate::qa_log::Logged) -> bool {
     (l.reward.is_some() || l.rating.is_some() || graded(l).is_some() || pr_outcome(l).is_some())
         && ((l.session.is_none() && l.kind.as_deref() != Some(crate::sessions::KIND))
             || ((crate::sessions::an_ask(&l.question) || graded(l).is_some())
                 && !l.episodes.is_empty()
-                && !crate::sessions::automated(l)))
+                && crate::sessions::teaches(l)
+                && (!crate::sessions::automated(l) || program_backed(l))))
+}
+
+/// Whether a program's session ([`crate::sessions::automated`]) is backed well enough to teach: an eval's training
+/// session (its grader's reward), or one an outcome or a reviewer rewarded (what became of its PRs, an admin's
+/// review). Its own agent's reward, a caller's on the session, a rating or the judge's never are: the program runs
+/// with its person's credentials and can say anything of itself, as often as it runs, so runs only it could have
+/// vouched for would write the team's notes.
+fn program_backed(l: &crate::qa_log::Logged) -> bool {
+    crate::sessions::split(l) == Some(crate::sessions::TRAIN)
+        || pr_outcome(l).is_some()
+        || crate::qa_log::reviewed(l)
 }
 
 /// Whether the reward `l` teaches by was given by someone, not only read by the engine's judge (a reason starting
-/// `judged: `): a caller's reward (`reward_run`, `end_session`'s, the hooks' `outcome`), a person's rating, review or
+/// `judged: `) or said by the agent of its own session as it ended ([`crate::sessions::SAID`]): a caller's reward
+/// (`reward_run`, an eval's training `end_session`, the hooks' `outcome`), a person's rating, review or
 /// next message, or what became of its PRs. Where a scope asks for a person's own advice at one run
 /// ([`personal_runs`]), only such a run brings it forward: one model's reading of one run backs no note.
 pub(crate) fn given(l: &crate::qa_log::Logged) -> bool {
@@ -1524,10 +1570,9 @@ pub(crate) fn given(l: &crate::qa_log::Logged) -> bool {
         || l.rating.is_some()
         || graded(l).is_some()
         || (l.reward.is_some()
-            && !l
-                .reward_reason
-                .as_deref()
-                .is_some_and(|w| w.starts_with(crate::qa_log::JUDGED)))
+            && !l.reward_reason.as_deref().is_some_and(|w| {
+                w.starts_with(crate::qa_log::JUDGED) || w.starts_with(crate::sessions::SAID)
+            }))
 }
 
 /// What became of the PRs session `l` opened or pushed to, as its reward and why ([`crate::session_prs::outcome`]).
@@ -1629,6 +1674,7 @@ fn task_runs(l: &crate::qa_log::Logged, body: &str, graded: &[(usize, usize, boo
                 at: l.asked_at,
                 // The person's own next message graded it.
                 given: true,
+                train: crate::sessions::split(l) == Some(crate::sessions::TRAIN),
             })
         })
         .collect()
@@ -4283,6 +4329,10 @@ async fn learn_space(
     // The team's notes are written from what enough people did ([`crate::sessions::min_learn_people`], at least
     // two, whatever the scope's serving bar), each item from runs of that many; a person's own, from that person
     // alone.
+    // Where the scope runs evals ([`evals`]), an eval's training runs are rewarded by its grader and one evaluator
+    // runs them: a situation whose runs all are training runs takes a note from one rewarded run of one person. Any
+    // other run (a person's session in the same scope) keeps the scope's bars, so it never writes a team note alone.
+    let eval = evals(store, scope).await;
     let min_people = if space.owner.is_some() {
         1
     } else {
@@ -4307,10 +4357,19 @@ async fn learn_space(
         None => None,
     };
     for ((c, s), rs) in &groups {
+        let trained = eval && rs.iter().all(|r| r.train);
+        let min_people = if trained { 1 } else { min_people };
+        let sooner = if trained { Some(1) } else { sooner };
         let sooner = sooner.filter(|n| *n > 1 || rs.iter().any(|r| r.given));
         let bar = |b: usize| sooner.map_or(b, |n| b.min(n));
         let wrong = rs.iter().filter(|r| !r.right).count();
-        if wrong < bar(min_wrong.max(1)) && rs.len() - wrong < bar(min_right()) {
+        // Enough runs: that many wrong ones or right ones, or a few that an outcome or a person rewarded, whichever
+        // way they went ([`backed_runs`]): a model's reading alone never brings a note sooner.
+        let backed = rs.iter().filter(|r| !judged(r)).count();
+        if wrong < bar(min_wrong.max(1))
+            && rs.len() - wrong < bar(min_right())
+            && backed < bar(backed_runs())
+        {
             done.too_few += 1;
             continue;
         }

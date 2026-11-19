@@ -50,6 +50,7 @@ mod routing;
 mod signin;
 pub mod studio;
 mod unsubscribe;
+mod upload;
 pub mod writer;
 
 /// Rebuild the catalog this often (`AMPUP_MEMORY_CATALOG_REFRESH_SECS`, default 300): inside SPCS its session
@@ -584,6 +585,7 @@ pub async fn serve_with(
     metrics.register(Box::new(crate::extract::MODEL_TOKENS.clone()));
     metrics.register(Box::new(crate::limits::UNATTRIBUTED.clone()));
     metrics.register(Box::new(crate::extract::REFUSED_FACTS.clone()));
+    metrics.register(Box::new(crate::extract::EXTRACTED_FACTS.clone()));
     metrics.register(Box::new(crate::search::embed_cache::LOOKUPS.clone()));
     metrics.register(Box::new(crate::extract::cache::CALLS.clone()));
     metrics.register(Box::new(crate::metrics::STORE_COMMIT_FAILURES.clone()));
@@ -850,7 +852,14 @@ pub async fn serve_with(
         };
         let bg = st.clone();
         bg.background("sessions", async move {
-            let mut walk = ScopeWalk::default();
+            // Its work waits on timers after a scope's last change: a session ends idle, so a changed scope is gone
+            // over every five minutes for twice the idle time. A profile is folded a day after the last, a note it
+            // cites gone (aged out of its retention, which no commit shows) is let go and notes are dreamed over
+            // once a day: a settled scope is gone over hourly.
+            let hour = Duration::from_secs(3600);
+            let mut walk = ScopeWalk::waiting((crate::sessions::idle() * 2).max(hour))
+                .every(Duration::from_secs(300))
+                .rechecked(hour);
             loop {
                 tokio::time::sleep(every).await;
                 if !st.writer.holds() {
@@ -872,6 +881,7 @@ pub async fn serve_with(
                         && ((st.fixed() && scope == st.scope)
                             || dir.as_ref().is_some_and(|d| d.learns_advice(&scope)));
                     let signed = |asker: &str| format!("{REMEMBER_SOURCE}:{asker}:");
+                    let mut settled = true;
                     match crate::sessions::sweep(
                         &store,
                         &scope,
@@ -883,6 +893,7 @@ pub async fn serve_with(
                     .await
                     {
                         Ok(d) if d.ended + d.judged + d.graded + d.unrewarded > 0 => {
+                            settled = false;
                             eprintln!(
                                 "sessions {scope}: {} ended idle, {} judged, {} graded by request, \
                                  {} judge's rewards dropped that their verdicts no longer gave",
@@ -890,11 +901,19 @@ pub async fn serve_with(
                             )
                         }
                         Ok(_) => {}
-                        Err(e) => eprintln!("sessions {scope}: {e:#}"),
+                        Err(e) => {
+                            settled = false;
+                            eprintln!("sessions {scope}: {e:#}")
+                        }
                     }
                     // People's profiles due a fold: a day since the last, or a note it cites gone.
-                    if let Err(e) = crate::profile::sweep(&store, &scope, st.fixed()).await {
-                        eprintln!("profile {scope}: {e:#}");
+                    match crate::profile::sweep(&store, &scope, st.fixed()).await {
+                        Ok(0) => {}
+                        Ok(_) => settled = false,
+                        Err(e) => {
+                            settled = false;
+                            eprintln!("profile {scope}: {e:#}");
+                        }
                     }
                     // People's own advice, right after their sessions, where the scope learns advice and asks for
                     // it sooner: in the background, so the sweep never waits on the learning model.
@@ -923,6 +942,9 @@ pub async fn serve_with(
                     // People's notes due a dream (`crate::notes_dream`): looked at hourly, a pass in the background.
                     crate::notes_dream::sweep(&store, &scope, st.fixed());
                     drop(_org);
+                    if settled {
+                        walk.settled(&scope);
+                    }
                 }
             }
         });
@@ -1029,7 +1051,10 @@ pub async fn serve_with(
         let ast = state.clone();
         let ready = settled.clone();
         state.background("aggregate", async move {
-            let mut walk = ScopeWalk::default();
+            // A subject's summary waits for a full batch or a long wait (an hour unless its schema says); what an
+            // aging out of retention takes away is summarised again at the hourly pass.
+            let mut walk = ScopeWalk::waiting(Duration::from_secs(26 * 3600))
+                .rechecked(Duration::from_secs(3600));
             let mut last: std::collections::HashMap<Scope, std::time::Instant> = Default::default();
             loop {
                 tokio::time::sleep(every.max(Duration::from_secs(60)).min(pass)).await;
@@ -1053,15 +1078,17 @@ pub async fn serve_with(
                 use futures::StreamExt;
                 // A scope a reader's refresh is summarising is skipped, not waited on (a refresh can be
                 // several model calls long, holding a slot the other scopes need), and tried at the next tick.
-                let busy: Vec<Scope> = futures::stream::iter(scopes)
+                // Each scope either busy (tried again at the next tick) or gone over, with whether nothing was left.
+                let done: Vec<Result<(Scope, bool), Scope>> = futures::stream::iter(scopes)
                     .map(|scope| async move {
                         if !lease.holds() {
-                            return Some(scope);
+                            return Err(scope);
                         }
                         // Not while its org may ask no model (`crate::limits`): summarised at a later pass.
                         if crate::limits::paused(scope.org_name()) {
-                            return Some(scope);
+                            return Err(scope);
                         }
+                        let mut quiet = true;
                         let org = scope.org_name().map(String::from);
                         // What enough people each said in their own memory, shared with everyone in it.
                         if crate::keep::on()
@@ -1071,6 +1098,7 @@ pub async fn serve_with(
                             )
                             .await
                         {
+                            quiet = false;
                             eprintln!("sharing what people said in {scope} failed: {e:#}");
                         }
                         let due = crate::aggregate::When::Due;
@@ -1078,22 +1106,33 @@ pub async fn serve_with(
                             store, &scope, agg, due, None, None,
                         );
                         match crate::log_org::with(org.as_deref(), run).await {
-                            None => return Some(scope),
-                            Some(Ok(r)) if r.subjects + r.failed > 0 => eprintln!(
-                                "aggregated {scope}: {} subjects, {} rows, {} failed",
-                                r.subjects, r.rows, r.failed
-                            ),
+                            None => return Err(scope),
+                            Some(Ok(r)) if r.subjects + r.failed > 0 => {
+                                quiet = false;
+                                eprintln!(
+                                    "aggregated {scope}: {} subjects, {} rows, {} failed",
+                                    r.subjects, r.rows, r.failed
+                                )
+                            }
                             Some(Ok(_)) => {}
-                            Some(Err(e)) => eprintln!("aggregation of {scope} failed: {e:#}"),
+                            Some(Err(e)) => {
+                                quiet = false;
+                                eprintln!("aggregation of {scope} failed: {e:#}")
+                            }
                         }
-                        None
+                        Ok((scope, quiet))
                     })
                     .buffer_unordered(parallel)
-                    .filter_map(|s| async move { s })
                     .collect()
                     .await;
-                for s in busy {
-                    last.remove(&s);
+                for d in done {
+                    match d {
+                        Err(busy) => {
+                            last.remove(&busy);
+                        }
+                        Ok((s, true)) => walk.settled(&s),
+                        Ok(_) => {}
+                    }
                 }
             }
         });
@@ -1124,7 +1163,10 @@ pub async fn serve_with(
                 let dst = state.clone();
                 let ready = settled.clone();
                 state.background("dream", async move {
-                    let mut walk = ScopeWalk::default();
+                    // A pass waits for its gate after the scope's last change; what an aging out of retention takes
+                    // from under a dream is let go at the hourly look.
+                    let mut walk = ScopeWalk::waiting(gate.every + Duration::from_secs(3600))
+                        .rechecked(Duration::from_secs(3600));
                     loop {
                         tokio::time::sleep(Duration::from_secs(3600).min(gate.every)).await;
                         if !dst.writer.holds() {
@@ -1149,6 +1191,9 @@ pub async fn serve_with(
                             let tick = crate::dream::tick(&store, &scope, &dx, &gate);
                             match crate::log_org::with(scope.org_name(), tick).await {
                                 Ok(r) => {
+                                    if r.skipped && r.released == 0 {
+                                        walk.settled(&scope);
+                                    }
                                     if !r.skipped || r.released > 0 {
                                         eprintln!(
                                             "dreamed over {scope}: {} new facts, {} calls ({} failed, {} left), {} \
@@ -1262,21 +1307,23 @@ pub async fn serve_with(
                 // A few scopes at a time, each with its own budget of episodes per round: an org with a
                 // backlog holds one slot while the others go on in the rest.
                 use futures::StreamExt;
-                let done: Vec<(usize, usize, usize)> = futures::stream::iter(scopes)
+                // Each scope's round, and whether it found nothing left to read there.
+                let done: Vec<(usize, usize, usize, Option<Scope>)> = futures::stream::iter(scopes)
                     .map(|scope| async move {
                         let (mut read, mut down, mut waiting) = (0, 0, 0);
                         if !lease.holds() {
-                            return (read, down, waiting);
+                            return (read, down, waiting, None);
                         }
                         // Its org past its model allowance or its expiry (`crate::limits`): its episodes wait,
                         // unread and not given up, for the month to turn or the allowance to be raised.
                         if crate::limits::paused(scope.org_name()) {
-                            return (read, down, waiting);
+                            return (read, down, waiting, None);
                         }
                         // What was just added there is being read: this round comes back to it next time.
                         let Some(_turn) = crate::extract::try_turn(&scope) else {
-                            return (read, down, waiting);
+                            return (read, down, waiting, None);
                         };
+                        let mut quiet = true;
                         // The org's (or team's) extraction model, where the operator chose one.
                         let ex = &match dir.as_ref().and_then(|d| d.model(&scope, |s| s.extract_model.as_ref())) {
                             Some(m) => ex.with_model(&m),
@@ -1291,6 +1338,7 @@ pub async fn serve_with(
                         match round {
                             Ok(r) => {
                                 if r.episodes + r.failed > 0 {
+                                    quiet = false;
                                     // Facts found and every one refused: an error, not a quiet round.
                                     eprintln!(
                                         "{}extracted {scope}: {} episodes, {} facts ({} refused by the schema), {} ended, {} in conflict, {} failed ({} with the API down)",
@@ -1298,12 +1346,17 @@ pub async fn serve_with(
                                         r.episodes, r.facts, r.refused, r.closed, r.conflicts, r.failed, r.unavailable
                                     );
                                 }
+                                // Labelled by an org the directory holds, else `-`, and refusals by why (a drop's
+                                // code, one of a set the engine names).
+                                let org = scope
+                                    .org_name()
+                                    .filter(|o| dir.as_ref().is_some_and(|d| d.orgs.contains_key(*o)));
+                                if r.facts > 0 {
+                                    crate::extract::EXTRACTED_FACTS
+                                        .with_label_values(&[org.unwrap_or("-")])
+                                        .inc_by(r.facts as u64);
+                                }
                                 if r.refused > 0 {
-                                    // Labelled by an org the directory holds, else `-`, and by why (a drop's code,
-                                    // one of a set the engine names).
-                                    let org = scope.org_name().filter(|o| {
-                                        dir.as_ref().is_some_and(|d| d.orgs.contains_key(*o))
-                                    });
                                     for (reason, n) in &r.refused_by {
                                         crate::extract::REFUSED_FACTS
                                             .with_label_values(&[org.unwrap_or("-"), reason])
@@ -1314,7 +1367,10 @@ pub async fn serve_with(
                                 down += r.unavailable;
                                 waiting += r.episodes + r.failed;
                             }
-                            Err(e) => eprintln!("extraction of {scope} failed: {e:#}"),
+                            Err(e) => {
+                                quiet = false;
+                                eprintln!("extraction of {scope} failed: {e:#}")
+                            }
                         }
                         // Its sessions' own branches, where its org gives each session one.
                         if scope.org_name().is_some_and(|o| {
@@ -1324,6 +1380,7 @@ pub async fn serve_with(
                             match crate::log_org::with(scope.org_name(), tend).await {
                                 Ok(t) => {
                                     if t.extracted > 0 || !t.merged.is_empty() {
+                                        quiet = false;
                                         eprintln!(
                                             "session branches of {scope}: {} episodes extracted, merged {:?}",
                                             t.extracted, t.merged
@@ -1331,16 +1388,24 @@ pub async fn serve_with(
                                     }
                                     read += t.extracted;
                                 }
-                                Err(e) => eprintln!("session branches of {scope} failed: {e:#}"),
+                                Err(e) => {
+                                    quiet = false;
+                                    eprintln!("session branches of {scope} failed: {e:#}")
+                                }
                             }
                         }
-                        (read, down, waiting)
+                        (read, down, waiting, quiet.then_some(scope))
                     })
                     .buffer_unordered(parallel)
                     .collect()
                     .await;
+                for (_, _, _, s) in &done {
+                    if let Some(s) = s {
+                        walk.settled(s);
+                    }
+                }
                 let (read, down, waiting) =
-                    done.iter().fold((0, 0, 0), |(r, d, w), (r2, d2, w2)| {
+                    done.iter().fold((0, 0, 0), |(r, d, w), (r2, d2, w2, _)| {
                         (r + r2, d + d2, w + w2)
                     });
                 crate::metrics::EXTRACTION_BACKLOG.set(waiting as i64);
@@ -1412,6 +1477,7 @@ pub async fn serve_with(
                         continue;
                     }
                     let _org = LogOrg::of(&scope);
+                    let mut quiet = true;
                     // The org's (or team's) models, where the operator chose them (`set_settings`).
                     let cx = scoped_models(&cx, dir.as_ref(), &scope);
                     // Its batch size and what its sources are, where its admins said (`set_settings`): a group
@@ -1430,6 +1496,7 @@ pub async fn serve_with(
                         {
                             Ok(r) => {
                                 if r.episodes + r.failed > 0 {
+                                    quiet = false;
                                     eprintln!(
                                         "compiled {scope} ({}): {} sources, {} skills, {} AIP graphs ({} dropped), {} failed ({} with the API down)",
                                         sources.join(","),
@@ -1444,8 +1511,14 @@ pub async fn serve_with(
                                 read += r.episodes;
                                 down += r.unavailable;
                             }
-                            Err(e) => eprintln!("compiling {scope} failed: {e:#}"),
+                            Err(e) => {
+                                quiet = false;
+                                eprintln!("compiling {scope} failed: {e:#}")
+                            }
                         }
+                    }
+                    if quiet {
+                        walk.settled(&scope);
                     }
                 }
                 wait = if down > 0 && read == 0 {
@@ -1484,7 +1557,8 @@ pub async fn serve_with(
         let lst = state.clone();
         lst.background("runs", async move {
             let mut wait = every;
-            let mut walk = ScopeWalk::default();
+            // Runs nobody rewarded wait a while before the judge reads them.
+            let mut walk = ScopeWalk::waiting(Duration::from_secs(26 * 3600));
             let mut tried: HashMap<Scope, std::collections::BTreeSet<String>> = HashMap::new();
             loop {
                 tokio::time::sleep(wait).await;
@@ -1522,6 +1596,9 @@ pub async fn serve_with(
                             }
                             answered |= r.answered();
                             down |= r.unavailable();
+                            if !r.did() && !r.unavailable() {
+                                walk.settled(&scope);
+                            }
                         }
                         Err(e) => eprintln!("advice {scope}: failed: {e:#}"),
                     }
@@ -1606,6 +1683,8 @@ pub async fn serve_with(
             );
             let lst = state.clone();
             lst.background("auto_review", async move {
+                // What it decides comes with commits (proposals, main moving under a held one): nothing waits on a
+                // timer.
                 let mut walk = ScopeWalk::default();
                 let mut asked: HashMap<Scope, std::collections::HashSet<(String, String)>> =
                     HashMap::new();
@@ -1635,7 +1714,7 @@ pub async fn serve_with(
                             Ok(r) if r.approved + r.rejected + r.unanswered + r.renewed > 0 => {
                                 eprintln!("auto review {scope}: {r:?}")
                             }
-                            Ok(_) => {}
+                            Ok(_) => walk.settled(&scope),
                             Err(e) => eprintln!("auto review {scope}: failed: {e:#}"),
                         }
                     }
@@ -1702,8 +1781,24 @@ pub async fn serve_with(
                                     eprintln!("maintained {table}: {before} -> {after} snapshots");
                                 }
                             }
+                            // Snapshots come with commits: none since, none to expire. The system tables are
+                            // the round's first scope's to take along, whichever it is.
+                            walk.settled(&scope);
                         }
                         Err(e) => eprintln!("maintaining {scope} failed: {e:#}"),
+                    }
+                }
+                // Every scope settled: the system tables still get their round.
+                if system {
+                    match store.maintain_system(keep, 2 * keep).await {
+                        Ok(tables) => {
+                            for (table, before, after) in tables {
+                                if before != after {
+                                    eprintln!("maintained {table}: {before} -> {after} snapshots");
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("maintaining the system tables failed: {e:#}"),
                     }
                 }
                 compaction::observe(&st, &compact).await;
@@ -1793,6 +1888,10 @@ pub async fn serve_with(
             tokio::time::sleep(Duration::from_secs(60)).await;
             if let Some(r) = crate::loads::report() {
                 eprintln!("catalog in the last minute: {r}");
+            }
+            let walks = walks_report();
+            if !walks.is_empty() {
+                eprintln!("background rounds, scopes gone over: {walks}");
             }
         }
     });
@@ -4622,9 +4721,42 @@ fn warm_days() -> i64 {
 /// Workspaces past their time to live and orgs being purged are left out. A server that identifies no one
 /// takes nothing from the directory (it serves its own scope), except its live workspaces with
 /// `--workspaces`. Each round starts one scope further along, so no org is always last.
-#[derive(Default)]
+///
+/// Only scopes with something to go over: one nothing was ever committed to (in the ledger, which every server
+/// reads anyway) is left out without a catalog read, and so is one this loop went over and found nothing left
+/// to do in ([`ScopeWalk::settled`]) until it changes: a commit there, its org's or team's settings, or, for a
+/// loop whose work waits on a timer, not before it has stood unchanged for that loop's `horizon`. A sign-up
+/// that never writes costs the loops nothing, however many there are, and an idle org nothing once each loop
+/// has been over it. Each quiet scope is looked at again anyway after a while (`recheck`, spread), in case
+/// something the version doesn't show (a model back after an outage, an episode aging out of its retention) left
+/// it work. A scope settles only once its version is older than the cache's hard staleness limit (and a margin):
+/// a pass sooner may have read another server's tables from before the change the version shows.
 struct ScopeWalk {
     round: usize,
+    /// How long a scope's version must have stood before this loop may find it settled.
+    horizon: Duration,
+    /// How long a settled scope is left alone at most: between this and twice it, spread.
+    recheck: Duration,
+    /// For a loop with a horizon: how often a scope with nothing to do is gone over until then (None: every
+    /// round).
+    soon: Option<Duration>,
+    /// How old a version must be before a pass can have read every table as of it (the cache's hard staleness
+    /// limit and a margin), from the store at each round.
+    floor: Duration,
+    /// Each scope's version as this walk last handed it out, and since when it has had it (µs since the epoch).
+    seen: HashMap<Scope, (Version, i64)>,
+    /// Scopes this loop found nothing to do in: at which version, and until when they are left alone.
+    quiet: HashMap<Scope, (Version, Instant)>,
+}
+
+/// What a scope's version is made of: its ledger rows (how many, the newest's time) and its settings, which say
+/// what the loops do there (compiling, learning advice, models).
+type Version = (u64, i64, u64);
+
+impl Default for ScopeWalk {
+    fn default() -> Self {
+        ScopeWalk::waiting(Duration::ZERO)
+    }
 }
 
 /// This server's search index updates, one at a time: two updating a scope's index at once undo each other's
@@ -4667,9 +4799,93 @@ impl Drop for Indexing {
 }
 
 impl ScopeWalk {
+    /// A walk for a loop whose work in a scope can wait on a timer after its last change (a session ends idle, a
+    /// dream once a day): a scope settles only once its version has stood for `horizon`.
+    fn waiting(horizon: Duration) -> Self {
+        ScopeWalk {
+            round: 0,
+            horizon,
+            recheck: Duration::from_secs(6 * 3600),
+            soon: None,
+            floor: Duration::from_secs(180),
+            seen: HashMap::new(),
+            quiet: HashMap::new(),
+        }
+    }
+
+    /// Settled scopes left alone for `recheck` to twice it.
+    fn rechecked(mut self, recheck: Duration) -> Self {
+        self.recheck = recheck;
+        self
+    }
+
+    /// Until the horizon, a scope gone over with nothing to do is gone over again only every `every`.
+    fn every(mut self, every: Duration) -> Self {
+        self.soon = Some(every);
+        self
+    }
+
+    /// This loop went over `scope` (handed out by the last [`ScopeWalk::next`]) and found nothing left to do: it
+    /// is left out until its version changes, if that version has stood for the horizon.
+    fn settled(&mut self, scope: &Scope) {
+        let Some((version, since)) = self.seen.get(scope) else {
+            return;
+        };
+        let stood = Duration::from_micros((crate::now_micros() - since).max(0) as u64);
+        // Too soon after the change for this pass to have seen it all: once more when it can have.
+        if stood < self.floor {
+            self.quiet.insert(
+                scope.clone(),
+                (*version, Instant::now() + (self.floor - stood)),
+            );
+            return;
+        }
+        if stood < self.horizon {
+            if let Some(every) = self.soon {
+                self.quiet
+                    .insert(scope.clone(), (*version, Instant::now() + every));
+            }
+            return;
+        }
+        let spread = Duration::from_millis(
+            (uuid::Uuid::new_v4().as_u128() % (self.recheck.as_millis().max(1))) as u64,
+        );
+        self.quiet.insert(
+            scope.clone(),
+            (*version, Instant::now() + self.recheck + spread),
+        );
+    }
+
     async fn next(&mut self, state: &State, store: &Store) -> Vec<Scope> {
+        self.next_keeping(state, store, &|_| false).await
+    }
+
+    /// [`ScopeWalk::next`], where `keep` says which scopes are handed out even when settled (the maintenance
+    /// window's scheduled purges, which run by the clock).
+    async fn next_keeping(
+        &mut self,
+        state: &State,
+        store: &Store,
+        keep: &(dyn Fn(&Scope) -> bool + Sync),
+    ) -> Vec<Scope> {
+        self.floor = store.hard_staleness() + Duration::from_secs(120);
+        // What has been committed where, from the ledger's cached copy. Unreadable: every scope is gone over, as
+        // if nothing were known.
+        let versions = match store.scope_versions().await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("background: the ledger is unreadable, every scope is gone over: {e:#}");
+                None
+            }
+        };
+        let written = |s: &Scope| {
+            versions
+                .as_ref()
+                .is_none_or(|v| v.contains_key(&s.namespace()))
+        };
         let mut scopes = std::collections::BTreeSet::from([state.scope.clone()]);
         scopes.extend(state.served.lock().unwrap().iter().cloned());
+        let mut settings: HashMap<Scope, u64> = HashMap::new();
         if !state.fixed() || state.workspaces {
             match crate::people::directory::Directory::load(store).await {
                 Ok(dir) => {
@@ -4687,16 +4903,26 @@ impl ScopeWalk {
                         {
                             continue;
                         }
-                        let mut own: Vec<Scope> = Scope::org(name).into_iter().collect();
+                        let mut own: Vec<(Scope, u64)> = Scope::org(name)
+                            .into_iter()
+                            .map(|s| (s, fingerprint(&org.settings)))
+                            .collect();
                         for t in org.teams.keys() {
-                            own.extend(Scope::team(name, t));
+                            own.extend(Scope::team(name, t).into_iter().map(|s| {
+                                (s, fingerprint(&(&org.settings, org.team_settings.get(t))))
+                            }));
                         }
-                        for scope in own {
+                        for (scope, set) in own {
                             live.insert(scope.clone());
                             // Another cell's: never even looked at here.
                             if !cell::mine(&scope) {
                                 continue;
                             }
+                            // Nothing was ever committed there: nothing to go over, and no table to ask about.
+                            if !written(&scope) && scope != state.scope {
+                                continue;
+                            }
+                            settings.insert(scope.clone(), set);
                             if ready.contains(&scope) || scopes.contains(&scope) {
                                 scopes.insert(scope);
                                 continue;
@@ -4733,8 +4959,56 @@ impl ScopeWalk {
                 }
             }
         }
-        // Another cell's orgs are that cell's servers' to work on.
-        let mut scopes: Vec<Scope> = scopes.into_iter().filter(cell::mine).collect();
+        // Another cell's orgs are that cell's servers' to work on. A served scope nothing was committed to has
+        // nothing to go over either.
+        let mut scopes: Vec<Scope> = scopes
+            .into_iter()
+            .filter(|s| cell::mine(s) && (written(s) || *s == state.scope))
+            .collect();
+        // Each scope's version now; those this loop settled at the same version are left out until their recheck.
+        // Nothing known (the ledger unreadable): every scope, and what was settled stays as it was.
+        let Some(versions) = versions else {
+            return self.rotated(scopes);
+        };
+        let now = Instant::now();
+        let now_us = crate::now_micros();
+        let mut handed = HashMap::new();
+        let before = scopes.len();
+        scopes.retain(|s| {
+            let ledger = versions.get(&s.namespace()).copied().unwrap_or_default();
+            let version = (
+                ledger.0,
+                ledger.1,
+                settings.get(s).copied().unwrap_or_default(),
+            );
+            let since = match self.seen.get(s) {
+                Some((v, at)) if *v == version => *at,
+                // Only its settings changed: from now.
+                Some(_) => now_us,
+                // First seen (a start): since its last commit, so a restart doesn't put off every scope's
+                // horizon again.
+                None => ledger.1.min(now_us),
+            };
+            handed.insert(s.clone(), (version, since));
+            let quiet = self
+                .quiet
+                .get(s)
+                .is_some_and(|(v, until)| *v == version && now < *until);
+            !quiet || keep(s)
+        });
+        // Forgotten once gone from the directory, or changed: a new org of a deleted one's name starts over.
+        self.quiet
+            .retain(|s, (v, _)| handed.get(s).is_some_and(|(now, _)| now == v));
+        self.seen = handed;
+        WALKS.lock().unwrap().insert(
+            crate::loads::caller(),
+            (scopes.len(), before - scopes.len()),
+        );
+        self.rotated(scopes)
+    }
+
+    /// Each round starts one scope further along, so no org is always last.
+    fn rotated(&mut self, mut scopes: Vec<Scope>) -> Vec<Scope> {
         if !scopes.is_empty() {
             let n = self.round % scopes.len();
             scopes.rotate_left(n);
@@ -4742,6 +5016,30 @@ impl ScopeWalk {
         self.round = self.round.wrapping_add(1);
         scopes
     }
+}
+
+/// Per loop, how many scopes its last round went over and how many it left out as settled: said once a minute
+/// with the catalog's loads.
+static WALKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<&'static str, (usize, usize)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// [`WALKS`] as one line.
+fn walks_report() -> String {
+    WALKS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(name, (over, quiet))| format!("{name} {over} ({quiet} settled)"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A short hash of what an org's (or team's) settings say, for a scope's [`Version`].
+fn fingerprint(v: &impl serde::Serialize) -> u64 {
+    let s = serde_json::to_string(v).unwrap_or_default();
+    let d = sha2::Sha256::digest(s.as_bytes());
+    u64::from_le_bytes(d[..8].try_into().unwrap_or_default())
 }
 
 /// `POST /digest/preview {person?, week?}`: a person's weekly digest as it would be mailed (`crate::digest`), sent to
@@ -5298,12 +5596,17 @@ async fn refresh(state: &Arc<State>) -> Result<()> {
                     result
                 })
                 .await;
-                if let Err(e) = r {
-                    all = false;
-                    metrics.index_failures.inc();
-                    eprintln!(
-                        "index update of {scope} failed (search keeps the previous index): {e:#}"
-                    );
+                match r {
+                    // Up to date with what it holds: nothing to index until something is committed there.
+                    Ok(_) if st.role == Role::Worker => WALK.lock().await.settled(&scope),
+                    Ok(_) => {}
+                    Err(e) => {
+                        all = false;
+                        metrics.index_failures.inc();
+                        eprintln!(
+                            "index update of {scope} failed (search keeps the previous index): {e:#}"
+                        );
+                    }
                 }
             }
             if all {
@@ -6851,7 +7154,13 @@ async fn handle(
             return Ok(match writes {
                 Writes::Scope => match learn::add(&state, &store, &scope, &who, &args).await {
                     Ok(v) => {
-                        crate::usage::METER.op(crate::usage::Op::Turn, who.user());
+                        // A part of a recording on its way is no turn: the recording is, once it is all here.
+                        let only_parts = ["added", "refused", "transcribing"]
+                            .iter()
+                            .all(|k| v[*k].as_array().is_none_or(|a| a.is_empty()));
+                        if !only_parts {
+                            crate::usage::METER.op(crate::usage::Op::Turn, who.user());
+                        }
                         reply(StatusCode::OK, v)
                     }
                     Err(ref e) if let Some(l) = crate::limits::LimitReached::of(e) => {
@@ -13503,6 +13812,7 @@ fn session_tools() -> Vec<Value> {
                 "context": {"type": "string", "description": "What the user asked, with what came with it"},
                 "harness": {"type": "string", "description": "The client: claude-ai, chatgpt, copilot, ..."},
                 "thread": {"type": "string", "description": "The client's own id for this conversation, if it has one: the sessions one conversation is split into share it, so they read as one"},
+                "split": {"type": "string", "enum": ["train", "test"], "description": "Only for an eval harness: train (teaches advice by end_session's reward) or test (reads advice, teaches nothing)"},
                 "keep": KEEP_ARG.clone(),
             }},
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false},
@@ -13767,13 +14077,14 @@ async fn apply_advice_requests(st: &State, store: &Store, scope: &Scope) -> bool
     }
 }
 
-/// Whether advice is routed for session `l`: not for one a program runs (its harness named `:sdk`,
-/// [`crate::sessions::automated`]: `claude -p`, an SDK run, a review bot, an eval's generator), unless its scope's
-/// `advice_automated` setting asks. Advice is learned from people's sessions only, so a program's own kind of
-/// task never has a note: on one production deployment over three days, 1,561 lookups by automated programs were
-/// served 6, each costing the decisions model's calls and 1 to 12 s.
+/// Whether advice is routed for session `l`: for one a program runs (its harness named `:sdk`,
+/// [`crate::sessions::automated`]: `claude -p`, an SDK run, a review bot, an eval's generator) unless its scope's
+/// `advice_automated` setting is off (it is on by default: a program's sessions teach as people's do). An org turns it
+/// off where its programs' lookups only cost: on one production deployment over three days, while programs taught
+/// nothing, 1,561 of their lookups were served 6, each costing the decisions model's calls and 1 to 12 s. An eval's session ([`crate::sessions::split`]) is
+/// routed whatever the setting: the eval measures what advice does for it.
 async fn routes_for(store: &Store, scope: &Scope, l: &crate::qa_log::Logged) -> bool {
-    if !crate::sessions::automated(l) {
+    if !crate::sessions::automated(l) || crate::sessions::split(l).is_some() {
         return true;
     }
     let on = crate::people::directory::Directory::load(store)

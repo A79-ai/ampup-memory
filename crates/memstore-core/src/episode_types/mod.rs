@@ -408,6 +408,30 @@ pub fn locate<'a>(units: &'a [Unit], quote: &str, hint: Option<usize>) -> Option
     let holds = |u: &&Unit| squash(&u.text).contains(&q);
     hint.and_then(|h| units.iter().find(|u| u.index == h).filter(holds))
         .or_else(|| units.iter().find(holds))
+        .or_else(|| spanning(units, &q))
+}
+
+/// Most units one quote may run across ([`spanning`]).
+const SPAN: usize = 4;
+
+/// The first of up to [`SPAN`] consecutive units that hold a quote together: a transcriber splits one sentence
+/// over several turns ("we" / "got to do a little bit of both you" / "know yeah perfect"), and a quote of that
+/// sentence is in no one of them.
+fn spanning<'a>(units: &'a [Unit], q: &str) -> Option<&'a Unit> {
+    let words: Vec<String> = units.iter().map(|u| squash(&u.text)).collect();
+    (0..units.len()).find_map(|i| {
+        let mut joined = words[i].clone();
+        for w in words.iter().skip(i + 1).take(SPAN - 1) {
+            if !w.is_empty() {
+                joined.push(' ');
+                joined.push_str(w);
+            }
+            if joined.contains(q) {
+                return Some(&units[i]);
+            }
+        }
+        None
+    })
 }
 
 /// `[mm:ss] Speaker: text`, `[h:mm:ss] Speaker: text` or `Speaker: text` lines: (ms, speaker, text).

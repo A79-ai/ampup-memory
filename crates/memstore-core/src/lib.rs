@@ -6054,7 +6054,7 @@ impl Store {
 
     /// [`Store::maintain_over`] of the system tables alone (the ledger, the directory and its snapshots,
     /// installations, key usage, the audit log): they are the catalog's, not a scope's.
-    async fn maintain_system(
+    pub async fn maintain_system(
         &self,
         keep: usize,
         over: usize,
@@ -6078,6 +6078,8 @@ impl Store {
     ) -> Result<Vec<(String, usize, usize)>> {
         let mut out = vec![];
         for &(tns, name) in tables {
+            // Within the loops' rate of catalog reads, as their table reads are.
+            loads::turn().await;
             let ident = TableIdent::new(NamespaceIdent::new(tns.into()), name.into());
             if !self.has_table(&ident).await? {
                 continue;
@@ -6476,7 +6478,19 @@ impl Store {
         &self,
         held: Option<&HeldFold>,
     ) -> Result<(Option<Table>, Arc<directory::Folded>)> {
-        let (table, f) = self.fold_directory_from(held).await?;
+        // A compaction on the writer lease's holder deletes the files of the snapshots it replaced as soon as its
+        // swap lands, so a table loaded just before then may name files already gone: loaded again, it names the
+        // compacted ones.
+        let mut tries = 0u64;
+        let (table, f) = loop {
+            match self.fold_directory_from(held).await {
+                Err(e) if retry::is_swept(&e) && tries < 5 => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(20 * tries)).await;
+                }
+                r => break r?,
+            }
+        };
         self.dir.metrics.loaded(f.blocked);
         Ok((table, f))
     }
@@ -6599,7 +6613,15 @@ impl Store {
                 (table, f)
             };
             if let Some((after, events)) = tried.take() {
-                let since = directory_rows(&table, Some(after)).await?;
+                let since = match directory_rows(&table, Some(after)).await {
+                    Ok(since) => since,
+                    // Compacted since it was loaded (see `fold_directory`): read again.
+                    Err(e) if retry::is_swept(&e) => {
+                        tried = Some((after, events));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 if events.iter().all(|e| since.contains(e)) {
                     let sid = table.metadata().current_snapshot().map(|s| s.snapshot_id());
                     return self.directory_written(read_at, sid, base, events).await;
@@ -9089,6 +9111,35 @@ impl Store {
         Ok((found, newest))
     }
 
+    /// Per namespace with anything in the ledger, how many rows it has there and the newest one's time (µs), from
+    /// the ledger every server reads (its cached copy: no catalog read while warm). Either changes with every
+    /// commit there, on any branch, and when its rows are removed (an org deleted): how a background loop tells a
+    /// scope with something new from one it already went over, without reading the scope. Worked out once per
+    /// copy of the ledger.
+    pub async fn scope_versions(&self) -> Result<Arc<HashMap<String, (u64, i64)>>> {
+        type Versions = Arc<HashMap<String, (u64, i64)>>;
+        static LAST: Mutex<Option<(Arc<Vec<RecordBatch>>, Versions)>> = Mutex::new(None);
+        let snap = self.rows(SYSTEM_NS, LEDGER).await?;
+        if let Some((rows, v)) = LAST.lock().unwrap().as_ref()
+            && Arc::ptr_eq(rows, &snap.rows)
+        {
+            return Ok(v.clone());
+        }
+        let mut by: HashMap<String, (u64, i64)> = HashMap::new();
+        for b in snap.rows.iter() {
+            let sc = strings(b, "scope");
+            let recorded = timestamps(b, "recorded_at");
+            for i in 0..b.num_rows() {
+                let e = by.entry(sc[i].clone()).or_default();
+                e.0 += 1;
+                e.1 = e.1.max(recorded[i].unwrap_or_default());
+            }
+        }
+        let v: Versions = Arc::new(by);
+        *LAST.lock().unwrap() = Some((snap.rows.clone(), v.clone()));
+        Ok(v)
+    }
+
     /// The ledger rows for one scope's namespace.
     async fn ledger(&self, scope: &Scope) -> Result<Ledger> {
         let snap = self.rows(SYSTEM_NS, LEDGER).await?;
@@ -9715,6 +9766,9 @@ fn qa_log_schema() -> Result<Schema> {
         // The harness's own id for the conversation it ran in: a conversation the harness split into several
         // sessions (at a compaction, or after it went idle) has the same one on each, so they read as one.
         ("thread", false, PrimitiveType::String),
+        // Where an eval runs it, its split: `train` (it teaches advice by the reward its caller gives) or `test` (it
+        // reads advice and teaches nothing).
+        ("split", false, PrimitiveType::String),
     ])
 }
 
@@ -10011,6 +10065,19 @@ pub async fn appended(
                 return Ok(after);
             }
             Err(e) => anyhow::Error::from(e),
+        };
+        // The snapshot this try was made on had its files deleted by a compaction that landed meanwhile (its sweep
+        // deletes them at once): the new snapshot's manifest list is built from the parent's, which is gone, so the
+        // try failed before anything was sent to the catalog. That is a lost race like any other writer's commit:
+        // said as a refused commit, so the table is read again and a compare-and-set caller re-plans.
+        let e = match retry::is_swept(&e) {
+            true => anyhow::Error::from(iceberg::Error::new(
+                iceberg::ErrorKind::CatalogCommitConflicts,
+                format!(
+                    "the table was compacted under this commit, its snapshot's files are gone: {e:#}"
+                ),
+            )),
+            false => e,
         };
         let conflict = is_commit_conflict(&e);
         if attempt >= 100 || !(conflict || is_transient(&e) || commit_state_unknown(&e)) {
