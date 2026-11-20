@@ -133,6 +133,10 @@ pub(super) async fn part(
     if n == 0 {
         super::learn::transcribes(&super::learn::ext_of(&super::learn::item_name(v)))
             .map_err(refuse)?;
+        // Nor is a recording uploaded that its org couldn't have transcribed: past its model tokens or its plan's end.
+        if let Some(l) = crate::limits::model_gate(scope.org_name()) {
+            return Err(refuse(l.message));
+        }
     }
     let op = place(store).await?.ok_or_else(|| {
         refuse("recordings this large aren't taken here: this memory keeps no uploads")
@@ -235,16 +239,20 @@ pub(super) async fn part(
         "transcribe {scope}: upload {id}, {} bytes of .{} in {parts} parts, to transcribe",
         kept.size, kept.ext
     );
-    tokio::spawn(transcribe(
-        state.clone(),
-        store.clone(),
-        scope.clone(),
-        who.clone(),
-        author.to_string(),
-        op,
-        dir,
-        id.clone(),
-        kept.clone(),
+    // Working for the request's org: its model tokens counted, its limits held to (`crate::limits`).
+    tokio::spawn(crate::log_org::with(
+        scope.org_name(),
+        transcribe(
+            state.clone(),
+            store.clone(),
+            scope.clone(),
+            who.clone(),
+            author.to_string(),
+            op,
+            dir,
+            id.clone(),
+            kept.clone(),
+        ),
     ));
     Ok(Part::Transcribing(
         json!({"name": kept.name, "upload_id": id}),
@@ -309,8 +317,8 @@ async fn transcribe(
                    "source": f.source, "finished": Utc::now()})
         }
         Err(e) => {
-            let reason = match e.downcast_ref::<ToolError>() {
-                Some(m) => m.0.clone(),
+            let reason = match super::learn::refusal(&e) {
+                Some(why) => why,
                 None => {
                     eprintln!("transcribe {scope}: upload {id} failed: {e:#}");
                     crate::report::failure("learn upload", &e);

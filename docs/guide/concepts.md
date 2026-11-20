@@ -46,7 +46,7 @@ An episode is one source record: a note, a call transcript, a Slack thread, an e
 
 | Type | Sources |
 |---|---|
-| `sales_call` | `meeting:`, `gong:`, `zoom:`, `recall:`, `ampup:meeting:`, `granola:`, `fireflies:`, `fathom:` |
+| `sales_call` | `meeting:`, `gong:`, `zoom:`, `recall:`, `ampup:meeting:`, `granola:`, `fireflies:`, `fathom:`, `calendar:` |
 | `slack_thread` | `slack:` |
 | `email` | `gmail:`, `outlook:`, `email:` |
 | `crm_update` | `hubspot:`, `salesforce:`, `dynamicsCRM:`, `crm:` |

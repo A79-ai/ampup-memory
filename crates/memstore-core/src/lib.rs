@@ -908,8 +908,11 @@ pub struct Vis {
     /// The retracted episodes only a newer version superseded, each with its source: written again, each is
     /// current again ([`retracted`]).
     superseded: HashMap<String, String>,
-    /// Superseded episodes written again since, current again, each with the ledger time it came back.
+    /// Superseded or released episodes written again since, current again, each with the ledger time it came back.
     revived: HashMap<String, i64>,
+    /// The retracted episodes a delete by prefix took without holding them back (`"hold": false`), each with its
+    /// source: a purge deletes them, and written again, each is current again.
+    released: HashMap<String, String>,
     /// Facts retracted by id: no reader sees them. (A withdrawn extractor's commits are left out of
     /// `committed` instead, with everything they wrote.)
     pub retracted_facts: HashSet<String>,
@@ -1741,6 +1744,7 @@ impl Vis {
             retracted,
             superseded: self.superseded.clone(),
             revived: self.revived.clone(),
+            released: self.released.clone(),
             retracted_facts: self.retracted_facts.clone(),
             retraction_targets: self.retraction_targets.clone(),
             retention: self.retention.clone(),
@@ -1825,6 +1829,7 @@ impl Vis {
             (self.retracted != full.retracted, "retracted"),
             (self.superseded != full.superseded, "superseded"),
             (self.revived != full.revived, "revived"),
+            (self.released != full.released, "released"),
             (
                 self.retracted_facts != full.retracted_facts,
                 "retracted facts",
@@ -7525,6 +7530,7 @@ impl Store {
                 targets: retraction_targets,
                 superseded,
                 revived,
+                released,
             } = retracted(&retractions, &episodes.rows, &deleted, &|c| {
                 times.get(c).copied()
             });
@@ -7705,6 +7711,7 @@ impl Store {
                 retracted,
                 superseded,
                 revived,
+                released,
                 retracted_facts,
                 retraction_targets,
                 retention,
@@ -8626,7 +8633,23 @@ impl Store {
         actor: &str,
         targets: &[AclTarget],
     ) -> Result<Vec<String>> {
-        self.retract_rows(scope, actor, targets, false).await
+        self.retract_rows(scope, actor, targets, Mark::Delete).await
+    }
+
+    /// A delete by source prefix that holds nothing back (`/retract`'s `"hold": false`): what `prefix` names is
+    /// gone now for every reader, with every fact citing it, and a purge deletes it for good, as a delete's. Unlike
+    /// a delete, the same episode written again later (a source the org removed, then added back) is current
+    /// again, as a new episode is. A delete naming its id or exact source, before or after, still holds for good.
+    /// Returns the ids retracted, sorted.
+    pub async fn retract_released(
+        &self,
+        scope: &Scope,
+        actor: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>> {
+        let target = AclTarget::SourcePrefix(prefix.to_string());
+        self.retract_rows(scope, actor, std::slice::from_ref(&target), Mark::Release)
+            .await
     }
 
     /// A record's newer version replaced its other versions (`/ingest`'s `replaces_source`): retire the
@@ -8640,7 +8663,8 @@ impl Store {
         actor: &str,
         targets: &[AclTarget],
     ) -> Result<Vec<String>> {
-        self.retract_rows(scope, actor, targets, true).await
+        self.retract_rows(scope, actor, targets, Mark::Supersede)
+            .await
     }
 
     async fn retract_rows(
@@ -8648,8 +8672,10 @@ impl Store {
         scope: &Scope,
         actor: &str,
         targets: &[AclTarget],
-        superseded: bool,
+        mark: Mark,
     ) -> Result<Vec<String>> {
+        // Only a delete holds back the exact id or source it names; the others write the episodes they took.
+        let superseded = mark != Mark::Delete;
         let mut ids: Vec<String> = self
             .current_episodes(scope)
             .await?
@@ -8688,11 +8714,15 @@ impl Store {
         }
         // A delete by prefix, or of a source's other versions, also takes the versions a newer one superseded
         // (a source's row or an id's already does): readers don't see them now, but written again they would be.
+        // A delete for good also takes what one by prefix took without holding it back, which it would otherwise
+        // let back.
+        let released = vis.released.iter().filter(|_| mark == Mark::Delete);
         let mut dormant: Vec<&str> = vis
             .superseded
             .iter()
+            .chain(released)
             .filter(|(id, source)| {
-                !superseded
+                mark != Mark::Supersede
                     && targets.iter().any(|t| {
                         matches!(
                             t,
@@ -8717,7 +8747,13 @@ impl Store {
                 rows.iter().map(|r| [r.0, r.1][i]).collect::<Vec<_>>(),
             ))
         };
-        let mark = superseded.then_some(true);
+        let flag = |m: Mark| {
+            Arc::new(arrow_array::BooleanArray::from(vec![
+                (mark == m)
+                    .then_some(true);
+                n
+            ]))
+        };
         self.append_own(
             &ns,
             RETRACTIONS,
@@ -8733,10 +8769,8 @@ impl Store {
                     "recorded_at",
                     ts(std::iter::repeat_n(Some(now_micros()), n)),
                 ),
-                (
-                    "superseded",
-                    Arc::new(arrow_array::BooleanArray::from(vec![mark; n])),
-                ),
+                ("superseded", flag(Mark::Supersede)),
+                ("released", flag(Mark::Release)),
             ],
             OnConflict::Recommit,
         )
@@ -9518,16 +9552,29 @@ pub struct Retracted {
     /// The hidden episodes only a newer version superseded (no delete names them), each with its source: one
     /// written again is current again, and a delete that names it later holds for good.
     pub superseded: HashMap<String, String>,
-    /// Superseded episodes written again since, current again: each with when it came back (the ledger time of
-    /// the first commit that wrote it after it was last superseded).
+    /// Superseded or released episodes written again since, current again: each with when it came back (the
+    /// ledger time of the first commit that wrote it after it was last superseded or released).
     pub revived: HashMap<String, i64>,
+    /// The hidden episodes a delete took without holding them back (`released`, and no delete for good names
+    /// them), each with its source: a purge deletes them, and one written again is current again.
+    pub released: HashMap<String, String>,
 }
 
-/// What committed retractions hide. A delete (any row not marked `superseded`) holds for good: an episode is
-/// gone when a delete names its id or the exact source of any of its rows, whenever it was written, so a delete
-/// that overtook its record still removes the record and the same record written again stays gone. A row
-/// marked `superseded` (a newer version of the source replaced this one) hides the episode only until a commit
-/// after it writes the episode again: then it is current again, as a new episode is. Order is the ledger's:
+/// What a retraction row of an episode is: a delete (for good), a version a newer one superseded, or a delete
+/// that holds nothing back ([`Store::retract_released`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mark {
+    Delete,
+    Supersede,
+    Release,
+}
+
+/// What committed retractions hide. A delete (any row not marked `superseded` or `released`) holds for good: an
+/// episode is gone when a delete names its id or the exact source of any of its rows, whenever it was written, so
+/// a delete that overtook its record still removes the record and the same record written again stays gone. A row
+/// marked `superseded` (a newer version of the source replaced this one) or `released` (a delete that holds
+/// nothing back) hides the episode only until a commit after it writes the episode again: then it is current
+/// again, as a new episode is. A released one is not [`Retracted::superseded`]: a purge deletes it. Order is the ledger's:
 /// `time` gives a commit's ledger time (each commit's is past its parents'), `committed` which commits count.
 /// Rows written before the mark existed are all deletes, whatever wrote them.
 pub fn retracted(
@@ -9537,14 +9584,18 @@ pub fn retracted(
     time: &dyn Fn(&str) -> Option<i64>,
 ) -> Retracted {
     let (mut ids, mut sources, mut targets) = (HashSet::new(), HashSet::new(), HashSet::new());
-    // Each superseded episode, with when it was last superseded.
+    // Each superseded or released episode, with when it was last; and when each was last released and last
+    // superseded: the newer of the two says whether a purge deletes it.
     let mut replaced: HashMap<String, i64> = HashMap::new();
+    let (mut released_at, mut superseded_at): (HashMap<String, i64>, HashMap<String, i64>) =
+        (HashMap::new(), HashMap::new());
     for b in retractions {
         let commit = strings(b, "commit_id");
-        let (id, source, superseded) = (
+        let (id, source, superseded, release) = (
             optional_strings(b, "episode_id"),
             optional_strings(b, "source"),
             optional_bools(b, "superseded"),
+            optional_bools(b, "released"),
         );
         for i in 0..b.num_rows() {
             if !committed(&commit[i]) {
@@ -9553,10 +9604,20 @@ pub fn retracted(
             match &id[i] {
                 // Only a row naming one episode and nothing else is a supersession; a time the ledger
                 // doesn't give keeps it hidden.
-                Some(id) if superseded[i] == Some(true) && source[i].is_none() => {
+                Some(id)
+                    if (superseded[i] == Some(true) || release[i] == Some(true))
+                        && source[i].is_none() =>
+                {
                     let at = time(&commit[i]).unwrap_or(i64::MAX);
-                    let t = replaced.entry(id.clone()).or_insert(at);
-                    *t = (*t).max(at);
+                    for t in [
+                        replaced.entry(id.clone()).or_insert(at),
+                        match release[i] == Some(true) {
+                            true => released_at.entry(id.clone()).or_insert(at),
+                            false => superseded_at.entry(id.clone()).or_insert(at),
+                        },
+                    ] {
+                        *t = (*t).max(at);
+                    }
                 }
                 Some(id) => {
                     ids.insert(id.clone());
@@ -9599,20 +9660,28 @@ pub fn retracted(
     }
     // A delete holds whatever else happened to the episode.
     revived.retain(|id, _| !ids.contains(id));
-    let superseded: HashMap<String, String> = replaced
+    let held: Vec<String> = replaced
         .into_keys()
         .filter(|id| !ids.contains(id) && !revived.contains_key(id))
-        .map(|id| {
-            let source = source_of.remove(&id).unwrap_or_default();
-            (id, source)
-        })
         .collect();
-    ids.extend(superseded.keys().cloned());
+    let (mut superseded, mut released_now) = (HashMap::new(), HashMap::new());
+    for id in held {
+        let source = source_of.remove(&id).unwrap_or_default();
+        let released = released_at
+            .get(&id)
+            .is_some_and(|r| superseded_at.get(&id).is_none_or(|s| r >= s));
+        match released {
+            true => released_now.insert(id.clone(), source),
+            false => superseded.insert(id.clone(), source),
+        };
+        ids.insert(id);
+    }
     Retracted {
         hidden: ids,
         targets,
         superseded,
         revived,
+        released: released_now,
     }
 }
 
@@ -9799,6 +9868,9 @@ fn retractions_schema() -> Result<Schema> {
         // True on an episode id a newer version of its source replaced (`replaces_source`): written again
         // later, it is current again. Null on every delete, and on every row written before it existed.
         ("superseded", false, PrimitiveType::Boolean),
+        // True on an episode id a delete by prefix took without holding it back (`"hold": false`): a purge deletes
+        // it, and written again later it is current again. Null on every other row.
+        ("released", false, PrimitiveType::Boolean),
     ])
 }
 

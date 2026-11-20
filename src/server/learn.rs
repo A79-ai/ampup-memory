@@ -161,8 +161,8 @@ pub(super) async fn add(
             match super::upload::part(state, store, scope, who, whose, &author, raw).await {
                 Ok(super::upload::Part::Uploading(v)) => uploading.push(v),
                 Ok(super::upload::Part::Transcribing(v)) => transcribing.push(v),
-                Err(e) => match e.downcast_ref::<ToolError>() {
-                    Some(m) => refused.push(json!({"name": item_name(raw), "reason": m.0})),
+                Err(e) => match refusal(&e) {
+                    Some(why) => refused.push(json!({"name": item_name(raw), "reason": why})),
                     None => return Err(e),
                 },
             }
@@ -199,8 +199,8 @@ pub(super) async fn add(
                 );
             }
             // What the item itself is refused for (a body no episode type reads, say): that item alone.
-            Err(e) => match e.downcast_ref::<ToolError>() {
-                Some(m) => refused.push(json!({"name": item.name, "reason": m.0})),
+            Err(e) => match refusal(&e) {
+                Some(why) => refused.push(json!({"name": item.name, "reason": why})),
                 None => return Err(e),
             },
         }
@@ -267,8 +267,9 @@ async fn file_text(
 /// [`recorded`] before it transcribes. Its source is `memstore:recording:<digest>` under who added it
 /// ([`crate::origin::RECORDED`]): its speakers' words, not theirs. Its speakers are listed as no one, so the engine
 /// writes no person for a label, only the meeting (`meeting:recording-<digest>`), its title and when it was recorded
-/// (else added). Personal identifiers are redacted in each turn where the scope asks, before the transcript is laid
-/// out, so redaction can't touch its times. A transcript over [`MAX_TEXT`] is refused (a [`ToolError`]).
+/// (else added); the episode is about that meeting ([`recording_about`]), so those facts are kept. Personal identifiers
+/// are redacted in each turn where the scope asks, before the transcript is laid out, so redaction can't touch its
+/// times. A transcript over [`MAX_TEXT`] is refused (a [`ToolError`]).
 pub(super) async fn file_recording(
     state: &State,
     store: &Store,
@@ -291,7 +292,6 @@ pub(super) async fn file_recording(
         found.count();
         out
     };
-    let digest = &rec.sha256[..12];
     let title = rec.title.clone().unwrap_or_else(|| {
         let stem = rec
             .name
@@ -317,7 +317,7 @@ pub(super) async fn file_recording(
     // The body sales_call reads: nothing in it changes from one sending to the next, so the same transcript is the
     // same episode.
     let mut body = json!({
-        "meeting": format!("meeting:recording-{digest}"),
+        "meeting": recording_meeting(rec),
         "title": clean(&title),
         "participants": [],
         "turns": turns,
@@ -337,8 +337,9 @@ pub(super) async fn file_recording(
     }
     let call = json!({"source": source, "body": body, "document": key, "for": whose});
     let call = super::remember_for(state, who, &call)?;
+    let about = recording_about(store, scope, rec).await?;
     let (id, readers) =
-        super::commit_recorded(state, store, scope, who, &call, rec.recorded_at).await?;
+        super::commit_recorded(state, store, scope, who, &call, rec.recorded_at, about).await?;
     Ok(Filed {
         id,
         readers,
@@ -386,6 +387,10 @@ pub(super) async fn file_media(
     let Ok(Some(t)) = &*crate::transcribe::TRANSCRIBER else {
         return Err(ToolError(NOT_TRANSCRIBED.into()).into());
     };
+    // Transcribing is model work the org pays for: refused before it is spent, past its allowance or its plan's end.
+    if let Some(l) = crate::limits::model_gate(scope.org_name()) {
+        return Err(l.into());
+    }
     let started = std::time::Instant::now();
     let heard = match within {
         Some(w) => t.transcribe_within(ext, bytes, w).await,
@@ -402,8 +407,17 @@ pub(super) async fn file_media(
             return Err(ToolError(why).into());
         }
     };
+    // Paid for now, whatever comes of it: counted against the org's monthly model tokens. Where the service didn't say
+    // how long the audio is, the last turn's start stands in.
+    let seconds = heard.seconds.unwrap_or_else(|| {
+        let last = heard.turns.last().map_or(0, |t| t.start_ms) as f64 / 1000.0;
+        eprintln!("transcribe {scope}: the service didn't say how long the audio is: counted as {last:.1} s");
+        last
+    });
+    let tokens = crate::transcribe::tokens_for(seconds);
+    crate::limits::count_for(scope.org_name(), tokens);
     eprintln!(
-        "transcribe {scope}: {} bytes of .{ext}, {} s of audio, {} turns, language {}, in {took:.1} s",
+        "transcribe {scope}: {} bytes of .{ext}, {} s of audio ({tokens} model tokens), {} turns, language {}, in {took:.1} s",
         bytes.len(),
         heard.seconds.map_or("?".to_string(), |s| format!("{s:.1}")),
         heard.turns.len(),
@@ -423,6 +437,15 @@ pub(super) async fn file_media(
         })
         .collect();
     file_recording(state, store, scope, who, whose, author, &rec).await
+}
+
+/// Why an item (or an upload) is refused, as its receipt says it: what it was refused for ([`ToolError`]), or the
+/// org's limit it ran into (a recording past the org's model tokens or its plan's end). None: a failure.
+pub(super) fn refusal(e: &anyhow::Error) -> Option<String> {
+    match e.downcast_ref::<ToolError>() {
+        Some(m) => Some(m.0.clone()),
+        None => crate::limits::LimitReached::of(e).map(|l| l.message.clone()),
+    }
 }
 
 /// Why a recording's file isn't read where this server doesn't transcribe.
@@ -449,7 +472,8 @@ pub(super) async fn recorded(
     let body = String::from_utf8_lossy(&body).into_owned();
     let call = json!({"source": source, "body": body, "document": key, "for": whose});
     let call = super::remember_for(state, who, &call)?;
-    let (_, readers) = super::commit_recorded(state, store, scope, who, &call, None).await?;
+    let about = recording_about(store, scope, rec).await?;
+    let (_, readers) = super::commit_recorded(state, store, scope, who, &call, None, about).await?;
     Ok(Some(Filed {
         id,
         readers,
@@ -1053,6 +1077,23 @@ fn filed(item: &Item, author: &str) -> (String, String) {
             )
         }
     }
+}
+
+/// The meeting a recording is the record of, by its media's digest: `meeting:recording-<digest>`.
+fn recording_meeting(rec: &Recording) -> String {
+    format!("meeting:recording-{}", &rec.sha256[..12])
+}
+
+/// What a recording's episode is about: its meeting, where the scope's schema has meetings (or no schema), so the
+/// engine's facts about it (its name, when it was recorded) are kept. A schema without them would refuse the
+/// write, and could keep no such fact anyway: there it is about nothing, as before.
+async fn recording_about(store: &Store, scope: &Scope, rec: &Recording) -> Result<Vec<String>> {
+    let meeting = recording_meeting(rec);
+    let typed = match store.schema(scope, crate::MAIN).await? {
+        Some(s) => s.entity_type(&meeting).is_some(),
+        None => true,
+    };
+    Ok(if typed { vec![meeting] } else { vec![] })
 }
 
 /// Where a recording is filed: under [`crate::origin::RECORDED`] by its media's digest, not its name (two recordings

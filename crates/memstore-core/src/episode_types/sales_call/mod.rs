@@ -1,10 +1,11 @@
-//! A recorded call or meeting: a sales call, a team's meeting, a note-taker's notes of one. The body is the
-//! transcript, as JSON from the recorder (turns with speaker, start and text, and the meeting's id, title and
-//! participants, and its notes' summary) or as `[mm:ss] Speaker: text` lines. A meeting with notes and no
-//! transcript is its summary alone. Facts cite a turn (its number, when it starts and who spoke) or a line of the
-//! summary (a span of it, under its heading). The engine writes the meeting's name (its title) and time, who was
-//! invited (from the participants), who attended (from who spoke) and the full name a participant listed only by
-//! their address speaks under; the model writes the rest, from `catalog.json`.
+//! A recorded call or meeting: a sales call, a team's meeting, a note-taker's notes of one, or a meeting on a calendar.
+//! The body is the transcript, as JSON from the recorder (turns with speaker, start and text, and the meeting's id,
+//! title and participants, and its notes' summary) or as `[mm:ss] Speaker: text` lines. A meeting with notes and no
+//! transcript is its summary alone; a calendar's event is the same JSON with no turns, its description as the summary,
+//! and its title (else who it lists) when it has no description. Facts cite a turn (its number, when it starts and who
+//! spoke), a line of the summary (a span of it, under its heading) or that title. The engine writes the meeting's name
+//! (its title) and time, who was invited (from the participants), who attended (from who spoke) and the full name a
+//! participant listed only by their address speaks under; the model writes the rest, from `catalog.json`.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -17,7 +18,9 @@ pub struct SalesCall;
 
 /// The recorder's JSON: `turns` with `speaker` (or `speaker_id`), `start_ms` (or `start_time` in seconds) and
 /// `text`; `meeting` (`meeting:<id>`), `title`, `participants` (`{id, name}`) and `summary` (the notes' summary
-/// as Markdown, also read as `notes` or `summary_markdown`) when known. Turns, a summary, or both.
+/// as Markdown, also read as `notes` or `summary_markdown`) when known. Turns, a summary, or both; with neither,
+/// the title, else the participants. `start` (ISO 8601: a time, or a date for an event that lasts all day, which
+/// `all_day` also says), when the body knows when the meeting starts, as a calendar's event does.
 #[derive(Deserialize)]
 struct Body {
     #[serde(default)]
@@ -30,6 +33,29 @@ struct Body {
     turns: Vec<Turn>,
     #[serde(default, alias = "notes", alias = "summary_markdown")]
     summary: Option<String>,
+    /// Read loosely, so a body whose `start` or `all_day` is of some other shape still reads.
+    #[serde(default)]
+    start: serde_json::Value,
+    #[serde(default)]
+    all_day: serde_json::Value,
+}
+
+/// When the meeting starts, as the body says it: a time in UTC (`2026-03-09T17:00:00Z`), or, for an event that
+/// lasts all day (a date, or `all_day`), its date as written (`2026-03-09`). None when the body has no start it
+/// can read.
+fn starts(b: &Body) -> Option<String> {
+    let start = b.start.as_str()?.trim();
+    let date = |s: &str| {
+        s.get(..10)
+            .filter(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
+            .map(str::to_string)
+    };
+    if b.all_day.as_bool() == Some(true) || start.len() == 10 {
+        return date(start);
+    }
+    let at = crate::query::schema::parse_instant(start).ok()?;
+    chrono::DateTime::from_timestamp_micros(at)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
 }
 
 /// A summary's lines as units, numbered on from `first`: each line that isn't a heading, a list's marker left out,
@@ -70,6 +96,32 @@ fn summary_units(summary: &str, first: usize) -> Vec<Unit> {
     out
 }
 
+/// The one unit of a body with no turns and no summary: its title, else who it lists, citing that field of the
+/// meeting. None when it has neither.
+fn title_unit(b: &Body) -> Option<Unit> {
+    let names: Vec<&str> = b
+        .participants
+        .iter()
+        .map(|p| p.name.trim())
+        .filter(|n| !n.is_empty())
+        .collect();
+    let (field, text) = match b.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(title) => ("title", title.to_string()),
+        None if !names.is_empty() => ("participants", names.join(", ")),
+        None => return None,
+    };
+    Some(Unit {
+        index: 0,
+        speaker: None,
+        text,
+        cite: Cite::Field {
+            object: b.meeting.clone().unwrap_or_default(),
+            field: field.into(),
+            changed_at: None,
+        },
+    })
+}
+
 #[derive(Deserialize)]
 struct Turn {
     #[serde(alias = "speaker_id")]
@@ -98,6 +150,7 @@ impl EpisodeType for SalesCall {
             "granola:",
             "fireflies:",
             "fathom:",
+            "calendar:",
         ]
     }
     fn catalog_json(&self) -> &'static str {
@@ -116,10 +169,10 @@ impl EpisodeType for SalesCall {
         ]
     }
     fn instructions(&self) -> &'static str {
-        "A recorded call or meeting, as its transcript, its notes' summary, or both. On a sales call our reps \
-         (internal) talk with a prospect (external). Write simple statements the meeting makes, each citing the \
-         turn or summary line it is said in. Never judge status or progress: that is worked out later from many \
-         episodes."
+        "A recorded call or meeting, as its transcript, its notes' summary, or both; or a meeting on a calendar, as \
+         its description (what was planned, not what was said). On a sales call our reps (internal) talk with a \
+         prospect (external). Write simple statements the meeting makes, each citing the turn or summary line it \
+         is said in. Never judge status or progress: that is worked out later from many episodes."
     }
     fn units(&self, ep: &Episode) -> Result<Vec<Unit>> {
         let text = String::from_utf8_lossy(&ep.body);
@@ -132,6 +185,10 @@ impl EpisodeType for SalesCall {
                 .as_deref()
                 .map(|s| summary_units(s, turns))
                 .unwrap_or_default();
+            // A calendar's event with no description says what it is only by its title or who it lists.
+            if turns == 0 && summary.is_empty() {
+                return Ok(title_unit(&b).into_iter().collect());
+            }
             return Ok(b
                 .turns
                 .into_iter()
@@ -198,15 +255,15 @@ impl EpisodeType for SalesCall {
     /// Invited: every participant. Attended: a participant who speaks, cited at their first turn. Calendar
     /// participants are only invitees: a no-show is invited and never attends.
     /// Who speaks is [`participants::heard`], and a participant listed only by their address is also known by the
-    /// full name they speak under (`_alias`). The meeting's name is the recorder's title and its `scheduled_at` the
-    /// episode's time, so it is found by either.
+    /// full name they speak under (`_alias`). The meeting's name is the recorder's title and its `scheduled_at` when
+    /// it starts, as the body says ([`starts`]), else the episode's time, so it is found by either.
     fn engine_facts(&self, ep: &Episode, units: &[Unit]) -> Result<Vec<EngineFact>> {
         let text = String::from_utf8_lossy(&ep.body);
         if !text.trim_start().starts_with('{') {
             return Ok(vec![]);
         }
         let b: Body = serde_json::from_str(&text).context("sales_call body: not a transcript")?;
-        let Some(meeting) = b.meeting else {
+        let Some(meeting) = b.meeting.clone() else {
             return Ok(vec![]);
         };
         let fact = |predicate: &str, value: String, cite: Cite| EngineFact {
@@ -228,7 +285,10 @@ impl EpisodeType for SalesCall {
                 field("title"),
             ));
         }
-        if let Some(at) = chrono::DateTime::from_timestamp_micros(ep.occurred_at) {
+        // A calendar's event is sent when it last changed, which is not when it starts: its start is in the body.
+        if let Some(at) = starts(&b) {
+            out.push(fact("scheduled_at", at, field("start")));
+        } else if let Some(at) = chrono::DateTime::from_timestamp_micros(ep.occurred_at) {
             let at = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             out.push(fact("scheduled_at", at, field("occurred_at")));
         }

@@ -4,11 +4,14 @@
 //!
 //! The rule (`/retract`): it acts in the org the request selects, as reads do. The operator's admin key and the
 //! org's admins retract anything there, by prefix too. The org's ingest key retracts in its own memory only what
-//! it could write: one exact source (or its other versions, `except` the current one), or one episode that is
-//! there, never under a source the server owns, never by prefix, and it is told only how many. A member, a writer
-//! or reader key and another org's key are refused, and change nothing. Facts an episode alone supports go with
-//! it; facts another episode wrote stay. A delete is for good: a deleted version sent again never comes back,
-//! also one a newer version had only retired (`replaces_source`), which sent again alone would.
+//! it could write: one exact source (or its other versions, `except` the current one), one episode that is
+//! there, or a prefix naming a source family and something in it (`<kind>:<more>`, so a removed connector's
+//! source goes), never under a source the server owns, never outside its key's sources, and it is told only how
+//! many. A member, a writer or reader key and another org's key are refused, and change nothing. Facts an episode
+//! alone supports go with it; facts another episode wrote stay. A delete is for good: a deleted version sent again
+//! never comes back, also one a newer version had only retired (`replaces_source`), which sent again alone would.
+//! A prefix holds only what exists now. With `"hold": false` (a prefix only) the delete holds nothing back: what
+//! it took is gone, purged too, and the same record sent again later is back.
 
 use std::time::{Duration, Instant};
 
@@ -288,11 +291,53 @@ async fn an_org_retracts_its_own_episodes_and_nobody_elses() {
             403,
         ),
         (
-            "acme's key, by prefix",
+            "acme's key, a whole connector by prefix",
             a_ingest.as_str(),
             vec![],
-            json!({"source_prefix": "email:hubspot:"}),
+            json!({"source_prefix": "email:"}),
             403,
+        ),
+        (
+            "acme's key, a prefix with no family",
+            a_ingest.as_str(),
+            vec![],
+            json!({"source_prefix": ":hubspot"}),
+            403,
+        ),
+        (
+            "acme's key, the whole org by prefix",
+            a_ingest.as_str(),
+            vec![],
+            json!({"source_prefix": ""}),
+            400,
+        ),
+        (
+            "acme's key, a prefix too short",
+            a_ingest.as_str(),
+            vec![],
+            json!({"source_prefix": "x"}),
+            400,
+        ),
+        (
+            "acme's key, the server's sources by prefix",
+            a_ingest.as_str(),
+            vec![],
+            json!({"source_prefix": "mcp:remember_memory:"}),
+            403,
+        ),
+        (
+            "acme's key, a source not held back",
+            a_ingest.as_str(),
+            vec![],
+            json!({"source": "email:hubspot:2", "hold": false}),
+            400,
+        ),
+        (
+            "the operator, an episode not held back",
+            ADMIN_KEY,
+            in_acme.to_vec(),
+            json!({"episode_id": note1, "hold": false}),
+            400,
         ),
         (
             "acme's key, the server's source",
@@ -438,4 +483,192 @@ async fn an_org_retracts_its_own_episodes_and_nobody_elses() {
         let now = live().await;
         assert!(!now.contains(gone), "{source} {gone} is back: {now:?}");
     }
+
+    // A connector removed from the org: its ingest key retracts what it wrote by prefix, with the facts citing
+    // it, and nothing of another org's, though globex wrote the very same source and body.
+    let globex = Scope::org("globex").unwrap();
+    let ingest = async |bearer: &str, source: &str, text: &str| -> String {
+        let (status, v) = post(
+            &format!("{s}/ingest"),
+            bearer,
+            &[],
+            &batch(source, text, &["group:sales"]),
+        )
+        .await;
+        assert_eq!(status, 200, "{v}");
+        v["episode_ids"][0].as_str().unwrap().to_string()
+    };
+    let issue1 = ingest(&a_ingest, "sentry:acme/api/1", "TypeError in checkout").await;
+    let issue2 = ingest(&a_ingest, "sentry:acme/api/2", "Timeout on login").await;
+    let web1 = ingest(&a_ingest, "sentry:acme/web/1", "Hydration mismatch").await;
+    let theirs = ingest(&b_ingest, "sentry:acme/api/1", "TypeError in checkout").await;
+    store
+        .commit(
+            &acme,
+            "extract:test",
+            &[],
+            &[Fact::new("issue:acme/api/1", "error", "TypeError")
+                .from_episodes(&[&ep("sentry:acme/api/1", "TypeError in checkout")])],
+        )
+        .await
+        .unwrap();
+    let values = async |want: &[&str], absent: &[&str]| {
+        let t = Instant::now();
+        loop {
+            let v: Vec<String> = store
+                .read(&acme, &amy, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|f| f.value)
+                .collect();
+            if want.iter().all(|w| v.iter().any(|x| x == w))
+                && absent.iter().all(|a| !v.iter().any(|x| x == a))
+            {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(15), "{v:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    values(&["TypeError"], &[]).await;
+    // A key held to some sources retracts no prefix wider than they are.
+    let web_key = format!("msk_{}web", uuid::Uuid::new_v4().simple());
+    let (status, v) = post(
+        &format!("{s}/admin"),
+        ADMIN_KEY,
+        &[],
+        &json!({"op": "create_key", "org": "acme", "name": "web", "role": "ingest",
+                "key": web_key, "sources": ["sentry:acme/web/"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+    for prefix in ["sentry:acme/", "sentry:acme/api/"] {
+        let (status, v) = retract(&web_key, &[], json!({"source_prefix": prefix})).await;
+        assert_eq!(status, 403, "{prefix}: {v}");
+    }
+    let (status, v) = retract(&a_ingest, &[], json!({"source_prefix": "sentry:"})).await;
+    assert_eq!(status, 403, "{v}");
+    let (status, v) = retract(&a_ingest, &[], json!({"source_prefix": "sentry:acme/api/"})).await;
+    assert_eq!((status, v), (200, json!({"retracted": 2})));
+    let now = live().await;
+    assert!(!now.contains(&issue1) && !now.contains(&issue2), "{now:?}");
+    assert!(now.contains(&web1), "{now:?}");
+    values(&[], &["TypeError"]).await;
+    assert!(
+        store
+            .current_episodes(&globex)
+            .await
+            .unwrap()
+            .contains_key(&theirs),
+        "globex's episode went with acme's"
+    );
+    // Sent again, it stays gone: a prefix delete holds for what it took.
+    ingest(&a_ingest, "sentry:acme/api/1", "TypeError in checkout").await;
+    assert!(!live().await.contains(&issue1));
+    // A prefix with nothing under it retracts nothing and holds nothing back.
+    let (status, v) = retract(
+        &a_ingest,
+        &[],
+        json!({"source_prefix": "sentry:acme/jobs/"}),
+    )
+    .await;
+    assert_eq!((status, v), (200, json!({"retracted": 0})));
+    let job1 = ingest(&a_ingest, "sentry:acme/jobs/1", "Queue backed up").await;
+    assert!(live().await.contains(&job1));
+
+    // Removed with `"hold": false`, as a source the org may add back: gone now with its facts, and back when
+    // the same record is sent again, before a purge and after it. One the source deleted for good stays gone.
+    let pr1 = ingest(&a_ingest, "github:acme/app#1", "Fix the login redirect").await;
+    let pr2 = ingest(&a_ingest, "github:acme/app#2", "Bump the parser").await;
+    let pr3 = ingest(&a_ingest, "github:acme/app#3", "Drop the old cache").await;
+    // An extractor read the first two.
+    let read = |id: &str, facts: i64| memstore::Extraction {
+        episode_id: id.to_string(),
+        extractor: "extract:test".into(),
+        facts,
+        tokens: None,
+    };
+    store
+        .commit_extracted(
+            &acme,
+            "extract:test",
+            &[Fact::new("pr:acme/app#1", "fixes", "login redirect")
+                .from_episodes(&[&ep("github:acme/app#1", "Fix the login redirect")])],
+            &[read(&pr1, 1), read(&pr2, 0)],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    values(&["login redirect"], &[]).await;
+    let (status, _) = retract(&a_ingest, &[], json!({"source": "github:acme/app#3"})).await;
+    assert_eq!(status, 200);
+    let (status, v) = retract(
+        &a_ingest,
+        &[],
+        json!({"source_prefix": "github:acme/app#", "hold": false}),
+    )
+    .await;
+    assert_eq!((status, v), (200, json!({"retracted": 2})));
+    let now = live().await;
+    assert!(
+        [&pr1, &pr2, &pr3].iter().all(|id| !now.contains(id)),
+        "{now:?}"
+    );
+    values(&[], &["login redirect"]).await;
+    // Sent again before a purge: back, with the fact it supports.
+    assert_eq!(
+        ingest(&a_ingest, "github:acme/app#1", "Fix the login redirect").await,
+        pr1
+    );
+    assert!(live().await.contains(&pr1));
+    values(&["login redirect"], &[]).await;
+    // A purge erases the one not sent again, and keeps the one that came back.
+    let ns = acme.namespace();
+    let purgeable = store.purgeable_in(&ns, Duration::ZERO).await.unwrap();
+    assert!(
+        purgeable.contains(&pr2) && !purgeable.contains(&pr1),
+        "{purgeable:?}"
+    );
+    store.purge_retracted_in(&ns).await.unwrap();
+    assert!(
+        store
+            .purgeable_in(&ns, Duration::ZERO)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(live().await.contains(&pr1));
+    // Sent again after the purge: back, and read again (its facts went with the purge). The one deleted for good
+    // is not.
+    assert_eq!(
+        ingest(&a_ingest, "github:acme/app#2", "Bump the parser").await,
+        pr2
+    );
+    let extracted = store.extracted(&acme, "extract:test").await.unwrap();
+    assert!(
+        extracted.contains(&pr1) && !extracted.contains(&pr2),
+        "{extracted:?}"
+    );
+    ingest(&a_ingest, "github:acme/app#3", "Drop the old cache").await;
+    let now = live().await;
+    assert!(now.contains(&pr1) && now.contains(&pr2), "{now:?}");
+    assert!(!now.contains(&pr3), "{now:?}");
+    // A delete for good by the same prefix after it holds for what came back.
+    let (status, v) = retract(&a_ingest, &[], json!({"source_prefix": "github:acme/app#"})).await;
+    assert_eq!((status, v), (200, json!({"retracted": 2})));
+    ingest(&a_ingest, "github:acme/app#2", "Bump the parser").await;
+    assert!(!live().await.contains(&pr2));
+    // An admin may hold nothing back too, and sees which.
+    let (status, v) = retract(
+        &alice,
+        &in_acme,
+        json!({"source_prefix": "sentry:acme/web/", "hold": false}),
+    )
+    .await;
+    assert_eq!((status, &v["episode_ids"]), (200, &json!([web1])), "{v}");
+    assert!(!live().await.contains(&web1));
+    ingest(&a_ingest, "sentry:acme/web/1", "Hydration mismatch").await;
+    assert!(live().await.contains(&web1));
 }

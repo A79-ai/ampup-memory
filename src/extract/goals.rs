@@ -658,23 +658,35 @@ fn prepare(offer: &Offer, ep: &Episode, listing: Option<&Listing>) -> Result<Pre
     // Ids the facts may be about: what the episode is about, its people, and items it opens.
     // What the episode is about is set by whoever wrote it (a connector), not by its body: the engine's
     // facts must be about one of those ids, and the people they name (a call's participants) widen what
-    // the model may write about only through them. A body can't grant itself subjects.
-    let engine_facts: Vec<_> = offer
-        .kind
-        .engine_facts(ep, &units)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|f| ep.about.contains(&f.subject))
-        .collect();
-    let mut known: Vec<String> = ep.about.clone();
-    for f in &engine_facts {
-        // Only an id the engine's facts name (a participant), never a value such as a title or a time.
-        let names_id = offer
+    // the model may write about only through them. A body can't grant itself subjects. The one exception is
+    // the engine's own name for such a person (`_alias`: the full name a participant listed only by their
+    // address speaks under), kept for an id a kept engine fact names: a connector that puts only the meeting
+    // in `about` still links its participants' names to their addresses.
+    let all = offer.kind.engine_facts(ep, &units).unwrap_or_default();
+    // Only an id the engine's facts name (a participant), never a value such as a title or a time.
+    let names_id = |f: &episode_types::EngineFact| {
+        offer
             .checked
             .entity_type(&f.subject)
             .and_then(|ty| offer.checked.predicate(ty, &f.predicate))
-            .is_some_and(|pd| pd.value == ValueType::Ref);
-        if names_id && !known.contains(&f.value) {
+            .is_some_and(|pd| pd.value == ValueType::Ref)
+    };
+    let named: HashSet<&str> = all
+        .iter()
+        .filter(|f| ep.about.contains(&f.subject) && names_id(f))
+        .map(|f| f.value.as_str())
+        .collect();
+    let engine_facts: Vec<_> = all
+        .iter()
+        .filter(|f| {
+            ep.about.contains(&f.subject)
+                || (f.predicate == schema::ALIAS && named.contains(f.subject.as_str()))
+        })
+        .cloned()
+        .collect();
+    let mut known: Vec<String> = ep.about.clone();
+    for f in engine_facts.iter().filter(|f| names_id(f)) {
+        if !known.contains(&f.value) {
             known.push(f.value.clone());
         }
     }

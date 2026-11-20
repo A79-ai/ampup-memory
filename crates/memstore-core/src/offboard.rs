@@ -2066,9 +2066,11 @@ impl Store {
 
     /// Delete for good the episodes retracted in one namespace (deleted at their source, `POST /retract`)
     /// or past its retention policy: their rows and bodies, the facts citing them, those facts' backfilled
-    /// quotes, the closures they are evidence for, and the namespace's search indexes. The retraction rows
-    /// stay (they hold only ids), so a late retry of a purged episode is still retracted. A version a newer one
-    /// only superseded (`replaces_source`) isn't deleted and stays, with its facts, to come back if written
+    /// quotes, the closures they are evidence for, the records of their extraction, and the namespace's search
+    /// indexes. The retraction rows
+    /// stay (they hold only ids), so a late retry of a purged episode is still retracted, but for one a delete by
+    /// prefix took without holding it back (`"hold": false`), which written again is current again. A version a
+    /// newer one only superseded (`replaces_source`) isn't deleted and stays, with its facts, to come back if written
     /// again. Nothing to purge, nothing rewritten. The nightly window's scheduled purge goes the same way
     /// ([`Store::purgeable_in`], an [`Erasure`]), with a grace and inside its compactions.
     pub async fn purge_retracted_in(&self, ns: &str) -> Result<Forgotten> {
@@ -2128,6 +2130,14 @@ impl Store {
             times.get(c).copied()
         });
         gone.retain(|id| !superseded.contains_key(id));
+        // One a delete took without holding it back (`released`) and written again since is current again: kept,
+        // though the write is newer than the grace.
+        if grace > std::time::Duration::ZERO {
+            let now = crate::retracted(&retractions, &episodes, &on_main, &|c| {
+                times.get(c).copied()
+            });
+            gone.retain(|id| now.hidden.contains(id));
+        }
         let retention = read(RETENTION).await?;
         let (now_policy, then_policy) = (
             crate::newest_retention(&retention, &on_main)?,
@@ -2464,13 +2474,14 @@ impl Store {
 type RowsGone<'a> = dyn Fn(&str, &str) -> bool + Send + Sync + 'a;
 
 /// The tables an erasure rewrites, in its order: what cites an episode first, the episodes last.
-pub const ERASED_TABLES: [&str; 8] = [
+pub const ERASED_TABLES: [&str; 9] = [
     FACTS,
     QUOTES,
     CLOSURES,
     AGGREGATES,
     QA_LOG,
     FEEDBACK,
+    EXTRACTIONS,
     crate::governance::TABLE,
     EPISODES,
 ];
@@ -2572,7 +2583,9 @@ impl<'a> Erasure<'a> {
                         .collect())
                 }))
             }
-            CLOSURES => Some(Box::new(move |b| {
+            // And the record that an extractor read it: the facts it read went, so the same episode written again
+            // (one a delete by prefix held nothing back for) is read again.
+            CLOSURES | EXTRACTIONS => Some(Box::new(move |b| {
                 Ok(strings(b, "episode_id")
                     .iter()
                     .map(|e| Some(!gone.contains(e)))

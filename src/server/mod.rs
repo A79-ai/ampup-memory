@@ -3850,12 +3850,21 @@ fn episode_target(req: &Value) -> Result<(crate::AclTarget, &'static str, &str)>
 /// delete, for good: what it names never comes back, also the versions a newer one had superseded (which
 /// `/ingest` would otherwise bring back when written again). Replaying a delete retracts nothing.
 ///
+/// `{"source_prefix": "...", "hold": false}` deletes the same way but holds nothing back: a source the org
+/// removed and later added back. What the prefix names is gone now, with the facts citing it, and a purge
+/// deletes it, but the same record written again later (the same source and body) is current again. Only a
+/// prefix may opt out (`hold` defaults to `true`, and with `source` or `episode_id` it may only be `true`), and
+/// a delete for good that names an episode, before or after, still holds.
+///
 /// The operator's admin key and an org's admins may retract anything in the scope. An org's `ingest` key may
-/// retract in its own scope only what it could write: one exact source, or one episode that exists, never
-/// under a source the server owns ([`RESERVED_SOURCES`]), never outside its source prefixes if it has
-/// them, and never by prefix (`limited`). Nor does it place a standing delete: a plain `source` no episode
-/// has yet retracts nothing and holds nothing back (an admin may still pre-block one). Answers
-/// `{"retracted": n, "episode_ids": [...]}`; an ingest key, which reads nothing, gets only the count.
+/// retract in its own scope only what it could write (`limited`): one exact source, one episode that exists,
+/// or a source prefix that names at least a family and something in it (`<kind>:<more>`, never a bare `""` or
+/// `slack:`: [`narrow_prefix`]), so a connector removed from the org takes what it wrote. Never under a source
+/// the server owns ([`RESERVED_SOURCES`]), and never outside its source prefixes if it has them. Nor does it
+/// place a standing delete: a plain `source` no episode has yet retracts nothing and holds nothing back (an
+/// admin may still pre-block one), and a prefix, from anyone, takes only what exists now (a prefix with no
+/// episodes retracts 0). Answers `{"retracted": n, "episode_ids": [...]}`; an ingest key, which reads nothing,
+/// gets only the count.
 async fn retract(
     state: &State,
     scope: &Scope,
@@ -3867,6 +3876,18 @@ async fn retract(
         serde_json::from_slice(body).map_err(|_| BadRequest("body is not JSON".into()))?;
     let (mut target, kind, name) = episode_target(&req)?;
     let name = name.to_string();
+    let hold = match &req["hold"] {
+        Value::Null => true,
+        Value::Bool(h) => *h,
+        _ => return Err(BadRequest("hold is true or false".into()).into()),
+    };
+    if !hold && kind != "source_prefix" {
+        return Err(BadRequest(
+            "hold: false is for a source_prefix: a source or an episode deleted is deleted for good"
+                .into(),
+        )
+        .into());
+    }
     match &req["except"] {
         Value::Null => {}
         Value::Array(a) if kind == "source" => {
@@ -3890,13 +3911,15 @@ async fn retract(
     if let Some(key) = limited {
         let refuse = |m: String| -> anyhow::Error { Forbidden(m).into() };
         match &target {
-            crate::AclTarget::SourcePrefix(_) => {
-                return Err(refuse(
-                    "an ingest key retracts one source or one episode: a prefix is for an admin"
-                        .into(),
-                ));
+            crate::AclTarget::SourcePrefix(p) if !narrow_prefix(p) => {
+                return Err(refuse(format!(
+                    "an ingest key retracts by a prefix that names a source family and something in it \
+                     (<kind>:<more>), not {p:?}: a wider one is for an admin"
+                )));
             }
-            crate::AclTarget::Source(s) | crate::AclTarget::SourceExcept { source: s, .. }
+            crate::AclTarget::Source(s)
+            | crate::AclTarget::SourceExcept { source: s, .. }
+            | crate::AclTarget::SourcePrefix(s)
                 if reserved_source(s) =>
             {
                 return Err(refuse(format!(
@@ -3904,7 +3927,10 @@ async fn retract(
                     RESERVED_SOURCES.join(", ")
                 )));
             }
-            crate::AclTarget::Source(s) | crate::AclTarget::SourceExcept { source: s, .. }
+            // A prefix is within the key's sources when everything under it is: it starts with one of them.
+            crate::AclTarget::Source(s)
+            | crate::AclTarget::SourceExcept { source: s, .. }
+            | crate::AclTarget::SourcePrefix(s)
                 if !key.may_write_source(s) =>
             {
                 return Err(refuse(format!(
@@ -3954,9 +3980,13 @@ async fn retract(
             _ => {}
         }
     }
-    let ids = store.retract_episodes(scope, actor, &target).await?;
+    let ids = match hold {
+        true => store.retract_episodes(scope, actor, &target).await?,
+        false => store.retract_released(scope, actor, &name).await?,
+    };
     eprintln!(
-        "retract by {actor} in {scope}: {kind} {name:?}: {} episodes",
+        "retract by {actor} in {scope}: {kind} {name:?}{}: {} episodes",
+        if hold { "" } else { ", held back for nothing" },
         ids.len()
     );
     Ok(match limited {
@@ -4323,6 +4353,16 @@ const RESERVED_DOCUMENTS: [&str; 8] = [
 
 /// The largest version of a starter document a note may write (the hooks send files of up to this).
 const STARTER_MAX_BYTES: usize = 64 * 1024;
+
+/// Whether an ingest key's `/retract` prefix is narrow enough: a source family and something in it
+/// (`<kind>:<more>`, as `sentry:acme/api/` or `github:acme/app#`), so it never names a whole org (`""`) or a
+/// whole connector (`slack:`). Every source under it is in that family, so [`reserved_source`] on the prefix
+/// decides for all of them.
+fn narrow_prefix(prefix: &str) -> bool {
+    prefix
+        .split_once(':')
+        .is_some_and(|(kind, more)| !kind.trim().is_empty() && !more.trim().is_empty())
+}
 
 /// Whether `source` is in a family the server owns, by the family before its first `:` (case aside).
 fn reserved_source(source: &str) -> bool {
@@ -16011,7 +16051,7 @@ async fn commit_remembered(
     who: &Principal,
     args: &Value,
 ) -> Result<(String, String)> {
-    commit_note(state, store, scope, who, args, false, None).await
+    commit_note(state, store, scope, who, args, false, None, vec![]).await
 }
 
 /// [`commit_remembered`] of what a person added in Studio (`/learn`), filed under [`crate::origin::LEARNED`] so it
@@ -16023,11 +16063,12 @@ async fn commit_learned(
     who: &Principal,
     args: &Value,
 ) -> Result<(String, String)> {
-    commit_note(state, store, scope, who, args, true, None).await
+    commit_note(state, store, scope, who, args, true, None, vec![]).await
 }
 
 /// [`commit_learned`] of a recording a person added in Studio, its transcript filed as a call
-/// ([`crate::origin::RECORDED`]), said at `at` (microseconds) when it is known when it was recorded.
+/// ([`crate::origin::RECORDED`]), said at `at` (microseconds) when it is known when it was recorded, and about
+/// `about` (the meeting it is the record of, so the engine's facts about it are kept).
 async fn commit_recorded(
     state: &State,
     store: &Store,
@@ -16035,10 +16076,12 @@ async fn commit_recorded(
     who: &Principal,
     args: &Value,
     at: Option<i64>,
+    about: Vec<String>,
 ) -> Result<(String, String)> {
-    commit_note(state, store, scope, who, args, true, at).await
+    commit_note(state, store, scope, who, args, true, at, about).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn commit_note(
     state: &State,
     store: &Store,
@@ -16047,6 +16090,7 @@ async fn commit_note(
     args: &Value,
     learned: bool,
     at: Option<i64>,
+    about: Vec<String>,
 ) -> Result<(String, String)> {
     let (source, body) = remember_args_as(args, learned)?;
     let (body, _) = redacted_for(store, scope, body).await?;
@@ -16097,6 +16141,7 @@ async fn commit_note(
     if let Some(at) = at {
         ep.occurred_at = at;
     }
+    ep.about = about;
     crate::episode_types::check(&ep).map_err(|e| ToolError(format!("{e:#}")))?;
     let readers = match entries.as_slice() {
         ["*"] => format!("everyone who reads {scope}"),

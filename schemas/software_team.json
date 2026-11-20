@@ -1,6 +1,6 @@
 {
   "name": "software_team",
-  "version": 2,
+  "version": 3,
   "description": "A software team's working memory: the services it builds and runs, the changes that ship to them, the incidents and errors they have, the decisions taken and the procedures that fix things, from pull requests, error reports, chat threads, meeting notes and tickets.",
   "default_type": "topic",
   "types": {
@@ -80,7 +80,7 @@
       }
     },
     "meeting": {
-      "description": "A meeting or call, by the id its source gives it (meeting:granola:<id>, meeting:<id>)."
+      "description": "A meeting or call, by the id its source gives it (meeting:granola:<id>, a calendar event as meeting:google:<event id>, meeting:<id>)."
     },
     "channel": {
       "description": "A chat channel, by its id (channel:C024BE91L)."
@@ -145,18 +145,24 @@
     "rep": {
       "description": "One of the team's own people on an email or a deal, as rep:<email>, or rep:hs-<id> for a CRM record's owner by their CRM user id."
     },
+    "feature": {
+      "description": "Part of the product the team builds, as its users see it: a screen, a flow, an agent, an integration or a capability, named in lower case by what the team calls it (feature:bulk_export)."
+    },
+    "project": {
+      "description": "Work with a goal and an end: a launch, a migration, a pilot, an event or a campaign, named for what it delivers (project:postgres_16_upgrade)."
+    },
     "topic": {
       "description": "Anything else a colleague would look up by name: a process, a policy, a vendor's product, a customer request (topic:sso_rollout)."
     }
   },
   "guidance": [
-    "Facts read from pull requests, error reports, chat, meeting notes and tickets are statements: one sentence each, under the service, pull request (pr), issue, change, incident, decision, procedure or person it is about, its kind as the predicate (problem, cause, fix, decision, commitment, plan, update, requirement, question, note). Filter by type and kind, and rank by text. Facts from calendar events, emails and CRM records keep the predicates their types declare.",
+    "Facts read from pull requests, error reports, chat, meeting notes and tickets are statements: one sentence each, under the service, feature, project, pull request (pr), issue, change, incident, decision, procedure or person it is about, its kind as the predicate (problem, cause, fix, decision, commitment, plan, update, requirement, question, note). Filter by type and kind, and rank by text. Facts from calendar events, emails and CRM records keep the predicates their types declare.",
     "What broke and why: find type incident by text (the error message, the service, the release) and read its problem, cause and fix statements; the pull requests and changes that name it say what shipped.",
     "Before changing a service: read its statements, then the decisions and incidents whose text names it.",
     "A procedure's statements quote commands as the team wrote them: read the evidence (include: [\"evidence\"]) before running one. One person may be two subjects, by login and by name."
   ],
   "extract": {
-    "sources": {"prefixes": ["github:", "sentry:", "slack:", "granola:", "linear:", "hubspot:", "salesforce:", "dynamicsCRM:", "email:", "gong:", "fireflies:", "fathom:"]},
+    "sources": {"prefixes": ["github:", "sentry:", "slack:", "granola:", "linear:", "hubspot:", "salesforce:", "dynamicsCRM:", "email:", "gong:", "fireflies:", "fathom:", "calendar:"]},
     "style": "statements",
     "facts_per_episode": 15
   }

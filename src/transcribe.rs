@@ -9,6 +9,11 @@
 //!   start, and each recording is refused saying so.
 //! - `AMPUP_MEMORY_TRANSCRIBE_URL`: the service's base URL (default `https://api.elevenlabs.io`), for a stand-in.
 //! - `AMPUP_MEMORY_TRANSCRIBE_TIMEOUT_SECS`: how long one transcription may take (default 120).
+//! - `AMPUP_MEMORY_TRANSCRIBE_TOKENS_PER_MIN`: what a minute of audio counts as against its org's monthly model
+//!   tokens ([`tokens_for`]; default [`TOKENS_PER_MIN`]).
+//!
+//! Transcribing is a model call the org pays for like any other: it is refused once the org's allowance or plan has
+//! run out (`crate::limits::model_gate`), and its minutes count against the allowance afterwards.
 //!
 //! The language is the service's to detect. Words are grouped into turns by speaker, a long run of one speaker
 //! split at a sentence's end once it passes [`TURN_MS`], so a fact cites a moment rather than a monologue; sounds
@@ -23,6 +28,24 @@ use serde::Deserialize;
 const ELEVENLABS: &str = "https://api.elevenlabs.io";
 /// How long a turn of one speaker runs before it is split at the next sentence's end.
 const TURN_MS: u64 = 30_000;
+
+/// What a minute of audio counts as against an org's monthly model tokens. Set from cost: Scribe at its highest
+/// listed price, $0.40 an hour, is $0.0067 a minute; the default extraction model (Haiku 5.5, $1 per million tokens
+/// read and $5 written, mostly read) is about $1.50 per million tokens, so a minute costs what ~4,400 tokens do.
+/// 4,000 rounds that down; Starter's 2M tokens then hold about 8 hours of audio if nothing else were read.
+pub const TOKENS_PER_MIN: u64 = 4_000;
+
+/// The model tokens `seconds` of audio count as (`AMPUP_MEMORY_TRANSCRIBE_TOKENS_PER_MIN`, default
+/// [`TOKENS_PER_MIN`]), each started second counted.
+pub fn tokens_for(seconds: f64) -> u64 {
+    static RATE: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("AMPUP_MEMORY_TRANSCRIBE_TOKENS_PER_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(TOKENS_PER_MIN)
+    });
+    (seconds.max(0.0).ceil() as u64 * *RATE).div_ceil(60)
+}
 
 /// A service that turns speech into text.
 pub struct Transcriber {

@@ -141,7 +141,7 @@ as if it didn't exist.
 | `POST /facts` | a caller who may read and write | `{facts: [{entity, predicate, value, quote, source_episodes, valid_from?}]}`, 1 to 500 |
 | `POST /close` | a caller who may write | `{fact_id, reason, when?, acl?}` |
 | `POST /forget` | the note's author | `{episode_id}` |
-| `POST /retract` | the operator, an org admin, or an ingest key for its own records | `{source_prefix \| source \| episode_id, except?}` |
+| `POST /retract` | the operator, an org admin, or an ingest key for its own records | `{source_prefix \| source \| episode_id, except?, hold?}` |
 | `POST /acl` | admin key | `{source_prefix \| source \| episode_id, acl}` |
 | `POST /feedback` | a person who may read the fact | `{fact_id, signal: positive \| negative \| very_negative, reason?}` |
 
@@ -152,7 +152,14 @@ as if it didn't exist.
   and value (common words aside) must occur in the cited text.
 - `/forget` re-ACLs the episode to an entry nobody holds; the ledger keeps the change.
 - `/retract` hides an episode, and every fact citing it, for every reader on every branch at every time. The bytes
-  stay until a purge (`ampup-memory org purge`).
+  stay until a purge (`ampup-memory org purge`). A retracted record written again stays retracted. An ingest key
+  retracts one source, one episode, or a prefix that names a source family and something in it
+  (`sentry:acme/api/`, not `""` or `sentry:`), within its own sources, and learns only how many. A prefix takes
+  only what exists now.
+- `{"source_prefix": "...", "hold": false}` is for a source that was removed and may be added back: it deletes
+  the same, and a purge erases it, but the same record (source and body) written again later is current again.
+  `hold` defaults to `true`; only a `source_prefix` may set it to `false`. A delete of an exact source or episode
+  stays for good.
 
 ## Admin and operations
 

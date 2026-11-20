@@ -1,6 +1,6 @@
 {
   "name": "sales",
-  "version": 2,
+  "version": 4,
   "description": "B2B sales memory: deals, accounts, contacts and reps from the CRM, plus what calls, emails and notes say about them (stakeholders, commitments, objections, competitors, qualification).",
   "types": {
     "deal": {
@@ -12,8 +12,8 @@
         "close_date": {"type": "date", "plan": true},
         "owner": {"type": "ref", "to": ["rep"]},
         "account": {"type": "ref", "to": ["account"], "part_of": true},
-        "champion": {"type": "ref", "to": ["contact"], "card": "many"},
-        "economic_buyer": {"type": "ref", "to": ["contact"], "card": "many"},
+        "champion": {"type": "ref", "to": ["contact", "person"], "card": "many"},
+        "economic_buyer": {"type": "ref", "to": ["contact", "person"], "card": "many"},
         "competitor": {"type": "ref", "to": ["competitor"], "card": "many"},
         "current_tool": {"type": "string", "card": "many", "list": true, "description": "a tool they use today relevant to the deal, including in-house tools and home-built attempts that failed; keep the key specifics"},
         "next_step": {"type": "text", "freshness_days": 21},
@@ -55,7 +55,7 @@
       "description": "A contact's part in one deal: an edge with properties. Ids are stakeholder:<deal id>:<contact id>.",
       "predicates": {
         "deal": {"type": "ref", "to": ["deal"], "part_of": true},
-        "contact": {"type": "ref", "to": ["contact"]},
+        "contact": {"type": "ref", "to": ["contact", "person"]},
         "role": {"type": "enum", "values": ["champion", "economic_buyer", "technical_evaluator", "decision_maker", "influencer", "blocker", "other"]},
         "stance": {"type": "enum", "values": ["supportive", "neutral", "skeptical", "opposed"], "freshness_days": 90},
         "engagement": {"type": "enum", "values": ["high", "medium", "low", "none"], "freshness_days": 60},
@@ -78,18 +78,18 @@
         "status": {"type": "enum", "values": ["scheduled", "completed", "cancelled", "no_show"]},
         "deal": {"type": "ref", "to": ["deal"], "part_of": true},
         "account": {"type": "ref", "to": ["account"], "part_of": true},
-        "participant": {"type": "ref", "to": ["contact", "rep"], "card": "many"},
+        "participant": {"type": "ref", "to": ["contact", "rep", "person"], "card": "many"},
         "series": {"type": "string"}
       }
     },
     "commitment": {
       "description": "Something someone said they would do. Ids are commitment:<id>.",
       "predicates": {
-        "owner": {"type": "ref", "to": ["rep", "contact"]},
+        "owner": {"type": "ref", "to": ["rep", "contact", "person"]},
         "action": {"type": "text"},
         "due": {"type": "date", "plan": true},
         "status": {"type": "enum", "values": ["open", "done", "stale", "dropped"], "pending": ["open", "stale"], "freshness_days": 30},
-        "about": {"type": "ref", "to": ["deal", "account"], "part_of": true},
+        "about": {"type": "ref", "to": ["deal", "account", "topic"], "part_of": true},
         "stated_in": {"type": "ref", "to": ["meeting"]}
       }
     },
@@ -97,16 +97,15 @@
       "description": "A to-do in AmpUp or the CRM; its name is the subject. Ids are task:<id>.",
       "predicates": {
         "status": {"type": "enum", "description": "open, completed, dismissed, expired and the like (open enum).", "pending": ["open", "not_started", "in_progress", "waiting"]},
-        "priority": {"type": "enum", "values": ["low", "medium", "high"], "description": "How urgent the task is. A CRM's own spellings are stored as one of these (Normal as medium, P0 as high).",
-                     "aliases": {"none": "low", "normal": "medium", "urgent": "high", "critical": "high", "p0": "high", "p1": "medium", "p2": "low"}},
+        "priority": {"type": "enum", "values": ["low", "medium", "high"], "description": "How urgent the task is. A CRM's own spellings are stored as one of these (Normal as medium, P0 as high).", "aliases": {"critical": "high", "none": "low", "normal": "medium", "p0": "high", "p1": "medium", "p2": "low", "urgent": "high"}},
         "due": {"type": "timestamp", "plan": true},
-        "owner": {"type": "ref", "to": ["rep"]},
+        "owner": {"type": "ref", "to": ["rep", "person"]},
         "source": {"type": "string", "description": "Where the task came from, such as AmpUp or hubspot."},
         "resolved_at": {"type": "timestamp"},
         "deal": {"type": "ref", "to": ["deal"], "card": "many", "part_of": true},
         "account": {"type": "ref", "to": ["account"], "card": "many", "part_of": true},
         "meeting": {"type": "ref", "to": ["meeting"], "card": "many", "part_of": true},
-        "contact": {"type": "ref", "to": ["contact"], "card": "many"}
+        "contact": {"type": "ref", "to": ["contact", "person"], "card": "many"}
       }
     },
     "objection": {
@@ -115,7 +114,7 @@
         "category": {"type": "enum", "description": "The org's own objection categories (open enum)."},
         "text": {"type": "text"},
         "about": {"type": "ref", "to": ["deal", "account"], "part_of": true},
-        "raised_by": {"type": "ref", "to": ["contact"]},
+        "raised_by": {"type": "ref", "to": ["contact", "person"]},
         "raised_in": {"type": "ref", "to": ["meeting"], "card": "many", "description": "The meetings it came up in, so counts per meeting work."},
         "status": {"type": "enum", "values": ["open", "addressed", "resolved"], "pending": ["open"], "freshness_days": 60}
       }
@@ -135,6 +134,69 @@
         "period_start": {"type": "date"},
         "period_end": {"type": "date"}
       }
+    },
+    "channel": {
+      "description": "A chat channel, by its id (channel:C024BE91L)."
+    },
+    "incident": {
+      "description": "An error tracker's issue: one error grouped across its occurrences. Ids are incident:<org>/<project>/issues/<id>."
+    },
+    "issue": {
+      "description": "An issue or ticket, by the id its tracker gives it: issue:<owner>/<repo>#<number> from a code host, issue:<workspace>/<KEY-123> from a tracker.",
+      "predicates": {
+        "repo": {"type": "ref", "to": ["repo"], "part_of": true},
+        "title": {"type": "text"}
+      }
+    },
+    "lead": {
+      "description": "A CRM lead: someone the CRM tracks before they are a contact. Ids are lead:<crm>-<crm id> (lead:hs-42).",
+      "predicates": {
+        "email": {"type": "string"},
+        "title": {"type": "string", "freshness_days": 365},
+        "company": {"type": "string", "description": "The company name on the lead."},
+        "status": {"type": "enum", "description": "Its status in the CRM (open enum)."},
+        "lead_source": {"type": "string"},
+        "owner": {"type": "ref", "to": ["rep"], "description": "Who owns it in the CRM."}
+      }
+    },
+    "person": {
+      "description": "Anyone, by email address: person:<lower-cased email> (person:dana@example.com). The id calls, calendars and emails name people by; a CRM contact, lead or rep with that email is the same person.",
+      "predicates": {
+        "title": {"type": "string", "freshness_days": 365},
+        "company": {"type": "string", "description": "The company they work for, as stated."}
+      }
+    },
+    "pr": {
+      "description": "A merged pull request. Ids are pr:<owner>/<repo>#<number>.",
+      "predicates": {
+        "merged_at": {"type": "date"},
+        "repo": {"type": "ref", "to": ["repo"], "part_of": true},
+        "title": {"type": "text"}
+      }
+    },
+    "repo": {
+      "description": "A code repository. Ids are repo:<owner>/<repo>.",
+      "predicates": {
+        "description": {"type": "text"}
+      }
+    },
+    "slack_user": {
+      "description": "A chat account, by its id (slack_user:U024BE7LH); the person behind it is a person or a rep."
+    },
+    "thread": {
+      "description": "A chat thread, as thread:<channel id>:<thread ts>."
+    },
+    "topic": {
+      "description": "What an internal meeting or Slack thread is about when it is not one deal: a project, product area or feature, a customer's issue, a process, hiring, an incident. Ids are topic:<slug>, such as topic:notetaker_recording or topic:q4_pricing.",
+      "predicates": {
+        "decision": {"type": "text", "card": "many", "description": "A decision taken, with who took it when that is said."},
+        "discussed_in": {"type": "ref", "to": ["meeting"], "card": "many"},
+        "issue": {"type": "text", "card": "many", "description": "A problem raised and not yet resolved."},
+        "next_step": {"type": "text", "card": "many", "description": "What someone said happens next, with the owner's name when said."},
+        "owner": {"type": "ref", "to": ["rep", "person"], "card": "many"},
+        "related_deal": {"type": "ref", "to": ["deal", "account"], "card": "many", "description": "Deals or accounts the topic touches, when any."},
+        "summary": {"type": "text", "description": "Where it stands, one or two lines, as of the latest discussion."}
+      }
     }
   },
   "metrics": {
@@ -142,8 +204,7 @@
       "title": "Open pipeline by stage",
       "tags": ["pipeline"],
       "description": "Open deals per stage, with their total amount.",
-      "query": {"find": "count", "type": "deal", "where": [{"attr": "status", "eq": "open"}],
-                "group_by": "stage", "metrics": ["count", {"sum": "amount"}]}
+      "query": {"find": "count", "type": "deal", "where": [{"attr": "status", "eq": "open"}], "group_by": "stage", "metrics": ["count", {"sum": "amount"}]}
     },
     "objections_by_category": {
       "title": "Objections by category",
@@ -159,15 +220,85 @@
     },
     "open_commitments_by_owner": {
       "title": "Open commitments by owner",
-      "tags": ["follow_through"],
+      "tags": ["execution"],
       "description": "Open or stale commitments per owner.",
-      "query": {"find": "count", "type": "commitment",
-                "where": [{"attr": "status", "in": ["open", "stale"]}], "group_by": "owner.name"}
+      "query": {"find": "count", "group_by": "owner", "type": "commitment", "where": [{"attr": "status", "in": ["open", "stale"]}]}
+    },
+    "active_deals": {
+      "title": "Active deals, last 90 days vs the 90 before",
+      "tags": ["overview", "pipeline"],
+      "description": "Deals with a meeting in the window.",
+      "sql": "SELECT count(DISTINCT d.value_ref) FILTER (WHERE s.value_ts >= now() - INTERVAL '90 days') AS last_90d, count(DISTINCT d.value_ref) FILTER (WHERE s.value_ts < now() - INTERVAL '90 days' AND s.value_ts >= now() - INTERVAL '180 days') AS prior_90d, array_agg(d.fact_id) FILTER (WHERE s.value_ts >= now() - INTERVAL '90 days') AS fact_ids FROM current d JOIN current s ON s.entity = d.entity WHERE d.predicate = 'deal' AND s.predicate = 'scheduled_at' AND s.value_ts <= now()",
+      "types": ["meeting"]
+    },
+    "coaching_by_skill": {
+      "title": "Coaching signals by skill",
+      "tags": ["coaching"],
+      "description": "What coaching observations are about, across reps.",
+      "query": {"find": "count", "group_by": "skill", "type": "coaching_signal"}
+    },
+    "deal_signals": {
+      "title": "Objections and competitors per deal",
+      "tags": ["objections", "competitors"],
+      "description": "Each deal's objection categories and the competitors named on it, to set against outcomes.",
+      "sql": "SELECT a.value_ref AS deal, 'objection' AS kind, c.value AS value, array_agg(DISTINCT c.fact_id) AS fact_ids FROM current a JOIN current c ON c.entity = a.entity WHERE a.predicate = 'about' AND c.predicate = 'category' AND a.value_ref LIKE 'deal:%' GROUP BY 1, 2, 3 UNION ALL SELECT entity AS deal, 'competitor' AS kind, value_ref AS value, array_agg(DISTINCT fact_id) AS fact_ids FROM current WHERE predicate = 'competitor' AND entity LIKE 'deal:%' GROUP BY 1, 2, 3",
+      "types": ["deal", "objection"]
+    },
+    "deals_by_competitor": {
+      "title": "Deals by competitor",
+      "tags": ["competitors"],
+      "description": "Deals where a competitor is in play.",
+      "sql": "SELECT value_ref AS competitor, count(DISTINCT entity) AS deals, array_agg(fact_id) AS fact_ids FROM current WHERE predicate = 'competitor' GROUP BY 1 ORDER BY deals DESC, competitor",
+      "types": ["deal"]
+    },
+    "meddpicc_coverage": {
+      "title": "MEDDPICC coverage",
+      "tags": ["pipeline", "coaching"],
+      "description": "Deals per MEDDPICC element confirmed or partly known.",
+      "sql": "SELECT replace(predicate, 'meddpicc_', '') AS element, count(*) FILTER (WHERE value = 'confirmed') AS confirmed, count(*) FILTER (WHERE value = 'partial') AS partial, count(*) AS known, array_agg(fact_id) FILTER (WHERE value IN ('confirmed', 'partial')) AS fact_ids FROM current WHERE predicate LIKE 'meddpicc_%' GROUP BY 1 ORDER BY confirmed DESC, element",
+      "types": ["deal"]
+    },
+    "meetings_analyzed": {
+      "title": "Meetings analyzed, last 90 days vs the 90 before",
+      "tags": ["overview"],
+      "description": "Meetings held, by when they were scheduled.",
+      "sql": "SELECT count(*) FILTER (WHERE value_ts >= now() - INTERVAL '90 days') AS last_90d, count(*) FILTER (WHERE value_ts < now() - INTERVAL '90 days' AND value_ts >= now() - INTERVAL '180 days') AS prior_90d, array_agg(fact_id) FILTER (WHERE value_ts >= now() - INTERVAL '90 days') AS fact_ids FROM current WHERE predicate = 'scheduled_at' AND value_ts <= now()",
+      "types": ["meeting"]
+    },
+    "objections_trend": {
+      "title": "Objections, last 30 days vs the 30 before",
+      "tags": ["objections"],
+      "description": "Objections raised per category, by when they were recorded.",
+      "sql": "SELECT value AS category, count(*) FILTER (WHERE valid_from >= now() - INTERVAL '30 days') AS last_30d, count(*) FILTER (WHERE valid_from < now() - INTERVAL '30 days' AND valid_from >= now() - INTERVAL '60 days') AS prior_30d, array_agg(fact_id) FILTER (WHERE valid_from >= now() - INTERVAL '60 days') AS fact_ids FROM current WHERE predicate = 'category' GROUP BY 1 HAVING count(*) FILTER (WHERE valid_from >= now() - INTERVAL '60 days') > 0 ORDER BY last_30d DESC, category",
+      "types": ["objection"]
+    },
+    "overdue_commitments": {
+      "title": "Overdue commitments by owner",
+      "tags": ["execution"],
+      "description": "Open commitments past their due date.",
+      "sql": "SELECT o.value_ref AS owner, count(DISTINCT o.entity) AS overdue, array_agg(DISTINCT d.fact_id) AS fact_ids FROM current o JOIN current s ON s.entity = o.entity JOIN current d ON d.entity = o.entity WHERE o.predicate = 'owner' AND s.predicate = 'status' AND s.value = 'open' AND d.predicate = 'due' AND d.value_ts < now() GROUP BY 1 ORDER BY overdue DESC, owner",
+      "types": ["commitment"]
+    },
+    "stuck_deals": {
+      "title": "What's holding active deals",
+      "tags": ["pipeline", "execution"],
+      "description": "Per deal with a meeting in the last 90 days, the signals in memory that it is stuck: open objections, overdue commitments, skeptical or opposed stakeholders, no next step, no confirmed champion.",
+      "sql": "WITH active AS ( SELECT m.value_ref AS deal, max(s.value_ts) AS last_meeting FROM current m JOIN current s ON s.entity = m.entity WHERE m.entity_type = 'meeting' AND m.predicate = 'deal' AND s.predicate = 'scheduled_at' AND s.value_ts >= now() - INTERVAL '90 days' AND s.value_ts <= now() GROUP BY 1), signals AS ( SELECT a.value_ref AS deal, 'open objection' AS reason, a.fact_id AS fact_id FROM current a JOIN current st ON st.entity = a.entity WHERE a.entity_type = 'objection' AND a.predicate = 'about' AND st.predicate = 'status' AND st.value = 'open' UNION ALL SELECT a.value_ref, 'overdue commitment', a.fact_id FROM current a JOIN current st ON st.entity = a.entity JOIN current du ON du.entity = a.entity WHERE a.entity_type = 'commitment' AND a.predicate = 'about' AND st.predicate = 'status' AND st.value = 'open' AND du.predicate = 'due' AND du.value_ts < now() UNION ALL SELECT a.value_ref, 'skeptical stakeholder', sn.fact_id FROM current a JOIN current sn ON sn.entity = a.entity WHERE a.entity_type = 'stakeholder' AND a.predicate = 'deal' AND sn.predicate = 'stance' AND sn.value IN ('skeptical', 'opposed') UNION ALL SELECT d.deal, 'no next step', CAST(NULL AS VARCHAR) FROM active d WHERE d.deal NOT IN (SELECT entity FROM current WHERE predicate = 'next_step') UNION ALL SELECT d.deal, 'no confirmed champion', CAST(NULL AS VARCHAR) FROM active d WHERE d.deal NOT IN (SELECT entity FROM current WHERE predicate = 'meddpicc_champion' AND value = 'confirmed')) SELECT s.deal, max(o.value_ref) AS owner, array_agg(DISTINCT s.reason) AS reasons, count(DISTINCT s.reason) AS signals, max(a.last_meeting) AS last_meeting, max(am.value_num) AS amount, array_agg(DISTINCT s.fact_id) FILTER (WHERE s.fact_id IS NOT NULL) AS fact_ids FROM signals s JOIN active a ON a.deal = s.deal LEFT JOIN current o ON o.entity = s.deal AND o.predicate = 'owner' LEFT JOIN current am ON am.entity = s.deal AND am.predicate = 'amount' GROUP BY s.deal ORDER BY signals DESC, s.deal",
+      "types": ["meeting", "deal", "objection", "commitment", "stakeholder"]
     }
   },
   "guidance": [
+    "Know where every deal stands: MEDDPICC coverage, open commitments and objections, and what comes next.",
     "Deals won in a period: count by close_date, which the CRM sets when a deal is won. Deals lost in a period: a lost deal's close_date often keeps its old expected date, so count by when its status changed to lost (find changes with type deal, select [\"status\"] and that window). When close_date and the status change disagree, say which you counted.",
     "A stakeholder's CRM role is often missing or stale. For who decides, the champion or a blocker, also read passages about the deal (deal context, qualification reviews, calls) and say where they disagree with the CRM.",
-    "Tasks are records, not passages: find them with type task, for example where {\"rel\": \"deal\", \"to\": {\"id\": \"deal:<id>\"}} and status eq open."
-  ]
+    "Tasks are records, not passages: find them with type task, for example where {\"rel\": \"deal\", \"to\": {\"id\": \"deal:<id>\"}} and status eq open.",
+    "Internal meetings and Slack threads are often about no deal: record them as a topic (project, feature, customer issue, process, incident) with its decisions, open issues and next steps, and link related_deal only when a deal or account is actually named.",
+    "A customer's deal or account is the subject of what is said about that customer, even in an internal thread or meeting: write it to deal:<name> or account:<name>, never to a topic named after the customer. A topic is for the team's own work (a feature, a project, a process, an incident).",
+    "One person may have several ids: person:<email> from calls, calendars and emails, and contact:, lead: or rep: from the CRM. Search by their email to find them all."
+  ],
+  "extract": {
+    "sources": {"prefixes": ["ampup:meeting:", "email:hubspot:", "mcp:remember_memory:", "hubspot:", "salesforce:", "dynamicsCRM:", "email:", "gong:", "fireflies:", "fathom:", "granola:", "calendar:"]},
+    "aggregates": {"elements": {"meddpicc.champion": ["advocate"], "meddpicc.competition": ["competitor", "current_tool"], "meddpicc.decision_criteria": ["decision_criterion", "requirement"], "meddpicc.decision_process": ["decision_process_step", "decision_date", "decision_maker"], "meddpicc.economic_buyer": ["economic_buyer"], "meddpicc.identify_pain": ["pain", "compelling_event"], "meddpicc.metrics": ["close_rate", "avg_deal_size", "team_size", "desired_outcome"]}, "every": 1, "items": {"commitment": ["open", "done", "dropped"], "meeting_plan": ["proposed", "confirmed", "held", "superseded", "cancelled"], "objection": ["open", "handled"]}, "max_wait_minutes": 5, "plans": ["next_meeting", "due", "starts_at"], "subject": "deal"},
+    "outcomes": ["mcp:remember_memory:"]
+  }
 }

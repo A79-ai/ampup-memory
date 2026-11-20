@@ -3,7 +3,8 @@
 //!
 //! - **Model tokens.** Every model call the engine makes for an org (extracting, learning and routing advice,
 //!   judging, dreaming, compiling, summarising, profiles, answering) counts the tokens it read and wrote against
-//!   that org, per calendar month (UTC); a remote embedding call counts too, a local one is no spend. Past the
+//!   that org, per calendar month (UTC); a remote embedding call counts too, a local one is no spend, and a
+//!   recording transcribed counts its minutes at a token rate (`crate::transcribe::tokens_for`). Past the
 //!   allowance, the org's background model work waits (nothing it would have read is given up: it is read once
 //!   the month turns or the allowance is raised), and a request that would call a model now is refused (402).
 //!   Writing and reading go on.

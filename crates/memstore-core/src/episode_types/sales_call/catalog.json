@@ -50,7 +50,8 @@
     "advocate": {
      "type": "ref",
      "to": [
-      "contact"
+      "contact",
+      "person"
      ],
      "card": "many",
      "description": "a prospect who says they want this or will push for it"
