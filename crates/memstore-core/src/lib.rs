@@ -933,7 +933,8 @@ pub struct Vis {
     /// kept under it, so it never outlives what it read.
     pub removals: u64,
     /// For each source with a superseded version ([`Vis::superseded`]), the ACLs of its versions readers see
-    /// now: whether the version that replaced one is readable by everyone who could read it.
+    /// now, one per version however often it was written: whether the version that replaced one is readable by
+    /// everyone who could read it.
     source_acls: HashMap<String, Vec<Vec<String>>>,
     /// Each superseded episode's newest ACL here: one forgotten or narrowed since the state before is a loss,
     /// though a newer version replaced it.
@@ -1669,6 +1670,8 @@ impl Vis {
             self.source_acls.clone(),
         );
         let mut records: BTreeSet<&str> = BTreeSet::new();
+        // A version written more than once counts once, as a build counts it.
+        let mut counted: HashSet<&str> = HashSet::new();
         for (e, source, ..) in &rows {
             let Some(acl) = new_acls.get(e) else {
                 continue;
@@ -1689,7 +1692,7 @@ impl Vis {
             if source.starts_with(conflicts::SOURCE) {
                 records.insert(e);
             }
-            if replaced_sources.contains(source) {
+            if replaced_sources.contains(source) && counted.insert(e) {
                 source_acls
                     .entry(source.clone())
                     .or_default()
@@ -7587,6 +7590,8 @@ impl Store {
             let mut conflict_records = HashSet::new();
             let replaced_sources: HashSet<&String> = superseded.values().collect();
             let mut source_acls: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+            // One ACL per version, though a version written again has a row per commit.
+            let mut counted: HashSet<String> = HashSet::new();
             for b in episodes.rows.iter() {
                 let (commit, id, source) = (
                     strings(b, "commit_id"),
@@ -7613,7 +7618,7 @@ impl Store {
                     if source[i].starts_with(conflicts::SOURCE) {
                         conflict_records.insert(id[i].clone());
                     }
-                    if replaced_sources.contains(&source[i]) {
+                    if replaced_sources.contains(&source[i]) && counted.insert(id[i].clone()) {
                         source_acls
                             .entry(source[i].clone())
                             .or_default()

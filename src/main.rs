@@ -198,6 +198,12 @@ enum Cmd {
         #[arg(long, requires = "local")]
         background: bool,
     },
+    /// What `serve --local` reads by itself, with the credentials already on this machine (no account, no webhook):
+    /// `add github OWNER/REPO [--since DATE]` (its issues and pull requests, through GITHUB_TOKEN or `gh auth
+    /// token`; 30 days back by default), `remove github OWNER/REPO`, `list`. A running server picks a change up
+    /// within a minute and reads each source every 10 minutes
+    #[command(subcommand)]
+    Sources(SourcesCmd),
     /// Keep `serve --local` running in the background, started at login and again if it stops: a LaunchAgent on
     /// macOS, a systemd user unit on Linux, logging to DIR/logs/serve.log. `install [DIR] [--port p]` (again: rewrites
     /// it for this binary and restarts it), `uninstall` (stops it; the data stays), `status`, `restart`,
@@ -837,6 +843,37 @@ struct AgentArgs {
     /// One round, then exit
     #[arg(long)]
     once: bool,
+}
+
+#[derive(Subcommand)]
+enum SourcesCmd {
+    /// Read a source from now on
+    Add {
+        /// What kind of source
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(memstore::sources::KINDS))]
+        kind: String,
+        /// What to read: OWNER/REPO for github
+        target: String,
+        /// Read what changed since this date (YYYY-MM-DD or RFC 3339; default 30 days back)
+        #[arg(long)]
+        since: Option<String>,
+        /// The `serve --local` directory
+        #[arg(long, default_value = "~/.ampup-memory")]
+        dir: String,
+    },
+    /// Stop reading a source (what it wrote stays in memory)
+    Remove {
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(memstore::sources::KINDS))]
+        kind: String,
+        target: String,
+        #[arg(long, default_value = "~/.ampup-memory")]
+        dir: String,
+    },
+    /// The sources read, how many records each has sent, when it was last read and any error
+    List {
+        #[arg(long, default_value = "~/.ampup-memory")]
+        dir: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2673,6 +2710,40 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             }
             return Ok(());
         }
+        Cmd::Sources(cmd) => {
+            match cmd {
+                SourcesCmd::Add {
+                    kind,
+                    target,
+                    since,
+                    dir,
+                } => {
+                    let dir = memstore::service::data_dir(dir)?;
+                    let source = memstore::sources::add(&dir, kind, target, since.as_deref())?;
+                    println!(
+                        "reading {} from {}: a running `serve --local` on {} starts within a minute",
+                        source.key(),
+                        since.as_deref().unwrap_or("30 days back"),
+                        dir.display()
+                    );
+                }
+                SourcesCmd::Remove { kind, target, dir } => {
+                    let dir = memstore::service::data_dir(dir)?;
+                    match memstore::sources::remove(&dir, kind, target)? {
+                        true => println!("no longer reading {kind}:{target}; what it wrote stays"),
+                        false => anyhow::bail!("{kind}:{target} isn't a source"),
+                    }
+                }
+                SourcesCmd::List { dir } => {
+                    let dir = memstore::service::data_dir(dir)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&memstore::sources::list(&dir)?)?
+                    );
+                }
+            }
+            return Ok(());
+        }
         Cmd::Telemetry(TelemetryCmd::Check { file }) => {
             let text = if file == "-" {
                 std::io::read_to_string(std::io::stdin())?
@@ -3128,6 +3199,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
         | Cmd::SupportBundle { .. }
         | Cmd::Hooks { .. }
         | Cmd::Service(_)
+        | Cmd::Sources(_)
         | Cmd::Studio { .. }
         | Cmd::Gen { .. }
         | Cmd::Embed { .. }
@@ -3731,6 +3803,7 @@ async fn serve_local(dir: &str, port: u16, scope: Scope, groups: Vec<String>) ->
             bind: Some("127.0.0.1".into()),
             loopback_only: true,
             writes_here: true,
+            sources_dir: Some(dir.clone()),
             ..Default::default()
         },
     )

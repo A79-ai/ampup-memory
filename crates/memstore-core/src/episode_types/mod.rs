@@ -10,7 +10,7 @@
 //!   and the predicates the engine writes itself, never the model (who was invited, a CRM field's new value);
 //! - what the model is told about it.
 //!
-//! Every type extracts onto shared subjects (`deal:hs-…`, `contact:…`) with a shared predicate vocabulary, so
+//! Every type extracts onto shared subjects (`deal:hs-…`, `deal:sf-…`, `contact:…`) with a shared predicate vocabulary, so
 //! facts from a call and from a Slack follow-up land on the same deal and aggregation can read them together.
 //! Status is never extracted by any type: aggregation derives it.
 

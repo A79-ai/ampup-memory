@@ -95,6 +95,7 @@ pub mod server;
 pub mod service;
 pub mod session_prs;
 pub mod sessions;
+pub mod sources;
 pub mod support_bundle;
 pub mod telemetry;
 pub mod train_data;

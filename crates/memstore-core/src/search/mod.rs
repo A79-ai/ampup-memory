@@ -3349,7 +3349,20 @@ pub async fn warm(store: &Store, scope: &Scope) -> Result<()> {
         .await
         .map(Float32Array::from);
     let index = open_cached(store, scope).await?;
-    store.fact_files(scope, &index.held).await?;
+    let (_, tail) = store.fact_files(scope, &index.held).await?;
+    // And the unindexed tail's embeddings, which a search otherwise computes while its caller waits: 81 tail facts
+    // took 4.5 s of a 5.3 s search on one production deployment. Only text the tail cache lacks is embedded.
+    if q.is_some() {
+        let texts: Vec<String> = tail
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .flat_map(|b| crate::decode_facts(b, "source_episodes"))
+            .map(|(_, f)| fact_text(&f.entity, &f.predicate, &f.value))
+            .collect();
+        if !texts.is_empty() && texts.len() <= TAIL_EMBED_MAX {
+            crate::log_org::with(scope.org_name(), embed_tail_or_none(&texts)).await;
+        }
+    }
     let keyword = keyword_queries(&fact_terms(query), false, None)?;
     for ds in [&index.open, &index.closed].into_iter().flatten() {
         for (k, _) in &keyword {
@@ -3691,11 +3704,30 @@ async fn ranked(
             slow.mark("index");
             let (current, tail) = store.fact_files(scope, &index.held).await?;
             slow.mark("files");
-            Ok::<_, anyhow::Error>((index, current, tail))
+            // The unindexed tail's embeddings (below), started now rather than after the index lists: the tail
+            // cache usually holds them (`warm`), and when it doesn't they cost the query's embedding wait at most.
+            let tail_facts: Vec<(String, Fact)> = tail
+                .iter()
+                .flat_map(|(_, rows)| rows.iter())
+                .flat_map(|b| crate::decode_facts(b, "source_episodes"))
+                .collect();
+            let tail_vecs = match tail_facts.len() {
+                0 => None,
+                n if n > TAIL_EMBED_MAX => None,
+                _ => {
+                    let texts: Vec<String> = tail_facts
+                        .iter()
+                        .map(|(_, f)| fact_text(&f.entity, &f.predicate, &f.value))
+                        .collect();
+                    embed_tail_or_none(&texts).await
+                }
+            };
+            slow.mark("tail embedded");
+            Ok::<_, anyhow::Error>((index, current, tail_facts, tail_vecs))
         }
     );
     let q_vec = q_vec?;
-    let (index, current, tail) = found?;
+    let (index, current, tail_facts, tail_vecs) = found?;
     let current = index.trusted(current);
     let cols: Vec<&str> = FTS_FIELDS.iter().map(|f| f.0).collect();
     let keep = fewest(
@@ -3974,22 +4006,11 @@ async fn ranked(
     slow.mark("rescored");
 
     // The unindexed tail: newer, rewritten or newly-deleted-from data files, scanned directly.
-    // Its facts are embedded here too, unless there are more than TAIL_EMBED_MAX of them (after a
+    // Its facts were embedded with the query, unless there are more than TAIL_EMBED_MAX of them (after a
     // compaction, say), when they are found by keyword only until the next index update.
-    let tail_facts: Vec<(String, Fact)> = tail
-        .iter()
-        .flat_map(|(_, rows)| rows.iter())
-        .flat_map(|b| crate::decode_facts(b, "source_episodes"))
-        .collect();
     let tail_vecs = match &q_vec {
-        Some(q) if tail_facts.len() <= TAIL_EMBED_MAX && !tail_facts.is_empty() => {
-            let texts: Vec<String> = tail_facts
-                .iter()
-                .map(|(_, f)| fact_text(&f.entity, &f.predicate, &f.value))
-                .collect();
-            embed_tail_or_none(&texts).await.map(|v| (v, q))
-        }
-        _ => None,
+        Some(q) => tail_vecs.map(|v| (v, q)),
+        None => None,
     };
     for (i, (commit, fact)) in tail_facts.into_iter().enumerate() {
         // Squared L2, as Lance reports `_distance`, so tail and index rows rank on one scale.

@@ -18,13 +18,15 @@ impl EpisodeType for Doc {
         Format::Text
     }
     /// Running text, by where it comes from: an agent's note (`/remember`, MCP `remember_memory` and
-    /// `close_memory`, all signed `mcp:remember_memory:<who>:…`), a GitHub issue or pull request, a Linear
+    /// `close_memory`, all signed `mcp:remember_memory:<who>:…`), a GitHub issue or pull request, a local git
+    /// commit (`git:<repo>@<sha>`: message, author and the files it touched), a Linear
     /// issue (`linear:<workspace>/<KEY-123>`: title, metadata, description, comments and linked pull requests
     /// as markdown), a document, a note. An error tracker's issue is an `incident`, a meeting's notes a call.
     fn source_prefixes(&self) -> &'static [&'static str] {
         &[
             "mcp:remember_memory:",
             "github:",
+            "git:",
             "linear:",
             "doc:",
             "note:",

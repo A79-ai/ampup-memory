@@ -920,8 +920,9 @@ pub struct SignIn {
     /// for this email (`approve_signin`), and nowhere else ([`Directory::access`]).
     pub unverified: Option<String>,
     /// Signed in through the platform's Auth0 tenant for the operators' Organization
-    /// (`AMPUP_MEMORY_AUTH0_OPERATORS_ORG`): they manage orgs (create them, bind them to Auth0, set their
-    /// admins and members, see every org) and nothing else: [`Change::operators`].
+    /// (`AMPUP_MEMORY_AUTH0_OPERATORS_ORG`): an admin of every org without being its member ([`Directory::access`]),
+    /// who also makes the changes that are the platform's ([`Change::operators`]: create orgs, bind them to Auth0,
+    /// set their limits).
     pub operator: bool,
     /// A recorder key acting for the member this names (`x-memstore-as`): what it records is the key's account of
     /// the member's work, never the member's own words, so nothing is kept as theirs from it (`memstore::keep`).
@@ -2248,6 +2249,22 @@ impl Directory {
                 teams: BTreeSet::new(),
             };
             return BTreeMap::from([(org.clone(), admin)]);
+        }
+        // An operator is an admin of every org, as the platform's own support: in no org's member list, so its
+        // people don't see them there, and in none of its teams (a team keeps its memory from its org's admins
+        // too). The sign-in itself came through the operators' Organization, never an org's own provider.
+        if via.operator && via.key.is_none() {
+            return self
+                .orgs
+                .keys()
+                .map(|org| {
+                    let admin = Access {
+                        role: Role::Admin,
+                        teams: BTreeSet::new(),
+                    };
+                    (org.clone(), admin)
+                })
+                .collect();
         }
         let user = user_id(user);
         let mut out = BTreeMap::new();

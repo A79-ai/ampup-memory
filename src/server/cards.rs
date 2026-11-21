@@ -333,6 +333,7 @@ pub(super) async fn search(
         }
     };
     let (pool, found, arrived) = tokio::join!(facts, source_text, arrived);
+    crate::phases::mark("facts and passages");
     // Not counted, the search still answers.
     let arrived = arrived.and_then(|a| {
         a.map_err(|e| eprintln!("search_memory: arrivals: {}", super::writer::redacted(&e)))
@@ -343,16 +344,19 @@ pub(super) async fn search(
         from: hit_scope,
     } = pool?;
 
-    // A name nothing mentions, said once, on the first page.
-    let missing = match offset {
-        0 => {
-            let as_json: Vec<Value> = pool
-                .iter()
-                .map(|h| json!({"entity": h.fact.entity, "value": h.fact.value, "quote": h.fact.quote}))
-                .collect();
-            unmentioned(&reads, store, who, ask.query, &as_json).await?
-        }
+    // A name nothing mentions, said once, on the first page: checked while the claims of absence are (below).
+    let as_json: Vec<Value> = match offset {
+        0 => pool
+            .iter()
+            .map(|h| json!({"entity": h.fact.entity, "value": h.fact.value, "quote": h.fact.quote}))
+            .collect(),
         _ => vec![],
+    };
+    let missing = async {
+        match offset {
+            0 => unmentioned(&reads, store, who, ask.query, &as_json).await,
+            _ => Ok(vec![]),
+        }
     };
 
     // Facts that share a content word with the query, when any does; else what is nearest in meaning.
@@ -373,10 +377,20 @@ pub(super) async fn search(
     // over history keeps them, marked.
     let mut pool = pool;
     let mut gone: HashSet<String> = HashSet::new();
-    let contradicted = match ask.valid_at {
-        Some(i64::MAX) => {
-            let facts: Vec<&crate::Fact> = pool.iter().map(|h| &h.fact).collect();
-            let marks = reads.absence(store, who, &facts, ask.valid_at).await;
+    let absent = async {
+        match ask.valid_at {
+            Some(i64::MAX) => {
+                let facts: Vec<&crate::Fact> = pool.iter().map(|h| &h.fact).collect();
+                Some(reads.absence(store, who, &facts, ask.valid_at).await)
+            }
+            _ => None,
+        }
+    };
+    let (missing, absent) = tokio::join!(missing, absent);
+    let missing = missing?;
+    crate::phases::mark("unmentioned and absence");
+    let contradicted = match absent {
+        Some(marks) => {
             let before = pool.len();
             pool.retain(|h| {
                 let out = matches!(
@@ -390,7 +404,7 @@ pub(super) async fn search(
             });
             before - pool.len()
         }
-        _ => 0,
+        None => 0,
     };
 
     // Items join the entity their episode is the record of.
@@ -406,6 +420,7 @@ pub(super) async fn search(
             .collect()
     };
     read(&reads, store, who, item_episodes, &mut sources).await?;
+    crate::phases::mark("item episodes");
     let home = |h: &search::Hit| -> String {
         if is_item(&h.fact.entity)
             && let Some(subject) = h
@@ -469,6 +484,7 @@ pub(super) async fn search(
     let read_facts = reads
         .read_in(store, who, search::Col::Entity, &ids, record_at)
         .await?;
+    crate::phases::mark("entities read");
     // One-valued where a scope read says so (the caller's own alone, unless it reads others).
     let one = |f: &crate::Fact| {
         reads.sessions().any(|r| {
@@ -560,6 +576,7 @@ pub(super) async fn search(
         .collect();
     wanted.extend(passages.iter().map(|p| p.passage.episode_id.clone()));
     read(&reads, store, who, wanted, &mut sources).await?;
+    crate::phases::mark("sources read");
     // What to call an id: a person by the name their episodes give, anything by its display name.
     let mut names: HashMap<String, String> = HashMap::new();
     for s in sources.values() {
@@ -613,6 +630,7 @@ pub(super) async fn search(
             }
         }
     }
+    crate::phases::mark("names read");
     let shown_facts: Vec<(String, Vec<String>)> = window
         .iter()
         .flat_map(|c| {
@@ -623,13 +641,12 @@ pub(super) async fn search(
         })
         .map(|f| (f.fact_id.clone(), f.source_episodes.clone()))
         .collect();
-    let tallies = reads.tallies(store, who, &shown_facts).await?;
     // What has gone stale or overdue, where the scope asks (`crate::freshness`): said beside the fact. A result
     // holds its entities' every current fact, plans and statuses among them.
     // And what another fact says against one, where the scope keeps conflicts (`crate::conflicts`), that only an
     // agent wrote one (`crate::origin`), or how many independent sources say it, where more than one does
     // (`crate::corroboration`).
-    let (marks, conflicts, origins) = {
+    let (tallies, marks, conflicts, origins) = {
         let all: Vec<&crate::Fact> = window
             .iter()
             .flat_map(|c| {
@@ -652,12 +669,15 @@ pub(super) async fn search(
                 Some((f.fact_id.clone(), note))
             })
             .collect();
-        (
-            reads.marks(store, who, &all, ask.valid_at, true).await?,
-            reads.conflicts(store, who, &all, ask.valid_at).await?,
-            origins,
-        )
+        // Each reads what it needs on its own: at once.
+        let (tallies, marks, conflicts) = tokio::join!(
+            reads.tallies(store, who, &shown_facts),
+            reads.marks(store, who, &all, ask.valid_at, true),
+            reads.conflicts(store, who, &all, ask.valid_at),
+        );
+        (tallies?, marks?, conflicts?, origins)
     };
+    crate::phases::mark("tallies, marks and conflicts");
     // The scope of each found fact that isn't the caller's own.
     let hit_scope: HashMap<String, String> = hit_scope
         .into_iter()

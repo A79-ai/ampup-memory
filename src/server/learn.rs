@@ -415,7 +415,7 @@ pub(super) async fn file_media(
         last
     });
     let tokens = crate::transcribe::tokens_for(seconds);
-    crate::limits::count_for(scope.org_name(), tokens);
+    crate::limits::count_for(scope.org_name(), "transcription", tokens);
     eprintln!(
         "transcribe {scope}: {} bytes of .{ext}, {} s of audio ({tokens} model tokens), {} turns, language {}, in {took:.1} s",
         bytes.len(),

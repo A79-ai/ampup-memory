@@ -1,19 +1,24 @@
 //! Usage metering: what the deployment did each hour, for credits and billing.
 //!
 //! The server counts its operations as it serves them ([`METER`]): searches, asks (on the customer's own
-//! model key or not), episodes ingested and their 4 KB units, agents' turns, reads by id, extraction tokens
-//! by model family, and the distinct callers of all of these. The inventory count sets two gauges (facts
-//! stored, bytes stored). Counters go in an hourly bucket, the hour named by its start (UTC).
+//! model key or not), episodes ingested and their 4 KB units, agents' turns, reads by id, model tokens by
+//! model family (on the customer's own key apart), and the distinct callers of all of these. Each is counted
+//! against the org the work is for (the task's org, `crate::log_org`, as `crate::limits` counts an org's
+//! month), or [`SYSTEM`] when no org is in scope. The inventory count sets two gauges per org (facts stored,
+//! bytes stored). Counters go in an hourly bucket per org, the hour named by its start (UTC).
 //!
 //! Every process (a server, a worker, a cell) counts what it served, and writes its book beside the system
-//! tables every minute. The process sending telemetry adds every process's book up ([`merge`]), a stopped
-//! one's too, and sends each hour on the `usage` channel when it changed; the control plane replaces an
-//! hour's counters with each send, so a resent hour is never billed twice. Hours are kept for
-//! [`KEEP_DAYS`]. An older engine kept the sender's book in the catalog (`memory_system.usage_hours`); its
-//! hours the control plane didn't take are added in too.
+//! tables every minute. The process sending telemetry adds every process's book up ([`merge`], [`rows`]), a
+//! stopped one's too, and sends each hour on the `usage` channel when it changed: one row per hour for the
+//! whole deployment, or, once the control plane says the deployment is hosted (it serves many orgs, and bills
+//! each its own), one row per hour and org. The control plane replaces an hour's counters with each send, so a
+//! resent hour is never billed twice. Hours are kept for [`KEEP_DAYS`]. An older engine kept the sender's
+//! book in the catalog (`memory_system.usage_hours`), and an older process writes a book without orgs; their
+//! hours are added in too, to nobody's org ([`SYSTEM`]) when rows are per org.
 //!
 //! What a bucket keeps beside its counters is hashes of caller names (to count distinct callers across
-//! processes); they stay in the customer's account. Only the counts leave.
+//! processes); they stay in the customer's account. Only the counts leave, and an org's name only to a control
+//! plane that asked for rows per org.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{LazyLock, Mutex};
@@ -28,9 +33,25 @@ use schemars::JsonSchema;
 pub const KEEP_DAYS: i64 = 35;
 /// An ingested body's unit: each started block of this many bytes is one.
 pub const UNIT_BYTES: usize = 4096;
+/// The org that work done for no org is counted against: the engine's own rounds, a person's own memory.
+/// Billed to nobody. No org can take the name (an org's name never starts with `_`).
+pub const SYSTEM: &str = "_system";
 
 /// This process's book: the server counts into it and the telemetry loop sends from it.
 pub static METER: LazyLock<Meter> = LazyLock::new(Meter::default);
+
+/// Whether the deployment's model calls run on the customer's own model key (`AMPUP_MEMORY_BYOK=on`): their
+/// tokens are counted as `model_tokens_byok`, not `extraction_tokens`, and their asks as `asks_byok`.
+pub fn byok() -> bool {
+    static BYOK: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("AMPUP_MEMORY_BYOK").as_deref() == Ok("on"));
+    *BYOK
+}
+
+/// The org a count goes to: `org`, else [`SYSTEM`].
+pub fn org_or_system(org: Option<&str>) -> String {
+    org.unwrap_or(SYSTEM).to_string()
+}
 
 /// An operation a caller made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,8 +65,8 @@ pub enum Op {
     Read,
 }
 
-/// One hour as kept: its counters, the hashes of its callers, and whether the control plane took it after
-/// it closed. What the catalog stores, as JSON.
+/// One hour of one org as kept: its counters, the hashes of its callers, and whether the control plane took it
+/// after it closed (an older engine's catalog book). What a report and the catalog store, as JSON.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bucket {
     pub counters: UsageCounters,
@@ -56,32 +77,41 @@ pub struct Bucket {
 }
 
 impl Bucket {
-    /// The hour's usage as sent: its counters, `active_seats` its distinct callers.
-    pub fn usage(&self, hour: DateTime<Utc>) -> Usage {
+    /// The hour's usage as sent, for `org` (none: the deployment's): its counters, `active_seats` its distinct
+    /// callers.
+    pub fn usage(&self, hour: DateTime<Utc>, org: Option<&str>) -> Usage {
         let mut counters = self.counters.clone();
         counters.active_seats = self.callers.len() as u64;
-        Usage { hour, counters }
+        Usage {
+            hour,
+            org: org.map(str::to_string),
+            counters,
+        }
+    }
+
+    /// `other` added in: counters added, callers joined. Gauges are left as they are ([`rows`] sets them).
+    fn add(&mut self, other: &Bucket) {
+        add(&mut self.counters, &other.counters);
+        self.callers.extend(other.callers.iter().cloned());
     }
 }
 
+/// An hour and an org: a bucket's key.
+pub type HourOrg = (DateTime<Utc>, String);
+
+/// Facts and bytes stored, per org, as last measured ([`Meter::gauges`]).
+pub type Gauges = BTreeMap<String, (u64, u64)>;
+
 #[derive(Default)]
 struct Book {
-    hours: BTreeMap<DateTime<Utc>, Bucket>,
-    /// The last facts and bytes measured: a new hour starts from them.
-    gauges: Option<(u64, u64)>,
+    hours: BTreeMap<HourOrg, Bucket>,
+    /// The last facts and bytes measured per org, and the hour they were measured in.
+    gauges: Option<(DateTime<Utc>, Gauges)>,
 }
 
 impl Book {
-    fn bucket(&mut self, hour: DateTime<Utc>) -> &mut Bucket {
-        let gauges = self.gauges;
-        self.hours.entry(hour).or_insert_with(|| {
-            let mut b = Bucket::default();
-            if let Some((facts, bytes)) = gauges {
-                b.counters.facts_stored = facts;
-                b.counters.storage_bytes = bytes;
-            }
-            b
-        })
+    fn bucket(&mut self, hour: DateTime<Utc>, org: Option<&str>) -> &mut Bucket {
+        self.hours.entry((hour, org_or_system(org))).or_default()
     }
 }
 
@@ -118,20 +148,21 @@ fn add(to: &mut UsageCounters, c: &UsageCounters) {
     to.ingested_units += c.ingested_units;
     to.turns += c.turns;
     to.reads += c.reads;
+    to.model_tokens_byok += c.model_tokens_byok;
     for (f, n) in &c.extraction_tokens {
         *to.extraction_tokens.entry(*f).or_default() += n;
     }
 }
 
 impl Meter {
-    /// `caller` made `op`, now.
+    /// `caller` made `op`, now, for the org this task works for.
     pub fn op(&self, op: Op, caller: &str) {
-        self.op_at(Utc::now(), op, caller)
+        self.op_at(Utc::now(), crate::log_org::current().as_deref(), op, caller)
     }
 
-    pub fn op_at(&self, now: DateTime<Utc>, op: Op, caller: &str) {
+    pub fn op_at(&self, now: DateTime<Utc>, org: Option<&str>, op: Op, caller: &str) {
         let mut book = self.book.lock().unwrap();
-        let b = book.bucket(hour_of(now));
+        let b = book.bucket(hour_of(now), org);
         let c = &mut b.counters;
         match op {
             Op::Search => c.searches += 1,
@@ -143,97 +174,262 @@ impl Meter {
         b.callers.insert(caller_hash(caller));
     }
 
-    /// Episodes with bodies of these sizes (bytes) were ingested, now.
-    pub fn ingested(&self, bodies: impl IntoIterator<Item = usize>) {
-        self.ingested_at(Utc::now(), bodies)
+    /// Episodes with bodies of these sizes (bytes) were ingested into `org`, now.
+    pub fn ingested(&self, org: Option<&str>, bodies: impl IntoIterator<Item = usize>) {
+        self.ingested_at(Utc::now(), org, bodies)
     }
 
-    pub fn ingested_at(&self, now: DateTime<Utc>, bodies: impl IntoIterator<Item = usize>) {
+    pub fn ingested_at(
+        &self,
+        now: DateTime<Utc>,
+        org: Option<&str>,
+        bodies: impl IntoIterator<Item = usize>,
+    ) {
         let mut book = self.book.lock().unwrap();
-        let c = &mut book.bucket(hour_of(now)).counters;
+        let c = &mut book.bucket(hour_of(now), org).counters;
         for b in bodies {
             c.ingested_episodes += 1;
             c.ingested_units += units(b);
         }
     }
 
-    /// The extraction model `model` read and wrote `tokens`, now.
-    pub fn tokens(&self, model: &str, tokens: u64) {
-        self.tokens_at(Utc::now(), model, tokens)
+    /// A model call for `org` (`model`) read and wrote `tokens`, now: `byok`, on the customer's own key.
+    /// Counted by `crate::limits::count_for` alone, with the org's month, so the two never disagree.
+    pub(crate) fn tokens(&self, org: Option<&str>, model: &str, tokens: u64, byok: bool) {
+        self.tokens_at(Utc::now(), org, model, tokens, byok)
     }
 
-    pub fn tokens_at(&self, now: DateTime<Utc>, model: &str, tokens: u64) {
+    pub fn tokens_at(
+        &self,
+        now: DateTime<Utc>,
+        org: Option<&str>,
+        model: &str,
+        tokens: u64,
+        byok: bool,
+    ) {
         if tokens == 0 {
             return;
         }
         let mut book = self.book.lock().unwrap();
-        *book
-            .bucket(hour_of(now))
-            .counters
-            .extraction_tokens
-            .entry(ModelFamily::of(model))
-            .or_default() += tokens;
+        let c = &mut book.bucket(hour_of(now), org).counters;
+        if byok {
+            c.model_tokens_byok += tokens;
+        } else {
+            *c.extraction_tokens
+                .entry(ModelFamily::of(model))
+                .or_default() += tokens;
+        }
     }
 
-    /// The facts and bytes stored, as just measured: the current hour's gauges, and the next hours' until
-    /// measured again.
-    pub fn gauges(&self, facts: u64, bytes: u64) {
-        self.gauges_at(Utc::now(), facts, bytes)
+    /// The facts and bytes stored per org, as just measured: the gauges of the current hour's rows, and of the
+    /// next hours' until measured again.
+    pub fn gauges(&self, by_org: Gauges) {
+        self.gauges_at(Utc::now(), by_org)
     }
 
-    pub fn gauges_at(&self, now: DateTime<Utc>, facts: u64, bytes: u64) {
-        let mut book = self.book.lock().unwrap();
-        book.gauges = Some((facts, bytes));
-        let c = &mut book.bucket(hour_of(now)).counters;
-        c.facts_stored = facts;
-        c.storage_bytes = bytes;
+    pub fn gauges_at(&self, now: DateTime<Utc>, by_org: Gauges) {
+        self.book.lock().unwrap().gauges = Some((hour_of(now), by_org));
     }
 
-    /// The current hour as it stands now.
+    /// The facts and bytes per org as last measured here; none before the first measure.
+    pub fn last_gauges(&self) -> Option<Gauges> {
+        self.book
+            .lock()
+            .unwrap()
+            .gauges
+            .as_ref()
+            .map(|(_, g)| g.clone())
+    }
+
+    /// The current hour as it stands now, for the whole deployment (what `GET /telemetry` shows).
     pub fn current(&self, now: DateTime<Utc>) -> Usage {
-        let mut book = self.book.lock().unwrap();
         let hour = hour_of(now);
-        book.bucket(hour).usage(hour)
+        let mut by_org = BTreeMap::new();
+        for ((h, org), b) in self.book(now) {
+            if h == hour {
+                by_org.insert((h, org), b);
+            }
+        }
+        let merged = Merged {
+            by_org,
+            legacy: BTreeMap::new(),
+        };
+        rows(
+            &merged,
+            false,
+            &BTreeMap::new(),
+            self.last_gauges().as_ref(),
+            now,
+        )
+        .into_iter()
+        .find(|u| u.hour == hour)
+        .unwrap_or(Usage {
+            hour,
+            org: None,
+            counters: UsageCounters::default(),
+        })
     }
 
-    /// Every hour this process counted in the last [`KEEP_DAYS`] (older ones dropped), as it stands now:
-    /// what it reports for the process sending telemetry to add up ([`merge`]).
-    pub fn book(&self, now: DateTime<Utc>) -> Vec<(DateTime<Utc>, Bucket)> {
+    /// Every hour and org this process counted in the last [`KEEP_DAYS`] (older ones dropped), as it stands
+    /// now: what it reports for the process sending telemetry to add up ([`merge`]).
+    pub fn book(&self, now: DateTime<Utc>) -> Vec<(HourOrg, Bucket)> {
         let mut book = self.book.lock().unwrap();
         let oldest = hour_of(now) - TimeDelta::days(KEEP_DAYS);
-        book.hours.retain(|h, _| *h >= oldest);
-        book.hours.iter().map(|(h, b)| (*h, b.clone())).collect()
+        book.hours.retain(|(h, _), _| *h >= oldest);
+        book.hours
+            .iter()
+            .map(|(k, b)| (k.clone(), b.clone()))
+            .collect()
     }
 }
 
-/// The deployment's hours from several processes' books (each counts only what it served): counters added,
-/// callers joined, and the gauges (facts and bytes stored, measured by one process) the largest reported.
+/// `book` (hours per org) added up per hour: what a process that sends no orgs reports beside it, for an older
+/// sender to read.
+pub fn collapsed(book: &[(HourOrg, Bucket)]) -> Vec<(DateTime<Utc>, Bucket)> {
+    let mut out: BTreeMap<DateTime<Utc>, Bucket> = BTreeMap::new();
+    for ((h, _), b) in book {
+        out.entry(*h).or_default().add(b);
+    }
+    out.into_iter().collect()
+}
+
+/// The deployment's hours from several processes' books (each counts only what it served), added up: per hour
+/// and org from books that keep orgs, per hour from those that don't (an older process's, the catalog's).
+#[derive(Debug, Default)]
+pub struct Merged {
+    pub by_org: BTreeMap<HourOrg, Bucket>,
+    pub legacy: BTreeMap<DateTime<Utc>, Bucket>,
+}
+
+/// Whether the control plane needs to keep `u` among the rows it took: a closed hour's row of gauges alone is
+/// never made again ([`rows`] makes rows of gauges alone for the current hour only), so it needn't be. Keeps the
+/// rows kept from growing with every org that holds anything, every hour.
+pub fn keep_taken(u: &Usage, now: DateTime<Utc>) -> bool {
+    if u.hour >= hour_of(now) {
+        return true;
+    }
+    let c = &u.counters;
+    c.searches
+        + c.asks
+        + c.asks_byok
+        + c.ingested_episodes
+        + c.turns
+        + c.reads
+        + c.model_tokens_byok
+        > 0
+        || c.extraction_tokens.values().any(|n| *n > 0)
+}
+
+/// Every process's book added up: counters added and callers joined, per hour and org (`by_org`) and per hour
+/// (`legacy`, books without orgs). Gauges in the books are left out: they are the sender's own ([`rows`]).
 /// Hours older than [`KEEP_DAYS`] before `now` are left out.
 pub fn merge<'a>(
-    books: impl IntoIterator<Item = &'a [(DateTime<Utc>, Bucket)]>,
+    by_org: impl IntoIterator<Item = &'a [(HourOrg, Bucket)]>,
+    legacy: impl IntoIterator<Item = &'a [(DateTime<Utc>, Bucket)]>,
     now: DateTime<Utc>,
-) -> BTreeMap<DateTime<Utc>, Bucket> {
+) -> Merged {
     let oldest = hour_of(now) - TimeDelta::days(KEEP_DAYS);
-    let mut out: BTreeMap<DateTime<Utc>, Bucket> = BTreeMap::new();
-    for book in books {
-        for (hour, b) in book {
-            if *hour < oldest || !Usage::on_the_hour(*hour) {
-                continue;
+    let kept = |h: &DateTime<Utc>| *h >= oldest && Usage::on_the_hour(*h);
+    let mut out = Merged::default();
+    for book in by_org {
+        for ((h, org), b) in book {
+            if kept(h) {
+                out.by_org.entry((*h, org.clone())).or_default().add(b);
             }
-            let m = out.entry(*hour).or_default();
-            add(&mut m.counters, &b.counters);
-            m.counters.facts_stored = m.counters.facts_stored.max(b.counters.facts_stored);
-            m.counters.storage_bytes = m.counters.storage_bytes.max(b.counters.storage_bytes);
-            m.callers.extend(b.callers.iter().cloned());
+        }
+    }
+    for book in legacy {
+        for (h, b) in book {
+            if kept(h) {
+                out.legacy.entry(*h).or_default().add(b);
+            }
         }
     }
     out
 }
 
+/// The rows to send, as `merged` stands now, leaving out those the control plane already took (`took`, keyed by
+/// hour and org, none for a row of the whole deployment).
+///
+/// - `per_org` false: one row per hour, no org, as an engine always sent.
+/// - `per_org` true: one row per hour and org; work for no org, and books without orgs, under [`SYSTEM`].
+///
+/// An hour keeps the form the control plane first took it in, whichever is asked for now: one taken as one row
+/// for the deployment stays one (it was billed to the deployment's org; sent again per org, it would be billed
+/// twice), and one taken per org stays per org (sent again as one row, it would all be billed again to the
+/// deployment's org). So a switch either way starts with the next hour that has nothing taken.
+///
+/// Gauges: the current hour's rows carry `gauges` (as last measured), a row per org that holds anything even
+/// with no other use; an earlier hour's keep what was sent for it, as does the current hour's before the first
+/// measure (`gauges` none).
+pub fn rows(
+    merged: &Merged,
+    per_org: bool,
+    took: &BTreeMap<(DateTime<Utc>, Option<String>), Usage>,
+    gauges: Option<&Gauges>,
+    now: DateTime<Utc>,
+) -> Vec<Usage> {
+    let current = hour_of(now);
+    let taken_per_org: BTreeSet<DateTime<Utc>> = took
+        .keys()
+        .filter(|(_, org)| org.is_some())
+        .map(|(h, _)| *h)
+        .collect();
+    let whole = |h: &DateTime<Utc>| {
+        if per_org {
+            took.contains_key(&(*h, None))
+        } else {
+            !taken_per_org.contains(h)
+        }
+    };
+    // Each row's bucket, before gauges.
+    let mut out: BTreeMap<(DateTime<Utc>, Option<String>), Bucket> = BTreeMap::new();
+    for ((h, org), b) in &merged.by_org {
+        let key = (*h, (!whole(h)).then(|| org.clone()));
+        out.entry(key).or_default().add(b);
+    }
+    for (h, b) in &merged.legacy {
+        let key = (*h, (!whole(h)).then(|| SYSTEM.to_string()));
+        out.entry(key).or_default().add(b);
+    }
+    if let Some(gauges) = gauges.filter(|g| !g.is_empty()) {
+        if whole(&current) {
+            out.entry((current, None)).or_default();
+        } else {
+            for (org, (facts, bytes)) in gauges {
+                if *facts > 0 || *bytes > 0 {
+                    out.entry((current, Some(org.clone()))).or_default();
+                }
+            }
+        }
+    }
+    out.into_iter()
+        .map(|((h, org), b)| {
+            let mut u = b.usage(h, org.as_deref());
+            let (facts, bytes) = if let Some(gauges) = gauges.filter(|_| h == current) {
+                match &org {
+                    None => gauges
+                        .values()
+                        .fold((0, 0), |(f, b), (f2, b2)| (f + f2, b + b2)),
+                    Some(o) => gauges.get(o).copied().unwrap_or_default(),
+                }
+            } else {
+                took.get(&(h, org.clone())).map_or((0, 0), |t| {
+                    (t.counters.facts_stored, t.counters.storage_bytes)
+                })
+            };
+            u.counters.facts_stored = facts;
+            u.counters.storage_bytes = bytes;
+            u
+        })
+        .filter(|u| took.get(&(u.hour, u.org.clone())) != Some(u))
+        .collect()
+}
+
 /// Counts keyed by a closed set: a key outside it fails to read, and the schema says so.
 pub type Counts<K> = std::collections::BTreeMap<K, u64>;
 
-/// One hour of the deployment's use (this module), the hour named by its start. The hour's counters are
+/// One hour of the deployment's use, or of one org's in it (this module), the hour named by its start. The hour's counters are
 /// sent as they stand, again as they grow, and once more after the hour ends: each send replaces the last
 /// for that hour on the control plane, so a resent hour is never counted twice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -242,6 +438,10 @@ pub type Counts<K> = std::collections::BTreeMap<K, u64>;
 pub struct Usage {
     /// The hour's start (UTC, on the hour).
     pub hour: chrono::DateTime<chrono::Utc>,
+    /// The org the hour's use is for: only from a hosted deployment the control plane asked for rows per org
+    /// (`_system`: work for no org); none, the whole deployment's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
     pub counters: UsageCounters,
 }
 
@@ -252,6 +452,11 @@ pub struct Usage {
 struct UsageFields {
     /// The hour's start (RFC 3339, UTC, minutes, seconds and fractions all zero).
     hour: chrono::DateTime<chrono::Utc>,
+    /// The org the row is for (a hosted deployment's rows per org; `_system`: work for no org). Absent: the
+    /// whole deployment's.
+    #[serde(default)]
+    #[schemars(regex(pattern = r"^[a-z0-9_]{1,64}$"))]
+    org: Option<String>,
     counters: UsageCounters,
 }
 
@@ -261,8 +466,17 @@ impl TryFrom<UsageFields> for Usage {
         if !Usage::on_the_hour(f.hour) {
             return Err("usage names an hour by its start: minutes, seconds and fractions zero");
         }
+        if f.org.as_deref().is_some_and(|o| {
+            !(1..=64).contains(&o.len())
+                || !o
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        }) {
+            return Err("an org is 1 to 64 of a-z, 0-9 and _");
+        }
         Ok(Usage {
             hour: f.hour,
+            org: f.org,
             counters: f.counters,
         })
     }
@@ -301,8 +515,19 @@ pub struct UsageCounters {
     pub storage_bytes: u64,
     /// Distinct callers of the operations above in the hour.
     pub active_seats: u64,
-    /// Tokens the extraction model read and wrote, by its family ([`ModelFamily::of`]).
+    /// Model tokens read and written on a key that isn't the customer's own, by the model's family
+    /// ([`ModelFamily::of`]): every model call the engine makes (extracting, advice, judging, dreaming,
+    /// compiling, answering, remote embeddings; a recording transcribed at its token rate), as an org's month
+    /// counts them (`crate::limits`). Named for the first it counted.
     pub extraction_tokens: Counts<ModelFamily>,
+    /// Model tokens read and written on the customer's own key (`AMPUP_MEMORY_BYOK=on`). Absent: 0 (an older
+    /// engine's); left out when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub model_tokens_byok: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A model's family, from its name ([`ModelFamily::of`]). No doc comments on variants, as for

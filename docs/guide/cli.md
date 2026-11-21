@@ -54,6 +54,37 @@ environment names. Stop the server first: one process owns a directory at a time
 - If something else holds the port, `install` says so and leaves it alone. `serve --local` in a terminal while the
   service runs says the service is already serving.
 
+### Sources the local server reads
+
+`ampup-memory sources add github OWNER/REPO [--since DATE] [--dir DIR]` has the local server (`serve --local` or the
+service) read a repository's issues and pull requests every 10 minutes, with the GitHub login already on this
+machine: `GITHUB_TOKEN` or `GH_TOKEN` where the server runs, else `gh auth token`. The service doesn't carry those
+variables, so under it the `gh` login is the one used (`gh` is found where it installs, whatever the service's
+`PATH`). The token is never stored. `sources list` shows each source's records read, last read and last error;
+`sources remove github OWNER/REPO` stops reading one, and what it read stays. More in
+[self-hosting](self-hosting.md#sources-serve---local-reads-by-itself).
+
+`ampup-memory sources add github-prs OWNER/REPO` reads a repository's merged pull requests whole instead: the
+description, files changed, reviews and discussion, and each review thread with its diff, leaving out what bots
+wrote. It needs a token even for a public repository. Add `github` for the same repository too to get its issues and
+open pull requests; it then leaves the merged ones to `github-prs`.
+
+`ampup-memory sources add git PATH [--since DATE] [--dir DIR]` has it read a local repository's commit history
+instead, with the `git` on this machine and no network: each commit's message, author, date and the files it touched
+(lines added and removed, not the diff), on the checked-out branch, merges left out. `sources remove git PATH` stops
+reading it.
+
+`ampup-memory sources add linear WORKSPACE/TEAM [--since DATE]` reads a Linear team's issues, with their comments
+and linked pull requests, every 10 minutes, with a personal API key in the server's environment, `LINEAR_API_KEY`.
+`WORKSPACE` is the workspace's URL key and `TEAM` the team's key (`acme/ENG`). The key is never stored; the service
+doesn't get it (no key goes into its file), so run `serve --local` with it set. `sources remove linear
+WORKSPACE/TEAM` stops reading one.
+
+`ampup-memory sources add sentry ORG/PROJECT` reads a Sentry project's issues as incidents, with `SENTRY_AUTH_TOKEN`
+where the server runs, else the file `AMPUP_MEMORY_SENTRY_TOKEN_FILE` names, else `sentry-cli login`'s
+`~/.sentryclirc`. A server a session starts gets `SENTRY_AUTH_TOKEN` from that session. The service carries no token, but it carries `AMPUP_MEMORY_SENTRY_TOKEN_FILE` and reads
+`~/.sentryclirc`. `SENTRY_URL` points it at a self-hosted Sentry (default `https://sentry.io`).
+
 ## Writing and reading
 
 | Command | What it does |

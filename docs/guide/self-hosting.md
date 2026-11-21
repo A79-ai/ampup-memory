@@ -42,6 +42,67 @@ ampup-memory service install                 # or keep it running in the backgro
 - One process owns a directory at a time. Commands with `--local DIR` (`schema set`, `runs load`, `compile`,
   `advice`, `extract`, `load`, …) need the server stopped.
 
+#### Sources `serve --local` reads by itself
+
+`ampup-memory sources add github OWNER/REPO [--since DATE] [--dir DIR]` names a repository in `DIR/sources.json`.
+The server reads that file every minute and each source every 10 minutes, with the token this machine already
+holds (`GITHUB_TOKEN` or `GH_TOKEN` in the server's environment, else `gh auth token`; a public repository is read
+with none, at GitHub's lower rate). The token is never stored. Each issue and pull request is written as of its last
+update (source `github:OWNER/REPO#N`, the hosted connector's format) through the same path as `/ingest`, readable by
+the server's groups. The first read goes back 30 days unless `--since` says otherwise; later reads start an hour
+before the newest change read (the cursor in `DIR/sources-state.json`), and once a day four days before it, since
+GitHub lists a few records under an earlier time than they show. What's held already as sent isn't written again. `sources list` shows each source's records read, last read and last error; `sources remove` stops
+reading one (what it read stays).
+
+`ampup-memory sources add github-prs OWNER/REPO` reads the same list but keeps only the merged pull requests, each
+read whole through GitHub's GraphQL API, in the hosted GitHub PR connector's format: one episode for the pull
+request (source `github:OWNER/REPO#N`: description, files changed, reviews, discussion) and one for each review
+thread a person started (`github:OWNER/REPO#N/thread/ID`: file and line, resolved or outdated, the diff hunk, the
+comments), dated at the merge. Each replaces its source's earlier versions, so a pull request read before it merged
+is replaced by its merged version. Bots' pull requests, reviews and comments, and threads a bot started, are left
+out; to leave out a review bot of your own that posts from a person's account, set
+`AMPUP_MEMORY_GITHUB_REVIEW_BOT` to how its review bodies start. GraphQL needs a token, even for a public
+repository. A pull request GitHub can't give whole, twice, is written as the issues list shows it. A round stops
+early, and goes on next round, when GitHub says to wait or fewer than 100 of its hourly points are left. With both
+`github` and `github-prs` on one repository, `github` leaves merged pull requests to `github-prs`.
+
+`ampup-memory sources add git PATH [--since DATE] [--dir DIR]` names a local repository instead: the path is kept as
+its work tree's top directory, absolute. The server reads it with the `git` on this machine (`PATH`, else
+`/usr/bin`, `/opt/homebrew/bin` or `/usr/local/bin`): no network, no token. Each commit reachable from the checked-out
+`HEAD`, merges left out (a merge's diffstat repeats its parents'), is one episode: its message, author, date and the
+files it touched with lines added and removed, never the diff itself. Its source is `git:OWNER/REPO@SHA` when the
+`origin` remote is on GitHub (about `repo:OWNER/REPO`, as the GitHub source writes it, and the pull request a
+squash-merged subject ends with, `(#N)`), else `git:DIRNAME@SHA`. The first read goes back 30 days unless `--since`
+says otherwise; later reads take only the commits after the last one read (`CURSOR..HEAD`), at most 5,000 a round.
+If that commit is gone (rewritten history, then garbage collection), the next read starts from `--since` again, and
+what's held already as sent isn't written again. Commits later rebased away stay in memory beside their rewrites.
+
+`ampup-memory sources add linear WORKSPACE/TEAM [--since DATE]` names a Linear team: the workspace's URL key, as in
+its address, and the team's key (`acme/ENG`). The server reads it with a personal API key in its environment,
+`LINEAR_API_KEY` (from Linear's settings, Security & access); the key is never stored, and a key for another
+workspace, or one that can't see the team, is refused with the reason in `sources list`. Each issue is written with
+its comments (people's, not bots') and the merged GitHub pull requests linked to it (source
+`linear:WORKSPACE/ENG-123`, the hosted connector's format), and written again as a new version, retiring the last,
+whenever that text changes. Later reads start an hour before the newest change read; a new comment or a linked pull
+request counts as a change to its issue. A server a session starts by itself gets `LINEAR_API_KEY` from that
+session's environment; the background service doesn't (no key goes into its file), so run `serve --local` with the
+key set to read Linear.
+
+`ampup-memory sources add sentry ORG/PROJECT [--since DATE] [--dir DIR]` names a Sentry project. The
+token is `SENTRY_AUTH_TOKEN` in the server's environment, else the file `AMPUP_MEMORY_SENTRY_TOKEN_FILE` names, else
+the one `sentry-cli login` keeps in `~/.sentryclirc`; it needs to read the project, its issues and their events (a
+personal token or an internal integration's; an organization token made for uploading releases can't). It is never
+stored. Sentry is `SENTRY_URL` (or `AMPUP_MEMORY_SENTRY_URL`, or `url` in `~/.sentryclirc`), else
+`https://sentry.io`: set it for a self-hosted Sentry, or to `https://de.sentry.io` for an organization in the EU.
+Each issue is written as it stands (source `sentry:ORG/PROJECT/issues/ID`, an `incident` episode in the hosted
+connector's format: status, counts, releases, error, stack and activity), and its new version retires the one before.
+The first read lists the issues with events since `--since`; later reads start an hour before the newest event read,
+and once a day 14 days back, for an issue resolved, ignored or assigned with no event since. An issue is written
+again when its state changes (status, assignee, comments, title, culprit, level), or, for new events alone, at most
+once a day, so a busy issue isn't written every round. A server a session starts by itself gets
+`SENTRY_AUTH_TOKEN` and `SENTRY_URL` from that session's environment; the background service has neither, but it
+carries `AMPUP_MEMORY_SENTRY_TOKEN_FILE` and `AMPUP_MEMORY_SENTRY_URL` and reads `~/.sentryclirc`.
+
 ### Any Iceberg REST catalog over S3
 
 This is the configuration the repository's catalog tests run (Apache Iceberg's REST fixture on MinIO,

@@ -1530,9 +1530,8 @@ impl Extractor {
         MODEL_TOKENS
             .with_label_values(&["in_cached"])
             .inc_by(self.prompt_cache_read(v));
-        // And the hour's usage, by the model's family (`crate::usage`), and the org's month (`crate::limits`).
-        crate::usage::METER.tokens(&self.model, read + wrote);
-        crate::limits::count(read + wrote);
+        // And the org's month (`crate::limits`), and with it the hour's usage by the model's family (`crate::usage`).
+        crate::limits::count(&self.model, read + wrote);
         // And this extractor's own count, for what one run (a backfill) spends.
         self.usage.add(read, wrote);
         let _ = CALL_TOKENS.try_with(|t| {

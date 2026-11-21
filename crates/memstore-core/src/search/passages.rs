@@ -928,6 +928,20 @@ pub async fn warm(
     q: Option<&arrow_array::Float32Array>,
 ) -> Result<()> {
     let index = open_cached(store, scope).await?;
+    // The unindexed tail's embeddings, as `search::warm` does the facts': a search otherwise embeds them while its
+    // caller waits. A search embeds the tail its reader sees when that is at most TAIL_EMBED_MAX passages; all of
+    // it is warmed, up to a few times that.
+    if q.is_some() {
+        let files = store.episode_files(scope).await?;
+        let texts: Vec<String> = tail(store, scope, &files, &index.held)
+            .await?
+            .into_iter()
+            .map(|p| p.text)
+            .collect();
+        if !texts.is_empty() && texts.len() <= 4 * search::TAIL_EMBED_MAX {
+            crate::log_org::with(scope.org_name(), search::embed_tail_or_none(&texts)).await;
+        }
+    }
     let Some(ds) = &index.passages else {
         return Ok(());
     };
@@ -1184,8 +1198,22 @@ pub async fn search(
     let searched = keep.as_ref().map_or(fts.len(), HashSet::len);
     fts.retain(|t| keep.as_ref().is_none_or(|k| k.contains(t)));
     let fts = fts.join(" ");
+    // The unindexed tail the reader sees, embedded with the query rather than after the index lists: the tail cache
+    // usually holds it (`warm`), and when it doesn't it costs the query's embedding wait at most.
+    let tail: Vec<Passage> = tail.into_iter().filter(|p| visible(p)).collect();
+    let tail_embedded = async {
+        match tail.len() {
+            0 => None,
+            n if n > search::TAIL_EMBED_MAX => None,
+            _ => {
+                let texts: Vec<String> = tail.iter().map(|p| p.text.clone()).collect();
+                search::embed_tail_or_none(&texts).await
+            }
+        }
+    };
     // None without an embedder (the local model not fetched, and offline): the keyword list alone.
-    let q_vec = search::embed_query(text).await.map(Float32Array::from);
+    let (q_vec, tail_embedded) = tokio::join!(search::embed_query(text), tail_embedded);
+    let q_vec = q_vec.map(Float32Array::from);
     mark!("embed");
     // (bm25, distance) per (episode, chunk), and the passage.
     let mut hits: HashMap<(String, i32), Ranked> = HashMap::new();
@@ -1286,13 +1314,9 @@ pub async fn search(
     }
 
     // The unindexed tail: matched by its share of the query's terms, and by meaning when small.
-    let tail: Vec<Passage> = tail.into_iter().filter(|p| visible(p)).collect();
     let tail_vecs = match &q_vec {
-        Some(q) if !tail.is_empty() && tail.len() <= search::TAIL_EMBED_MAX => {
-            let texts: Vec<String> = tail.iter().map(|p| p.text.clone()).collect();
-            search::embed_tail_or_none(&texts).await.map(|v| (v, q))
-        }
-        _ => None,
+        Some(q) => tail_embedded.map(|v| (v, q)),
+        None => None,
     };
     // Matched as the index would match it: stemmed, stop words out.
     let q_stems = search::stems(&q_terms.iter().cloned().collect::<Vec<_>>().join(" "));

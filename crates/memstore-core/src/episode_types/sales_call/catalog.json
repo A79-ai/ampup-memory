@@ -5,7 +5,7 @@
  "mode": "strict",
  "types": {
   "deal": {
-   "description": "A sales opportunity, by its CRM id: deal:hs-<id>.",
+   "description": "A sales opportunity, by its CRM id: deal:<p>-<id>, p the CRM's code (hs HubSpot, sf Salesforce, d365 Dynamics).",
    "predicates": {
     "pain": {
      "type": "string",

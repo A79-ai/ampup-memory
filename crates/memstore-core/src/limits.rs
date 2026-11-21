@@ -11,6 +11,12 @@
 //! - **Episodes.** A write that would take the org past its cap is refused (403); reads go on.
 //! - **Expiry.** Past it, writes and model calls are refused (402) and background model work waits; reads,
 //!   search and export go on.
+//! - **The plan's stops.** A hosted deployment's control plane says, in its answer to telemetry, which orgs it
+//!   stopped (`org_limits`: their credits ran out, say): an org whose ingestion is stopped takes no new memory
+//!   (402), and one whose asks are stopped asks no model (402) while its background model work waits, as past
+//!   its allowance. Search and reads go on. Only the process sending telemetry hears the answer: it writes the
+//!   stops beside the reports (`memstore::server::reports`), and every process reads them from there
+//!   ([`set_plan_stops`]).
 //!
 //! The limits live in the directory (an org-wide `org.settings` change; `people::directory::limits_in` says why), so
 //! every server holds the same ones. Each process counts the
@@ -70,6 +76,10 @@ pub enum Limit {
     ModelTokens,
     Expired,
     Episodes,
+    /// The control plane stopped the org's ingestion ([`PlanStop`]).
+    IngestStopped,
+    /// The control plane stopped the org's asks ([`PlanStop`]).
+    AskStopped,
 }
 
 impl Limit {
@@ -78,6 +88,8 @@ impl Limit {
             Limit::ModelTokens => "model_tokens",
             Limit::Expired => "expired",
             Limit::Episodes => "episodes",
+            Limit::IngestStopped => "plan_ingest",
+            Limit::AskStopped => "plan_ask",
         }
     }
 }
@@ -113,6 +125,10 @@ impl LimitReached {
             Limit::Episodes => {
                 json!({"error": self.message, "cap_reached": true, "limit": "episodes"})
             }
+            Limit::IngestStopped => {
+                json!({"error": self.message, "limit": "plan", "stopped": "ingest"})
+            }
+            Limit::AskStopped => json!({"error": self.message, "limit": "plan", "stopped": "ask"}),
         }
     }
 
@@ -139,6 +155,83 @@ static MINE: LazyLock<Mutex<Book>> = LazyLock::new(Default::default);
 static OTHERS: LazyLock<RwLock<Book>> = LazyLock::new(Default::default);
 /// Each limited org's limits, as the directory last folded here said.
 static LIMITS: LazyLock<RwLock<HashMap<String, OrgLimits>>> = LazyLock::new(Default::default);
+/// The orgs the control plane stopped something for, as last read ([`set_plan_stops`]).
+static PLAN: LazyLock<RwLock<BTreeMap<String, PlanStop>>> = LazyLock::new(Default::default);
+
+/// What the control plane stopped for one org of a hosted deployment (its answer's `org_limits`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStop {
+    /// New memory is refused.
+    #[serde(default)]
+    pub ingest: bool,
+    /// Asks are refused, and background model work waits.
+    #[serde(default)]
+    pub ask: bool,
+    /// Why, as the control plane said (bounded, no control characters).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl PlanStop {
+    /// Whether it stops anything.
+    pub fn any(&self) -> bool {
+        self.ingest || self.ask
+    }
+}
+
+/// The orgs the control plane stopped something for now (an org it stopped nothing for has no entry): said when
+/// they change.
+pub fn set_plan_stops(stops: BTreeMap<String, PlanStop>) {
+    let stops: BTreeMap<String, PlanStop> = stops.into_iter().filter(|(_, s)| s.any()).collect();
+    let mut held = PLAN.write().unwrap();
+    if *held != stops {
+        let names = |m: &BTreeMap<String, PlanStop>, f: fn(&PlanStop) -> bool| {
+            m.iter()
+                .filter(|(_, s)| f(s))
+                .map(|(o, _)| o.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        eprintln!(
+            "limits: the control plane stops ingestion for [{}] and asks for [{}]",
+            names(&stops, |s| s.ingest),
+            names(&stops, |s| s.ask)
+        );
+        *held = stops;
+    }
+}
+
+/// The orgs the control plane stopped something for, as last read here.
+pub fn plan_stops() -> BTreeMap<String, PlanStop> {
+    PLAN.read().unwrap().clone()
+}
+
+/// The refusal of `org`'s ingestion (`ask` false) or asks (`ask` true), if the control plane stopped it.
+fn plan_refusal(org: &str, ask: bool) -> Option<LimitReached> {
+    let plan = PLAN.read().unwrap();
+    let stop = plan
+        .get(org)
+        .filter(|s| if ask { s.ask } else { s.ingest })?;
+    let what = if ask {
+        "asks no model"
+    } else {
+        "takes no new memory"
+    };
+    let why = stop
+        .reason
+        .as_deref()
+        .filter(|r| !r.trim().is_empty())
+        .map_or_else(|| "its plan's limits".to_string(), str::to_string);
+    Some(LimitReached {
+        limit: if ask {
+            Limit::AskStopped
+        } else {
+            Limit::IngestStopped
+        },
+        message: format!("org {org} {what} for now: {why}. Its memory is still read and searched"),
+        at: None,
+    })
+}
 
 /// Model calls whose tokens no org was known for, while some org is limited: a path that doesn't say which org it
 /// works for (`crate::log_org`).
@@ -150,16 +243,19 @@ pub static UNATTRIBUTED: LazyLock<prometheus::IntCounter> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// The tokens a model call just read and wrote, counted against the org this task works for ([`crate::log_org`]).
-pub fn count(tokens: u64) {
-    count_for(crate::log_org::current().as_deref(), tokens)
+/// The tokens a model call (`model`) just read and wrote, counted against the org this task works for
+/// ([`crate::log_org`]).
+pub fn count(model: &str, tokens: u64) {
+    count_for(crate::log_org::current().as_deref(), model, tokens)
 }
 
-/// [`count`] against `org` (none: nobody's).
-pub fn count_for(org: Option<&str>, tokens: u64) {
+/// [`count`] against `org` (none: nobody's). The one place model tokens are counted: the org's month here, and
+/// the hour's usage (`crate::usage`, under `_system` for no org), so the two never disagree.
+pub fn count_for(org: Option<&str>, model: &str, tokens: u64) {
     if tokens == 0 {
         return;
     }
+    crate::usage::METER.tokens(org, model, tokens, crate::usage::byok());
     let Some(org) = org else {
         if !LIMITS.read().unwrap().is_empty() {
             UNATTRIBUTED.inc_by(tokens);
@@ -295,6 +391,9 @@ pub fn model_gate(org: Option<&str>) -> Option<LimitReached> {
 
 fn model_gate_now(org: Option<&str>) -> Option<LimitReached> {
     let org = org?;
+    if let Some(stopped) = plan_refusal(org, true) {
+        return Some(stopped);
+    }
     let l = limits_of(org)?;
     let now = Utc::now();
     if let Some(e) = expired(org, &l, now) {
@@ -315,14 +414,18 @@ fn model_gate_now(org: Option<&str>) -> Option<LimitReached> {
     })
 }
 
-/// Whether `org` takes new memory now: refused past its expiry. (Its episode cap is checked where episodes are
-/// committed.)
+/// Whether `org` takes new memory now: refused past its expiry, and while the control plane stops its ingestion.
+/// (Its episode cap is checked where episodes are committed.)
 pub fn write_gate(org: Option<&str>) -> Option<LimitReached> {
     let org = org?;
+    if let Some(stopped) = plan_refusal(org, false) {
+        return raised(Some(stopped));
+    }
     raised(expired(org, &limits_of(org)?, Utc::now()))
 }
 
-/// Whether `org`'s background model work waits now (its expiry or its month's allowance).
+/// Whether `org`'s background model work waits now (its expiry, its month's allowance, or the control plane
+/// stopping its asks).
 pub fn paused(org: Option<&str>) -> bool {
     model_gate_now(org).is_some()
 }

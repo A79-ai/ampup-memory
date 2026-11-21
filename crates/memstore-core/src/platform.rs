@@ -1289,6 +1289,7 @@ pub async fn gemini(model: &str, prompt: &str) -> Result<String> {
         out["error"]["message"]
     );
     crate::limits::count(
+        model,
         out["usageMetadata"]["totalTokenCount"]
             .as_u64()
             .unwrap_or(0),

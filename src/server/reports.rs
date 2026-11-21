@@ -8,8 +8,10 @@
 //! readings from those written in the last few minutes. A report is deleted once its newest hour is past
 //! [`crate::usage::KEEP_DAYS`].
 //!
-//! Beside them, `_delivered.json`: each hour's usage as the control plane last took it, so the sender sends
-//! an hour again only when it changed (a report written after the hour closed, a restart).
+//! Beside them, `_delivered.json`: each hour's usage (per org, for a hosted deployment) as the control plane last
+//! took it, so the sender sends a row again only when it changed (a report written after the hour closed, a
+//! restart). And `_org_limits.json`: what the control plane last stopped for each org (`crate::limits::PlanStop`),
+//! which only the sender hears: written by it, read by every process each round.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
@@ -20,11 +22,15 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::State;
-use crate::usage::{Bucket, Usage};
+use crate::usage::{Bucket, HourOrg, Usage};
 
 /// The directory beside the writer lease's.
 const DIR: &str = "_reports";
 const DELIVERED: &str = "_delivered.json";
+const ORG_LIMITS: &str = "_org_limits.json";
+
+/// A row the control plane took: its hour, and its org (none: the whole deployment's).
+pub type RowKey = (DateTime<Utc>, Option<String>);
 /// A report written longer ago than this is a stopped process's: its usage counts, its readings don't.
 const FRESH: TimeDelta = TimeDelta::minutes(3);
 /// How often the place is found again (its credentials taken again; sooner where they run out sooner, as the
@@ -41,8 +47,11 @@ pub struct Report {
     pub written_at: DateTime<Utc>,
     /// Totals since the process started.
     pub readings: crate::alerts::Readings,
-    /// Its hours in the last [`crate::usage::KEEP_DAYS`].
+    /// Its hours in the last [`crate::usage::KEEP_DAYS`], every org's added up: what an older sender reads.
     pub usage: Vec<(DateTime<Utc>, Bucket)>,
+    /// Its hours per org. None: an older process's report, whose hours have no org.
+    #[serde(default)]
+    pub usage_by_org: Option<Vec<(HourOrg, Bucket)>>,
     /// The model tokens it spent for each org, this month and last ([`crate::limits`]): an org's month is every
     /// process's added up.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -145,13 +154,16 @@ pub async fn run(state: Arc<State>, every: Duration) {
                 }
             }
         }
+        read_org_limits(&store).await;
+        let book = crate::usage::METER.book(Utc::now());
         let report = Report {
             holder: holder().to_string(),
             cell: super::cell::me().to_string(),
             role: format!("{:?}", state.role).to_ascii_lowercase(),
             written_at: Utc::now(),
             readings: super::alert_readings(&state, &dirs),
-            usage: crate::usage::METER.book(Utc::now()),
+            usage: crate::usage::collapsed(&book),
+            usage_by_org: Some(book),
             org_tokens: crate::limits::book(),
         };
         match write(&store, &report).await {
@@ -274,8 +286,8 @@ async fn others_once(store: &crate::Store) -> Result<Vec<Arc<Report>>> {
     Ok(out)
 }
 
-/// Each hour's usage as the control plane last took it.
-pub async fn delivered(state: &State) -> Result<BTreeMap<DateTime<Utc>, Usage>> {
+/// Each row of usage as the control plane last took it, by hour and org.
+pub async fn delivered(state: &State) -> Result<BTreeMap<RowKey, Usage>> {
     let Some(op) = place(state).await? else {
         return Ok(BTreeMap::new());
     };
@@ -283,7 +295,10 @@ pub async fn delivered(state: &State) -> Result<BTreeMap<DateTime<Utc>, Usage>> 
         Ok(b) => {
             let sent: Vec<Usage> =
                 serde_json::from_slice(&b.to_vec()).with_context(|| format!("read {DELIVERED}"))?;
-            Ok(sent.into_iter().map(|u| (u.hour, u)).collect())
+            Ok(sent
+                .into_iter()
+                .map(|u| ((u.hour, u.org.clone()), u))
+                .collect())
         }
         Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(BTreeMap::new()),
         Err(e) => Err(anyhow::Error::from(e).context(format!("read {DELIVERED}"))),
@@ -291,7 +306,7 @@ pub async fn delivered(state: &State) -> Result<BTreeMap<DateTime<Utc>, Usage>> 
 }
 
 /// Keep what the control plane took.
-pub async fn keep_delivered(state: &State, sent: &BTreeMap<DateTime<Utc>, Usage>) -> Result<()> {
+pub async fn keep_delivered(state: &State, sent: &BTreeMap<RowKey, Usage>) -> Result<()> {
     let Some(op) = place(state).await? else {
         return Ok(());
     };
@@ -302,8 +317,58 @@ pub async fn keep_delivered(state: &State, sent: &BTreeMap<DateTime<Utc>, Usage>
     Ok(())
 }
 
+/// Keep what the control plane last stopped for each org, for every process to read ([`read_org_limits`]).
+pub async fn keep_org_limits(
+    state: &State,
+    stops: &BTreeMap<String, crate::limits::PlanStop>,
+) -> Result<()> {
+    let Some(op) = place(state).await? else {
+        return Ok(());
+    };
+    op.write(ORG_LIMITS, serde_json::to_vec(stops)?)
+        .await
+        .with_context(|| format!("write {ORG_LIMITS}"))?;
+    Ok(())
+}
+
+/// Read what the control plane last stopped for each org, as the sender kept it, into `crate::limits`. Unread
+/// (the place failing), they stand as last read; none kept, none stopped.
+async fn read_org_limits(store: &crate::Store) {
+    static FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let read = async {
+        let Some(op) = place_in(store).await? else {
+            return Ok(None);
+        };
+        match op.read(ORG_LIMITS).await {
+            Ok(b) => Ok(Some(
+                serde_json::from_slice::<BTreeMap<String, crate::limits::PlanStop>>(&b.to_vec())
+                    .with_context(|| format!("read {ORG_LIMITS}"))?,
+            )),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(Some(BTreeMap::new())),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("read {ORG_LIMITS}"))),
+        }
+    };
+    match read.await {
+        Ok(stops) => {
+            FAILING.store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(stops) = stops {
+                crate::limits::set_plan_stops(stops);
+            }
+        }
+        Err(e) => {
+            if !FAILING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "reports: the orgs' stops not read (kept as last read; retrying): {}",
+                    super::writer::redacted(&e)
+                );
+            }
+        }
+    }
+}
+
 /// Run `work`, in a process that isn't a server (a dream job's worker), for `org`: its model calls count against
-/// the org's month with every server's and are held to the org's limits as a server's are ([`crate::limits`]).
+/// the org's month with every server's, and in the deployment's usage, and are held to the org's limits (and the
+/// control plane's stops) as a server's are ([`crate::limits`]).
 /// Before it, the org's limits are folded from the directory and every process's month read from their reports;
 /// while it runs, this process's own counts are written beside theirs (as `role`) every `every`, and the others'
 /// read again; and once more when it ends, however it ends. Nothing is written while it spent nothing.
@@ -328,8 +393,10 @@ pub async fn standalone<T>(
                 super::writer::redacted(&e)
             ),
         }
+        read_org_limits(store).await;
         let org_tokens = crate::limits::book();
-        if org_tokens.is_empty() {
+        let book = crate::usage::METER.book(Utc::now());
+        if org_tokens.is_empty() && book.is_empty() {
             return;
         }
         let report = Report {
@@ -338,7 +405,8 @@ pub async fn standalone<T>(
             role: role.to_string(),
             written_at: Utc::now(),
             readings: Default::default(),
-            usage: vec![],
+            usage: crate::usage::collapsed(&book),
+            usage_by_org: Some(book),
             org_tokens,
         };
         if let Err(e) = write(store, &report).await {

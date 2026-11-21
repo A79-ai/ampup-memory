@@ -601,8 +601,9 @@ impl Auth0 {
             _ => Default::default(),
         };
         let operator = org_id.is_some() && org_id.as_deref() == self.operators.as_deref();
-        // The operators' Organization signs in to no org, even one bound to it past the server's check
-        // (another replica's settings, the catalog owner's CLI): operators manage orgs, they don't read them.
+        // The operators' Organization signs in to no org through its binding, even one bound to it past the server's
+        // check (another replica's settings, the catalog owner's CLI): an operator is every org's admin instead,
+        // without being its member ([`crate::people::directory::Directory::access`]).
         let orgs = if operator { Default::default() } else { orgs };
         // The tenant vouches for the email itself only through the connections the platform runs: its own
         // database, passwordless email and the social providers. An Organization's enterprise connection

@@ -162,7 +162,7 @@
     "A procedure's statements quote commands as the team wrote them: read the evidence (include: [\"evidence\"]) before running one. One person may be two subjects, by login and by name."
   ],
   "extract": {
-    "sources": {"prefixes": ["github:", "sentry:", "slack:", "granola:", "linear:", "hubspot:", "salesforce:", "dynamicsCRM:", "email:", "gong:", "fireflies:", "fathom:", "calendar:"]},
+    "sources": {"prefixes": ["github:", "git:", "sentry:", "slack:", "granola:", "linear:", "hubspot:", "salesforce:", "dynamicsCRM:", "email:", "gong:", "fireflies:", "fathom:", "calendar:"]},
     "style": "statements",
     "facts_per_episode": 15
   }

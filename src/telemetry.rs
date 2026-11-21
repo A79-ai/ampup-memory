@@ -10,7 +10,9 @@
 //! followed over time and never read or guessed; `crate::sessions`). Never sent: fact, episode or passage
 //! text, a query, a source, an entity, predicate or schema name, an org, team, scope or user name, a
 //! key, a log line, an advice note or its situation, a session's context, conversation or transcript. The full Prometheus set (`/metrics`) stays in the account too: its labels carry org
-//! names.
+//! names. One exception, for a deployment the control plane runs itself for many orgs (hosted): once its answer
+//! to telemetry says `per_org`, `usage` is sent per hour and org, each row naming its org, so each org is
+//! billed for its own use. A deployment in a customer's account is never told to, so it never names an org.
 //!
 //! The contract is these types. Every field is a number, a time, a version, or a value from a closed
 //! set the engine owns; none holds caller text, so a payload can't carry what it has no field for. The
@@ -23,8 +25,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The contract's version: raised when a field is added or its meaning changes. 2 added `inventory`,
-/// 3 `alerts`, 4 `usage`, 5 `advice`.
-pub const CONTRACT: u32 = 5;
+/// 3 `alerts`, 4 `usage`, 5 `advice`, 6 `usage`'s `org` (a hosted deployment's rows per org) and
+/// `model_tokens_byok`.
+pub const CONTRACT: u32 = 6;
 
 /// One payload a deployment sends.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -622,65 +625,193 @@ impl Limits {
     }
 }
 
+/// What the control plane stopped for each org it stopped something for.
+pub type OrgStops = std::collections::BTreeMap<String, crate::limits::PlanStop>;
+
+/// What the control plane's answer says of a hosted deployment's orgs: whether to send usage per org
+/// (`per_org`), and what it stopped for each org (`org_limits`, each as [`Limits`]). Read leniently, as
+/// [`Limits`] are.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrgAnswer {
+    pub per_org: bool,
+    /// None: the answer says nothing of orgs' limits (they stand as they were). Some: every org the control
+    /// plane stopped something for (an org not in it is stopped for nothing).
+    pub org_limits: Option<std::collections::BTreeMap<String, crate::limits::PlanStop>>,
+}
+
+impl OrgAnswer {
+    /// `per_org` and `org_limits` in a telemetry answer. An org's entry that doesn't read, or whose name isn't
+    /// an org's, is left out (said).
+    pub fn in_answer(body: &serde_json::Value) -> Self {
+        let per_org = body.get("per_org").and_then(|v| v.as_bool()) == Some(true);
+        let org_limits = body
+            .get("org_limits")
+            .filter(|v| !v.is_null())
+            .and_then(|v| {
+                let mut out = std::collections::BTreeMap::new();
+                let Some(m) = v.as_object() else {
+                    eprintln!(
+                        "telemetry: the control plane's org_limits aren't an object; unchanged"
+                    );
+                    return None;
+                };
+                for (org, l) in m {
+                    if crate::check_name("org", org).is_err() {
+                        eprintln!("telemetry: org_limits name an org that can't be one; left out");
+                        continue;
+                    }
+                    let Some(l) = Limits::in_answer(&serde_json::json!({ "limits": l })) else {
+                        continue;
+                    };
+                    out.insert(
+                        org.clone(),
+                        crate::limits::PlanStop {
+                            ingest: l.ingest == Gate::Stopped,
+                            ask: l.ask == Gate::Stopped,
+                            reason: l.reason,
+                        },
+                    );
+                }
+                Some(out)
+            });
+        OrgAnswer {
+            per_org,
+            org_limits,
+        }
+    }
+}
+
 /// What `store` holds now, as [`Inventory`]. Totals come from each table's snapshot summary (no data
 /// read); the counts by type and connector read the episodes' `source` column alone, every scope's.
 pub async fn inventory(store: &crate::Store) -> anyhow::Result<Inventory> {
     Ok(holdings(store).await?.0)
 }
 
-/// [`inventory`], and the bytes of every scope's episode and fact data files (from the same snapshot
-/// summaries): what `usage` reports as `storage_bytes`.
-pub async fn holdings(store: &crate::Store) -> anyhow::Result<(Inventory, u64)> {
-    use crate::Scope;
+/// [`inventory`], and the facts and bytes (of the episode and fact data files, from the same snapshot summaries)
+/// each org holds, over its scopes (a person's own memory, no org's, under `crate::usage::SYSTEM`): the gauges
+/// `usage` reports. A scope that doesn't read (an org deleted meanwhile, or half-deleted: its catalog entries
+/// left, their files gone) is left out and said, so one scope never stops the count of all the others; an error
+/// only when no scope read.
+pub async fn holdings(store: &crate::Store) -> anyhow::Result<(Inventory, crate::usage::Gauges)> {
     let mut inv = Inventory::default();
-    let mut bytes = 0;
+    let mut by_org = crate::usage::Gauges::new();
+    let mut failed = Failed::default();
     for scope in store.scopes().await? {
-        match scope {
-            Scope::Org | Scope::NamedOrg(_) => inv.scopes.orgs += 1,
-            Scope::Team(_) => inv.scopes.teams += 1,
-            Scope::User(_) => inv.scopes.users += 1,
-        }
-        let ns = scope.namespace();
-        let (episodes, episode_bytes) = store.snapshot_totals(&ns, crate::EPISODES).await?;
-        let (facts, fact_bytes) = store.snapshot_totals(&ns, crate::FACTS).await?;
-        inv.episodes += episodes;
-        inv.facts += facts;
-        bytes += episode_bytes + fact_bytes;
-        let ident = iceberg::TableIdent::new(
-            iceberg::NamespaceIdent::new(ns.clone()),
-            crate::EPISODES.into(),
-        );
-        if store.has_table(&ident).await? {
-            let table = store.catalog().load_table(&ident).await?;
-            for b in crate::scan_rows(&table, Some(&["source"]), None).await? {
-                for source in crate::strings(&b, "source") {
-                    *inv.episodes_by_type
-                        .entry(EpisodeKind::of(&source))
-                        .or_default() += 1;
-                    *inv.episodes_by_connector
-                        .entry(Connector::of(&source))
-                        .or_default() += 1;
-                }
+        let mut one = Inventory::default();
+        let bytes = match scope_holdings(store, &scope, &mut one).await {
+            Ok(b) => b,
+            Err(e) => {
+                failed.left_out("inventory", &scope, e);
+                continue;
             }
+        };
+        failed.read += 1;
+        let g = by_org
+            .entry(crate::usage::org_or_system(scope.org_name()))
+            .or_default();
+        g.0 += one.facts;
+        g.1 += bytes;
+        add_inventory(&mut inv, one);
+    }
+    failed.check()?;
+    Ok((inv, by_org))
+}
+
+/// The scopes a count over every scope read, and the first that didn't.
+#[derive(Default)]
+struct Failed {
+    read: usize,
+    first: Option<anyhow::Error>,
+}
+
+impl Failed {
+    fn left_out(&mut self, what: &str, scope: &crate::Scope, e: anyhow::Error) {
+        eprintln!("telemetry: {scope} left out of the {what}, it doesn't read: {e:#}");
+        self.first.get_or_insert(e);
+    }
+
+    /// An error when scopes failed and none read.
+    fn check(self) -> anyhow::Result<()> {
+        match self.first {
+            Some(e) if self.read == 0 => Err(e),
+            _ => Ok(()),
         }
-        match store.schema(&scope, crate::MAIN).await? {
-            None => inv.schemas.none += 1,
-            Some(s) => {
-                match BuiltinSchema::of(&s) {
-                    Some(b) => *inv.schemas.builtin.entry(b).or_default() += 1,
-                    None => inv.schemas.custom += 1,
-                }
-                inv.schemas.types += s.types.len() as u64;
-                inv.schemas.predicates += s
-                    .types
-                    .values()
-                    .map(|t| t.predicates.len() as u64)
-                    .sum::<u64>();
-                inv.schemas.metrics += s.metrics.len() as u64;
+    }
+}
+
+fn add_inventory(to: &mut Inventory, one: Inventory) {
+    to.scopes.orgs += one.scopes.orgs;
+    to.scopes.teams += one.scopes.teams;
+    to.scopes.users += one.scopes.users;
+    to.episodes += one.episodes;
+    to.facts += one.facts;
+    for (k, n) in one.episodes_by_type {
+        *to.episodes_by_type.entry(k).or_default() += n;
+    }
+    for (k, n) in one.episodes_by_connector {
+        *to.episodes_by_connector.entry(k).or_default() += n;
+    }
+    for (k, n) in one.schemas.builtin {
+        *to.schemas.builtin.entry(k).or_default() += n;
+    }
+    to.schemas.custom += one.schemas.custom;
+    to.schemas.none += one.schemas.none;
+    to.schemas.types += one.schemas.types;
+    to.schemas.predicates += one.schemas.predicates;
+    to.schemas.metrics += one.schemas.metrics;
+}
+
+/// What `scope` holds, counted into `inv`; the bytes of its episode and fact data files.
+async fn scope_holdings(
+    store: &crate::Store,
+    scope: &crate::Scope,
+    inv: &mut Inventory,
+) -> anyhow::Result<u64> {
+    use crate::Scope;
+    match scope {
+        Scope::Org | Scope::NamedOrg(_) => inv.scopes.orgs += 1,
+        Scope::Team(_) => inv.scopes.teams += 1,
+        Scope::User(_) => inv.scopes.users += 1,
+    }
+    let ns = scope.namespace();
+    let (episodes, episode_bytes) = store.snapshot_totals(&ns, crate::EPISODES).await?;
+    let (facts, fact_bytes) = store.snapshot_totals(&ns, crate::FACTS).await?;
+    inv.episodes += episodes;
+    inv.facts += facts;
+    let ident = iceberg::TableIdent::new(
+        iceberg::NamespaceIdent::new(ns.clone()),
+        crate::EPISODES.into(),
+    );
+    if store.has_table(&ident).await? {
+        let table = store.catalog().load_table(&ident).await?;
+        for b in crate::scan_rows(&table, Some(&["source"]), None).await? {
+            for source in crate::strings(&b, "source") {
+                *inv.episodes_by_type
+                    .entry(EpisodeKind::of(&source))
+                    .or_default() += 1;
+                *inv.episodes_by_connector
+                    .entry(Connector::of(&source))
+                    .or_default() += 1;
             }
         }
     }
-    Ok((inv, bytes))
+    match store.schema(scope, crate::MAIN).await? {
+        None => inv.schemas.none += 1,
+        Some(s) => {
+            match BuiltinSchema::of(&s) {
+                Some(b) => *inv.schemas.builtin.entry(b).or_default() += 1,
+                None => inv.schemas.custom += 1,
+            }
+            inv.schemas.types += s.types.len() as u64;
+            inv.schemas.predicates += s
+                .types
+                .values()
+                .map(|t| t.predicates.len() as u64)
+                .sum::<u64>();
+            inv.schemas.metrics += s.metrics.len() as u64;
+        }
+    }
+    Ok(episode_bytes + fact_bytes)
 }
 
 /// How the advice served in agents' sessions worked out (`crate::sessions`), over every scope, as it stands:
@@ -869,8 +1000,19 @@ impl From<NoteId> for String {
 /// with `salt`.
 pub async fn advice(store: &crate::Store, salt: &[u8; 32]) -> anyhow::Result<Advice> {
     let mut a = Advice::default();
+    let mut failed = Failed::default();
     for scope in store.scopes().await? {
-        let o = crate::sessions::outcomes(store, &scope).await?;
+        // A scope that doesn't read is left out, as from the inventory.
+        let o = match crate::sessions::outcomes(store, &scope).await {
+            Ok(o) => {
+                failed.read += 1;
+                o
+            }
+            Err(e) => {
+                failed.left_out("advice", &scope, e);
+                continue;
+            }
+        };
         let t = &mut a.sessions;
         t.started += o.started;
         t.open += o.open;
@@ -905,6 +1047,7 @@ pub async fn advice(store: &crate::Store, salt: &[u8; 32]) -> anyhow::Result<Adv
             .then(x.note.cmp(&y.note))
     });
     a.notes.truncate(Advice::MAX);
+    failed.check()?;
     Ok(a)
 }
 
@@ -952,6 +1095,9 @@ pub struct Outbox {
     limits: std::path::PathBuf,
     /// Limits answered since [`Outbox::take_limits`] last looked.
     answered: std::sync::Mutex<Option<Limits>>,
+    /// What the last answer said of orgs: `per_org` (none before this process's first answer), and the
+    /// `org_limits` answered since [`Outbox::take_org_limits`] last looked.
+    orgs: std::sync::Mutex<(Option<bool>, Option<OrgStops>)>,
 }
 
 /// Most payloads the spool keeps (the oldest go first): a day of heartbeats a minute apart.
@@ -993,6 +1139,7 @@ impl Outbox {
             spool: beside(&mirror, "telemetry.spool.jsonl"),
             limits: beside(&mirror, "telemetry.limits.json"),
             answered: Default::default(),
+            orgs: Default::default(),
             credential,
             mirror,
         }
@@ -1051,6 +1198,19 @@ impl Outbox {
         Ok(took)
     }
 
+    /// Whether the control plane's last answer asked for usage per org (a hosted deployment); none before it
+    /// answered this process at all, so a restarted sender sends no usage before it knows how.
+    pub fn per_org(&self) -> Option<bool> {
+        self.orgs.lock().unwrap().0
+    }
+
+    /// The orgs' limits the control plane answered with since this was last asked, if any.
+    pub fn take_org_limits(
+        &self,
+    ) -> Option<std::collections::BTreeMap<String, crate::limits::PlanStop>> {
+        self.orgs.lock().unwrap().1.take()
+    }
+
     /// The limits the control plane answered with since this was last asked, if any.
     pub fn take_limits(&self) -> Option<Limits> {
         self.answered.lock().unwrap().take()
@@ -1064,8 +1224,26 @@ impl Outbox {
             .ok()
     }
 
-    /// The control plane answered 200 with `body`: keep its limits, if it says any.
+    /// The control plane answered 200 with `body`: keep what it says of orgs, and its limits, if it says any.
     fn answered(&self, body: &serde_json::Value) {
+        let o = OrgAnswer::in_answer(body);
+        {
+            let mut orgs = self.orgs.lock().unwrap();
+            if orgs.0 != Some(o.per_org) {
+                eprintln!(
+                    "telemetry: the control plane asks for usage {}",
+                    if o.per_org {
+                        "per org (a hosted deployment)"
+                    } else {
+                        "for the whole deployment"
+                    }
+                );
+            }
+            orgs.0 = Some(o.per_org);
+            if o.org_limits.is_some() {
+                orgs.1 = o.org_limits;
+            }
+        }
         let Some(l) = Limits::in_answer(body) else {
             return;
         };

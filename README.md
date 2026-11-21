@@ -96,6 +96,68 @@ use a key, the local Ollama, or no model, and keeps the answer in `~/.ampup-memo
 model (`HF_HUB_OFFLINE=1`, nothing fetched yet), search ranks by keyword alone. More in the
 [quickstart](https://docs.ampup.ai/ampup-memory/quickstart#offline-on-your-laptop).
 
+### Your GitHub repositories, with the login you already have
+
+`serve --local` reads a repository's issues and pull requests by itself, with the token this machine already
+holds (`GITHUB_TOKEN`, `GH_TOKEN`, else `gh auth token`). Nothing goes through anyone else, and nothing needs a
+public address.
+
+```bash
+ampup-memory sources add github OWNER/REPO               # 30 days back; --since 2026-01-01 for more
+ampup-memory sources list                                # records read, last read, any error
+ampup-memory sources remove github OWNER/REPO            # stops reading; what it read stays
+```
+
+A running server picks a new source up within a minute and reads each one every 10 minutes.
+
+#### Merged pull requests with their reviews
+
+`ampup-memory sources add github-prs OWNER/REPO` reads the repository's merged pull requests whole: the
+description, the files changed, the reviews and discussion, and each review thread with its diff, in the format
+hosted AmpUp Memory writes. What bots and AI reviewers wrote is left out. It needs a token, even for a public
+repository (`gh auth login` is enough). Add both kinds for a repository to get its issues and open pull requests
+too: `github` then leaves the merged ones to `github-prs`.
+
+### Your local git history, with no network at all
+
+`serve --local` also reads a repository on this machine with the `git` already installed: each commit's message,
+author, date and the files it touched (lines added and removed, not the diff). So "why did we change this file" and
+"who touched that" are answered from memory, offline, with no account anywhere.
+
+```bash
+ampup-memory sources add git ~/code/my-repo              # 30 days back; --since 2026-01-01 for more
+ampup-memory sources remove git ~/code/my-repo           # stops reading; what it read stays
+```
+
+It reads the commits on whatever branch is checked out, merges left out, and after that only the commits new since
+the last one it read.
+
+### Your Linear team, with a personal API key
+
+`serve --local` reads a Linear team's issues, with their comments and the merged pull requests linked to them,
+using a personal API key (Linear's settings, Security & access) in the server's environment as `LINEAR_API_KEY`.
+The key is never stored. The target is the workspace's URL key and the team's key.
+
+```bash
+LINEAR_API_KEY=lin_api_... ampup-memory serve --local    # or have it set where the agent starts the server
+ampup-memory sources add linear acme/ENG                 # 30 days back; --since 2026-01-01 for more
+```
+
+The background service (`ampup-memory service install`) never writes keys into its file, so it has no Linear key:
+run `serve --local` yourself to read Linear.
+
+### Your Sentry projects
+
+`serve --local` also reads a Sentry project's issues, each written as an incident, with a Sentry token from the
+server's environment (`SENTRY_AUTH_TOKEN`), a file `AMPUP_MEMORY_SENTRY_TOKEN_FILE` names, or `sentry-cli login`'s
+`~/.sentryclirc`. The token needs to read the project's issues and events. For a self-hosted Sentry, or an
+organization kept in the EU, set `SENTRY_URL` (the default is `https://sentry.io`).
+
+```bash
+ampup-memory sources add sentry ORG/PROJECT              # 30 days back; --since 2026-01-01 for more
+ampup-memory sources remove sentry ORG/PROJECT
+```
+
 ## First memory, search and advice
 
 ```bash

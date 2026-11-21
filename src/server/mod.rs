@@ -444,6 +444,9 @@ pub struct Options {
     /// that has no sign-in. Such a server (`serve --local`, the only one that sets it) also serves the Studio, the
     /// web page for looking at your memory, at `/studio/` (`studio`).
     pub loopback_only: bool,
+    /// Read the sources named in this directory's `sources.json` (`crate::sources`) and write what they hold as
+    /// the server's groups: `serve --local`, the only one that sets it.
+    pub sources_dir: Option<std::path::PathBuf>,
     /// `remember_memory` and `/remember` commit straight into the served scope, whatever it is (a single
     /// person's own store: `serve --local`). Otherwise only an org's or team's memory the directory gave the
     /// caller is written this way.
@@ -722,6 +725,21 @@ pub async fn serve_with(
         Err(_) => Duration::from_secs(60),
     };
     tokio::spawn(reports::run(state.clone(), usage_persist));
+    // Sources this machine reads by itself (`serve --local`): GitHub repositories with the token it already holds,
+    // Linear teams with the key in its environment, Sentry projects with a token it finds.
+    if let Some(dir) = options.sources_dir.clone() {
+        let st = state.clone();
+        let acl: Vec<String> = st.groups.iter().map(|g| format!("group:{g}")).collect();
+        let write = move |body: Value| -> futures::future::BoxFuture<'static, Result<usize>> {
+            let st = st.clone();
+            Box::pin(async move {
+                let bytes = serde_json::to_vec(&body)?;
+                let out = ingest_episodes(&st, &st.scope, "sources", &bytes, None).await?;
+                Ok(out["committed"].as_u64().unwrap_or(0) as usize)
+            })
+        };
+        state.background("sources", crate::sources::run(dir, acl, write));
+    }
     if let Some(outbox) = crate::telemetry::Outbox::from_env()? {
         // The last limits answered hold until the control plane answers again.
         if let Some(l) = outbox.saved_limits() {
@@ -4228,7 +4246,7 @@ async fn ingest_episodes(
         episodes.len(),
         same.len()
     );
-    crate::usage::METER.ingested(sizes);
+    crate::usage::METER.ingested(scope.org_name(), sizes);
     let mut out = json!({
         "committed": episodes.len() + same.len(),
         "episode_ids": episodes.iter().chain(&same).map(|e| e.episode_id.as_str()).collect::<Vec<_>>(),
@@ -9036,6 +9054,27 @@ const PROVISIONER_OPS: [&str; 6] = [
     "show",
 ];
 
+/// The directory a provisioner key's check on `org` reads: this server's fold when it already shows `org` as one the
+/// key created, else the catalog read now. Servers' folds may be `AMPUP_MEMORY_MAX_STALENESS_MS` apart, so an org the
+/// key created through another server a moment ago may not be in this one's yet; refused on that fold, the sign-up
+/// service is told its own new org isn't its, and makes a second one.
+async fn provisioner_directory(
+    store: &Store,
+    org: &str,
+    key: &str,
+) -> Result<crate::people::directory::Directory> {
+    use crate::people::directory::Directory;
+    let dir = Directory::load(store).await?;
+    if dir
+        .orgs
+        .get(org)
+        .is_some_and(|o| crate::people::directory::created_by(o, key))
+    {
+        return Ok(dir);
+    }
+    Directory::fresh(store).await
+}
+
 /// `show {org}`'s limits and usage: `"limits"` (each one, null where unset) and `"usage"` (this month's model tokens,
 /// every server's, and the episodes the org holds), beside its view and in it.
 async fn with_limits(
@@ -9174,7 +9213,7 @@ async fn directory_change(
         if op == "show" {
             let org = req["org"].as_str().unwrap_or_default();
             let store = state.store.read().unwrap().clone();
-            let dir = Directory::load(&store).await?;
+            let dir = provisioner_directory(&store, org, key).await?;
             return match dir.orgs.get(org) {
                 Some(o) if crate::people::directory::created_by(o, key) => {
                     let mut v = json!({"view": o});
@@ -9284,7 +9323,10 @@ async fn directory_change(
     if req["op"] == "set_schema" {
         // Type an org's memory with a built-in schema or one given inline; never a path on this server.
         let org = req["org"].as_str().unwrap_or_default();
-        let dir = Directory::load(&store).await?;
+        let dir = match &via.provisioner {
+            Some(key) => provisioner_directory(&store, org, key).await?,
+            None => Directory::load(&store).await?,
+        };
         if let Some(key) = &via.provisioner {
             // A sign-up service gives the orgs it created a starting schema, as it gives them their limits: a
             // built-in by name, never one written by the caller, never proposed, and never over a schema the
@@ -10544,10 +10586,12 @@ fn metrics_reply(state: &State) -> Response<Full<Bytes>> {
 ///
 /// Usage (`crate::usage`) goes every `every` too, the deployment's: this process's book added to every
 /// other process's report (`reports`) and the book an older engine kept in the catalog
-/// (`memory_system.usage_hours`), each hour sent when it changed since the control plane last took it,
-/// straight rather than through the spool (an hour's latest counters are all that matter). The alerts read
-/// every process's readings the same way. Each answer may carry the control plane's limits, which hold from
-/// then on.
+/// (`memory_system.usage_hours`), each hour (or, for a hosted deployment, each hour and org: `crate::usage::rows`)
+/// sent when it changed since the control plane last took it, straight rather than through the spool (an hour's
+/// latest counters are all that matter). None is sent before the control plane first answers this process, which
+/// says how. The alerts read every process's readings the same way. Each answer may carry the control plane's
+/// limits, the deployment's and each org's, which hold from then on (each org's written beside the reports, for
+/// every process: `reports::keep_org_limits`).
 async fn export_telemetry(
     state: Arc<State>,
     outbox: crate::telemetry::Outbox,
@@ -10582,6 +10626,8 @@ async fn export_telemetry(
     let mut kept_at = std::time::Instant::now();
     let mut delivered = None;
     let mut usage_at = std::time::Instant::now();
+    // The orgs' stops last answered, until kept beside the reports.
+    let mut org_limits: Option<std::collections::BTreeMap<String, crate::limits::PlanStop>> = None;
     loop {
         if std::time::Instant::now() >= kept_at {
             let store = state.store.read().unwrap().clone();
@@ -10715,7 +10761,7 @@ async fn export_telemetry(
                 retry_at = std::time::Instant::now();
             }
         }
-        if let (Some(kept), Some(took)) = (&kept, &mut delivered)
+        if let (Some(kept), Some(took), Some(per_org)) = (&kept, &mut delivered, outbox.per_org())
             && std::time::Instant::now() >= usage_at
             && std::time::Instant::now() >= retry_at
         {
@@ -10723,14 +10769,18 @@ async fn export_telemetry(
             let built = chrono::Utc::now();
             let mine = crate::usage::METER.book(built);
             let others = others_reports(&state).await;
-            let books = [mine.as_slice(), kept.as_slice()]
-                .into_iter()
-                .chain(others.iter().map(|r| r.usage.as_slice()));
-            let hours: Vec<crate::usage::Usage> = crate::usage::merge(books, built)
-                .into_iter()
-                .map(|(h, b)| b.usage(h))
-                .filter(|u| took.get(&u.hour) != Some(u))
-                .collect();
+            let by_org = std::iter::once(mine.as_slice())
+                .chain(others.iter().filter_map(|r| r.usage_by_org.as_deref()));
+            // Books without orgs: the catalog's, and an older process's report.
+            let legacy = std::iter::once(kept.as_slice()).chain(
+                others
+                    .iter()
+                    .filter(|r| r.usage_by_org.is_none())
+                    .map(|r| r.usage.as_slice()),
+            );
+            let merged = crate::usage::merge(by_org, legacy, built);
+            let gauges = crate::usage::METER.last_gauges();
+            let hours = crate::usage::rows(&merged, per_org, took, gauges.as_ref(), built);
             let sent = match crate::telemetry::DeploymentId::from_env() {
                 Ok(deployment) => {
                     let batch: Vec<crate::telemetry::Envelope> = hours
@@ -10751,8 +10801,8 @@ async fn export_telemetry(
                     if !hours.is_empty() {
                         let oldest = crate::usage::hour_of(built)
                             - chrono::TimeDelta::days(crate::usage::KEEP_DAYS);
-                        took.retain(|h, _| *h >= oldest);
-                        took.extend(hours.into_iter().map(|u| (u.hour, u)));
+                        took.extend(hours.into_iter().map(|u| ((u.hour, u.org.clone()), u)));
+                        took.retain(|(h, _), u| *h >= oldest && crate::usage::keep_taken(u, built));
                         // Kept for a restart: lost, every hour is sent once more (each send replaces).
                         if let Err(err) = reports::keep_delivered(&state, took).await {
                             eprintln!(
@@ -10802,6 +10852,24 @@ async fn export_telemetry(
             if *held != l {
                 eprintln!("telemetry: the control plane's limits are now {l:?}");
                 *held = l;
+            }
+        }
+        // Each org's: held here at once, and kept beside the reports for every other process (the cells serving
+        // those orgs), until kept.
+        if let Some(stops) = outbox.take_org_limits() {
+            crate::limits::set_plan_stops(stops.clone());
+            org_limits = Some(stops);
+        }
+        if let Some(stops) = &org_limits {
+            match reports::keep_org_limits(&state, stops).await {
+                Ok(()) => org_limits = None,
+                Err(err) => {
+                    eprintln!(
+                        "telemetry: the orgs' stops not kept for the other processes (retrying): {}",
+                        writer::redacted(&err)
+                    );
+                    reports::forget().await;
+                }
             }
         }
         tokio::time::sleep(tick).await;
@@ -10949,8 +11017,8 @@ async fn latest_inventory(state: &State) -> Result<crate::telemetry::Envelope> {
 async fn telemetry_inventory(state: &State) -> Result<crate::telemetry::Envelope> {
     use crate::telemetry::{CONTRACT, DeploymentId, Envelope, Payload};
     let store = state.store.read().unwrap().clone();
-    let (inventory, bytes) = crate::telemetry::holdings(&store).await?;
-    crate::usage::METER.gauges(inventory.facts, bytes);
+    let (inventory, by_org) = crate::telemetry::holdings(&store).await?;
+    crate::usage::METER.gauges(by_org);
     Ok(Envelope {
         contract: CONTRACT,
         deployment: DeploymentId::from_env()?,
@@ -11395,47 +11463,37 @@ async fn unmentioned(
             .iter()
             .any(|k| h[*k].as_str().is_some_and(|t| says(t, name)))
     };
-    let mut missing = vec![];
-    for name in names {
-        if hits.iter().any(|h| in_hit(h, &name)) {
-            continue;
-        }
-        let rank = search::Rank {
-            as_of: None,
-            diverse: false,
-            group: 0,
-            classic: false,
-        };
-        // Mentioned in any scope read is mentioned.
-        let facts = reads
-            .search(store, who, &name, 5, None, None, rank)
-            .await?
-            .items;
-        if facts.iter().any(|h| {
-            [&h.fact.entity, &h.fact.value]
-                .into_iter()
-                .chain(h.fact.quote.as_ref())
-                .any(|t| says(t, &name))
-        }) {
-            continue;
-        }
-        let passages = reads
-            .passages(
-                store,
-                who,
-                Some(&name),
-                &search::passages::PassageFilter::default(),
-                5,
-                rank,
-            )
-            .await?
-            .items;
-        if passages.iter().any(|p| says(&p.passage.text, &name)) {
-            continue;
-        }
-        missing.push(name);
-    }
-    Ok(missing)
+    let rank = search::Rank {
+        as_of: None,
+        diverse: false,
+        group: 0,
+        classic: false,
+    };
+    // Each name at once, and its facts and source text at once: each is a search of its own, with an embedding of
+    // its own, and one after another they cost a search what the search itself did.
+    let checked = futures::future::try_join_all(
+        names
+            .into_iter()
+            .filter(|name| !hits.iter().any(|h| in_hit(h, name)))
+            .map(|name| async move {
+                // Mentioned in any scope read is mentioned.
+                let any = search::passages::PassageFilter::default();
+                let (facts, passages) = tokio::join!(
+                    reads.search(store, who, &name, 5, None, None, rank),
+                    reads.passages(store, who, Some(&name), &any, 5, rank,)
+                );
+                let in_facts = facts?.items.iter().any(|h| {
+                    [&h.fact.entity, &h.fact.value]
+                        .into_iter()
+                        .chain(h.fact.quote.as_ref())
+                        .any(|t| says(t, &name))
+                });
+                let in_text = passages?.items.iter().any(|p| says(&p.passage.text, &name));
+                anyhow::Ok((!in_facts && !in_text).then_some(name))
+            }),
+    )
+    .await?;
+    Ok(checked.into_iter().flatten().collect())
 }
 
 /// The episodes a search's dates keep (from, to), from what [`search_dates`] returns: occurred on or after

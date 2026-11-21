@@ -75,11 +75,16 @@ pub fn carried_env() -> (Vec<(String, String)>, Vec<String>) {
     (carried, secret)
 }
 
-/// The rest of the environment a server started from here keeps: where home is, what runs, the locale, and how
-/// it reaches the network (a proxy, certificates, the embedding model's files). Never a model key: the server
-/// reads its model from `llm.json`, as the service does, so a key in an agent's environment isn't spent unasked.
+/// The rest of the environment a server started from here keeps: where home is, what runs, the locale, how it
+/// reaches the network (a proxy, certificates, the embedding model's files), and the keys the sources it reads
+/// take from its environment (in the process alone: none is written to a file, so the service has none). Never a
+/// model key: the server reads its model from `llm.json`, as the service does, so a key in an agent's environment
+/// isn't spent unasked.
 fn kept(name: &str) -> bool {
     const KEEP: &[&str] = &[
+        "LINEAR_API_KEY",
+        "SENTRY_AUTH_TOKEN",
+        "SENTRY_URL",
         "HOME",
         "PATH",
         "USER",

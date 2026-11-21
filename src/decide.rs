@@ -215,6 +215,7 @@ impl Decider {
             let started = std::time::Instant::now();
             let v = self.send(&body).await?;
             crate::limits::count(
+                &self.model,
                 v["usage"]["prompt_tokens"].as_u64().unwrap_or_default()
                     + v["usage"]["completion_tokens"].as_u64().unwrap_or_default(),
             );

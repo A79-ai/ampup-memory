@@ -2588,15 +2588,9 @@ async fn asking_to_join_grants_nothing_until_an_admin_approves() {
         "{body}"
     );
     assert!(reads_beta(&bob_google).await);
-    // Which sign-ins an org takes is the operator's to set too (as binding it to Auth0 is), and nothing
-    // else of its settings with it.
+    // Which sign-ins an org takes is the operator's to set too (as binding it to Auth0 is): an operator
+    // is every org's admin.
     let operator = tenant_token_for(&tenant, "olivia@ops.test", "auth0|olivia", Some("org_ops"));
-    let (status, b) = changes(
-        &operator,
-        json!({"op": "set_settings", "org": "acme", "settings": {"require_sso": false, "compile": false}}),
-    )
-    .await;
-    assert_eq!(status, 403, "an operator set another setting with it: {b}");
     // Off again, by the operator: a sign-in as himself counts in acme again.
     let (status, b) = changes(
         &operator,

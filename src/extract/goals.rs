@@ -32,8 +32,10 @@
 //!
 //! Status is never extracted: aggregation derives it. The prompt asks for no outcomes either, unless
 //! `extract.outcomes` asks for what the text reports happened (a result, a decision, a change, dated); never the
-//! progress of what is pending. Other repeats and supersession are left to aggregation too, so nothing else here
-//! is reconciled: nothing is ended and no repeat dropped. Only where the scope records conflicts
+//! progress of what is pending. Other repeats and supersession are left to aggregation too, so nothing else a model
+//! reads is reconciled: nothing is ended and no repeat dropped. A record no model reads (a CRM row, sent again on
+//! every change) is a version of what its source said before: a value it gives again isn't written again, and a
+//! changed one ends the older at the version's time ([`record_versions`]). Only where the scope records conflicts
 //! ([`crate::conflicts`]) are an episode's facts checked, on main, against the open facts of the same things and
 //! attributes from other sources, and what disagrees recorded beside both ([`Acts::Conflicts`]). An episode is read once (`extractions` under `schema`, and under `schema@v<n>` for the version of
 //! the schema that read it, the n-th set on the branch): a new version reads new episodes with what it now offers,
@@ -1801,6 +1803,14 @@ pub(super) async fn run(
                     "ERROR extract {scope} with {as_said}: repeated items were not merged: {e:#}"
                 );
             }
+            // A record no model reads is a version of what its source said before: unchanged values aren't written
+            // again, and a changed one ends the older ([`record_versions`]).
+            let mut closures = record_versions(store, scope, branch, &mut results)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("ERROR extract {scope} with {as_said}: versions not compared: {e:#}");
+                    HashMap::new()
+                });
             // Where the scope records conflicts ([`crate::conflicts`]), each episode's facts are checked on main
             // against the open facts of the same things and attributes from other sources, and what disagrees is
             // recorded; every fact is kept and nothing is ended ([`Acts::Conflicts`]). In waves, oldest first, as
@@ -1868,6 +1878,7 @@ pub(super) async fn run(
                             }
                             e.0.extend(found.facts);
                             e.2.extend(records);
+                            e.3.extend(closures.remove(&ep.episode_id).unwrap_or_default());
                         }
                         Err(e) if e.downcast_ref::<Refused>().is_some() => {
                             eprintln!("extract {} with {as_said}: {e:#}", ep.episode_id);
@@ -1891,7 +1902,7 @@ pub(super) async fn run(
                             .append(&mut failed);
                     }
                 }
-                for (actor, (facts, read, records)) in by_actor {
+                for (actor, (facts, read, records, ends)) in by_actor {
                     let n = read
                         .iter()
                         .filter(|x| x.facts != FAILED_TRY && x.extractor == k)
@@ -1905,13 +1916,7 @@ pub(super) async fn run(
                             true => {
                                 store
                                     .commit_extracted_on(
-                                        scope,
-                                        branch,
-                                        &actor,
-                                        &facts,
-                                        &read,
-                                        &[],
-                                        adds,
+                                        scope, branch, &actor, &facts, &read, &ends, adds,
                                     )
                                     .await
                             }
@@ -1919,13 +1924,7 @@ pub(super) async fn run(
                             false => {
                                 store
                                     .commit_reconciled(
-                                        scope,
-                                        &actor,
-                                        &facts,
-                                        &read,
-                                        &[],
-                                        &records,
-                                        adds,
+                                        scope, &actor, &facts, &read, &ends, &records, adds,
                                     )
                                     .await
                             }
@@ -1941,6 +1940,7 @@ pub(super) async fn run(
                     done.episodes += n;
                     done.facts += facts.len();
                     done.conflicts += records.len();
+                    done.closed += ends.len();
                 }
             }
         }
@@ -1951,8 +1951,17 @@ pub(super) async fn run(
 /// An episode read under an offer, and what came of it.
 type Got = (Episode, Arc<Offer>, Result<Found>);
 
-/// What one actor commits: facts, the episodes they were read from, and the records of the conflicts they are in.
-type Commit = (Vec<Fact>, Vec<Extraction>, Vec<Episode>);
+/// What one actor's backfill commits: facts, the episodes they were read from, and the closures they make.
+type Backfilled = (Vec<Fact>, Vec<Extraction>, Vec<crate::Closure>);
+
+/// What one actor commits: facts, the episodes they were read from, the records of the conflicts they are in, and the
+/// closures that end what the facts replace ([`record_versions`]).
+type Commit = (
+    Vec<Fact>,
+    Vec<Extraction>,
+    Vec<Episode>,
+    Vec<crate::Closure>,
+);
 
 /// Episodes read, in waves, oldest first: an episode goes in the wave after the last one holding an earlier episode
 /// with a fact of the same thing and attribute, so it is checked against what that one committed. Episodes with
@@ -2012,6 +2021,199 @@ async fn disputes(store: &Store, scope: &Scope, ex: &Extractor, got: Got) -> (Go
         }
         Err(e) => ((ep, o, Err(e)), vec![]),
     }
+}
+
+/// A record no model reads is a version of what its source said before (a CRM row's fields, sent again on every
+/// change): each fact of it is checked against the open facts of the same thing and attribute that the same source
+/// stated, as everyone who may read the episode sees them, and against the earlier versions in this batch (read
+/// oldest first). A value it gives again is not written again: the known fact stands, from when it was first
+/// stated. A changed value of a one-valued attribute ends the older ones at the version's time: a committed one by
+/// a closure citing the version, one from earlier in the batch by its own end. A many-valued attribute only drops
+/// repeats. A version older than one of its source's already read (it arrived late, or a backfill reads newest
+/// first) writes and ends nothing: what is newer stands, and a value the newer version gave again left no fact to
+/// tell it from. Returns the closures, by the episode they cite.
+async fn record_versions(
+    store: &Store,
+    scope: &Scope,
+    branch: &str,
+    results: &mut [(Episode, Arc<Offer>, Result<Found>)],
+) -> Result<HashMap<String, Vec<crate::Closure>>> {
+    let mut order: Vec<usize> = (0..results.len())
+        .filter(|&i| !results[i].1.kind.uses_model() && results[i].2.is_ok())
+        .collect();
+    let mut closures: HashMap<String, Vec<crate::Closure>> = HashMap::new();
+    if order.is_empty() {
+        return Ok(closures);
+    }
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&results[a].0, &results[b].0);
+        (a.occurred_at, &a.episode_id).cmp(&(b.occurred_at, &b.episode_id))
+    });
+    let session = store.pin(scope, branch).await?;
+    let vis = session.vis();
+    // When each version already read of these episodes' sources happened, as one of their readers sees them.
+    let read = store.extracted_on(scope, branch, KEY).await?;
+    let mut read_at: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut asked: HashSet<(Vec<String>, &'static str)> = HashSet::new();
+    for &i in &order {
+        let (ep, offer, _) = &results[i];
+        let Some(who) = super::audience(&ep.acl).into_iter().next() else {
+            continue;
+        };
+        if !asked.insert((ep.acl.clone(), offer.kind.name())) {
+            continue;
+        }
+        let sayers: HashSet<u64> = order
+            .iter()
+            .map(|&j| &results[j])
+            .filter(|(e, o, _)| e.acl == ep.acl && o.kind.name() == offer.kind.name())
+            .map(|(e, _, _)| crate::origin::sayer_id(&e.source))
+            .collect();
+        let ids: Vec<String> = vis
+            .episodes_of_type(offer.kind.name(), &who)
+            .into_iter()
+            .filter(|e| {
+                read.contains(e) && vis.episode_sayer(e).is_some_and(|s| sayers.contains(&s))
+            })
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        for (_, (source, at)) in session.episode_sources(store, &who, &ids).await? {
+            read_at.entry(source).or_default().push(at);
+        }
+    }
+    // What earlier versions in this batch wrote, still open: (result, fact) by (entity, predicate, sayer); and the
+    // committed facts they ended, ended once.
+    let mut pending: HashMap<(String, String, u64), Vec<(usize, usize)>> = HashMap::new();
+    let mut closed: HashSet<String> = HashSet::new();
+    for i in order {
+        let (ep, offer, found) = &results[i];
+        let Ok(found) = found else { continue };
+        let at = ep.occurred_at;
+        let sayer = crate::origin::sayer_id(&ep.source);
+        let readers = super::audience(&ep.acl);
+        if read_at
+            .get(&ep.source)
+            .is_some_and(|t| t.iter().any(|t| *t > at))
+        {
+            eprintln!(
+                "extract {}: a version of {} older than one already read: nothing written",
+                ep.episode_id, ep.source
+            );
+            if let Ok(found) = &mut results[i].2 {
+                found.facts.clear();
+            }
+            continue;
+        }
+        // The open facts every reader of the episode may read, of the things it writes about, that its source said.
+        let mut known: Vec<Fact> = vec![];
+        let entities: std::collections::BTreeSet<&str> =
+            found.facts.iter().map(|f| f.entity.as_str()).collect();
+        for entity in entities {
+            let filter = crate::search::Filter::Eq(
+                crate::search::Col::Entity,
+                crate::search::Lit::Str(entity.into()),
+            );
+            let mut common: Option<Vec<Fact>> = None;
+            for who in &readers {
+                let seen = session
+                    .read_where(store, who, &filter, Some(i64::MAX))
+                    .await?;
+                common = Some(match common {
+                    None => seen,
+                    Some(c) => c
+                        .into_iter()
+                        .filter(|x| seen.iter().any(|y| y.fact_id == x.fact_id))
+                        .collect(),
+                });
+            }
+            known.extend(common.unwrap_or_default().into_iter().filter(|k| {
+                k.valid_to.is_none()
+                    && !closed.contains(&k.fact_id)
+                    && !k.source_episodes.contains(&ep.episode_id)
+                    && !k.source_episodes.is_empty()
+                    && k.source_episodes
+                        .iter()
+                        .all(|e| vis.episode_sayer(e) == Some(sayer))
+            }));
+        }
+        let facts = found.facts.clone();
+        let one = |f: &Fact| {
+            offer.checked.card(f.entity_type.as_deref(), &f.predicate) == schema::Card::One
+        };
+        let mut kept: Vec<Fact> = vec![];
+        let mut ends: Vec<(usize, usize)> = vec![];
+        let mut ended: Vec<crate::Closure> = vec![];
+        for f in facts {
+            let key = (f.entity.clone(), f.predicate.clone(), sayer);
+            let earlier: Vec<(Option<(usize, usize)>, &Fact)> = known
+                .iter()
+                .filter(|k| k.entity == f.entity && k.predicate == f.predicate)
+                .map(|k| (None, k))
+                .chain(
+                    pending
+                        .get(&key)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|&(r, n)| {
+                            let k = results[r].2.as_ref().ok()?.facts.get(n)?;
+                            k.valid_to.is_none().then_some((Some((r, n)), k))
+                        }),
+                )
+                .collect();
+            // Given again by a version from before this one.
+            if earlier
+                .iter()
+                .any(|(_, k)| k.value == f.value && k.valid_from <= at)
+            {
+                continue;
+            }
+            if one(&f) {
+                for (slot, k) in earlier.iter().filter(|(_, k)| k.valid_from < at) {
+                    match slot {
+                        Some(s) => ends.push(*s),
+                        None if !ended.iter().any(|c| c.fact_id == k.fact_id) => {
+                            ended.push(crate::Closure {
+                                fact_id: k.fact_id.clone(),
+                                valid_to: at,
+                                episode_id: ep.episode_id.clone(),
+                            });
+                        }
+                        None => {}
+                    }
+                }
+            }
+            kept.push(f);
+        }
+        let slots: Vec<((String, String, u64), usize)> = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.valid_to.is_none())
+            .map(|(n, f)| ((f.entity.clone(), f.predicate.clone(), sayer), n))
+            .collect();
+        for (r, n) in ends {
+            if let Ok(found) = &mut results[r].2
+                && let Some(k) = found.facts.get_mut(n)
+            {
+                k.valid_to = Some(at);
+            }
+        }
+        if let Ok(found) = &mut results[i].2 {
+            found.facts = kept;
+        }
+        for (key, n) in slots {
+            pending.entry(key).or_default().push((i, n));
+        }
+        closed.extend(ended.iter().map(|c| c.fact_id.clone()));
+        if !ended.is_empty() {
+            closures
+                .entry(results[i].0.episode_id.clone())
+                .or_default()
+                .extend(ended);
+        }
+    }
+    Ok(closures)
 }
 
 /// The start of the day `at` falls on in `zone`, as a day the model resolved reads ([`schema::day_micros`]: that
@@ -2379,7 +2581,7 @@ pub async fn backfill(
             }
             break;
         }
-        let results: Vec<(Episode, Arc<Offer>, Result<Found>)> = futures::stream::iter(jobs)
+        let mut results: Vec<(Episode, Arc<Offer>, Result<Found>)> = futures::stream::iter(jobs)
             .map(|(ep, o)| async move {
                 let r = ex.extract_offer(&o, &ep, listing).await;
                 (ep, o, r)
@@ -2387,7 +2589,9 @@ pub async fn backfill(
             .buffer_unordered(ex.parallel(*PARALLEL))
             .collect()
             .await;
-        let mut by_actor: BTreeMap<String, (Vec<Fact>, Vec<Extraction>)> = BTreeMap::new();
+        // Newest first: a record's older versions come later, and change nothing that is newer ([`record_versions`]).
+        let mut closures = record_versions(store, scope, MAIN, &mut results).await?;
+        let mut by_actor: BTreeMap<String, Backfilled> = BTreeMap::new();
         let mut offer_of: HashMap<String, Arc<Offer>> = HashMap::new();
         let mut down = None;
         for (ep, o, r) in results {
@@ -2414,6 +2618,7 @@ pub async fn backfill(
                     }
                     out.facts += found.facts.len();
                     e.0.extend(found.facts);
+                    e.2.extend(closures.remove(&ep.episode_id).unwrap_or_default());
                 }
                 Err(e) if e.downcast_ref::<Refused>().is_some() => {
                     eprintln!("backfill {} with {as_said}: {e:#}", ep.episode_id);
@@ -2441,11 +2646,11 @@ pub async fn backfill(
                 .1
                 .append(&mut reads);
         }
-        for (actor, (facts, read)) in by_actor {
+        for (actor, (facts, read, ends)) in by_actor {
             // Checked as `settle` checked each fact: what the read offered, laid over the scope's schema now.
             let adds = offer_of.get(&actor).map(|o| &o.adds);
             store
-                .commit_extracted(scope, &actor, &facts, &read, &[], adds)
+                .commit_extracted(scope, &actor, &facts, &read, &ends, adds)
                 .await?;
         }
         let (i, o) = ex.usage();
