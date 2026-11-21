@@ -4,8 +4,9 @@
 //! transcript is its summary alone; a calendar's event is the same JSON with no turns, its description as the summary,
 //! and its title (else who it lists) when it has no description. Facts cite a turn (its number, when it starts and who
 //! spoke), a line of the summary (a span of it, under its heading) or that title. The engine writes the meeting's name
-//! (its title) and time, who was invited (from the participants), who attended (from who spoke) and the full name a
-//! participant listed only by their address speaks under; the model writes the rest, from `catalog.json`.
+//! (its title) and time, who was invited (from the participants), who attended (from who spoke) and the name each
+//! speaker is known by (their listed name, or the full name one listed only by their address speaks under); the
+//! model writes the rest, from `catalog.json`.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -254,8 +255,8 @@ impl EpisodeType for SalesCall {
     }
     /// Invited: every participant. Attended: a participant who speaks, cited at their first turn. Calendar
     /// participants are only invitees: a no-show is invited and never attends.
-    /// Who speaks is [`participants::heard`], and a participant listed only by their address is also known by the
-    /// full name they speak under (`_alias`). The meeting's name is the recorder's title and its `scheduled_at` when
+    /// Who speaks is [`participants::heard`], and a speaker is also known by their name (`_alias`): the one the
+    /// list gives them, or, listed only by their address, the full name they speak under. The meeting's name is the recorder's title and its `scheduled_at` when
     /// it starts, as the body says ([`starts`]), else the episode's time, so it is found by either.
     fn engine_facts(&self, ep: &Episode, units: &[Unit]) -> Result<Vec<EngineFact>> {
         let text = String::from_utf8_lossy(&ep.body);
@@ -271,6 +272,7 @@ impl EpisodeType for SalesCall {
             predicate: predicate.into(),
             value,
             cite,
+            unit: None,
         };
         let field = |field: &str| Cite::Field {
             object: meeting.clone(),
@@ -306,6 +308,7 @@ impl EpisodeType for SalesCall {
                     predicate: crate::query::schema::ALIAS.into(),
                     value: alias,
                     cite: u.cite.clone(),
+                    unit: None,
                 });
             }
         }

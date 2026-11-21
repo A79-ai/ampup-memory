@@ -446,13 +446,14 @@ pub static VIS_BUILD_SECONDS: std::sync::LazyLock<prometheus::HistogramVec> =
         .unwrap()
     });
 
-/// Visibility states built, by how: `incremental` (the last state with what was appended since) or `full`.
+/// Visibility states built, by how: `incremental` (main's last state with what was appended since), `kept` (a
+/// branch's last state, which a build would give again) or `full`.
 pub static VIS_BUILDS: std::sync::LazyLock<prometheus::IntCounterVec> = std::sync::LazyLock::new(
     || {
         prometheus::IntCounterVec::new(
         Opts::new(
             "memstore_visibility_builds_total",
-            "Visibility states built, by how: incremental (the last state with what was appended since) or full",
+            "Visibility states built, by how: incremental (main's last state with what was appended since), kept (a branch's last state, which a build would give again) or full",
         ),
         &["how"],
     )

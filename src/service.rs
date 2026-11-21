@@ -424,6 +424,20 @@ pub async fn install(dir: &str, port: u16) -> Result<()> {
             secret.join(", ")
         );
     }
+    // A source's token reaches the service through the login session's environment instead, never a file.
+    for t in secret
+        .iter()
+        .filter(|k| memstore_client::local::SOURCE_TOKENS.contains(&k.as_str()))
+    {
+        println!(
+            "for the service to read with {t}: `{}`, then `ampup-memory service restart` (it lasts until you log out)",
+            if cfg!(target_os = "macos") {
+                format!("launchctl setenv {t} \"${t}\"")
+            } else {
+                format!("systemctl --user set-environment {t}=\"${t}\"")
+            }
+        );
+    }
     println!("installed {}", file.display());
     let ready = wait_ready(port, READY_WITHIN, || Ok(())).await?;
     println!(

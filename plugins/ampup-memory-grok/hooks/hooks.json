@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "command": "\"${CURSOR_PLUGIN_ROOT}/bin/ampup-memory-client\" hook session-start --harness grok", "timeout": 90 }],
+    "beforeSubmitPrompt": [{ "command": "\"${CURSOR_PLUGIN_ROOT}/bin/ampup-memory-client\" hook prompt --harness grok", "timeout": 15 }],
+    "stop": [{ "command": "\"${CURSOR_PLUGIN_ROOT}/bin/ampup-memory-client\" hook stop --harness grok", "timeout": 30 }],
+    "preCompact": [{ "command": "\"${CURSOR_PLUGIN_ROOT}/bin/ampup-memory-client\" hook session-end --harness grok", "timeout": 30 }],
+    "sessionEnd": [{ "command": "\"${CURSOR_PLUGIN_ROOT}/bin/ampup-memory-client\" hook end --harness grok", "timeout": 30 }]
+  }
+}

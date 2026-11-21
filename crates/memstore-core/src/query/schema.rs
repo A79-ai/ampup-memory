@@ -842,11 +842,16 @@ impl Schema {
                 }
             }
             ValueType::Number | ValueType::Money => {
-                let n = parse_number(&f.value, pd.unit.as_deref())
+                // A money value keeps the currency its source gave it (a CRM record's own), else the predicate's.
+                let unit = match pd.value {
+                    ValueType::Money => f.unit.clone().or_else(|| pd.unit.clone()),
+                    _ => pd.unit.clone(),
+                };
+                let n = parse_number(&f.value, unit.as_deref())
                     .with_context(|| format!("{}: not a number", what()))?;
                 f.value = format_number(n);
                 f.value_num = Some(n);
-                f.unit = pd.unit.clone();
+                f.unit = unit;
             }
             ValueType::Date => {
                 let d = parse_day(&f.value).with_context(|| format!("{}: not a date", what()))?;

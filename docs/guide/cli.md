@@ -85,6 +85,12 @@ where the server runs, else the file `AMPUP_MEMORY_SENTRY_TOKEN_FILE` names, els
 `~/.sentryclirc`. A server a session starts gets `SENTRY_AUTH_TOKEN` from that session. The service carries no token, but it carries `AMPUP_MEMORY_SENTRY_TOKEN_FILE` and reads
 `~/.sentryclirc`. `SENTRY_URL` points it at a self-hosted Sentry (default `https://sentry.io`).
 
+`ampup-memory sources add slack CHANNEL` (a channel's name without `#`, or its id) reads a Slack channel's messages
+and its threads' replies every 10 minutes, with `SLACK_BOT_TOKEN` (a bot token from a Slack app you make in your
+workspace) where the server runs. The service doesn't carry it into its unit file; `launchctl setenv` (macOS) or
+`systemctl --user set-environment` (Linux) and `ampup-memory service restart` give it to the service. The app
+manifest and the steps to make it are in [self-hosting](self-hosting.md#sources-serve---local-reads-by-itself).
+
 ## Writing and reading
 
 | Command | What it does |

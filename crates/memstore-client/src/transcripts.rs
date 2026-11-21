@@ -498,7 +498,7 @@ fn turns(
             out,
         );
     };
-    if harness == Harness::ClaudeCode {
+    if harness.claude_lines() {
         // What a hook added to the session: memstore's hooks', a reference to what it named ([`left_out`]); any other
         // hook's isn't part of the conversation.
         if v["type"] == "attachment" {
@@ -677,10 +677,8 @@ async fn check(client: &Client, off: Option<&Path>, ask: &Value) -> Result<Value
 
 /// Sends what the session's transcript gained since the last part the memory took, in parts.
 pub(super) async fn send(client: &Client, input: &Value, harness: Harness, due: Due) -> Result<()> {
-    if !matches!(
-        harness,
-        Harness::ClaudeCode | Harness::Codex | Harness::Gemini
-    ) || std::env::var("AMPUP_MEMORY_CAPTURE").unwrap_or_default() == "off"
+    if !harness.keeps_transcript()
+        || std::env::var("AMPUP_MEMORY_CAPTURE").unwrap_or_default() == "off"
     {
         return Ok(());
     }
@@ -759,10 +757,7 @@ pub(super) async fn send(client: &Client, input: &Value, harness: Harness, due: 
     if from >= n {
         return Ok(());
     }
-    let who = match harness {
-        Harness::ClaudeCode => "Claude",
-        h => h.label(),
-    };
+    let who = harness.speaker();
     let calls = calls_of(&entries);
     let rendered: Vec<Vec<String>> = entries[from..]
         .iter()

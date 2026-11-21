@@ -756,15 +756,43 @@ pub enum Harness {
     Gemini,
     Cursor,
     Copilot,
+    /// Grok Bot (and Cursor's cloud agents) through the Grok plugin: Cursor's hooks, its own name.
+    Grok,
+    /// Factory's Droid: Claude Code's hooks and transcript, its lines `{type: "message", message}`.
+    Droid,
+    /// Qwen Code: Claude Code's hooks; a transcript of Gemini-style `parts`.
+    Qwen,
+    /// Nous Research's Hermes Agent: shell hooks in `config.yaml`, the conversation in the input, no transcript.
+    Hermes,
+    /// Kiro: hooks whose stdout is added to the context as it is.
+    Kiro,
+    /// Devin Desktop (once Windsurf): Claude Code's hooks, no transcript.
+    Devin,
+    /// Cline: an executable a hook, camelCase input, its task's messages as Anthropic's.
+    Cline,
+    /// OpenCode, Amp and Kilo Code: plugins that write Claude Code's transcript and take its output.
+    OpenCode,
+    Amp,
+    Kilo,
 }
 
 impl Harness {
-    pub const ALL: [Harness; 5] = [
+    pub const ALL: [Harness; 15] = [
         Harness::ClaudeCode,
         Harness::Codex,
         Harness::Gemini,
         Harness::Cursor,
         Harness::Copilot,
+        Harness::Grok,
+        Harness::Droid,
+        Harness::Qwen,
+        Harness::Hermes,
+        Harness::Kiro,
+        Harness::Devin,
+        Harness::Cline,
+        Harness::OpenCode,
+        Harness::Amp,
+        Harness::Kilo,
     ];
 
     pub fn parse(s: &str) -> Result<Self> {
@@ -774,8 +802,23 @@ impl Harness {
             "gemini" => Harness::Gemini,
             "cursor" => Harness::Cursor,
             "copilot" => Harness::Copilot,
-            other => bail!("no harness {other:?}: claude-code, codex, gemini, cursor or copilot"),
+            "grok" | "grok-bot" => Harness::Grok,
+            "droid" | "factory" => Harness::Droid,
+            "qwen" | "qwen-code" => Harness::Qwen,
+            "hermes" => Harness::Hermes,
+            "kiro" => Harness::Kiro,
+            "devin" | "windsurf" => Harness::Devin,
+            "cline" => Harness::Cline,
+            "opencode" => Harness::OpenCode,
+            "amp" => Harness::Amp,
+            "kilo" | "kilocode" | "kilo-code" => Harness::Kilo,
+            other => bail!("no harness {other:?}: {}", Harness::names()),
         })
+    }
+
+    /// Every harness's name, for a message.
+    pub fn names() -> String {
+        Harness::ALL.map(Harness::name).join(", ")
     }
 
     /// Its name on the command line and in sources (`<name>:<repo>:<session>`).
@@ -786,6 +829,16 @@ impl Harness {
             Harness::Gemini => "gemini",
             Harness::Cursor => "cursor",
             Harness::Copilot => "copilot",
+            Harness::Grok => "grok",
+            Harness::Droid => "droid",
+            Harness::Qwen => "qwen",
+            Harness::Hermes => "hermes",
+            Harness::Kiro => "kiro",
+            Harness::Devin => "devin",
+            Harness::Cline => "cline",
+            Harness::OpenCode => "opencode",
+            Harness::Amp => "amp",
+            Harness::Kilo => "kilo",
         }
     }
 
@@ -802,23 +855,46 @@ impl Harness {
     }
 
     /// How a condensed session names it.
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Harness::ClaudeCode => "Claude Code",
             Harness::Codex => "Codex",
             Harness::Gemini => "Gemini CLI",
             Harness::Cursor => "Cursor",
             Harness::Copilot => "Copilot",
+            Harness::Grok => "Grok Bot",
+            Harness::Droid => "Droid",
+            Harness::Qwen => "Qwen Code",
+            Harness::Hermes => "Hermes",
+            Harness::Kiro => "Kiro",
+            Harness::Devin => "Devin",
+            Harness::Cline => "Cline",
+            Harness::OpenCode => "OpenCode",
+            Harness::Amp => "Amp",
+            Harness::Kilo => "Kilo Code",
         }
     }
 
     /// Context added to the session, as this harness takes it from a hook's stdout.
-    fn context(self, event: &str, context: &str) -> Value {
+    fn context(self, event: &str, context: &str) -> String {
         match self {
-            Harness::Cursor => json!({"additional_context": context}),
-            Harness::Copilot => json!({"additionalContext": context}),
-            Harness::ClaudeCode | Harness::Codex | Harness::Gemini => {
+            Harness::Cursor | Harness::Grok => json!({"additional_context": context}).to_string(),
+            Harness::Copilot => json!({"additionalContext": context}).to_string(),
+            Harness::Hermes => json!({"context": context}).to_string(),
+            // Kiro adds a hook's stdout to the context as it is.
+            Harness::Kiro => context.to_string(),
+            Harness::Cline => json!({"cancel": false, "contextModification": context}).to_string(),
+            Harness::ClaudeCode
+            | Harness::Codex
+            | Harness::Gemini
+            | Harness::Droid
+            | Harness::Qwen
+            | Harness::Devin
+            | Harness::OpenCode
+            | Harness::Amp
+            | Harness::Kilo => {
                 json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}})
+                    .to_string()
             }
         }
     }
@@ -831,6 +907,315 @@ impl Harness {
             (_, false) => "UserPromptSubmit",
         }
     }
+
+    /// Whether its transcript reads as Claude Code's: its own lines, or lines [`as_claude`] makes them into.
+    pub(crate) fn claude_lines(self) -> bool {
+        matches!(
+            self,
+            Harness::ClaudeCode
+                | Harness::Droid
+                | Harness::Qwen
+                | Harness::Hermes
+                | Harness::Cline
+                | Harness::OpenCode
+                | Harness::Amp
+                | Harness::Kilo
+        )
+    }
+
+    /// Whether the hooks send its session's transcript to the memory (`POST /transcripts`; the server keeps the
+    /// same list): every harness whose transcript they read, but Cursor's and Copilot's.
+    pub(crate) fn keeps_transcript(self) -> bool {
+        self.claude_lines() || matches!(self, Harness::Codex | Harness::Gemini)
+    }
+
+    /// Whether a session's first prompt waits for the memory (its 4 s) rather than answering at once with what a
+    /// copy fetched before. These agents run no hook between a prompt and the next one but the turn's stop, so what
+    /// a copy fetches for the first prompt would reach the model a turn late; some (Grok Bot) may run no start hook
+    /// either, and then the first prompt opens the session. The agents this client hooked first keep answering at
+    /// once.
+    pub(crate) fn first_prompt_waits(self) -> bool {
+        !matches!(
+            self,
+            Harness::ClaudeCode
+                | Harness::Codex
+                | Harness::Gemini
+                | Harness::Cursor
+                | Harness::Copilot
+        )
+    }
+
+    /// How the transcript names the agent: Claude Code's "Claude", else its label.
+    pub(crate) fn speaker(self) -> &'static str {
+        match self {
+            Harness::ClaudeCode => "Claude",
+            h => h.label(),
+        }
+    }
+}
+
+/// One line of another agent's transcript as Claude Code's (`{type: "user" | "assistant", message: {role,
+/// content}}`, content Anthropic's blocks): Droid's `{type: "message", message}`, Cline's bare messages, Qwen Code's
+/// Gemini-style `parts` (`text`, `functionCall`, `functionResponse`; a `tool_result` line is the user's). Text the
+/// agent put in the person's turn (`<system-reminder>`…) is dropped block by block, so the words they typed stay.
+/// Anything else is left as it is.
+pub(crate) fn as_claude(v: Value, harness: Harness) -> Value {
+    if !harness.claude_lines() || harness == Harness::ClaudeCode {
+        return v;
+    }
+    let (role, message) = match (v["type"].as_str(), &v["message"]) {
+        // Droid's.
+        (Some("message"), m) if m.is_object() => {
+            (m["role"].as_str().unwrap_or_default(), m.clone())
+        }
+        // Qwen Code's.
+        (Some(t @ ("user" | "assistant" | "tool_result")), m) if m.is_object() => (
+            match t {
+                "assistant" => "assistant",
+                _ => "user",
+            },
+            m.clone(),
+        ),
+        // OpenAI's tool result (Hermes'): the user's turn, as Claude Code keeps one.
+        (None, _) if v["role"] == "tool" => {
+            let text = match &v["content"] {
+                Value::String(s) => s.clone(),
+                c => c.to_string(),
+            };
+            let result =
+                json!({"type": "tool_result", "tool_use_id": v["tool_call_id"], "content": text});
+            return json!({"type": "user", "message": {"role": "user", "content": [result]}});
+        }
+        // Cline's, Hermes' (OpenAI's), any bare message.
+        (None, _) if v["role"].is_string() => (v["role"].as_str().unwrap_or_default(), v.clone()),
+        _ => return v,
+    };
+    let role = match role {
+        "model" => "assistant",
+        r => r,
+    };
+    if !matches!(role, "user" | "assistant") {
+        return v;
+    }
+    let mut blocks: Vec<Value> = match (&message["content"], &message["parts"]) {
+        (Value::String(s), _) => vec![json!({"type": "text", "text": s})],
+        (Value::Array(b), _) => b.clone(),
+        (_, Value::Array(parts)) => parts
+            .iter()
+            .filter(|p| p["thought"].as_bool() != Some(true))
+            .filter_map(|p| {
+                if let Some(t) = p["text"].as_str() {
+                    return Some(json!({"type": "text", "text": t}));
+                }
+                let c = &p["functionCall"];
+                if c.is_object() {
+                    return Some(json!({"type": "tool_use", "id": c["id"], "name": c["name"], "input": c["args"]}));
+                }
+                let r = &p["functionResponse"];
+                if r.is_object() {
+                    let out = &r["response"];
+                    let text = out["output"]
+                        .as_str()
+                        .or(out["error"].as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| out.to_string());
+                    return Some(json!({"type": "tool_result", "tool_use_id": r["id"], "content": text,
+                                       "is_error": out["error"].is_string()}));
+                }
+                None
+            })
+            .collect(),
+        _ => vec![],
+    };
+    // OpenAI's calls (Hermes'): `tool_calls: [{id, function: {name, arguments}}]`, the arguments JSON text.
+    for c in message["tool_calls"].as_array().into_iter().flatten() {
+        let f = &c["function"];
+        let input = f["arguments"]
+            .as_str()
+            .and_then(|a| serde_json::from_str::<Value>(a).ok())
+            .unwrap_or_else(|| f["arguments"].clone());
+        blocks.push(json!({"type": "tool_use", "id": c["id"], "name": f["name"], "input": input}));
+    }
+    if role == "user" {
+        for b in blocks.iter_mut() {
+            if let Some(t) = b["text"]
+                .as_str()
+                .filter(|t| t.trim_start().starts_with("<user_input"))
+            {
+                let typed = unwrapped_input(t).to_string();
+                b["text"] = Value::String(typed);
+            }
+        }
+        blocks.retain(|b| {
+            b["type"] != "text" || !b["text"].as_str().is_some_and(|t| injected(t.trim()))
+        });
+        // A turn of nothing but what the agent added: no turn.
+        if blocks.is_empty() {
+            return Value::Null;
+        }
+    }
+    json!({"type": role, "message": {"role": role, "content": blocks}})
+}
+
+/// A hook's input with Claude Code's fields (`session_id`, `prompt`, `cwd`, `transcript_path`) set from where the
+/// agent keeps them, for the agents that name them otherwise: Qwen Code's typed prompt (`submitted_prompt`;
+/// `prompt` may hold what it expanded), Cline's camelCase (`taskId`, `userPromptSubmit.prompt`, `workspaceRoots`,
+/// its session's messages file), Hermes' `extra` (the prompt, and the conversation, written to a file the hooks
+/// read as a transcript; at its end, the one written last), Devin's project in `DEVIN_PROJECT_DIR`. Fields already set are kept, so running it again
+/// (in a copy) changes nothing.
+fn claude_input(mut input: Value, harness: Harness) -> Value {
+    let Some(o) = input.as_object_mut() else {
+        return input;
+    };
+    let text = |v: &Value| v.as_str().map(str::to_string);
+    let original = Value::Object(o.clone());
+    // Qwen Code: the typed prompt over the expanded one.
+    if harness == Harness::Qwen
+        && let Some(p) = text(&original["submitted_prompt"]).filter(|p| !p.trim().is_empty())
+    {
+        o.insert("prompt".into(), Value::String(p));
+    }
+    let mut set = |k: &str, v: Option<String>| {
+        if let Some(v) = v.filter(|v| !v.is_empty())
+            && !o
+                .get(k)
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        {
+            o.insert(k.to_string(), Value::String(v));
+        }
+    };
+    match harness {
+        Harness::Cline => {
+            let session = text(&original["sessionContext"]["rootSessionId"])
+                .or_else(|| text(&original["taskId"]));
+            set("session_id", text(&original["taskId"]).or(session.clone()));
+            set(
+                "prompt",
+                text(&original["userPromptSubmit"]["prompt"])
+                    .map(|p| unwrapped_input(&p).to_string()),
+            );
+            set("cwd", text(&original["workspaceRoots"][0]));
+            set(
+                "transcript_path",
+                session.as_deref().and_then(cline_transcript),
+            );
+            set("hook_event_name", text(&original["hookName"]));
+        }
+        Harness::Hermes => {
+            let extra = &original["extra"];
+            set("session_id", text(&extra["task_id"]));
+            let prompt = match &extra["user_message"] {
+                Value::String(s) => Some(s.clone()),
+                // A turn with images: its text parts.
+                Value::Array(parts) => Some(
+                    parts
+                        .iter()
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            };
+            set("prompt", prompt);
+            let session = text(&original["session_id"])
+                .filter(|s| !s.is_empty())
+                .or_else(|| text(&extra["task_id"]))
+                .unwrap_or_default();
+            set("transcript_path", hermes_transcript(&session, extra));
+        }
+        Harness::Devin => {
+            set("cwd", std::env::var("DEVIN_PROJECT_DIR").ok());
+        }
+        _ => {}
+    }
+    // An agent that says nowhere where it runs: where the hook runs.
+    if field(&input, &["cwd"]).is_none() && input["workspace_roots"][0].as_str().is_none() {
+        let dir = ["DEVIN_PROJECT_DIR", "CLAUDE_PROJECT_DIR"]
+            .iter()
+            .find_map(|k| std::env::var(k).ok().filter(|d| !d.is_empty()))
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|d| d.display().to_string())
+            });
+        if let (Some(d), Some(o)) = (dir, input.as_object_mut()) {
+            o.insert("cwd".into(), Value::String(d));
+        }
+    }
+    input
+}
+
+/// What the person typed, out of Cline's `<user_input mode="…">` wrapper.
+fn unwrapped_input(text: &str) -> &str {
+    let t = text.trim();
+    t.strip_prefix("<user_input")
+        .and_then(|r| r.split_once('>'))
+        .and_then(|(_, r)| r.strip_suffix("</user_input>"))
+        .map_or(text, str::trim)
+}
+
+/// Cline's session's messages: `<data>/sessions/<id>/<id>.messages.json` (`CLINE_SESSION_DATA_DIR`, else
+/// `CLINE_DATA_DIR`'s, else `~/.cline/data`'s), else the extension's older task file. None where there is neither.
+fn cline_transcript(id: &str) -> Option<String> {
+    if id.is_empty() || id.contains(['/', '\\']) || id.starts_with('.') {
+        return None;
+    }
+    let var = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    let data = var("CLINE_DATA_DIR")
+        .or_else(|| var("CLINE_DIR").map(|d| d.join("data")))
+        .or_else(|| var("HOME").map(|h| h.join(".cline/data")))?;
+    let sessions = var("CLINE_SESSION_DATA_DIR").unwrap_or_else(|| data.join("sessions"));
+    [
+        sessions.join(id).join(format!("{id}.messages.json")),
+        data.join("tasks")
+            .join(id)
+            .join("api_conversation_history.json"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+    .map(|p| p.display().to_string())
+}
+
+/// Hermes hands its hooks the conversation (`extra.conversation_history`, OpenAI's messages, and after a turn
+/// `assistant_response`), not a transcript: written as JSON lines beside the markers, a transcript for the hooks
+/// that read one. The same file each hook of the session; None where none was written.
+fn hermes_transcript(session: &str, extra: &Value) -> Option<String> {
+    let path = marker("hermes", session)?;
+    // A hook without the conversation (the session's end, a compaction): the one the last hook wrote.
+    let Some(history) = extra["conversation_history"].as_array() else {
+        return path.exists().then(|| path.display().to_string());
+    };
+    // What a turn holds, without the provider's reasoning (encrypted, often large) or Hermes' own bookkeeping.
+    let kept = |m: &Value| {
+        let mut out = serde_json::Map::new();
+        for k in ["role", "content", "tool_calls", "tool_call_id", "name"] {
+            if let Some(v) = m.get(k).filter(|v| !v.is_null()) {
+                out.insert(k.to_string(), v.clone());
+            }
+        }
+        Value::Object(out).to_string()
+    };
+    let mut lines: Vec<String> = history.iter().map(kept).collect();
+    // After a turn, its answer, unless the history ends with it already.
+    if let Some(answer) = extra["assistant_response"]
+        .as_str()
+        .filter(|a| !a.trim().is_empty())
+        && history
+            .last()
+            .is_none_or(|m| m["role"] != "assistant" || m["content"].as_str() != Some(answer))
+    {
+        lines.push(json!({"role": "assistant", "content": answer}).to_string());
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    write_whole(&path, &text).ok()?;
+    Some(path.display().to_string())
 }
 
 /// The first of `keys` the hook input carries as text: each harness names its fields its own way.
@@ -916,6 +1301,9 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
     let input: Value = serde_json::from_str(&raw).context("hook input is not JSON")?;
+    // In Claude Code's names from here on, whatever the agent called them; a copy is handed the same.
+    let input = claude_input(input, harness);
+    let raw = input.to_string();
     // Claude Code gives all SessionEnd hooks 1.5 s together and Codex 1 to 3 s, then cancels them.
     let ending = ["SessionEnd", "sessionEnd"]
         .iter()
@@ -979,7 +1367,7 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
         }
         // Before a final answer (a run ends with it) the hook waits for what fires: told one hook later, the
         // agent is told nothing.
-        let waits = final_answer(event, &input, harness);
+        let waits = final_answer(event, &input, harness) || first_prompt(event, &input, harness);
         if !(has_work(event, &input) && due(event, &input))
             || (!waits && detach(&raw, event, harness).is_ok())
         {
@@ -1178,6 +1566,21 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
                     }
                 });
             let advised = advised.unwrap_or_else(|e| {
+                // A first prompt that waited ([`Harness::first_prompt_waits`]) on a memory too slow for it: a copy
+                // asks again, as any other prompt's does, and the next hook hands its answer on.
+                if !detached && harness.first_prompt_waits() {
+                    if session_id(&input).is_none()
+                        && let Some(m) = marker("opening", session)
+                    {
+                        let _ = std::fs::remove_file(m);
+                    }
+                    if let Some(m) = marker("asked", session) {
+                        let _ = std::fs::remove_file(m);
+                    }
+                    if detach(&raw, event, harness).is_ok() {
+                        return None;
+                    }
+                }
                 warn(format!("no advice: {e:#}"));
                 None
             });
@@ -1185,12 +1588,18 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             let left = (BUDGET - START_FACTS)
                 .saturating_sub(advised.as_deref().map_or(0, |a| a.chars().count() + 1));
             let recalled = recalled.map(|r| r.and_then(|(t, _)| within(&t, left)));
-            say(
-                harness,
-                &input,
-                harness.event(false),
-                &[advised, recalled_or_none(recalled)],
-            )
+            // Answered here rather than from a copy ([`Harness::first_prompt_waits`]): the session's line and what
+            // its start's copy fetched come with it, as they would from the inbox.
+            let mut parts = vec![];
+            if !detached {
+                parts.push(opened_line(&input));
+            }
+            parts.extend([advised, recalled_or_none(recalled)]);
+            if !detached {
+                let used: usize = parts.iter().flatten().map(|p| p.chars().count()).sum();
+                parts.push(take_inbox(session, CONTEXT_CHARS.saturating_sub(used)));
+            }
+            say(harness, &input, harness.event(false), &parts)
         }
         "pre-tool" | "post-tool" => {
             if !has_work(event, &input) {
@@ -1988,6 +2397,13 @@ fn final_answer(event: &str, input: &Value, harness: Harness) -> bool {
         && field(input, &["tool_name", "toolName"]) == Some("StructuredOutput")
 }
 
+/// A session's first prompt, where the harness waits for it ([`Harness::first_prompt_waits`]).
+fn first_prompt(event: &str, input: &Value, harness: Harness) -> bool {
+    event == "prompt"
+        && harness.first_prompt_waits()
+        && marker("asked", session_of(input)).is_some_and(|m| !m.exists())
+}
+
 fn due(event: &str, input: &Value) -> bool {
     !(event == "post-tool" && ends_step(input)) || claim_decision(input)
 }
@@ -1996,9 +2412,9 @@ fn due(event: &str, input: &Value) -> bool {
 fn turn_calls(input: &Value, harness: Harness) -> usize {
     let entries = transcript_entries(input, harness);
     let typed = |v: &Value| -> bool {
-        let v = match harness {
-            Harness::ClaudeCode => v.clone(),
-            _ => normalized(v.clone()),
+        let v = match harness.claude_lines() {
+            true => v.clone(),
+            false => normalized(v.clone()),
         };
         v["type"].as_str() == Some("user")
             && v["isMeta"].as_bool() != Some(true)
@@ -2300,6 +2716,14 @@ async fn advise(
         };
         if let Some(m) = marker("opening", session_of(input)).filter(stale) {
             let _ = std::fs::write(m, "");
+            // Where the first prompt waits, it opens the session itself, with the prompt as its context: the start
+            // advice is this prompt's.
+            if harness.first_prompt_waits() && std::env::var_os(DETACHED).is_none() {
+                let opened = open_session(client, input, harness, prompt).await?;
+                first("asked", session_of(input));
+                first("lined", session_of(input));
+                return Ok(opened);
+            }
             let mut raw = input.clone();
             raw["source"] = json!("startup");
             let _ = detach(&raw.to_string(), "session-start", harness);
@@ -2862,18 +3286,27 @@ fn session_here(named: Option<&str>) -> Result<String> {
 /// the messages of one JSON document (Gemini CLI's saved chats). A line that doesn't parse stays, as null, so
 /// counts of lines stay true.
 fn entries_of(transcript: &str, harness: Harness) -> Vec<Value> {
-    if harness != Harness::ClaudeCode
-        && let Some(m) = serde_json::from_str::<Value>(transcript)
-            .ok()
-            .and_then(|d| d["messages"].as_array().cloned())
-    {
-        return m;
+    let lines = match whole_document(transcript, harness) {
+        Some(m) => m,
+        None => transcript
+            .split_inclusive('\n')
+            .filter(|l| l.ends_with('\n'))
+            .map(|l| serde_json::from_str(l).unwrap_or(Value::Null))
+            .collect(),
+    };
+    lines.into_iter().map(|v| as_claude(v, harness)).collect()
+}
+
+/// The messages of a transcript that is one JSON document: Gemini CLI's saved chats (`{messages: [...]}`), Cline's
+/// task (an array of messages). None for JSON lines, and for Claude Code's.
+fn whole_document(transcript: &str, harness: Harness) -> Option<Vec<Value>> {
+    if harness == Harness::ClaudeCode {
+        return None;
     }
-    transcript
-        .split_inclusive('\n')
-        .filter(|l| l.ends_with('\n'))
-        .map(|l| serde_json::from_str(l).unwrap_or(Value::Null))
-        .collect()
+    match serde_json::from_str::<Value>(transcript).ok()? {
+        Value::Array(m) => Some(m),
+        d => d["messages"].as_array().cloned(),
+    }
 }
 
 /// A stretch of a session as a run: the prompts typed in it, its trace, its last answer, and how many tool
@@ -2901,10 +3334,7 @@ enum Step {
 /// long. Claude Code's transcripts carry the tool calls; another harness's give what was said.
 fn segment(entries: &[Value], harness: Harness) -> Segment {
     let mut steps: Vec<Step> = vec![];
-    let label = match harness {
-        Harness::ClaudeCode => "Claude",
-        h => h.label(),
-    };
+    let label = harness.speaker();
     for v in entries {
         if [&v["isMeta"], &v["isSidechain"], &v["isCompactSummary"]]
             .iter()
@@ -2912,9 +3342,9 @@ fn segment(entries: &[Value], harness: Harness) -> Segment {
         {
             continue;
         }
-        let v = match harness {
-            Harness::ClaudeCode => v.clone(),
-            _ => normalized(v.clone()),
+        let v = match harness.claude_lines() {
+            true => v.clone(),
+            false => normalized(v.clone()),
         };
         let content = &v["message"]["content"];
         match v["type"].as_str() {
@@ -3240,7 +3670,10 @@ async fn remember_session(
         return Ok(());
     }
     let session = session_of(input);
-    let path = transcript_of(input).context("no transcript path in the hook input")?;
+    // An agent that keeps no transcript (Kiro, Devin, Grok Bot) has nothing to remember from one.
+    let Some(path) = transcript_of(input) else {
+        return Ok(());
+    };
     // A run that keeps no transcript has nothing to remember.
     if !Path::new(path).exists() {
         return Ok(());
@@ -3408,11 +3841,7 @@ pub fn condense_in(
     let (mut turns, mut files) = (vec![], Vec::<String>::new());
     let mut asked = 0;
     // A transcript is JSON lines, or (Gemini CLI's saved chats) one JSON document holding its messages.
-    let whole = (harness != Harness::ClaudeCode)
-        .then(|| serde_json::from_str::<Value>(transcript).ok())
-        .flatten()
-        .and_then(|d| d["messages"].as_array().cloned());
-    let lines: Vec<Value> = match whole {
+    let lines: Vec<Value> = match whole_document(transcript, harness) {
         Some(messages) => messages,
         None => transcript
             .lines()
@@ -3420,13 +3849,14 @@ pub fn condense_in(
             .collect(),
     };
     for v in lines {
+        let v = as_claude(v, harness);
         // A Codex session another agent started (its approval reviewer, a spawned thread): nobody typed it.
         if v["type"] == "session_meta" && v["payload"]["source"].get("subagent").is_some() {
             return None;
         }
-        let v = match harness {
-            Harness::ClaudeCode => v,
-            _ => normalized(v),
+        let v = match harness.claude_lines() {
+            true => v,
+            false => normalized(v),
         };
         if v["isMeta"].as_bool() == Some(true) || v["isSidechain"].as_bool() == Some(true) {
             continue;
@@ -3475,13 +3905,7 @@ pub fn condense_in(
                         Some("text") => {
                             let t = b["text"].as_str().unwrap_or_default().trim();
                             if !t.is_empty() {
-                                turns.push(format!(
-                                    "{}: {t}",
-                                    match harness {
-                                        Harness::ClaudeCode => "Claude",
-                                        h => h.label(),
-                                    }
-                                ));
+                                turns.push(format!("{}: {t}", harness.speaker()));
                             }
                         }
                         Some("tool_use") => {
@@ -3505,10 +3929,7 @@ pub fn condense_in(
                                         .filter_map(Value::as_str)
                                         .collect();
                                 if !wrote.is_empty() {
-                                    let who = match harness {
-                                        Harness::ClaudeCode => "Claude",
-                                        h => h.label(),
-                                    };
+                                    let who = harness.speaker();
                                     turns
                                         .push(format!("{who} wrote {p}:\n{}", wrote.join("\n…\n")));
                                 }

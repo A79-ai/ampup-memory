@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "ampup-memory": {
+      "url": "https://memory-api.ampup.ai/mcp"
+    }
+  }
+}

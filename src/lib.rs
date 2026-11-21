@@ -70,7 +70,7 @@ pub mod learned_from;
 pub mod lessons;
 pub mod listing;
 pub use memstore_client::hook;
-pub mod hook_install;
+pub use memstore_client::hook_install;
 pub mod keep;
 pub mod mail;
 pub mod names;

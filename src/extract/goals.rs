@@ -1547,6 +1547,15 @@ fn settle(
     }
     for e in engine_facts {
         let mut f = Fact::new(&e.subject, &e.predicate, &e.value).from_episodes(&[ep]);
+        // A money value in the currency the episode names (a CRM record's own); else in the predicate's unit.
+        let money = offer
+            .checked
+            .entity_type(&e.subject)
+            .and_then(|t| offer.checked.predicate(t, &e.predicate))
+            .is_some_and(|pd| pd.value == ValueType::Money);
+        if money {
+            f.unit = e.unit.clone();
+        }
         if let Err(err) = offer.checked.normalize(&mut f) {
             dropped.push(
                 json!({"engine_fact": format!("{} {} {}", e.subject, e.predicate, e.value),
@@ -2162,10 +2171,11 @@ async fn record_versions(
                         }),
                 )
                 .collect();
-            // Given again by a version from before this one.
+            // Given again by a version from before this one: the same value, in the same unit (an amount whose
+            // record now names another currency is a new value).
             if earlier
                 .iter()
-                .any(|(_, k)| k.value == f.value && k.valid_from <= at)
+                .any(|(_, k)| k.value == f.value && k.unit == f.unit && k.valid_from <= at)
             {
                 continue;
             }

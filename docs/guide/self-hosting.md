@@ -103,6 +103,64 @@ once a day, so a busy issue isn't written every round. A server a session starts
 `SENTRY_AUTH_TOKEN` and `SENTRY_URL` from that session's environment; the background service has neither, but it
 carries `AMPUP_MEMORY_SENTRY_TOKEN_FILE` and `AMPUP_MEMORY_SENTRY_URL` and reads `~/.sentryclirc`.
 
+`ampup-memory sources add slack CHANNEL [--since DATE] [--dir DIR]` reads a Slack channel (its name without `#`, or
+its id) the same way, with a bot token from a Slack app you make in your own workspace, `SLACK_BOT_TOKEN` in the
+server's environment. Each message, and each reply in its threads, is written as its own episode in the hosted
+connector's format (source `slack:CHANNEL_ID:#name:TS`, type `slack_thread`, about `channel:`, `thread:` and
+`slack_user:`), with people's names in place of their ids. A round reads what was posted since five minutes before
+the last round started (those five minutes are sent again, as the same episodes), and looks 14 days further back
+for threads with a reply since (a reply to a thread started longer ago is missed). Joins, topic changes and
+messages with no text are left out.
+
+To get the token:
+
+1. Open api.slack.com/apps (signed in to Slack), **Create New App**, **From a manifest**, pick your workspace and
+   paste this (read-only scopes; no events, no socket mode):
+
+   ```json
+   {
+     "display_information": {
+       "name": "AmpUp Memory",
+       "description": "Reads the channels you add it to into your own AmpUp Memory. Read-only."
+     },
+     "features": {
+       "bot_user": { "display_name": "AmpUp Memory", "always_online": false }
+     },
+     "oauth_config": {
+       "scopes": {
+         "bot": [
+           "channels:history",
+           "channels:join",
+           "channels:read",
+           "groups:history",
+           "groups:read",
+           "users:read"
+         ]
+       }
+     },
+     "settings": {
+       "org_deploy_enabled": false,
+       "socket_mode_enabled": false,
+       "token_rotation_enabled": false
+     }
+   }
+   ```
+
+2. **Create**, then **Install to Workspace** and **Allow**. Under **OAuth & Permissions**, copy the **Bot User OAuth
+   Token** (`xoxb-…`).
+3. Give it to the server, never to a file or the command line: `export SLACK_BOT_TOKEN=xoxb-…` in the shell that
+   runs `serve --local`. A server a session's start brings up gets it from the agent's environment. The service
+   (`ampup-memory service install`) doesn't carry it into its unit file: on macOS run
+   `launchctl setenv SLACK_BOT_TOKEN "$SLACK_BOT_TOKEN"`, on Linux
+   `systemctl --user set-environment SLACK_BOT_TOKEN="$SLACK_BOT_TOKEN"`, then `ampup-memory service restart`. It
+   lasts until you log out, and every program started in that login session from then on sees it too; where that's
+   too wide, run `serve --local` in a terminal with the token exported there instead.
+4. Add channels: `ampup-memory sources add slack general`. The app joins a public channel by itself; a private one
+   needs `/invite @AmpUp Memory` in it first.
+
+Slack's rate limits are waited out as it asks (`Retry-After`). Keep the app to your own workspace (don't distribute
+it): Slack reads history far more slowly for apps installed in other workspaces outside its Marketplace.
+
 ### Any Iceberg REST catalog over S3
 
 This is the configuration the repository's catalog tests run (Apache Iceberg's REST fixture on MinIO,

@@ -15,6 +15,10 @@
      "type": "money",
      "unit": "USD"
     },
+    "currency": {
+     "type": "string",
+     "description": "the ISO 4217 code of the deal's currency (EUR)"
+    },
     "close_date": {
      "type": "date"
     },

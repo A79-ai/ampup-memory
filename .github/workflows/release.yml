@@ -25,7 +25,10 @@ name: Release
 # Every archive carries LICENSE, NOTICE and THIRD-PARTY-NOTICES.txt: the licenses of every crate linked into the
 # binaries, ONNX Runtime's and the embedding model's, kept current by .github/scripts/third-party-notices.sh.
 #
-# Platforms: Linux x86_64 and arm64 (glibc 2.39 or newer: built on Ubuntu 24.04) and Apple Silicon macOS. Intel
+# Platforms: Linux x86_64 and arm64 and Apple Silicon macOS. On Linux, ampup-memory needs glibc 2.39 or newer (built on
+# Ubuntu 24.04), and ampup-memory-client, what the plugins run, needs only 2.28 (Debian 10, RHEL 8, Ubuntu 20.04 and
+# later): it is built with cargo-zigbuild against glibc 2.28's symbols, and the build fails if it asks for a newer one.
+# Built on the runner like the server, it needed 2.39 and wouldn't start on Debian 12 or Ubuntu 22.04. Intel
 # macOS (13.4 or newer) is built only when its ONNX Runtime can be: ort ships no prebuilt library for Intel Macs, so
 # .github/scripts/onnxruntime-x86_64-apple-darwin.sh builds one from github.com/microsoft/onnxruntime, and that
 # repository answers 404 since 2026-11-18, which failed every release (the publish job needs every build). The Intel
@@ -113,6 +116,15 @@ jobs:
           test -s studio/dist/index.html
           du -sh studio/dist
           echo "STUDIO_DIST=$PWD/studio/dist" >> "$GITHUB_ENV"
+      # Python: the server's wheel (a server release), and zig with cargo-zigbuild for the Linux client below.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        if: steps.kind.outputs.kind == 'server' || runner.os == 'Linux'
+        with:
+          python-version: "3.12"
+      # zig links the Linux client against an old glibc's symbols (the Platforms note at the top); pinned, from PyPI.
+      - name: Install zig and cargo-zigbuild
+        if: runner.os == 'Linux'
+        run: python3 -m pip install -q ziglang==0.17.1 cargo-zigbuild==0.24.1 && cargo-zigbuild --version
       # Both, for either kind: the check runs ampup-memory-client against ampup-memory. Only this release's kind is
       # packaged.
       - name: Build
@@ -131,12 +143,25 @@ jobs:
             mkdir -p target/release
             cp "target/$TARGET/release/ampup-memory" "target/$TARGET/release/ampup-memory-client" target/release/
             file target/release/ampup-memory target/release/ampup-memory-client
+          elif [ "$RUNNER_OS" = Linux ]; then
+            cargo build --release --config .cargo/release.toml --locked --bin ampup-memory
+            # The client for glibc 2.28 (the `.2.28` suffix is cargo-zigbuild's), where every other build is.
+            cargo zigbuild --release --config .cargo/release.toml --locked --target "$TARGET.2.28" --bin ampup-memory-client
+            cp "target/$TARGET/release/ampup-memory-client" target/release/
           else
             cargo build --release --config .cargo/release.toml --locked --bin ampup-memory --bin ampup-memory-client
           fi
       # Stripped before signing (stripping a signed binary breaks its signature), and both checked as they ship.
       - name: Strip
         run: strip target/release/ampup-memory target/release/ampup-memory-client
+      # The Linux client's glibc floor, from the symbol versions it asks for: no newer than 2.28 (the Platforms note).
+      - name: The Linux client needs glibc 2.28 at most
+        if: runner.os == 'Linux'
+        run: |
+          need=$(objdump -T target/release/ampup-memory-client | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          test -n "$need"
+          echo "ampup-memory-client needs $need"
+          test "$(printf '%s\n' "$need" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28
       # Every macOS build: signed with the Developer ID certificate and notarized by Apple when the signing secrets
       # are set, unsigned as before (and it says so) when they aren't. .github/scripts/macos-sign.sh says which.
       - name: Sign and notarize
@@ -209,18 +234,14 @@ jobs:
       # (and ampup-memory-client again as memstore-client, its old name, as the client's wheel had it), installed in
       # a fresh venv and checked as the build was, before the pypi job below may upload it (PyPI never takes a
       # version twice).
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        if: steps.kind.outputs.kind == 'server'
-        with:
-          python-version: "3.12"
       - name: Wheel
         if: steps.kind.outputs.kind == 'server'
         env:
           VERSION: ${{ steps.kind.outputs.version }}
         run: |
-          # The platform tag, from the binary itself: Linux's glibc floor (above), macOS's oldest version the binary
-          # says it runs on (11 and later as <major>_0, as pip looks for them) and its architecture (an Intel build
-          # is made on Apple Silicon).
+          # The platform tag, from the binary itself: Linux's glibc floor (the server's, above: the wheel holds both),
+          # macOS's oldest version the binary says it runs on (11 and later as <major>_0, as pip looks for them) and its
+          # architecture (an Intel build is made on Apple Silicon).
           bin=target/release/ampup-memory
           case "$RUNNER_OS" in
             Linux) platform=manylinux_2_39_$(uname -m) ;;

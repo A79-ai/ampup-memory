@@ -3332,6 +3332,13 @@ async fn export_facts(
             if !shown {
                 continue;
             }
+            // Ended as a reader sees it: by its own `valid_to`, or by a closure whose episode the export keeps.
+            let valid_to = match reader {
+                None => vis.valid_to_where(&f, |e| {
+                    vis.acls.contains_key(e) && !vis.is_retracted(e) && !forgotten(vis, e)
+                }),
+                Some(who) => vis.valid_to(&f, who),
+            };
             let e = entities.entry(f.entity.clone()).or_default();
             e.1 += 1;
             if e.0.is_none() {
@@ -3339,7 +3346,7 @@ async fn export_facts(
             }
             facts.push(json!({
                 "fact_id": f.fact_id, "entity": f.entity, "predicate": f.predicate, "value": f.value,
-                "valid_from": f.valid_from, "valid_to": f.valid_to, "source_episodes": f.source_episodes,
+                "valid_from": f.valid_from, "valid_to": valid_to, "source_episodes": f.source_episodes,
                 "quote": f.quote, "entity_type": f.entity_type, "value_type": f.value_type,
                 "value_num": f.value_num, "value_ts": f.value_ts, "value_ref": f.value_ref,
                 "unit": f.unit, "cite": crate::cite_json(&f), "time_basis": f.time_basis,

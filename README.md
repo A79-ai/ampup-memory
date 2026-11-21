@@ -31,7 +31,7 @@ it without installing: `uvx --from ampup-memory-cli ampup-memory serve --local`.
 
 Or with the installer, which needs only `curl` (or `wget`) and `tar`, puts both in `~/.local/bin` from the newest
 [release](https://github.com/A79-ai/ampup-memory/releases) (PyPI gets one a week), and with
-`AMPUP_MEMORY_INSTALL=client` installs the client alone:
+`AMPUP_MEMORY_INSTALL=client` installs the client alone (on Linux it needs only glibc 2.28 or newer):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/install.sh | sh
@@ -157,6 +157,19 @@ organization kept in the EU, set `SENTRY_URL` (the default is `https://sentry.io
 ampup-memory sources add sentry ORG/PROJECT              # 30 days back; --since 2026-01-01 for more
 ampup-memory sources remove sentry ORG/PROJECT
 ```
+
+### Your Slack channels, with an app you make
+
+Make a Slack app in your own workspace from the read-only manifest in the
+[self-hosting guide](https://docs.ampup.ai/ampup-memory/self-hosting), install it, and give its bot token to the
+server in its environment (never a file):
+
+```bash
+export SLACK_BOT_TOKEN=xoxb-...                          # the app's Bot User OAuth Token
+ampup-memory sources add slack general                   # a channel's name or id; private ones need /invite first
+```
+
+Each message and thread reply is written as the hosted Slack connector writes it, with people's names.
 
 ## First memory, search and advice
 

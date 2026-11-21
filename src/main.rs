@@ -246,7 +246,8 @@ enum Cmd {
         local: Option<PathBuf>,
     },
     /// Register memstore's hooks and MCP server in a coding agent: `ampup-memory hooks install --harness codex`
-    /// (codex, gemini, cursor or copilot; Claude Code installs its plugin). `uninstall` takes them out
+    /// (codex, gemini, cursor, copilot, droid, qwen, hermes, kiro, devin, cline, opencode, amp or kilo; Claude Code
+    /// and Grok Bot install a plugin). `uninstall` takes them out. `ampup-memory-client hooks` is the same
     Hooks {
         /// install or uninstall
         action: String,
@@ -255,6 +256,9 @@ enum Cmd {
         /// The memstore server, written into the hooks and MCP entry (AMPUP_MEMORY_URL otherwise, read when they run)
         #[arg(long)]
         url: Option<String>,
+        /// The org whose memory the MCP entry reaches (else AMPUP_MEMORY_ORG, else the context's)
+        #[arg(long)]
+        org: Option<String>,
         /// Say what would change, and change nothing
         #[arg(long)]
         dry_run: bool,
@@ -267,7 +271,8 @@ enum Cmd {
         event: String,
         /// outcome: good or bad, then why
         args: Vec<String>,
-        /// The agent it runs in: claude-code, codex, gemini, cursor or copilot
+        /// The agent it runs in: claude-code, codex, gemini, cursor, copilot, grok, droid, qwen, hermes, kiro,
+        /// devin, cline, opencode, amp or kilo
         #[arg(long, default_value = "claude-code")]
         harness: String,
         /// outcome: the session to rate (else CLAUDE_CODE_SESSION_ID, else the one last active in this repo)
@@ -2370,38 +2375,17 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             action,
             harness,
             url,
+            org,
             dry_run,
         } => {
-            let h = memstore::hook::Harness::parse(harness)?;
-            let remove = match action.as_str() {
-                "install" => false,
-                "uninstall" => true,
-                other => anyhow::bail!("ampup-memory hooks install|uninstall, not {other}"),
-            };
-            let changes = memstore::hook_install::apply(h, url.as_deref(), remove, *dry_run)?;
-            let lead = if *dry_run { "would change" } else { "changed" };
-            if changes.is_empty() {
-                println!("{}: nothing to change", h.name());
-            }
-            for c in &changes {
-                println!("{lead} {}: {}", c.path.display(), c.what);
-            }
-            if !remove
-                && memstore::hook_install::writes_token(h)
-                && std::env::var("AMPUP_MEMORY_TOKEN").is_ok()
-            {
-                println!(
-                    "note: {} can't read AMPUP_MEMORY_TOKEN from the environment, so its MCP entry holds the token",
-                    h.name()
-                );
-            }
-            if !remove && !changes.is_empty() {
-                println!(
-                    "restart {} to load them; `ampup-memory hook status` checks the server",
-                    h.name()
-                );
-            }
-            return Ok(());
+            return memstore::hook_install::cli(
+                memstore::naming::BIN,
+                action,
+                harness,
+                url.as_deref(),
+                org.as_deref(),
+                *dry_run,
+            );
         }
         Cmd::Hook {
             event,

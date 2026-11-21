@@ -656,24 +656,68 @@ pub(super) async fn search(
                     .chain(&rest[c.entity.as_str()])
             })
             .collect();
+        // The facts giving each entity's each value (as `Reads::corroboration` compares them), grouped once and each
+        // group counted once: a fact's count is its group's. Compared fact by fact, a page of a large entity's facts
+        // took 1.5-11 s on one staging org (every pair, each value normalized again).
+        let same = |v: &str| -> String {
+            v.chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect()
+        };
+        let mut groups: HashMap<(&str, String), Vec<&crate::Fact>> = HashMap::new();
+        for f in &all {
+            let group = groups
+                .entry((f.entity.as_str(), same(&f.value)))
+                .or_default();
+            if !group.iter().any(|g| g.fact_id == f.fact_id) {
+                group.push(f);
+            }
+        }
+        let mut counted: HashMap<(&str, String), usize> = HashMap::new();
         let origins: HashMap<String, String> = all
             .iter()
             .filter_map(|f| {
                 let note = match reads.fact_origin(f)?.note(f.valid_from) {
                     Some(n) => n,
-                    None => match reads.corroboration(who, f, &all) {
-                        n if n > 1 => format!("{n} sources say so"),
-                        _ => return None,
-                    },
+                    None => {
+                        let key = (f.entity.as_str(), same(&f.value));
+                        let n = match counted.get(&key) {
+                            Some(&n) => n,
+                            None => {
+                                let n = reads.corroboration_of(who, &groups[&key]);
+                                counted.insert(key, n);
+                                n
+                            }
+                        };
+                        match n {
+                            n if n > 1 => format!("{n} sources say so"),
+                            _ => return None,
+                        }
+                    }
                 };
                 Some((f.fact_id.clone(), note))
             })
             .collect();
+        crate::phases::mark("origins");
         // Each reads what it needs on its own: at once.
+        // Each marks its own end, so a slow search's line says which of them it waited for.
         let (tallies, marks, conflicts) = tokio::join!(
-            reads.tallies(store, who, &shown_facts),
-            reads.marks(store, who, &all, ask.valid_at, true),
-            reads.conflicts(store, who, &all, ask.valid_at),
+            async {
+                let t = reads.tallies(store, who, &shown_facts).await;
+                crate::phases::mark("tallies done");
+                t
+            },
+            async {
+                let m = reads.marks(store, who, &all, ask.valid_at, true).await;
+                crate::phases::mark("marks done");
+                m
+            },
+            async {
+                let c = reads.conflicts(store, who, &all, ask.valid_at).await;
+                crate::phases::mark("conflicts done");
+                c
+            },
         );
         (tallies?, marks?, conflicts?, origins)
     };

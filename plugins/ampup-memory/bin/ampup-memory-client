@@ -20,6 +20,10 @@
 #                                where the server offers sign-up, make your own). Not a member of the org yet:
 #                                asks to join it, and its admins are emailed to approve
 #
+# Grok Bot (`--harness grok`, the ampup-memory-grok plugin) runs its sessions on a fresh cloud computer, often a new
+# one each time, where "on from the next session" would mean never: there a session's start installs the client
+# first (a few seconds; the hook allows 90) and then runs it, so the memory is on from the first session.
+#
 # Each AMPUP_MEMORY_* variable is also read under its old name (MEMSTORE_*) when the new one isn't set.
 default_server=
 here=$(cd "$(dirname "$0")" && pwd)
@@ -88,6 +92,39 @@ update() {
 bin=$(find_bin)
 if [ -n "$bin" ] && [ "$1 $2" = "hook session-start" ] && ! selfupdates "$bin"; then
   (update "$bin" 60 </dev/null >/dev/null 2>&1 &)
+fi
+# Grok Bot: a session's start, or a prompt where no start hook ran first, waits for the install (at most 75 seconds
+# for a start, 10 for a prompt, inside their hooks' timeouts) and then runs the client. The install runs on its own,
+# so a hook that times out never leaves it half done. stdin stays the hook's, and stdout its answer, which must be a
+# JSON object or nothing.
+if [ -z "$bin" ] && { [ "$1 $2" = "hook session-start" ] || [ "$1 $2" = "hook prompt" ]; }; then
+  case " $* " in
+    *" --harness grok "*)
+      (install </dev/null >/dev/null 2>&1 &)
+      wait=10
+      [ "$2" = session-start ] && wait=75
+      i=0
+      while [ $i -lt $wait ] && [ -z "$(find_bin)" ]; do
+        # No install running any more (it failed): no use waiting on.
+        [ $i -ge 2 ] && [ ! -d "$cache/install.lock" ] && break
+        sleep 1
+        i=$((i + 1))
+      done
+      bin=$(find_bin)
+      # Installed but can't run here (a Linux older than the build's C library, say): said once, not every hook.
+      if [ -n "$bin" ] && ! why=$("$bin" --version 2>&1 </dev/null >/dev/null); then
+        why=$(printf '%s' "$why" | head -n1 | tr -d '"\\')
+        printf '%s\n' "{\"additional_context\": \"AmpUp Memory (the team memory) installed its client but it doesn't run on this machine ($why). Tell the user once, briefly, that the memory's hooks are off here. Then carry on with their request.\"}"
+        exit 0
+      fi
+      if [ -z "$bin" ]; then
+        # A prompt says nothing: the next one waits again, and the start says what went wrong.
+        [ "$2" = prompt ] && exit 0
+        printf '%s\n' "{\"additional_context\": \"AmpUp Memory (the team memory) couldn't install its client on this machine (see $cache/install.log). Tell the user once, briefly, that it can be installed with: curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/plugins/ampup-memory/bin/install.sh | sh. Then carry on with their request.\"}"
+        exit 0
+      fi
+      ;;
+  esac
 fi
 if [ -z "$bin" ]; then
   old=$(find_old_bin)

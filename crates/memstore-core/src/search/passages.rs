@@ -930,9 +930,20 @@ pub async fn warm(
     let index = open_cached(store, scope).await?;
     // The unindexed tail's embeddings, as `search::warm` does the facts': a search otherwise embeds them while its
     // caller waits. A search embeds the tail its reader sees when that is at most TAIL_EMBED_MAX passages; all of
-    // it is warmed, up to a few times that.
-    if q.is_some() {
-        let files = store.episode_files(scope).await?;
+    // it is warmed, up to a few times that. Not past TAIL_EMBED_MAX unindexed episodes (each one passage at least):
+    // a search wouldn't embed that tail, and reading it means every body the tail cache lacks, which on a staging
+    // org with 25,000 unindexed passages took a warm-up 117 s and, beside searches doing the same, its server's
+    // memory past its limit.
+    let files = match q {
+        Some(_) => store.episode_files(scope).await?,
+        None => HashMap::new(),
+    };
+    let unindexed: usize = files
+        .iter()
+        .filter(|(f, _)| !index.held.contains(*f))
+        .map(|(_, bs)| bs.iter().map(RecordBatch::num_rows).sum::<usize>())
+        .sum();
+    if unindexed > 0 && unindexed <= search::TAIL_EMBED_MAX {
         let texts: Vec<String> = tail(store, scope, &files, &index.held)
             .await?
             .into_iter()

@@ -253,6 +253,7 @@ impl EpisodeType for Incident {
                     predicate: predicate.into(),
                     value: value.into(),
                     cite: u.cite.clone(),
+                    unit: None,
                 });
             }
         };

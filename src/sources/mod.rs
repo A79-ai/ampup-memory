@@ -4,9 +4,9 @@
 //! what changed as episodes through the same path `/ingest` takes (redaction, the episode types' checks, and a
 //! record sent again as it was being taken without a write).
 //!
-//! Each kind is a module here ([`github`], [`github_prs`], [`git`], [`linear`], [`sentry`]): it makes its [`Source`] from the command line's
-//! target and reads it from its [`Progress`]. Adding one is that module, its variant of [`Source`], and a line each
-//! in [`KINDS`], [`add`] and the round's dispatch.
+//! Each kind is a module here ([`github`], [`github_prs`], [`git`], [`linear`], [`sentry`], [`slack`]): it makes
+//! its [`Source`] from the command line's target and reads it from its [`Progress`]. Adding one is that module,
+//! its variant of [`Source`], and a line each in [`KINDS`], [`add`] and the round's dispatch.
 //!
 //! **Who reads it.** The groups the server reads as (`group:local` by default): on `serve --local` that's the one
 //! person whose machine it is.
@@ -16,6 +16,7 @@ pub mod github;
 pub mod github_prs;
 pub mod linear;
 pub mod sentry;
+pub mod slack;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -79,6 +80,12 @@ pub enum Source {
         /// RFC 3339: no issue whose last event is before it is read.
         since: String,
     },
+    Slack {
+        /// The channel's name (no `#`) or id, as `sources add` was given it.
+        channel: String,
+        /// RFC 3339: nothing posted before it is read.
+        since: String,
+    },
 }
 
 impl Source {
@@ -91,14 +98,15 @@ impl Source {
                 workspace, team, ..
             } => format!("linear:{workspace}/{team}"),
             Source::Sentry { project, .. } => format!("sentry:{project}"),
+            Source::Slack { channel, .. } => format!("slack:{channel}"),
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Progress {
-    /// The newest change read (GitHub's `updated_at`, Linear's `updatedAt`; for git, the last commit read): the next
-    /// round reads from it.
+    /// Where the next round reads from: the newest change read (GitHub's `updated_at`, Linear's `updatedAt`; for
+    /// git, the last commit read), or the Slack `ts` a round read everything up to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cursor: Option<String>,
     /// When it was last read, in seconds since the epoch.
@@ -150,7 +158,7 @@ fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
 }
 
 /// The kinds `sources add` takes.
-pub const KINDS: &[&str] = &["github", "github-prs", "git", "linear", "sentry"];
+pub const KINDS: &[&str] = &["github", "github-prs", "git", "linear", "sentry", "slack"];
 
 /// `sources add KIND TARGET [--since DATE]`: kept in `dir`; a running server reads it within a minute.
 pub fn add(dir: &Path, kind: &str, target: &str, since: Option<&str>) -> Result<Source> {
@@ -165,6 +173,7 @@ pub fn add(dir: &Path, kind: &str, target: &str, since: Option<&str>) -> Result<
         "git" => git::source(target, since)?,
         "linear" => linear::source(target, since)?,
         "sentry" => sentry::source(target, since)?,
+        "slack" => slack::source(target, since)?,
         _ => bail!("{kind:?} isn't a kind of source ({})", KINDS.join(", ")),
     };
     std::fs::create_dir_all(dir)?;
@@ -200,6 +209,8 @@ pub fn remove(dir: &Path, kind: &str, target: &str) -> Result<bool> {
             "git:{}",
             git::top(target).unwrap_or_else(|_| target.to_string())
         ),
+        // As `add` kept it: the channel without its `#`.
+        "slack" => format!("slack:{}", target.trim().trim_start_matches('#')),
         _ => format!("{kind}:{target}"),
     };
     let before = config.sources.len();
@@ -306,6 +317,9 @@ where
             } => linear::read(workspace, team, since, &mut p, acl, write).await,
             Source::Sentry { project, since } => {
                 sentry::read(project, since, &mut p, acl, write).await
+            }
+            Source::Slack { channel, since } => {
+                slack::read(channel, since, &mut p, acl, write).await
             }
         };
         p.read_at = now;

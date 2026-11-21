@@ -42,7 +42,18 @@ pub const SOURCE: &str = crate::TRANSCRIPT_SOURCE;
 /// Where a transcript's parts are kept in versions: `transcripts/<harness>/<session>/<from>`.
 pub const PREFIX: &str = "transcripts/";
 /// The harnesses whose transcripts the hooks read tool calls from.
-const HARNESSES: [&str; 3] = ["claude-code", "codex", "gemini"];
+const HARNESSES: [&str; 10] = [
+    "claude-code",
+    "codex",
+    "gemini",
+    "droid",
+    "qwen",
+    "hermes",
+    "cline",
+    "opencode",
+    "amp",
+    "kilo",
+];
 /// Longest part kept, in bytes (the hooks send at most 2 MB).
 const MAX_TEXT: usize = 4 << 20;
 

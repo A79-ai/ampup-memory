@@ -140,6 +140,9 @@ pub struct EngineFact {
     pub predicate: String,
     pub value: String,
     pub cite: Cite,
+    /// The unit a money value is in, when the episode says (a CRM record's own currency); else the predicate's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
 }
 
 /// One kind of episode. Implemented once per folder under `src/episode_types/`.

@@ -1,8 +1,8 @@
 # Coding agents
 
 The plugin in [`plugins/ampup-memory`](../../plugins/ampup-memory) closes the learning loop in Claude Code with hooks, so
-it never depends on the model choosing to call a tool. The same hooks install into Codex, Gemini CLI, Cursor and
-Copilot with one command.
+it never depends on the model choosing to call a tool. The same hooks install into Codex, Gemini CLI, Cursor, Copilot,
+Factory Droid, Qwen Code, Hermes, Kiro, Devin, Cline, OpenCode, Kilo Code and Amp with one command.
 
 ## Claude Code
 
@@ -146,26 +146,47 @@ The prompt hook records a rating command before it expands, so none of them cost
 An organization can set the plugin, `AMPUP_MEMORY_URL` and `AMPUP_MEMORY_ORG` for everyone in Claude Code's managed
 settings (`enabledPlugins`, `env`).
 
-## Codex, Gemini CLI, Cursor and Copilot
+## Other coding agents
 
 ```bash
-ampup-memory hooks install --harness codex      # or gemini, cursor, copilot; --url <server>; --dry-run first
-ampup-memory hooks uninstall --harness codex
+ampup-memory-client hooks install --harness codex   # or any agent below; --dry-run first
+ampup-memory-client join <server> --org <org>      # or --api-key <key>, which needs no browser
+ampup-memory-client hooks uninstall --harness codex
 ```
+
+The lightweight client does it all (`ampup-memory hooks install` too). Without `--url`, the hooks and the MCP entry
+(the command `ampup-memory-client mcp`) follow the client's sign-in, so `join` can come before or after. With
+`--url <server> [--org <org>]` they name that server instead. `--dry-run` prints the hooks block too, for an org-wide
+config.
 
 | Harness | Files | Recall |
 |---|---|---|
 | codex | `~/.codex/hooks.json`, `[mcp_servers.ampup-memory]` in `~/.codex/config.toml` | session start; advice and facts at the first prompt |
 | gemini | `hooks` and `mcpServers` in `~/.gemini/settings.json` | session start; advice and facts at the first prompt |
-| cursor | `~/.cursor/hooks.json`, `~/.cursor/mcp.json` | session start only (its prompt hook can't add context) |
-| copilot | `~/.copilot/hooks/ampup-memory.json`, `~/.copilot/mcp-config.json` | session start only |
+| cursor | `~/.cursor/hooks.json`, `~/.cursor/mcp.json` | session start (its prompt hook can't add context, so no advice) |
+| copilot | `~/.copilot/hooks/ampup-memory.json`, `~/.copilot/mcp-config.json` | session start (the same) |
+| droid (Factory) | `~/.factory/hooks.json`, `~/.factory/mcp.json` | session start; advice and facts at the first prompt |
+| qwen (Qwen Code) | `hooks` and `mcpServers` in `~/.qwen/settings.json` | session start; advice and facts at the first prompt |
+| hermes | `hooks` and `mcp_servers` in `~/.hermes/config.yaml`, its commands approved in `~/.hermes/shell-hooks-allowlist.json` (`HERMES_HOME` moves both) | advice and facts at the first prompt (only `pre_llm_call` can add context) |
+| kiro | `~/.kiro/hooks/ampup-memory.json`, `~/.kiro/settings/mcp.json` | session start; advice and facts at the first prompt |
+| devin (Devin Local) | `hooks` in `~/.config/devin/config.json`, `~/.config/devin/mcp_config.json` | session start; advice and facts at the first prompt |
+| cline | one script per event in `~/Documents/Cline/Hooks/` (VS Code and the CLI both read it), `~/.cline/data/settings/cline_mcp_settings.json` | VS Code: task start; advice and facts at the first prompt. The CLI shows the model nothing a hook prints |
+| opencode | the plugin `~/.config/opencode/plugins/ampup-memory.ts`, `mcp` in `~/.config/opencode/opencode.json` | session start; advice and facts at the first prompt, in the system prompt |
+| kilo (Kilo Code) | the same plugin as `~/.config/kilo/plugin/ampup-memory.ts`, `mcp` in `~/.config/kilo/kilo.json` | the same |
+| amp | the plugin `~/.config/amp/plugins/ampup-memory.ts`, `amp.mcpServers` in `~/.config/amp/settings.json` | session start; advice and facts at the first prompt, as a hidden message |
+
+Grok Bot takes the Cursor-format plugin `plugins/ampup-memory-grok` instead: a user-level `~/.cursor/hooks.json` on
+its computer doesn't fire, so there is no `--harness grok` install. OpenCode, Kilo Code and Amp get the plugins in
+`plugins/integrations/`, which the client carries (a build without them says so); they find the client as
+`AMPUP_MEMORY_CLIENT`, else `~/.local/bin/ampup-memory-client`, else on the PATH.
 
 The installer keeps everything else in those files, backs each up before its first change
-(`<file>.ampup-memory-backup`), and changes nothing when run twice. Those transcripts are read for text only, so their
-traces hold no tool calls.
+(`<file>.ampup-memory-backup`), and changes nothing when run twice. Codex's and Gemini CLI's transcripts are read for
+text only, so their traces hold no tool calls; the other agents' keep them. A hook never fails the agent: without a
+transcript it skips the note.
 
 In Codex, a bare `+` or `-` typed as a prompt rates the session as in Claude Code, and Stop says so once, after a
-turn of real work. Gemini CLI, Cursor and Copilot have no way to keep a prompt from the model, so there you rate the
+turn of real work. The other agents have no way to keep a prompt from the model, so there you rate the
 last session from a terminal: `ampup-memory-client hook outcome good|bad [why]`.
 
 `ampup-memory setup <server> --org <org> [--harness codex,cursor] [--dry-run]` signs in and sets up every agent it

@@ -6,6 +6,11 @@
       "name": "ampup-memory",
       "source": "plugins/ampup-memory",
       "description": "AmpUp Memory, team memory for Cursor: recall at a session's start, sessions recorded as runs to learn from, and skills to search, follow advice, see where things stand and remember"
+    },
+    {
+      "name": "ampup-memory-grok",
+      "source": "plugins/ampup-memory-grok",
+      "description": "AmpUp Memory, team memory for Grok Bot and Cursor cloud agents: advice at each prompt, recall at a session's start, sessions recorded as runs to learn from, and the memory's tools over its hosted MCP server"
     }
   ]
 }

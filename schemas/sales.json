@@ -9,6 +9,7 @@
         "stage": {"type": "enum", "description": "The org's own pipeline stages (open enum).", "freshness_days": 45},
         "status": {"type": "enum", "values": ["open", "won", "lost"], "pending": ["open"]},
         "amount": {"type": "money", "unit": "USD", "freshness_days": 90},
+        "currency": {"type": "string", "description": "The ISO 4217 code of the deal's currency (EUR); its amount is in it, in USD when it names none."},
         "close_date": {"type": "date", "plan": true},
         "owner": {"type": "ref", "to": ["rep"]},
         "account": {"type": "ref", "to": ["account"], "part_of": true},
@@ -297,8 +298,8 @@
     "One person may have several ids: person:<email> from calls, calendars and emails, and contact:, lead: or rep: from the CRM. Search by their email to find them all."
   ],
   "extract": {
-    "sources": {"prefixes": ["ampup:meeting:", "email:hubspot:", "mcp:remember_memory:", "hubspot:", "salesforce:", "dynamicsCRM:", "email:", "gong:", "fireflies:", "fathom:", "granola:", "calendar:"]},
+    "sources": {"prefixes": ["ampup:meeting:", "email:hubspot:", "slack:ampup:thread:", "mcp:remember_memory:", "hubspot:", "salesforce:", "dynamicsCRM:", "email:", "gong:", "fireflies:", "fathom:", "granola:", "calendar:"]},
     "aggregates": {"elements": {"meddpicc.champion": ["advocate"], "meddpicc.competition": ["competitor", "current_tool"], "meddpicc.decision_criteria": ["decision_criterion", "requirement"], "meddpicc.decision_process": ["decision_process_step", "decision_date", "decision_maker"], "meddpicc.economic_buyer": ["economic_buyer"], "meddpicc.identify_pain": ["pain", "compelling_event"], "meddpicc.metrics": ["close_rate", "avg_deal_size", "team_size", "desired_outcome"]}, "every": 1, "items": {"commitment": ["open", "done", "dropped"], "meeting_plan": ["proposed", "confirmed", "held", "superseded", "cancelled"], "objection": ["open", "handled"]}, "max_wait_minutes": 5, "plans": ["next_meeting", "due", "starts_at"], "subject": "deal"},
-    "outcomes": ["mcp:remember_memory:"]
+    "outcomes": ["slack:ampup:thread:", "mcp:remember_memory:"]
   }
 }

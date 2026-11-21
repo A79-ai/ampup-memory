@@ -1,11 +1,11 @@
 //! `ampup-memory-client` (once `memstore-client`, still a link to it): what a person's machine runs to reach a
 //! team's memory, without the store and server that make `ampup-memory` hundreds of MB. Its commands are
-//! `ampup-memory`'s own, at the same names: `join` to sign in, `hook` for
-//! a coding agent's hooks, `mcp` for the server's MCP endpoint over stdio, `doctor` to check it all.
+//! `ampup-memory`'s own, at the same names: `join` to sign in, `hooks install` to register the hooks in a
+//! coding agent, `hook` for a coding agent's hooks, `mcp` for the server's MCP endpoint over stdio, `doctor` to check it all.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use memstore_client::{client, hook, naming, update};
+use memstore_client::{client, hook, hook_install, naming, update};
 
 /// The release this was built as (`v0.1.0-rc.7`, from the release workflow), else the crate's version: the
 /// plugin compares it with the latest release to keep the client current.
@@ -47,6 +47,31 @@ enum Cmd {
         /// In no org yet: make your own, where the server offers sign-up, without asking first
         #[arg(long)]
         create_org: bool,
+        /// Sign in with your personal API key (msk_…) instead of a browser: a cloud agent's machine, CI
+        #[arg(long, env = "AMPUP_MEMORY_API_KEY", hide_env_values = true)]
+        api_key: Option<String>,
+    },
+    /// Register AmpUp Memory's hooks and MCP server in a coding agent's user config: `hooks install --harness
+    /// <agent>`, `hooks uninstall --harness <agent>`. The agents: codex, gemini, cursor, copilot, droid, qwen,
+    /// hermes, kiro, devin, cline, opencode, amp and kilo (Claude Code and Grok Bot install a plugin instead).
+    /// The user's own entries are kept, each file is backed up before its first change, and installing twice
+    /// changes nothing
+    Hooks {
+        /// install or uninstall
+        action: String,
+        /// The agent: codex, gemini, cursor, copilot, droid, qwen, hermes, kiro, devin, cline, opencode, amp or kilo
+        #[arg(long)]
+        harness: String,
+        /// The server, written into the hooks and the MCP entry (else AMPUP_MEMORY_URL, else the context `join`
+        /// made, read when they run)
+        #[arg(long)]
+        url: Option<String>,
+        /// The org whose memory the MCP entry reaches (else AMPUP_MEMORY_ORG, else the context's)
+        #[arg(long)]
+        org: Option<String>,
+        /// Say what would change, and change nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// A coding agent's hook: session-start, prompt, stop, session-end or status, reading the hook's JSON on stdin;
     /// `outcome good|bad [why]` rates the session's run. Never fails the session: errors go to stderr and it exits 0
@@ -54,7 +79,8 @@ enum Cmd {
         event: String,
         /// outcome: good or bad, then why
         args: Vec<String>,
-        /// The agent it runs in: claude-code, codex, gemini, cursor or copilot
+        /// The agent it runs in: claude-code, codex, gemini, cursor, copilot, grok, droid, qwen, hermes, kiro,
+        /// devin, cline, opencode, amp or kilo
         #[arg(long, default_value = "claude-code")]
         harness: String,
         /// outcome: the session to rate (else CLAUDE_CODE_SESSION_ID, else the one last active in this repo)
@@ -111,7 +137,11 @@ async fn run() -> Result<()> {
             no_browser,
             sso,
             create_org,
+            api_key,
         } => {
+            if let Some(key) = api_key {
+                return client::join_with_key(&server, org.as_deref(), team.as_deref(), &key).await;
+            }
             update::before_sign_in(VERSION).await;
             client::join(
                 &server,
@@ -143,6 +173,20 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Hooks {
+            action,
+            harness,
+            url,
+            org,
+            dry_run,
+        } => hook_install::cli(
+            naming::CLIENT_BIN,
+            &action,
+            &harness,
+            url.as_deref(),
+            org.as_deref(),
+            dry_run,
+        ),
         Cmd::Mcp => hook::bridge().await,
         Cmd::Doctor => hook::doctor().await,
         Cmd::Metric {

@@ -109,6 +109,7 @@
       "predicates": {
         "stage": {"type": "enum", "description": "the pipeline stage (open enum)"},
         "amount": {"type": "money", "unit": "USD"},
+        "currency": {"type": "string", "description": "the ISO 4217 code of the deal's currency (EUR); its amount is in it, in USD when it names none"},
         "close_date": {"type": "date", "plan": true},
         "owner": {"type": "ref", "to": ["rep"], "description": "who owns it in the CRM"},
         "account": {"type": "ref", "to": ["account"], "part_of": true},

@@ -1,7 +1,8 @@
 //! The people an episode lists (`{id, name}`, such as a call's invitees) and the speakers its units name: which of
 //! them speaks, and by what name. A list often names someone only by their address ("Srosenbach" for
 //! srosenbach@), while the units hear their real name ("Scott Rosenbach"); that name is what they are shown by, and
-//! a full one is also theirs to be found by. Any type whose body lists people and has speakers uses this.
+//! a full one is also theirs to be found by. A speaker the list names ("Scott Rosenbach" for srosenbach@) is found by
+//! that name too. Any type whose body lists people and has speakers uses this.
 
 use std::collections::HashSet;
 
@@ -24,8 +25,8 @@ pub struct Heard<'a> {
     /// What to call them: their listed name, or, when it is only their address, the name they speak under. Empty
     /// when neither says more than the address, so a reader names them some other way.
     pub name: String,
-    /// A full name they speak under that their address is made from, when their listed name is only their
-    /// address: a name to find them by.
+    /// A name to find a speaker with an address by: their listed name, or, when it is only their address, a full
+    /// name they speak under that their address is made from.
     pub alias: Option<String>,
 }
 
@@ -39,10 +40,11 @@ pub fn heard<'a>(people: &[Participant], units: &'a [Unit]) -> Vec<Heard<'a>> {
         .zip(attendance(people, units))
         .map(|(p, first)| {
             if named(p) {
+                let name: String = p.name.trim().into();
                 return Heard {
                     turn: first.map(|(u, _)| u),
-                    name: p.name.trim().into(),
-                    alias: None,
+                    alias: (first.is_some() && !address(p).is_empty()).then(|| name.clone()),
+                    name,
                 };
             }
             let label = first

@@ -4,7 +4,9 @@
 //! `<object>:<p>-<id>`, citing the field, where `p` names the CRM the source's first segment does ([`provider`]):
 //! `deal:hs-42`, `deal:sf-006X`, `account:d365-7`. Values are written as the record gives them, each field a fact of
 //! its own (a stage's id, `stage_id`, too): the connector sends labels, not a CRM's codes, and nothing here maps
-//! one, but for the record's `currency`, written as its ISO code. Its catalog types the fields the engine writes.
+//! one, but for the record's `currency`, written as its ISO code. The record's money values (its `amount`) are in
+//! that currency, and in the schema's unit (USD) only when the record names none. Its catalog types the fields the
+//! engine writes.
 //!
 //! A person's row (a contact, a lead, a rep) that carries an email is also known by the one id every connector
 //! gives that person, `person:<email>` (lower case), as its `_alias`; so is a record's owner (`owner`, a `rep:`
@@ -147,6 +149,17 @@ impl CrmUpdate {
         })
     }
 
+    /// The record's currency as an ISO 4217 code, when it names one ([`currency`]): the unit its money values are
+    /// in. None when it names none, or one this can't read as a code, so they keep the schema's unit.
+    fn unit(b: &Body) -> Option<String> {
+        b.changes
+            .iter()
+            .filter(|c| c.field == CURRENCY)
+            .find_map(|c| c.value.as_str())
+            .map(currency)
+            .filter(|c| c.len() == 3 && c.chars().all(|x| x.is_ascii_uppercase()))
+    }
+
     /// The `_alias` facts naming who a row's people are by `person:<email>`: the row's own, when it is a
     /// person's and carries an email, and its owner's (the `rep:` id its `owner` gives) by its `owner_email`.
     fn aliases(b: &Body, subject: &str) -> Vec<EngineFact> {
@@ -160,6 +173,7 @@ impl CrmUpdate {
             predicate: crate::query::schema::ALIAS.into(),
             value: format!("person:{email}"),
             cite,
+            unit: None,
         };
         let mut out = vec![];
         if PEOPLE.contains(&b.object.as_str())
@@ -211,6 +225,7 @@ impl EpisodeType for CrmUpdate {
         &[
             "stage",
             "amount",
+            "currency",
             "close_date",
             "owner",
             "title",
@@ -251,11 +266,13 @@ impl EpisodeType for CrmUpdate {
             ..Header::default()
         }
     }
-    /// Each field's new value on the record, and who its people are by email ([`CrmUpdate::aliases`]).
+    /// Each field's new value on the record, a money value in the record's currency ([`CrmUpdate::unit`]), and who
+    /// its people are by email ([`CrmUpdate::aliases`]).
     fn engine_facts(&self, ep: &Episode, _units: &[Unit]) -> Result<Vec<EngineFact>> {
         let b = Self::body(ep)?;
         let subject = b.subject(&ep.source);
         let aliases = Self::aliases(&b, &subject);
+        let unit = Self::unit(&b);
         let mut out: Vec<EngineFact> = b
             .changes
             .into_iter()
@@ -272,6 +289,7 @@ impl EpisodeType for CrmUpdate {
                     field: c.field,
                     changed_at: c.changed_at,
                 },
+                unit: unit.clone(),
             })
             .collect();
         out.extend(aliases);

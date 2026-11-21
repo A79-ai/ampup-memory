@@ -1494,6 +1494,128 @@ impl Vis {
         Ok(added)
     }
 
+    /// Why this state of a branch other than main, built from the tables `built_from`, must be built again for the
+    /// tables `now`; Ok when a build of `now` gives this same state, so it is served as it is. A branch reads main
+    /// for what takes memory away (a delete, a retraction, a narrowed ACL, retention: main's word holds on every
+    /// branch), so what main did since counts, not only the branch's own commits. It is the same state when:
+    /// no side table changed (so no closure, retraction, retention, schema, quote or decision, nor one written
+    /// before its commit landed); the ledger and episodes were only appended to; none of the scope's new commits
+    /// is on this branch; each new commit on main follows only main's commits (no merge brings another branch's
+    /// commits to main, where its deletes would hold here); and no new episode row is one of a commit this state
+    /// holds (read after its commit), is one this state knows (a row written again can narrow its ACL, which
+    /// main's newest row governs here), carries a deleted source, or ages out under retention before this state
+    /// would. Anything else is built.
+    fn branch_unchanged(
+        &self,
+        ns: &str,
+        branch: &str,
+        built_from: &[Arc<Vec<RecordBatch>>; 8],
+        now: &[Arc<Vec<RecordBatch>>; 8],
+    ) -> std::result::Result<(), &'static str> {
+        if let Some(i) = (2..8).find(|&i| !Arc::ptr_eq(&built_from[i], &now[i])) {
+            return Err(SIDE_WRITTEN[i - 2]);
+        }
+        let Some(ledger) = added_batches(&built_from[0], &now[0]) else {
+            return Err("the ledger rewritten");
+        };
+        let Some(episodes) = added_batches(&built_from[1], &now[1]) else {
+            return Err("the episodes rewritten");
+        };
+        // The scope's new commits, and the parents of those on main.
+        let mut commits: HashSet<&str> = HashSet::new();
+        let mut parents_on_main: Vec<&str> = vec![];
+        for b in &ledger {
+            let text = |c: &str| b.column_by_name(c).expect(c).as_string::<i32>();
+            let (scope, id, on) = (text("scope"), text("commit_id"), text("branch"));
+            let parents = b.column_by_name("parents").map(|c| c.as_string::<i32>());
+            for i in 0..b.num_rows() {
+                if scope.value(i) != ns {
+                    continue;
+                }
+                if on.value(i) == branch {
+                    return Err("the branch moved");
+                }
+                commits.insert(id.value(i));
+                if on.value(i) == MAIN
+                    && let Some(p) = parents.filter(|p| !p.is_null(i))
+                {
+                    parents_on_main.extend(
+                        p.value(i)
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|p| !p.is_empty()),
+                    );
+                }
+            }
+        }
+        if !parents_on_main.is_empty() {
+            let wanted: HashSet<&str> = parents_on_main.into_iter().collect();
+            let mut found: HashSet<&str> = HashSet::new();
+            for b in now[0].iter() {
+                let text = |c: &str| b.column_by_name(c).expect(c).as_string::<i32>();
+                let (scope, id, on) = (text("scope"), text("commit_id"), text("branch"));
+                for i in 0..b.num_rows() {
+                    if scope.value(i) == ns && on.value(i) == MAIN && wanted.contains(id.value(i)) {
+                        found.insert(id.value(i));
+                    }
+                }
+            }
+            if found.len() != wanted.len() {
+                return Err("a merge brings another branch's commits to main");
+            }
+        }
+        let known = |e: &str| {
+            self.acls.contains_key(e)
+                || self.retracted.contains(e)
+                || self.documents.of.contains_key(e)
+        };
+        for b in &episodes {
+            let text = |c: &str| b.column_by_name(c).expect(c).as_string::<i32>();
+            let (id, source) = (text("episode_id"), text("source"));
+            let commit = text("commit_id");
+            for i in 0..b.num_rows() {
+                // The ledger and the episodes are read apart, so a state can be built from a ledger that holds a
+                // commit and episodes that don't hold its rows yet: they arrive later, as new rows of a commit
+                // this branch already holds.
+                if self.committed.contains(commit.value(i)) {
+                    return Err("rows of a commit the branch holds, read after it");
+                }
+                if known(id.value(i)) {
+                    return Err("an episode written again");
+                }
+                // A delete naming a source hides every episode that ever carried it, wherever it was written.
+                if self
+                    .retraction_targets
+                    .contains(&format!("source:{}", source.value(i)))
+                {
+                    return Err("an episode of a deleted source");
+                }
+            }
+        }
+        // Retention ages every episode, held or not, and the state lasts until the next one ages out.
+        let appended: Vec<RecordBatch> = episodes.iter().map(|b| (*b).clone()).collect();
+        let (aged, ends) = expired(&appended, &self.retention, now_micros());
+        if !aged.is_empty() {
+            return Err("an episode written past its retention");
+        }
+        if ends.is_some_and(|e| self.fresh_until.is_none_or(|f| e < f)) {
+            return Err("an episode that ages out sooner");
+        }
+        // A side row written before its commit takes effect with it.
+        for (t, why) in now[2..].iter().zip(SIDE_COMMITTED) {
+            for b in t.iter() {
+                let Some(c) = b.column_by_name("commit_id") else {
+                    continue;
+                };
+                let c = c.as_string::<i32>();
+                if (0..c.len()).any(|i| commits.contains(c.value(i))) {
+                    return Err(why);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The state a build of the tables `now` gives, made from this one (built from `built_from`) without reading
     /// the tables whole again, when all that changed since only adds memory ([`Vis::only_added`]) and brings no
     /// merge: this state's sets with the new commits and their episodes added. A merge can publish a proposal and
@@ -1852,7 +1974,6 @@ impl Vis {
             ),
             (self.replaced_acls != full.replaced_acls, "replaced acls"),
             (self.replaced_aged != full.replaced_aged, "replaced aged"),
-            (self.ledger_print != full.ledger_print, "ledger print"),
         ]
         .into_iter()
         .find_map(|(differs, what)| differs.then(|| what.to_string()))
@@ -2175,12 +2296,18 @@ impl Vis {
     /// corrects an earlier one). A closure the reader can't see is ignored for them, so it can
     /// neither end the fact nor override a closure they can see.
     pub fn valid_to(&self, f: &Fact, who: &Principal) -> Option<i64> {
+        self.valid_to_where(f, |episode| self.can_see_episode(episode, who))
+    }
+
+    /// When the fact stops being true for a reader who sees the episodes `sees` names: as [`Vis::valid_to`], for a
+    /// reader who isn't a principal (the operator's export reads every episode it keeps).
+    pub fn valid_to_where(&self, f: &Fact, sees: impl Fn(&str) -> bool) -> Option<i64> {
         let closed = self
             .closures
             .get(&f.fact_id)
             .into_iter()
             .flatten()
-            .find(|(_, episode)| self.can_see_episode(episode, who))
+            .find(|(_, episode)| sees(episode))
             .map(|(end, _)| *end);
         match (f.valid_to, closed) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -7458,21 +7585,27 @@ impl Store {
         let branch = branch.to_string();
         let heads = pinned.map(|(_, h)| h.to_vec());
         // Main's next state made from the last one, when all that changed since adds memory ([`Vis::extended`]):
-        // what was appended is read, not every table again.
+        // what was appended is read, not every table again. Another branch's last state is served as it is when a
+        // build of these tables gives the same one ([`Vis::branch_unchanged`]): an open proposal's branch is read
+        // for every listing of proposals, and main moves under it all the time.
         let extended = match kept {
             Some((built_from, p))
                 if pinned.is_none()
-                    && branch == MAIN
                     && p.fresh_until.is_none_or(|t| now_micros() < t)
                     && p.full_at.elapsed() < VIS_FULL_EVERY =>
             {
-                let (ns, stamp) = (ns.clone(), stamp.clone());
-                tokio::task::spawn_blocking(move || {
-                    p.extended(&ns, &built_from, &stamp, print, read_at)
+                let (ns, stamp, on) = (ns.clone(), stamp.clone(), branch.clone());
+                tokio::task::spawn_blocking(move || match on == MAIN {
+                    true => p
+                        .extended(&ns, &built_from, &stamp, print, read_at)
+                        .map(|next| (Arc::new(next), "incremental")),
+                    false => p
+                        .branch_unchanged(&ns, &on, &built_from, &stamp)
+                        .map(|()| (p, "kept")),
                 })
                 .await?
             }
-            Some(_) => Err("not main's current state, or ten minutes since a full build"),
+            Some(_) => Err("pinned, past its freshness, or ten minutes since a full build"),
             None => Err("none cached"),
         };
         let full = move || {
@@ -7747,13 +7880,20 @@ impl Store {
             Ok::<_, anyhow::Error>((Arc::new(vis), steps))
         };
         let (vis, steps, how) = match extended {
-            Ok(next) => {
-                let next = Arc::new(next);
+            Ok((next, made)) => {
                 if vis_oracle() {
                     // A build of the same tables: the state made from the last one must be the same, nothing more
                     // nor less.
                     let (fresh, _) = tokio::task::spawn_blocking(full).await??;
-                    if let Some(what) = next.same_as(&fresh) {
+                    // A branch's kept state keeps the print it was built with: the scope's ledger moved, so
+                    // the next read checks the branch again ([`Vis::branch_unchanged`]) instead of keeping
+                    // it on the print alone.
+                    let print_differs =
+                        made == "incremental" && next.ledger_print != fresh.ledger_print;
+                    if let Some(what) = next
+                        .same_as(&fresh)
+                        .or_else(|| print_differs.then(|| "ledger print".to_string()))
+                    {
                         metrics::VIS_ORACLE_DIVERGENCE.inc();
                         eprintln!(
                             "visibility oracle: the state of {scope_ns} made from the last one differs from a build in {what}"
@@ -7763,11 +7903,9 @@ impl Store {
                         );
                     }
                 }
-                metrics::VIS_BUILDS
-                    .with_label_values(&["incremental"])
-                    .inc();
+                metrics::VIS_BUILDS.with_label_values(&[made]).inc();
                 let took = build_started.elapsed().as_millis();
-                (next, vec![("incremental", took)], "incremental".to_string())
+                (next, vec![(made, took)], made.to_string())
             }
             Err(why) => {
                 metrics::VIS_BUILDS.with_label_values(&["full"]).inc();
@@ -8941,13 +9079,16 @@ impl Store {
             if g.value_ref.as_deref() == Some(from) || g.value == from {
                 g.value = into.into();
             }
-            // Typed columns are filled again from the schema on write.
+            // Typed columns are filled again from the schema on write, but for a money value's currency, which
+            // its source gave it ([`schema::Schema::normalize`]).
+            if g.value_type.as_deref() != Some(query::schema::ValueType::Money.as_str()) {
+                g.unit = None;
+            }
             g.entity_type = None;
             g.value_type = None;
             g.value_num = None;
             g.value_ts = None;
             g.value_ref = None;
-            g.unit = None;
             if held.contains(&(g.predicate.clone(), g.value.clone())) {
                 continue;
             }

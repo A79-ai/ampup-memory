@@ -2148,7 +2148,7 @@ async fn set_up_machine(
     for h in &agents {
         let changes = match h {
             Harness::ClaudeCode => hook_install::claude_code(false, dry)?,
-            h => hook_install::apply_with(*h, None, Mcp::SignedIn, false, dry)?,
+            h => hook_install::apply_with(*h, None, None, Mcp::SignedIn, false, dry)?,
         };
         if changes.is_empty() {
             println!("{}: already set up", h.name());

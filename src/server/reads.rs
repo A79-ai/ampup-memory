@@ -552,8 +552,14 @@ impl Reads {
                 g.fact_id != f.fact_id && g.entity == f.entity && same(&g.value) == value
             }))
             .collect();
+        self.corroboration_of(who, &facts)
+    }
+
+    /// How many independent sources say what `facts` say, all of them giving one value ([`Reads::corroboration`]
+    /// counts a fact's group this way).
+    pub fn corroboration_of(&self, who: &Principal, facts: &[&Fact]) -> usize {
         let vis: Vec<&crate::Vis> = self.sessions().map(|s| s.vis()).collect();
-        crate::corroboration::count(&vis, who, &facts)
+        crate::corroboration::count(&vis, who, facts)
     }
 
     /// The episodes of type `kind` the caller may read, in every scope read.
@@ -595,6 +601,7 @@ impl Reads {
         whole: bool,
     ) -> Result<HashMap<String, freshness::Mark>> {
         let mut marks = self.fresh(store, who, facts, valid_at, whole).await?;
+        crate::phases::mark("freshness done");
         marks.extend(self.absence(store, who, facts, valid_at).await);
         Ok(marks)
     }

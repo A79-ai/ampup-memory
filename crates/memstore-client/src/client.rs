@@ -884,6 +884,41 @@ pub async fn join(
     use_context(server, &org, team)
 }
 
+/// `ampup-memory-client join <server> --org <org> --api-key <key>`: signs in to `server` with a personal API key,
+/// with no browser (a cloud agent's machine, CI), as `ampup-memory auth login --api-key` does, then adds a context
+/// for `org` (and `team`) there and switches to it. With no org named, the one the server says the key's person is
+/// in. The key is kept in `credentials.json` (owner-only), never in a config an agent reads.
+pub async fn join_with_key(
+    server: &str,
+    org: Option<&str>,
+    team: Option<&str>,
+    key: &str,
+) -> Result<()> {
+    let server = server.trim_end_matches('/');
+    let c = Credentials::api_key(server, key).await?;
+    println!("Signed in to {server} as {} (API key)", c.user);
+    let org = match org {
+        Some(o) => o.to_string(),
+        None => {
+            let me = call_as(server, None, None, None, "GET", "/me", None).await?;
+            let orgs: Vec<String> = me["memberships"]
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            match orgs.as_slice() {
+                [one] => one.clone(),
+                [] => anyhow::bail!("{} is in no org on {server}: name one with --org", c.user),
+                many => anyhow::bail!(
+                    "{} is in several orgs ({}): name one with --org",
+                    c.user,
+                    many.join(", ")
+                ),
+            }
+        }
+    };
+    use_context(server, &org, team)
+}
+
 /// Add a context for `org` (and `team`) on `server` and switch to it.
 fn use_context(server: &str, org: &str, team: Option<&str>) -> Result<()> {
     let mut ctx = Context::default();

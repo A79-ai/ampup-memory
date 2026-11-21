@@ -28,6 +28,12 @@ const LOCK: &str = "autostart.lock";
 /// answers at once.
 const PROBE: Duration = Duration::from_millis(300);
 
+/// The tokens a source a local server reads takes from its environment (`ampup-memory sources`), by their vendors'
+/// own names, that the service can get from the login session instead of its unit file (`service install` says
+/// how). A server started from here keeps them with the other sources' keys (`kept`), never in a file; the
+/// service's unit doesn't carry them, and [`carried_env`] names them with the secrets left out.
+pub const SOURCE_TOKENS: &[&str] = &["SLACK_BOT_TOKEN"];
+
 /// The settings a local server started from here gets: `AMPUP_MEMORY_*` from this environment, but for the
 /// model's (kept in `llm.json`), the client's own and the installer's; and the names of those left out as secrets.
 pub fn carried_env() -> (Vec<(String, String)>, Vec<String>) {
@@ -52,6 +58,10 @@ pub fn carried_env() -> (Vec<(String, String)>, Vec<String>) {
     let mut carried = vec![];
     let mut secret = vec![];
     for (k, v) in std::env::vars() {
+        if SOURCE_TOKENS.contains(&k.as_str()) {
+            secret.push(k);
+            continue;
+        }
         if !k.starts_with("AMPUP_MEMORY_")
             || NOT_THE_SERVERS.contains(&k.as_str())
             || k.starts_with("AMPUP_MEMORY_INSTALL")
@@ -77,14 +87,15 @@ pub fn carried_env() -> (Vec<(String, String)>, Vec<String>) {
 
 /// The rest of the environment a server started from here keeps: where home is, what runs, the locale, how it
 /// reaches the network (a proxy, certificates, the embedding model's files), and the keys the sources it reads
-/// take from its environment (in the process alone: none is written to a file, so the service has none). Never a
-/// model key: the server reads its model from `llm.json`, as the service does, so a key in an agent's environment
-/// isn't spent unasked.
+/// take from its environment (in the process alone: none is written to a file, so the service has none but those
+/// [`SOURCE_TOKENS`] it gets from the login session). Never a model key: the server reads its model from
+/// `llm.json`, as the service does, so a key in an agent's environment isn't spent unasked.
 fn kept(name: &str) -> bool {
     const KEEP: &[&str] = &[
         "LINEAR_API_KEY",
         "SENTRY_AUTH_TOKEN",
         "SENTRY_URL",
+        "SLACK_BOT_TOKEN",
         "HOME",
         "PATH",
         "USER",
