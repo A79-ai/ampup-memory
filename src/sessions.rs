@@ -3949,20 +3949,41 @@ fn last_step(l: &Logged) -> i64 {
     }
 }
 
+/// How long after a session of one request its person's next session in the same client may grade it
+/// ([`grade_tasks`]): `AMPUP_MEMORY_NEXT_SESSION_SECS`, default a day. A client without hooks (claude.ai) keeps a
+/// conversation a session, and the person comes back to the next one hours later, not within the idle time: in one
+/// deployment, 5 of 34 such sessions had the person's next one within 30 minutes, 23 within a day.
+fn next_session_within() -> i64 {
+    std::env::var("AMPUP_MEMORY_NEXT_SESSION_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(86_400)
+        .max(idle().as_secs() as i64)
+        * 1_000_000
+}
+
 /// The person's next message after session `l`: the opening ask of the first of their own sessions in `all` begun
-/// after its last step (a sweep's span before it, which the idle end's time is uncertain by) and within
-/// [`next_within`] of it, a person's, not opened with the same words (an agent's second session for the same
-/// turn); and how long after the last step it came.
-fn next_message<'a>(l: &Logged, all: &'a [Logged]) -> Option<(&'a Logged, i64)> {
+/// after its last step (a sweep's span before it, which the idle end's time is uncertain by) and within `within` of
+/// it (with `same_client`, only one in the same client: a person who opens Claude Code between two claude.ai
+/// conversations answers the first in the second), a person's, not opened with the same words (an agent's second
+/// session for the same turn); and how long after the last step it came.
+fn next_message<'a>(
+    l: &Logged,
+    all: &'a [Logged],
+    within: i64,
+    same_client: bool,
+) -> Option<(&'a Logged, i64)> {
     const SLACK: i64 = 90_000_000;
     let last = last_step(l);
+    let harness = |l: &Logged| l.session.as_ref().and_then(|s| s.harness.clone());
     all.iter()
         .filter(|n| {
             n.answer_id != l.answer_id
                 && n.asker == l.asker
                 && n.asked_at > l.asked_at
                 && n.asked_at >= last - SLACK
-                && n.asked_at <= last + next_within()
+                && n.asked_at <= last + within
+                && (!same_client || harness(n) == harness(l))
                 && n.kind.as_deref() == Some(KIND)
                 && !automated(n)
                 && !discarded(n)
@@ -4011,7 +4032,7 @@ fn after(l: &Logged, all: &[Logged]) -> (String, Vec<&'static str>) {
     if !s.prs.is_empty() {
         kinds.push("pr");
     }
-    if let Some((n, gap)) = next_message(l, all) {
+    if let Some((n, gap)) = next_message(l, all, next_within(), false) {
         out.push(format!(
             "- The user's next message, {} after this session's last step, opening their next session:\n{}",
             minutes(gap),
@@ -4148,9 +4169,15 @@ pub async fn grade_tasks(
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
     let asks = requests(&body);
-    // Each request with the person's next message: the request after it, or for the last, their next session's.
-    let next = next_message(l, all);
-    if asks.len() == 1 && next.is_none() && last_step(l) + next_within() >= now_micros() {
+    // Each request with the person's next message: the request after it, or for the last, their next session's. A
+    // session of one request (a client without hooks keeps a conversation a session) waits up to a day for the
+    // person's next one in the same client.
+    let (within, same_client) = match asks.len() {
+        1 => (next_session_within(), true),
+        _ => (next_within(), false),
+    };
+    let next = next_message(l, all, within, same_client);
+    if asks.len() == 1 && next.is_none() && last_step(l) + within >= now_micros() {
         return Ok(None);
     }
     let pairs: Vec<(&Ask, &str)> = asks
@@ -4176,6 +4203,18 @@ pub async fn grade_tasks(
                     "interrupted": a.interrupted,
                     "next message": head(next.trim(), NEXT_TEXT),
                 })
+            })
+            .zip(
+                // The last's next message opened the person's next session: how long after.
+                std::iter::repeat_n(None, asks.len().saturating_sub(1))
+                    .chain([next.map(|(_, gap)| minutes(gap))]),
+            )
+            .map(|(mut r, came)| {
+                if let Some(c) = came {
+                    r["next message came"] =
+                        json!(format!("{c} later, opening their next conversation"));
+                }
+                r
             })
             .collect();
         let questions = (1..=requests.len())

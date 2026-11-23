@@ -461,6 +461,25 @@ pub static VIS_BUILDS: std::sync::LazyLock<prometheus::IntCounterVec> = std::syn
     },
 );
 
+/// Plans of a scope's facts table (the data files a key lookup, a search's tail and a kept answer's mark read), by how
+/// each was made: `full` (every manifest the snapshot names), `incremental` (the last plan with the manifests appended
+/// since) or `moved` (an own write's: the last plan with what the write appended, from the table it committed, with
+/// no catalog load); and by what made it: a read that waited for it, as none was cached (`cold`), an own write had made
+/// it stale (`written`) or it was past the hard staleness limit (`hard`); a refresh in the background (`background`);
+/// or an own write (`write`).
+pub static FACTS_PLANS: std::sync::LazyLock<prometheus::IntCounterVec> = std::sync::LazyLock::new(
+    || {
+        prometheus::IntCounterVec::new(
+            Opts::new(
+                "memstore_facts_plans_total",
+                "Plans of a scope's facts table, by how (full, incremental, moved) and what made it (cold, written, hard, background, write)",
+            ),
+            &["how", "trigger"],
+        )
+        .unwrap()
+    },
+);
+
 /// Lagged reads a fresh build showed held something it took away (`AMPUP_MEMORY_VIS_ORACLE`): never more than 0.
 pub static VIS_ORACLE_DIVERGENCE: std::sync::LazyLock<IntCounter> = std::sync::LazyLock::new(
     || {

@@ -81,7 +81,6 @@ pub mod notes_dream;
 #[rustfmt::skip] // not in this repository; rustfmt would look for it
 pub mod onboard;
 pub mod people;
-pub mod phases;
 pub mod pii;
 pub mod preflight;
 pub mod profile;

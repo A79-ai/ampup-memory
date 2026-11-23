@@ -623,6 +623,7 @@ pub async fn serve_with(
     metrics.register(Box::new(crate::metrics::VIS_BUILD_SECONDS.clone()));
     metrics.register(Box::new(crate::metrics::VIS_ORACLE_DIVERGENCE.clone()));
     metrics.register(Box::new(crate::metrics::VIS_BUILDS.clone()));
+    metrics.register(Box::new(crate::metrics::FACTS_PLANS.clone()));
     metrics.register(Box::new(crate::metrics::LEDGER_COMPACTION_FAILURES.clone()));
     metrics.register(Box::new(
         crate::metrics::LEDGER_COMPACTION_CLI_NEEDED.clone(),
@@ -14445,7 +14446,7 @@ fn session_tools() -> Vec<Value> {
                 kind of task (follow it unless the data contradicts it). Pass the session_id to get_advice and \
                 end_session.",
             "inputSchema": {"type": "object", "properties": {
-                "context": {"type": "string", "description": "What the user asked, with what came with it"},
+                "context": {"type": "string", "description": "The user's message word for word, as they typed it: not a summary of it or a description of them (\"User wants ...\")"},
                 "harness": {"type": "string", "description": "The client: claude-ai, chatgpt, copilot, ..."},
                 "thread": {"type": "string", "description": "The client's own id for this conversation, if it has one: the sessions one conversation is split into share it, so they read as one"},
                 "split": {"type": "string", "enum": ["train", "test"], "description": "Only for an eval harness: train (teaches advice by end_session's reward) or test (reads advice, teaches nothing)"},

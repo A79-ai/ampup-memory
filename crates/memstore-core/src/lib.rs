@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod offboard;
 pub mod origin;
 pub mod people;
+pub mod phases;
 pub mod pins;
 pub mod platform;
 pub mod query;
@@ -2886,7 +2887,22 @@ fn newest_rows(
     newest.into_iter().map(|(id, (_, r))| (id, r)).collect()
 }
 
-type Plan = (Instant, Table, Vec<FileScanTask>);
+/// A scope's facts plan: the table it is of, the scan tasks of its data files, and what the next plan needs to read
+/// only the manifests appended after it ([`Planned`]).
+#[derive(Clone)]
+struct Plan {
+    /// When it was planned; none once an own write made it stale, after which it is never served, only planned on.
+    at: Option<Instant>,
+    table: Table,
+    tasks: Vec<FileScanTask>,
+    planned: Planned,
+}
+
+impl Plan {
+    fn snapshot(&self) -> Option<&iceberg::spec::SnapshotRef> {
+        self.table.metadata().current_snapshot()
+    }
+}
 type DecodedFiles = HashMap<String, Arc<Vec<RecordBatch>>>;
 /// The tables a visibility state was built from (see `Store::visibility_at`).
 type VisStamp = [Arc<Vec<RecordBatch>>; 8];
@@ -3962,17 +3978,15 @@ impl Store {
         let planned: Vec<String> = self.plans.lock().unwrap().keys().cloned().collect();
         for ns in planned {
             let started = self.plan_generation.lock().unwrap().get(&ns).copied();
-            match load_plan(&*self.catalog(), &ns).await {
-                // Not over a plan our own write made stale meanwhile.
-                Ok((t, tasks))
-                    if self.plan_generation.lock().unwrap().get(&ns).copied() == started =>
-                {
-                    self.plans
-                        .lock()
-                        .unwrap()
-                        .insert(ns, (Instant::now(), t, tasks));
+            let base = self.plans.lock().unwrap().get(&ns).cloned();
+            match load_plan(&*self.catalog(), &ns, base.as_ref(), "background").await {
+                Ok(plan) => {
+                    let mut plans = self.plans.lock().unwrap();
+                    // Not over a plan our own write made stale meanwhile.
+                    if self.plan_generation.lock().unwrap().get(&ns).copied() == started {
+                        plans.insert(ns, plan);
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => eprintln!("memstore: reloading the plan of {ns} failed: {e:#}"),
             }
         }
@@ -4229,7 +4243,10 @@ impl Store {
                 .unwrap()
                 .entry(ns.into())
                 .or_default() += 1;
-            self.plans.lock().unwrap().remove(ns);
+            // Kept, never served again: the next plan reads only the manifests appended after it.
+            if let Some(p) = self.plans.lock().unwrap().get_mut(ns) {
+                p.at = None;
+            }
         }
         let key = format!("{ns}.{name}");
         // Bumped whether or not the table is cached: a load under way (of a table not cached, or dropped by the
@@ -4265,24 +4282,72 @@ impl Store {
     /// write was noted since `before` (one committed after it, or one committed before it but noted later), and
     /// is otherwise left stale, as [`Store::invalidate`] leaves it, as it is when reading the new files fails.
     pub async fn wrote(&self, ns: &str, name: &str, after: Table, before: u64) {
+        // Readers that find the plan stale while it moves wait for the move (the turn `facts_plan` takes to plan) and
+        // take the moved plan, rather than each loading the table. Never waited for here: a reader planning now
+        // keeps its turn, and the move goes on beside it.
+        let loading = (name == FACTS).then(|| self.cache.loading(&format!("plan:{ns}")));
+        let _turn = loading.as_ref().and_then(|l| l.try_lock().ok());
         self.invalidate(ns, name);
-        let key = format!("{ns}.{name}");
-        // Not cached, or cached under another schema (the write evolved it): moving would read every file of the
-        // table here, in the writer's turn. The next read loads it, as before.
-        let prev = self.cache.entries.lock().unwrap().get(&key).cloned();
-        // Nor a table a rewrite has marked (`refresh_once` refuses the ledger's then): the next read waits it out.
-        if prev
-            .as_ref()
-            .is_none_or(|p| p.schema_id != after.metadata().current_schema_id())
-            || after
-                .metadata()
-                .properties()
-                .contains_key(offboard::REWRITE_PROP)
-        {
+        // The facts plan moves with the rows: a read after the write doesn't wait for the catalog to plan the table.
+        let plan = async {
+            if name == FACTS {
+                self.plan_wrote(ns, &after, before).await;
+            }
+        };
+        let rows = async {
+            let key = format!("{ns}.{name}");
+            // Not cached, or cached under another schema (the write evolved it): moving would read every file of the
+            // table here, in the writer's turn. The next read loads it, as before.
+            let prev = self.cache.entries.lock().unwrap().get(&key).cloned();
+            // Nor a table a rewrite has marked (`refresh_once` refuses the ledger's then): the next read waits it out.
+            if prev
+                .as_ref()
+                .is_none_or(|p| p.schema_id != after.metadata().current_schema_id())
+                || after
+                    .metadata()
+                    .properties()
+                    .contains_key(offboard::REWRITE_PROP)
+            {
+                return;
+            }
+            if let Err(e) = install(&self.cache, key, prev, after.clone(), before + 1).await {
+                eprintln!("memstore: caching the rows written to {ns}.{name} failed: {e:#}");
+            }
+        };
+        tokio::join!(rows, plan);
+    }
+
+    /// This store's own append to `ns`'s facts committed as `after` ([`Store::wrote`], which has just made the plan
+    /// stale): the plan moves to `after` from the last one, reading only the manifests the snapshots since appended,
+    /// and with no catalog load. Fresh under the same rule as the rows: only when no other own write was noted since
+    /// `before`. Otherwise, or when `after` can't be planned on from the last plan (no plan held, or a snapshot since
+    /// removed or rewrote files), it stays stale and the next read plans: never a full plan in the writer's turn.
+    async fn plan_wrote(&self, ns: &str, after: &Table, before: u64) {
+        let started = self.plan_generation.lock().unwrap().get(ns).copied();
+        let Some(base) = self.plans.lock().unwrap().get(ns).cloned() else {
             return;
-        }
-        if let Err(e) = install(&self.cache, key, prev, after, before + 1).await {
-            eprintln!("memstore: caching the rows written to {ns}.{name} failed: {e:#}");
+        };
+        match plan_on(after, &base).await {
+            Ok(Some(plan)) => {
+                let mut plans = self.plans.lock().unwrap();
+                // Nor over a plan a refresh loaded since the write, of a later snapshot: a plan never moves back.
+                let seq = |p: &Plan| p.snapshot().map(|s| s.sequence_number());
+                let later = plans.get(ns).is_some_and(|held| {
+                    held.table.metadata().uuid() == plan.table.metadata().uuid()
+                        && seq(held) > seq(&plan)
+                });
+                if self.plan_generation.lock().unwrap().get(ns).copied() == started
+                    && self.generation(ns, FACTS) == before + 1
+                    && !later
+                {
+                    plans.insert(ns.to_string(), plan);
+                    metrics::FACTS_PLANS
+                        .with_label_values(&["moved", "write"])
+                        .inc();
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("memstore: planning the facts written to {ns} failed: {e:#}"),
         }
     }
 
@@ -9124,71 +9189,80 @@ impl Store {
     }
 
     /// The facts table's plan for `ns`: its table and data files. Same policy as `rows`: the cached plan,
-    /// refreshed in the background once older than the staleness window.
+    /// refreshed in the background once older than the staleness window; a read waits only when none is cached,
+    /// after an own write the plan couldn't move with ([`Store::wrote`]), or past the hard staleness limit. Readers
+    /// that wait share one plan, which reads only the manifests appended since the last one where it can.
     async fn facts_plan(&self, ns: &str) -> Result<(Table, Vec<FileScanTask>)> {
-        let ns = ns.to_string();
-        // Same policy as `rows`: serve the cached plan and refresh it in the background once
-        // older than the staleness window; block only when cold, after an own write (the entry
-        // is removed), or past the hard staleness limit.
-        let planned = self.plans.lock().unwrap().get(&ns).cloned();
-        Ok(match planned {
-            Some((at, table, tasks)) if at.elapsed() < self.hard_staleness => {
-                if at.elapsed() >= self.refresh_after()
-                    && self
-                        .cache
+        let held = self.plans.lock().unwrap().get(ns).cloned();
+        if let Some(p) = &held
+            && let Some(at) = p.at
+            && at.elapsed() < self.hard_staleness
+        {
+            if at.elapsed() >= self.refresh_after()
+                && self
+                    .cache
+                    .refreshing
+                    .lock()
+                    .unwrap()
+                    .insert(format!("plan:{ns}"))
+            {
+                let (catalog, plans, generations, cache) = (
+                    self.catalog(),
+                    self.plans.clone(),
+                    self.plan_generation.clone(),
+                    self.cache.clone(),
+                );
+                let ns = ns.to_string();
+                tokio::spawn(loads::later(async move {
+                    let started = generations.lock().unwrap().get(&ns).copied();
+                    let base = plans.lock().unwrap().get(&ns).cloned();
+                    match load_plan(&*catalog, &ns, base.as_ref(), "background").await {
+                        Ok(plan) => {
+                            let mut plans = plans.lock().unwrap();
+                            // Not over a plan our own write made stale meanwhile.
+                            if generations.lock().unwrap().get(&ns).copied() == started {
+                                plans.insert(ns.clone(), plan);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("memstore: background plan refresh of {ns} failed: {e:#}");
+                            tokio::time::sleep(retry::cooldown(&e)).await;
+                        }
+                    }
+                    cache
                         .refreshing
                         .lock()
                         .unwrap()
-                        .insert(format!("plan:{ns}"))
-                {
-                    let (catalog, plans, generations, cache) = (
-                        self.catalog(),
-                        self.plans.clone(),
-                        self.plan_generation.clone(),
-                        self.cache.clone(),
-                    );
-                    let ns = ns.clone();
-                    tokio::spawn(loads::later(async move {
-                        let started = generations.lock().unwrap().get(&ns).copied();
-                        match load_plan(&*catalog, &ns).await {
-                            Ok((t, tasks))
-                                if generations.lock().unwrap().get(&ns).copied() == started =>
-                            {
-                                plans
-                                    .lock()
-                                    .unwrap()
-                                    .insert(ns.clone(), (Instant::now(), t, tasks));
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                eprintln!(
-                                    "memstore: background plan refresh of {ns} failed: {e:#}"
-                                );
-                                tokio::time::sleep(retry::cooldown(&e)).await;
-                            }
-                        }
-                        cache
-                            .refreshing
-                            .lock()
-                            .unwrap()
-                            .remove(&format!("plan:{ns}"));
-                    }));
-                }
-                (table, tasks)
+                        .remove(&format!("plan:{ns}"));
+                }));
             }
-            _ => {
-                let started = self.plan_generation.lock().unwrap().get(&ns).copied();
-                let (table, tasks) = load_plan(&*self.catalog(), &ns).await?;
-                // Our own write landed meanwhile: use this plan once, but don't cache it.
-                if self.plan_generation.lock().unwrap().get(&ns).copied() == started {
-                    self.plans
-                        .lock()
-                        .unwrap()
-                        .insert(ns.clone(), (Instant::now(), table.clone(), tasks.clone()));
-                }
-                (table, tasks)
+            return Ok((p.table.clone(), p.tasks.clone()));
+        }
+        // One plan of a scope at a time: a reader that arrives meanwhile takes the plan it made.
+        let loading = self.cache.loading(&format!("plan:{ns}"));
+        let _turn = loading.lock().await;
+        let base = self.plans.lock().unwrap().get(ns).cloned();
+        if let Some(p) = &base
+            && p.at.is_some_and(|at| at.elapsed() < self.hard_staleness)
+        {
+            return Ok((p.table.clone(), p.tasks.clone()));
+        }
+        let why = match &base {
+            None => "cold: none cached",
+            Some(p) if p.at.is_none() => "written: an own write made it stale",
+            Some(_) => "hard: past the hard staleness limit",
+        };
+        let started = self.plan_generation.lock().unwrap().get(ns).copied();
+        let plan = load_plan(&*self.catalog(), ns, base.as_ref(), why).await?;
+        crate::phases::mark("facts plan waited");
+        {
+            let mut plans = self.plans.lock().unwrap();
+            // Our own write landed meanwhile: use this plan once, but don't cache it.
+            if self.plan_generation.lock().unwrap().get(ns).copied() == started {
+                plans.insert(ns.to_string(), plan.clone());
             }
-        })
+        }
+        Ok((plan.table, plan.tasks))
     }
 
     /// The facts table of `scope` as this server reads it now: its snapshot's sequence number, and its facts
@@ -12179,12 +12253,24 @@ async fn install(
     Ok(snap)
 }
 
-/// A facts table's metadata and its planned data files.
-async fn load_plan(catalog: &dyn Catalog, ns: &str) -> Result<(Table, Vec<FileScanTask>)> {
-    with_retries(|| load_plan_once(catalog, ns)).await
+/// A facts table's metadata and its planned data files, from `base` (the scope's last plan) where every snapshot
+/// since only appended ([`plan_on`]), else in full. `why`: what asked for it, for the slow-plan line and the
+/// metric's trigger (the part before any `:`).
+async fn load_plan(
+    catalog: &dyn Catalog,
+    ns: &str,
+    base: Option<&Plan>,
+    why: &str,
+) -> Result<Plan> {
+    with_retries(|| load_plan_once(catalog, ns, base, why)).await
 }
 
-async fn load_plan_once(catalog: &dyn Catalog, ns: &str) -> Result<(Table, Vec<FileScanTask>)> {
+async fn load_plan_once(
+    catalog: &dyn Catalog,
+    ns: &str,
+    base: Option<&Plan>,
+    why: &str,
+) -> Result<Plan> {
     let ident = TableIdent::new(NamespaceIdent::new(ns.into()), FACTS.into());
     let t0 = Instant::now();
     let table = catalog
@@ -12192,30 +12278,66 @@ async fn load_plan_once(catalog: &dyn Catalog, ns: &str) -> Result<(Table, Vec<F
         .await
         .with_context(|| format!("load table {ns}.{FACTS}"))?;
     let loaded = t0.elapsed();
-    let tasks = match table.metadata().current_snapshot() {
-        None => vec![],
-        Some(_) => {
-            planned(
-                table
-                    .scan()
-                    .select_all()
-                    .with_concurrency_limit(LOAD_CONCURRENCY)
-                    .build()?,
-            )
-            .await?
+    let on = match base {
+        Some(b) => plan_on(&table, b).await?,
+        None => None,
+    };
+    let how = if on.is_some() { "incremental" } else { "full" };
+    let plan = match on {
+        Some(p) => p,
+        None => {
+            let (tasks, planned) = plan_full(&table).await?;
+            Plan {
+                at: Some(Instant::now()),
+                table,
+                tasks,
+                planned,
+            }
         }
     };
+    metrics::FACTS_PLANS
+        .with_label_values(&[how, why.split(':').next().unwrap_or(why)])
+        .inc();
     // A plan that takes long says where: the table's metadata, or listing its files from the manifests.
     if t0.elapsed() > Duration::from_secs(1) {
         eprintln!(
-            "memstore: slow plan of {ns}: {} ms ({} ms loading the table, {} snapshots, then {} files planned)",
+            "memstore: slow plan of {ns} ({why}): {} ms ({} ms loading the table, {} snapshots, then {} files planned, {how})",
             t0.elapsed().as_millis(),
             loaded.as_millis(),
-            table.metadata().snapshots().count(),
-            tasks.len()
+            plan.table.metadata().snapshots().count(),
+            plan.tasks.len()
         );
     }
-    Ok((table, tasks))
+    Ok(plan)
+}
+
+/// `table`'s plan from `base`, an earlier plan of the same table: its tasks, with those of the files appended since
+/// ([`plan_appended`]). None when it can't be worked out that way (another table, schema, or a snapshot since that
+/// did more than append): the caller plans in full.
+async fn plan_on(table: &Table, base: &Plan) -> Result<Option<Plan>> {
+    let (meta, was) = (table.metadata(), base.table.metadata());
+    if meta.uuid() != was.uuid() || meta.current_schema_id() != was.current_schema_id() {
+        return Ok(None);
+    }
+    let since = base.snapshot().map(|s| s.snapshot_id());
+    let plan = |tasks, planned| Plan {
+        at: Some(Instant::now()),
+        table: table.clone(),
+        tasks,
+        planned,
+    };
+    if meta.current_snapshot().map(|s| s.snapshot_id()) == since {
+        return Ok(Some(plan(base.tasks.clone(), base.planned.clone())));
+    }
+    let Some((added, planned)) = plan_appended(table, since, &base.planned).await? else {
+        return Ok(None);
+    };
+    let mut keys: HashSet<String> = base.tasks.iter().map(file_key).collect();
+    keys.extend(added.iter().map(file_key));
+    check_plan(table, &keys, &added).await?;
+    let mut tasks = base.tasks.clone();
+    tasks.extend(added);
+    Ok(Some(plan(tasks, planned)))
 }
 
 /// A catalog that answers `load_table` for one table with a fixed, already-loaded version and
@@ -12468,8 +12590,15 @@ async fn read_planned(
     table: &Table,
     cached: HashMap<String, Arc<Vec<RecordBatch>>>,
 ) -> Result<(HashMap<String, Arc<Vec<RecordBatch>>>, Planned)> {
+    let (tasks, planned) = plan_full(table).await?;
+    Ok((read_tasks(table, tasks, cached).await?, planned))
+}
+
+/// A full plan of the current snapshot (every manifest it names), and what the next plan needs to read only what
+/// is appended after it.
+async fn plan_full(table: &Table) -> Result<(Vec<FileScanTask>, Planned)> {
     let Some(current) = table.metadata().current_snapshot() else {
-        return Ok((HashMap::new(), Planned::default()));
+        return Ok((vec![], Planned::default()));
     };
     let tasks = plan_all(table).await?;
     let planned = Planned {
@@ -12483,7 +12612,7 @@ async fn read_planned(
         }),
         template: tasks.first().cloned(),
     };
-    Ok((read_tasks(table, tasks, cached).await?, planned))
+    Ok((tasks, planned))
 }
 
 /// Object-store reads one table load keeps in flight: its manifests while planning, then its data files. They wait
@@ -12546,6 +12675,29 @@ async fn read_appended(
     prev_files: &HashMap<String, Arc<Vec<RecordBatch>>>,
     prev_planned: &Planned,
 ) -> Result<Option<(HashMap<String, Arc<Vec<RecordBatch>>>, Planned)>> {
+    let Some((tasks, planned)) = plan_appended(table, since, prev_planned).await? else {
+        return Ok(None);
+    };
+    let mut keys: HashSet<String> = prev_files.keys().cloned().collect();
+    keys.extend(tasks.iter().map(file_key));
+    check_plan(table, &keys, &tasks).await?;
+    let mut files = read_tasks(table, tasks, prev_files.clone()).await?;
+    // Every file the cached snapshot had is still there (nothing was removed).
+    for (k, b) in prev_files {
+        files.entry(k.clone()).or_insert_with(|| b.clone());
+    }
+    Ok(Some((files, planned)))
+}
+
+/// The scan tasks of the data files appended to `table` since the snapshot `since`, planned as `prev_planned` was,
+/// and what the next plan after them reads from: only the manifests the current snapshot names beyond
+/// `prev_planned`'s, when every snapshot after `since` only appended data files (no file removed or rewritten, no
+/// row deleted, no manifest rewritten). None otherwise: the caller plans the table in full.
+async fn plan_appended(
+    table: &Table,
+    since: Option<i64>,
+    prev_planned: &Planned,
+) -> Result<Option<(Vec<FileScanTask>, Planned)>> {
     use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus, Operation};
     let meta = table.metadata();
     let (Some(current), Some(since), Some(template)) =
@@ -12607,52 +12759,49 @@ async fn read_appended(
             });
         }
     }
-    let mut keys: HashSet<String> = prev_files.keys().cloned().collect();
-    keys.extend(tasks.iter().map(file_key));
-    // AMPUP_MEMORY_CHECK_PLAN (set in CI's test run): every incremental read is checked against a full plan, its
-    // files and how each new one is read. A divergence aborts the process: a refresh in the background only
-    // logs its errors, and the test that hit it must fail.
-    if std::env::var_os("AMPUP_MEMORY_CHECK_PLAN").is_some() {
-        let full = plan_all(table).await?;
-        let full_keys: HashSet<String> = full.iter().map(file_key).collect();
-        let by_key: HashMap<String, &FileScanTask> =
-            full.iter().map(|t| (file_key(t), t)).collect();
-        let misread = tasks.iter().find(|t| {
-            by_key.get(&file_key(t)).is_none_or(|f| {
-                f.schema != t.schema
-                    || f.project_field_ids != t.project_field_ids
-                    || f.partition != t.partition
-                    || f.record_count != t.record_count
-            })
-        });
-        if full_keys != keys || misread.is_some() {
-            eprintln!(
-                "AMPUP_MEMORY_CHECK_PLAN: the incremental plan of {} differs from the full plan: {} files only in it, \
-                 {} only in the full plan, new file read differently: {:?} (the full plan holds {} files, the snapshot \
-                 says {:?})",
-                meta.location(),
-                keys.difference(&full_keys).count(),
-                full_keys.difference(&keys).count(),
-                misread.map(|t| &t.data_file_path),
-                full.len(),
-                current
-                    .summary()
-                    .additional_properties
-                    .get("total-data-files")
-            );
-            std::process::abort();
-        }
-    }
     let planned = Planned {
         manifests: Arc::new(manifests),
         template: Some(template.clone()),
     };
-    let mut files = read_tasks(table, tasks, prev_files.clone()).await?;
-    // Every file the cached snapshot had is still there (nothing was removed).
-    for (k, b) in prev_files {
-        files.entry(k.clone()).or_insert_with(|| b.clone());
+    Ok(Some((tasks, planned)))
+}
+
+/// AMPUP_MEMORY_CHECK_PLAN (set in CI's test run): every incremental plan is checked against a full plan, its files
+/// (`keys`, the files it holds) and how each new one (`added`) is read. A divergence aborts the process: a refresh in
+/// the background only logs its errors, and the test that hit it must fail.
+async fn check_plan(table: &Table, keys: &HashSet<String>, added: &[FileScanTask]) -> Result<()> {
+    if std::env::var_os("AMPUP_MEMORY_CHECK_PLAN").is_none() {
+        return Ok(());
     }
-    Ok(Some((files, planned)))
+    let full = plan_all(table).await?;
+    let full_keys: HashSet<String> = full.iter().map(file_key).collect();
+    let by_key: HashMap<String, &FileScanTask> = full.iter().map(|t| (file_key(t), t)).collect();
+    let misread = added.iter().find(|t| {
+        by_key.get(&file_key(t)).is_none_or(|f| {
+            f.schema != t.schema
+                || f.project_field_ids != t.project_field_ids
+                || f.partition != t.partition
+                || f.record_count != t.record_count
+        })
+    });
+    if full_keys != *keys || misread.is_some() {
+        eprintln!(
+            "AMPUP_MEMORY_CHECK_PLAN: the incremental plan of {} differs from the full plan: {} files only in it, \
+             {} only in the full plan, new file read differently: {:?} (the full plan holds {} files, the snapshot \
+             says {:?})",
+            table.metadata().location(),
+            keys.difference(&full_keys).count(),
+            full_keys.difference(keys).count(),
+            misread.map(|t| &t.data_file_path),
+            full.len(),
+            table
+                .metadata()
+                .current_snapshot()
+                .and_then(|s| s.summary().additional_properties.get("total-data-files"))
+        );
+        std::process::abort();
+    }
+    Ok(())
 }
 
 /// Decoded batches per task's file, reusing `cached` for files already read.

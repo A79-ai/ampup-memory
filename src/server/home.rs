@@ -86,6 +86,7 @@ pub(super) async fn run(
     req: &Value,
 ) -> Result<Value> {
     let who = reader.who;
+    crate::phases::mark("home");
     // `parts`: those a first ask said were pending, waited for longer; else every part, for at most `FIRST`.
     let (wanted, wait): (Vec<&str>, Duration) = match req["parts"].as_array() {
         Some(asked) => (
@@ -152,6 +153,7 @@ pub(super) async fn run(
                         m.insert(name.into(), c["count"].clone());
                     }
                 }
+                crate::phases::mark("home counts");
                 return Some(Value::Object(m));
             }
             tokio::time::sleep(COUNTS_EVERY).await;
@@ -199,24 +201,27 @@ pub(super) async fn run(
             }
             None => work().await,
         };
+        crate::phases::mark("home week");
         got.map_err(|e| eprintln!("home: the week in {} not read: {e:#}", session.scope()))
             .ok()
     };
     let lessons = async {
-        browse(json!({"op": "lessons", "since": since, "count": true}))
-            .await
-            .map(|l| l["count"].clone())
+        let l = browse(json!({"op": "lessons", "since": since, "count": true})).await;
+        crate::phases::mark("home lessons");
+        l.map(|l| l["count"].clone())
     };
     // Branches as built already: Home builds none (a branch's state is a build of the whole memory), so a branch
     // not built has its skills unknown (null).
     let branches = async {
-        browse(json!({"op": "branches", "build": false}))
-            .await
-            .map(|b| b["branches"].clone())
+        let b = browse(json!({"op": "branches", "build": false})).await;
+        crate::phases::mark("home branches");
+        b.map(|b| b["branches"].clone())
     };
     let activity = async {
         let a =
-            admin(json!({"op": "activity", "since_secs": WEEK_DAYS * 86_400, "limit": 1})).await?;
+            admin(json!({"op": "activity", "since_secs": WEEK_DAYS * 86_400, "limit": 1})).await;
+        crate::phases::mark("home activity");
+        let a = a?;
         let people: Vec<&Value> = a["people"]
             .as_array()
             .into_iter()
@@ -258,15 +263,17 @@ pub(super) async fn run(
         }))
     };
     let conflicts = async {
-        admin(json!({"op": "list_conflicts", "mine": true, "limit": 1}))
-            .await
-            .map(|c| c["result"]["total"].clone())
+        let c = admin(json!({"op": "list_conflicts", "mine": true, "limit": 1})).await;
+        crate::phases::mark("home conflicts");
+        c.map(|c| c["result"]["total"].clone())
     };
     let dream = async {
-        let mut d = admin(
+        let d = admin(
             json!({"op": "dream_decisions", "status": "applied", "since": since, "limit": 1}),
         )
-        .await?;
+        .await;
+        crate::phases::mark("home dream");
+        let mut d = d?;
         d["result"]["decisions"] = json!([]);
         Some(d["result"].take())
     };
@@ -284,6 +291,7 @@ pub(super) async fn run(
             part(want("conflicts"), until, conflicts),
             part(want("dream"), until, dream),
         );
+        crate::phases::mark("home parts");
         let _ = rest_done.send(true);
         got
     };
@@ -302,6 +310,7 @@ pub(super) async fn run(
     };
     let ((counts, week, lessons, branches, activity, conflicts, dream), proposals) =
         tokio::join!(rest, proposals);
+    crate::phases::mark("home answered");
     let mut out = json!({"since": since});
     let mut pending = vec![];
     for (name, got) in [
