@@ -928,7 +928,9 @@ pub async fn list(store: &Store, scope: &Scope, goal: Option<&str>) -> Result<Ve
     crate::phases::mark("qa_log view");
     let rows = store.side_rows(&scope.namespace(), QA_LOG).await?;
     let decoded = decoded(scope, rows);
-    Ok(newest(&view, &decoded, goal))
+    let out = newest(&view, &decoded, goal);
+    crate::phases::mark("qa_log newest");
+    Ok(out)
 }
 
 /// One row of the log as written, decoded.

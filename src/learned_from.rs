@@ -10,6 +10,10 @@
 //! Every count is over what the caller may read and nothing else: an episode they can't read is in no count and
 //! names no source, and a fact counts only when they may read it (every episode it cites), as every read decides. A
 //! prefix with nothing the caller may read answers zeros, the same whether or not someone else's memory is there.
+//!
+//! Each source also says when its oldest and newest episodes happened (`first_occurred`, `last_occurred`), and, given
+//! `since` (µs), how many happened from then on (`since_episodes`): whether the memory holds a window of it, or
+//! needs it filled from further back (`ampup-memory-client index` reads it so).
 
 use std::collections::HashMap;
 
@@ -31,6 +35,10 @@ struct Tally {
     episodes: usize,
     last_written: Option<i64>,
     last_occurred: Option<i64>,
+    /// When its oldest episode happened: how far back the memory holds it.
+    first_occurred: Option<i64>,
+    /// Its episodes that happened at or after the request's `since`.
+    since: usize,
     facts: usize,
     current: usize,
     last_fact: Option<i64>,
@@ -59,6 +67,14 @@ pub async fn run(store: &Store, session: &Session, who: &Principal, req: &Value)
             .filter(|n| *n as usize <= MAX_TOP)
             .ok_or_else(|| bad(format!("top is a whole number, 0 to {MAX_TOP}")))?
             as usize,
+    };
+    // `since` (µs): also count each source's episodes that happened at or after it, so a caller sees what a window holds.
+    let since = match &req["since"] {
+        Value::Null => None,
+        v => Some(
+            v.as_i64()
+                .ok_or_else(|| bad("since is a time in microseconds"))?,
+        ),
     };
     let (eps, facts) = tokio::try_join!(episodes(store, session, who), facts(store, session, who))?;
 
@@ -94,6 +110,11 @@ pub async fn run(store: &Store, session: &Session, who: &Principal, req: &Value)
             t.episodes += 1;
             t.last_written = t.last_written.max(Some(e.recorded_at));
             t.last_occurred = t.last_occurred.max(Some(e.occurred_at));
+            t.first_occurred = Some(
+                t.first_occurred
+                    .map_or(e.occurred_at, |f| f.min(e.occurred_at)),
+            );
+            t.since += usize::from(since.is_some_and(|s| e.occurred_at >= s));
         }
         if !at.is_empty() {
             of_episode.insert(e.id.as_str(), at);
@@ -134,7 +155,7 @@ pub async fn run(store: &Store, session: &Session, who: &Principal, req: &Value)
                 .take(top)
                 .map(|(e, n)| json!({"entity": e, "facts": n}))
                 .collect();
-            json!({
+            let mut v = json!({
                 "source": source,
                 "type": crate::episode_types::name_of_source(&source),
                 "episodes": t.episodes,
@@ -145,7 +166,12 @@ pub async fn run(store: &Store, session: &Session, who: &Principal, req: &Value)
                 "last_fact": t.last_fact,
                 "entities": t.entities.len(),
                 "top_entities": top_entities,
-            })
+                "first_occurred": t.first_occurred,
+            });
+            if since.is_some() {
+                v["since_episodes"] = json!(t.since);
+            }
+            v
         })
         .collect();
     Ok(json!({"sources": sources}))

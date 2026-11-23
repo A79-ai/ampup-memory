@@ -194,6 +194,7 @@ pub async fn run(
 async fn branches(store: &Store, scope: &Scope, who: &Principal, build: bool) -> Result<Value> {
     // Listed only: the ledger as this server holds it, and each branch's skills read at once.
     let mut names: Vec<String> = store.branch_heads_held(scope).await?.into_keys().collect();
+    crate::phases::mark("branches listed");
     names.sort_by_key(|b| (b.as_str() != crate::MAIN, b.clone()));
     if names.is_empty() {
         names.push(crate::MAIN.to_string());
@@ -208,6 +209,7 @@ async fn branches(store: &Store, scope: &Scope, who: &Principal, build: bool) ->
         }
     }))
     .await?;
+    crate::phases::mark("branches pinned");
     let mut unbuilt = vec![];
     let mut out: Vec<Value> = Vec::with_capacity(names.len());
     for (b, session) in names.into_iter().zip(pinned) {

@@ -109,6 +109,52 @@ enum Cmd {
         #[arg(long)]
         refresh: bool,
     },
+    /// Index the Claude Code sessions on this machine that started in the last N days: send the ones the memory
+    /// doesn't have yet to it, as the hooks would have at their end, and write Memory Replay, a page of what your
+    /// sessions went back for again (files, commands, errors, lookups) with the notes that would have spared them,
+    /// written by Claude through your own Claude Code (`claude -p`: its login, or CLAUDE_CODE_OAUTH_TOKEN from
+    /// `claude setup-token`)
+    Index {
+        /// How far back, in days
+        #[arg(long, default_value_t = 14)]
+        days: u64,
+        /// Write the report only: send nothing to the memory
+        #[arg(long)]
+        report_only: bool,
+        /// At most this many notes Claude writes (0: none, and Claude isn't run)
+        #[arg(long, default_value_t = 12)]
+        notes: usize,
+        /// The model Claude Code writes the notes with
+        #[arg(long, env = "AMPUP_MEMORY_INDEX_MODEL", default_value = "sonnet")]
+        model: String,
+        /// Don't open the report in the browser
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// The facts you may read, newest first, one a line (`/ampup-memory:facts`)
+    Facts {
+        /// Words the fact's value or quote holds
+        text: Vec<String>,
+        /// How many (at most 500)
+        #[arg(long, default_value_t = 20)]
+        limit: u64,
+        /// Only facts from notes remembered in conversations
+        #[arg(long)]
+        mine: bool,
+    },
+    /// The advice you may read: your own and the team's, one situation a line (`/ampup-memory:advises`)
+    Advice {
+        /// Words the situation or its note holds
+        text: Vec<String>,
+        /// How many (at most 200)
+        #[arg(long, default_value_t = 20)]
+        limit: u64,
+        /// mine, team or all
+        #[arg(long, default_value = "all")]
+        space: String,
+    },
+    /// What the memory holds and what it learned and served this week (`/ampup-memory:stats`)
+    Stats,
     /// Install the newest release over this binary, if it is newer (a session's start runs this in the background)
     #[command(hide = true)]
     Update,
@@ -188,6 +234,22 @@ async fn run() -> Result<()> {
             dry_run,
         ),
         Cmd::Mcp => hook::bridge().await,
+        Cmd::Index {
+            days,
+            report_only,
+            notes,
+            model,
+            no_open,
+        } => {
+            hook::index::run(hook::index::Options {
+                days,
+                send: !report_only,
+                notes,
+                model,
+                open: !no_open,
+            })
+            .await
+        }
         Cmd::Doctor => hook::doctor().await,
         Cmd::Metric {
             name,
@@ -196,6 +258,15 @@ async fn run() -> Result<()> {
             filters,
             refresh,
         } => hook::metric(&name, evidence, limit, filters.as_deref(), refresh).await,
+        Cmd::Facts { text, limit, mine } => {
+            let t = text.join(" ");
+            hook::facts(Some(&t), limit, mine).await
+        }
+        Cmd::Advice { text, limit, space } => {
+            let t = text.join(" ");
+            hook::advice(Some(&t), limit, &space).await
+        }
+        Cmd::Stats => hook::stats().await,
         Cmd::Update => {
             update::now(VERSION).await;
             Ok(())

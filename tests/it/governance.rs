@@ -673,6 +673,9 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    // Her answer is worked out ahead in the background from her first ask on (a second's look, then the parts):
+    // given the time to be, the asks below after she loses the note check it is never answered.
+    tokio::time::sleep(Duration::from_secs(5)).await;
     let his = home(e.bob.clone()).await;
     assert!(!from_private(&his), "{his}");
     assert!(!his.to_string().contains("xprivate"), "{his}");
@@ -735,6 +738,11 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
     assert!(!theirs.contains("xprivate-value"), "{theirs}");
     assert!(!read(e.carol.clone()).await.contains("xprivate-value"));
     assert!(!read(e.bob.clone()).await.contains("xprivate-value"));
+    // Her Home, worked out ahead in the background since she asked for it, never answers what was worked out while
+    // she still read the note: from the first page it shows gone, her week no longer counts it.
+    let hers = home(e.carol.clone()).await;
+    assert!(!from_private(&hers), "{hers}");
+    assert!(!hers.to_string().contains("xprivate"), "{hers}");
     // Forgetting it stays immediate.
     e.store
         .change_acl(
@@ -758,6 +766,8 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
     let theirs = graph(e.carol.clone()).await;
     assert!(!theirs.contains("xprivate-value"), "{theirs}");
     assert!(!read(e.carol.clone()).await.contains("xprivate-value"));
+    let hers = home(e.carol.clone()).await;
+    assert!(!from_private(&hers), "{hers}");
 
     // Team membership is required even when the caller administers its organization.
     admin(

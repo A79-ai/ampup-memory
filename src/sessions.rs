@@ -3249,6 +3249,23 @@ pub async fn end(
     }
     // A run whose harness kept no transcript (`discard`) ends with nothing to keep, and out of the daily count.
     let discard = args["discard"].as_bool() == Some(true);
+    // When the session happened, for a session ended long after it ran (`ampup-memory-client index` backfilling a
+    // machine's past sessions): its conversation's episode is dated then, so what is learned from it is too. Only the
+    // hook client's (the server drops it from an agent's own call); never ahead of now. The session's row keeps its
+    // own times, which its grading and the day's count read.
+    let occurred = match &args["occurred_at"] {
+        Value::Null => None,
+        Value::String(t) => Some(
+            chrono::DateTime::parse_from_rfc3339(t)
+                .map_err(|_| refuse("occurred_at is an RFC 3339 time".into()))?
+                .timestamp_micros(),
+        ),
+        v => Some(
+            v.as_i64()
+                .ok_or_else(|| refuse("occurred_at is an RFC 3339 time".into()))?,
+        ),
+    }
+    .map(|t| t.min(now_micros()));
     // The transcript given, else the last conversation the session was sent (its episode).
     let transcript = match (text(args, "transcript"), s.conversation.take()) {
         _ if discard => None,
@@ -3319,7 +3336,10 @@ pub async fn end(
         .into(),
     );
     if let Some(t) = &transcript {
-        let ep = transcript_episode(signed, &id, &l.question, t, outcome, &s.acl);
+        let mut ep = transcript_episode(signed, &id, &l.question, t, outcome, &s.acl);
+        if let Some(at) = occurred {
+            ep.occurred_at = at;
+        }
         commit_unless_held(store, scope, asker, &ep).await?;
         l.episodes.push(ep.episode_id);
     }

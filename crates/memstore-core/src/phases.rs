@@ -35,3 +35,8 @@ pub fn mark(what: &'static str) {
         m.1.push((what, ms));
     });
 }
+
+/// How long ago the timed request (if any) began: none outside one.
+pub fn elapsed() -> Option<std::time::Duration> {
+    MARKS.try_with(|m| m.borrow().0.elapsed()).ok()
+}

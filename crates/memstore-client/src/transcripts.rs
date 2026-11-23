@@ -90,7 +90,7 @@ const ANSWER: &str = "AmpUp Memory's answer";
 const ADDED: &str = "what AmpUp Memory's hooks added";
 
 /// Whether `name` is one of memstore's own tools ([`MEMORY_TOOLS`]), under any server's name.
-fn memory_tool(name: &str) -> bool {
+pub(super) fn memory_tool(name: &str) -> bool {
     MEMORY_TOOLS.iter().any(|t| {
         name == *t
             || name

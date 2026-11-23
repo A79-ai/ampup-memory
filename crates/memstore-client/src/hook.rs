@@ -97,6 +97,8 @@ const DETACHED: &str = "AMPUP_MEMORY_HOOK_DETACHED";
 
 #[path = "advice_traces.rs"]
 mod advice_traces;
+#[path = "index.rs"]
+pub mod index;
 #[path = "repo_advice.rs"]
 mod repo_advice;
 #[path = "transcripts.rs"]
@@ -1852,6 +1854,274 @@ pub async fn metric(
         bail!("this memory has no metric {name:?}");
     };
     println!("{}", serde_json::to_string_pretty(m)?);
+    Ok(())
+}
+
+/// A `YYYY-MM-DD` date from microseconds since the epoch (UTC), with no date library: days to a civil date.
+fn day_of(micros: i64) -> String {
+    let z = micros.div_euclid(86_400_000_000) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Where the console shows `page` (`studio#/advice`) of the caller's org, when the server says where its console
+/// is (`/doctor`'s `console`, else `AMPUP_MEMORY_CONSOLE_URL` here) and an org is selected.
+async fn console_link(client: &Client, page: &str) -> Option<String> {
+    let org = client.org.as_deref()?;
+    let base = match std::env::var("AMPUP_MEMORY_CONSOLE_URL") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => client.get("/doctor").await.ok()?["console"]
+            .as_str()?
+            .to_string(),
+    };
+    Some(format!("{}/o/{org}/{page}", base.trim_end_matches('/')))
+}
+
+/// Ends a listing: how many there are past the page, and where the console shows the rest.
+async fn listing_footer(client: &Client, shown: usize, total: u64, page: &str) {
+    if total as usize > shown {
+        println!("({shown} of {total} shown)");
+    }
+    if let Some(l) = console_link(client, page).await {
+        println!("console: {l}");
+    }
+}
+
+/// A URL path segment: everything but unreserved characters percent-encoded.
+fn path_segment(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// `memstore-client facts [words]`. With words, what memory holds about them by meaning, not by their spelling
+/// (`search_memory`: facts ranked, each with its source pointers, and source text no fact cites yet). With none, the
+/// facts the caller may read, newest first (`/facts/list`), one a line: entity, predicate and value, since when,
+/// where it came from and its id.
+pub async fn facts(text: Option<&str>, limit: u64, mine: bool) -> Result<()> {
+    let client = Client::from_env(Duration::from_secs(60));
+    if let Some(t) = text.map(str::trim).filter(|t| !t.is_empty()) {
+        let answer = client
+            .tool("search_memory", json!({"query": t, "k": limit.min(50)}))
+            .await?;
+        println!("{}", answer.trim_end());
+        if let Some(l) = console_link(&client, &format!("studio#/search/{}", path_segment(t))).await
+        {
+            println!("console: {l}");
+        }
+        return Ok(());
+    }
+    let mut q = json!({"limit": limit});
+    if mine {
+        q["source"] = json!("mcp:remember_memory:");
+    }
+    let v = client.post("/facts/list", &q).await?;
+    let facts = v["facts"].as_array().cloned().unwrap_or_default();
+    if facts.is_empty() {
+        println!(
+            "no facts{}",
+            text.filter(|t| !t.trim().is_empty())
+                .map(|t| format!(" matching {t:?}"))
+                .unwrap_or_default()
+        );
+    }
+    for f in &facts {
+        let value = match f["unit"].as_str() {
+            Some(u) => format!("{} {u}", f["value"].as_str().unwrap_or_default()),
+            None => f["value"].as_str().unwrap_or_default().to_string(),
+        };
+        let since = f["valid_from"].as_i64().map(day_of).unwrap_or_default();
+        let ended = if f["valid_to"].is_null() {
+            ""
+        } else {
+            " (ended)"
+        };
+        let source = f["sources"][0]["source"].as_str().unwrap_or("?");
+        println!(
+            "- {} · {} = {value}{ended} · since {since} · {source} · fact {}",
+            f["entity"].as_str().unwrap_or("?"),
+            f["predicate"].as_str().unwrap_or("?"),
+            f["fact_id"].as_str().unwrap_or_default()
+        );
+    }
+    listing_footer(
+        &client,
+        facts.len(),
+        v["count"].as_u64().unwrap_or(0),
+        "studio#/explorer",
+    )
+    .await;
+    Ok(())
+}
+
+/// `memstore-client advice [task]`. With a task, the advice for that kind of task, as an agent starting it gets it
+/// (`POST /advice`, `get_advice`'s HTTP form): the task is routed to a situation by meaning, and its lessons and
+/// procedures are printed. With none, the advice the caller may read (`/advice/list`), one situation a line: whose,
+/// its situation and when it applies, how often it was served and helped, and whether it is ratified.
+pub async fn advice(text: Option<&str>, limit: u64, space: &str) -> Result<()> {
+    let client = Client::from_env(Duration::from_secs(60));
+    if let Some(t) = text.map(str::trim).filter(|t| !t.is_empty()) {
+        // `POST /advice` with no session only reads: `get_advice` would open a session for the caller.
+        let v = client.post("/advice", &json!({"question": t})).await?;
+        match (v["situation"].as_str(), v["advice"].as_str()) {
+            (Some(s), Some(a)) => println!("Situation: {s}\n\n{}", a.trim_end()),
+            _ => println!(
+                "no advice fits {t:?} yet: no lesson or procedure is learned for this kind of task. What memory \
+                 holds about it: `facts {t}`"
+            ),
+        }
+        if let Some(l) = console_link(&client, "studio#/advice").await {
+            println!("console: {l}");
+        }
+        return Ok(());
+    }
+    let q = json!({"limit": limit, "space": space});
+    let v = client.post("/advice/list", &q).await?;
+    let notes = v["advice"].as_array().cloned().unwrap_or_default();
+    if notes.is_empty() {
+        println!(
+            "no advice{}",
+            text.filter(|t| !t.trim().is_empty())
+                .map(|t| format!(" matching {t:?}"))
+                .unwrap_or_default()
+        );
+    }
+    for a in &notes {
+        let ev = &a["evidence"];
+        let tally = match (ev["served"].as_u64(), ev["helped"].as_u64()) {
+            (Some(s), Some(h)) => format!(" · served {s}, helped {h}"),
+            (Some(s), None) => format!(" · served {s}"),
+            _ => String::new(),
+        };
+        let ratified = if a["ratified"] == true {
+            " · ratified"
+        } else {
+            ""
+        };
+        let learned = a["learned_at"]
+            .as_i64()
+            .map(|t| format!(" · learned {}", day_of(t)))
+            .unwrap_or_default();
+        // A situation's `when` can run to a paragraph; the line keeps its start.
+        let when = a["when"].as_str().unwrap_or_default();
+        let when = match when.char_indices().nth(160) {
+            Some((i, _)) => format!("{} …", &when[..i]),
+            None => when.to_string(),
+        };
+        println!(
+            "- [{}] {}: {when}{tally}{ratified}{learned}",
+            a["space"].as_str().unwrap_or("?"),
+            a["key"].as_str().unwrap_or("?"),
+        );
+    }
+    listing_footer(
+        &client,
+        notes.len(),
+        v["count"].as_u64().unwrap_or(0),
+        "studio#/advice",
+    )
+    .await;
+    Ok(())
+}
+
+/// `memstore-client stats`: what Studio's Home counts (`/browse {op: "home"}`): the memory's totals, the week's
+/// new facts and where they came from, lessons learned and advice served. A part the caller may not read is left
+/// out, as Home leaves it out.
+pub async fn stats() -> Result<()> {
+    let client = Client::from_env(Duration::from_secs(60));
+    // A first ask answers with what is ready and names the rest `pending`; asking again for those waits for them.
+    let mut h = client.post("/browse", &json!({"op": "home"})).await?;
+    let wanted = ["counts", "week", "lessons"];
+    let pending: Vec<&str> = wanted
+        .into_iter()
+        .filter(|w| {
+            h["pending"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|x| x == w))
+        })
+        .collect();
+    if !pending.is_empty() {
+        let again = client
+            .post("/browse", &json!({"op": "home", "parts": pending}))
+            .await?;
+        for p in &pending {
+            if !again[*p].is_null() {
+                h[*p] = again[*p].clone();
+            }
+        }
+        // The week's part answers the advice served with it.
+        if pending.contains(&"week") && !again["advice"].is_null() {
+            h["advice"] = again["advice"].clone();
+        }
+        h["pending"] = again["pending"].clone();
+    }
+    if let Some(c) = h["counts"].as_object() {
+        let parts: Vec<String> = c
+            .iter()
+            .filter_map(|(k, n)| n.as_u64().map(|n| format!("{n} {k}")))
+            .collect();
+        println!("memory: {}", parts.join(", "));
+    }
+    let w = &h["week"];
+    if let Some(n) = w["count"].as_u64() {
+        // `[[source, n], ...]`, most first, counted over the newest of the week's facts (`sample`).
+        let by: Vec<String> = w["by_source"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| Some(format!("{} {}", p[0].as_str()?, p[1].as_u64()?)))
+            .collect();
+        let by = if by.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", by.join(", "))
+        };
+        println!("last 7 days: {n} new facts{by}");
+    }
+    if let Some(n) = h["lessons"].as_u64() {
+        println!("lessons learned this week: {n}");
+    }
+    let a = &h["advice"];
+    if !a.is_null() {
+        println!(
+            "advice served this week: {} times, {} notes{}",
+            a["times"].as_u64().unwrap_or(0),
+            a["notes"].as_u64().unwrap_or(0),
+            a["waiting"]
+                .as_u64()
+                .filter(|n| *n > 0)
+                .map(|n| format!(", {n} wait for ratifying"))
+                .unwrap_or_default()
+        );
+    }
+    let still: Vec<&str> = h["pending"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str())
+        .filter(|p| wanted.contains(p))
+        .collect();
+    if !still.is_empty() {
+        println!(
+            "still counting (run it again shortly): {}",
+            still.join(", ")
+        );
+    }
+    if let Some(l) = console_link(&client, "studio#/home").await {
+        println!("console: {l}");
+    }
     Ok(())
 }
 

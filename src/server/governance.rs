@@ -22,6 +22,7 @@ pub(super) async fn handle(
         }
         _ => Directory::load(store).await?,
     };
+    crate::phases::mark("governance directory");
     let scope = dir.resolve(
         who.user(),
         via,
@@ -60,10 +61,13 @@ pub(super) async fn handle(
             // list waits for no build; until then `proposals` is null, and the branches are built in the background.
             // Governance read as this server holds it, as the list itself is: Home asks again while they build.
             if req["built"] == true && !store.held(store.proposal_branches_built(&scope)).await? {
+                crate::phases::mark("proposals building");
                 return Ok(json!({"org": org, "scope": scope.to_string(),
                     "result": {"proposals": null, "building": true}}));
             }
+            crate::phases::mark("proposals built");
             let all = proposals_kept(store, &scope, &reader).await?;
+            crate::phases::mark("proposals read");
             let listed: Vec<&crate::governance::ProposalSummary> = all
                 .iter()
                 .filter(|p| entity.is_none_or(|e| p.entities.iter().any(|x| x == e)))

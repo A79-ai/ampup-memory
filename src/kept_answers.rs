@@ -39,6 +39,18 @@ use tokio::sync::watch;
 /// How old a kept answer may be and still be answered while the memory moved on (it never is past a loss).
 pub const STALE: Duration = Duration::from_secs(600);
 
+tokio::task_local! {
+    /// Set while an answer is worked out ahead of its reads ([`exact`]).
+    static EXACT: ();
+}
+
+/// `fut`, an answer worked out ahead of the reads that want it (and kept as at the state it read): the kept answers
+/// it reads are each worked out at that state, never one from before it answered while the next is worked out
+/// ([`Kept::get`]'s `lag`), or what it keeps would be one state behind and taken for current.
+pub async fn exact<F: Future>(fut: F) -> F::Output {
+    EXACT.scope((), fut).await
+}
+
 /// The [`STALE`]-long span of time now falls in: in the key of an answer over a window that ends now (the last 30 days),
 /// so a kept one is never answered for a window that ended more than [`STALE`] ago.
 pub fn span() -> u64 {
@@ -254,6 +266,7 @@ impl<T: Send + Sync + 'static> Kept<T> {
     {
         let key = format!("{ns}\n{reader}");
         let generation = generation(ns);
+        let lag = lag && EXACT.try_with(|_| ()).is_err();
         {
             let mut kept = self.entries.lock().unwrap();
             if let Some(e) = kept.get_mut(&key)
@@ -282,6 +295,24 @@ impl<T: Send + Sync + 'static> Kept<T> {
                 }
             }
         }
+        self.worked_out(ns, key, at, generation, lag, work).await
+    }
+
+    /// The answer for `key` at `at` under `generation`, from the work already under way for it (at `at`, or with `lag`
+    /// at a state it may be answered at), else from `work`, started now and kept once done.
+    async fn worked_out<F, Fut>(
+        &'static self,
+        ns: &str,
+        key: String,
+        at: At,
+        generation: u64,
+        lag: bool,
+        work: F,
+    ) -> Result<Arc<T>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    {
         let mut done = {
             let mut running = self.running.lock().unwrap();
             match running.get(&key) {
@@ -330,6 +361,37 @@ impl<T: Send + Sync + 'static> Kept<T> {
             Some(Err(e)) => Err(anyhow!("{e}")),
             None => unreachable!("waited for an outcome"),
         }
+    }
+
+    /// The answer [`Kept::get`] with `lag` would answer at once for `reader` at `at`, if one is kept: nothing is
+    /// worked out or started here. With it, whether it was worked out at `at` itself (not only at a state it may be
+    /// answered at while the next is worked out) and how old it is.
+    pub fn peek(&self, ns: &str, reader: &str, at: &At) -> Option<(Arc<T>, bool, Duration)> {
+        let key = format!("{ns}\n{reader}");
+        let kept = self.entries.lock().unwrap();
+        let e = kept.get(&key).filter(|e| e.generation == generation(ns))?;
+        let exact = e.at == *at;
+        (exact || e.at.lost_nothing(at) && e.made.elapsed() < STALE)
+            .then(|| (e.answer.clone(), exact, e.made.elapsed()))
+    }
+
+    /// The answer for `reader` at `at` worked out again by `work`, whatever is kept (one already being worked out at
+    /// `at` is waited for instead), and kept as [`Kept::get`] keeps one: for a loop that works answers out ahead of
+    /// the reads that want them.
+    pub async fn renew<F, Fut>(
+        &'static self,
+        ns: &str,
+        reader: &str,
+        at: At,
+        work: F,
+    ) -> Result<Arc<T>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    {
+        let key = format!("{ns}\n{reader}");
+        let generation = generation(ns);
+        self.worked_out(ns, key, at, generation, false, work).await
     }
 
     /// Keeps `answer`, worked out at `at` under `generation`: unless the scope changed here since (the answer may

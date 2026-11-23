@@ -110,6 +110,7 @@ pub async fn run(
         _ => return Err(bad("after is a page's next")),
     };
     let full = full_kept(store, session, reader, space, person, limit).await?;
+    crate::phases::mark("lessons read");
     let matching: Vec<&Value> = full
         .lessons
         .iter()
@@ -234,7 +235,9 @@ async fn full_kept(
         }
         false => None,
     };
+    crate::phases::mark("lessons state");
     let log = std::sync::Arc::new(crate::sessions::list(store, session.scope()).await?);
+    crate::phases::mark("lessons sessions");
     let Some(mut at) = at else {
         return Ok(std::sync::Arc::new(
             full(
@@ -315,10 +318,12 @@ async fn full(
         let who = if *owner == me { reader.who } else { &as_owner };
         let mine = Space::mine(owner);
         let listed = crate::advice::listed(session, store, who, &mine).await?;
+        crate::phases::mark("lessons own listed");
         if listed.is_empty() {
             continue;
         }
         let assigned = crate::advice::assigned(session, store, who, &mine).await?;
+        crate::phases::mark("lessons own assigned");
         for l in listed {
             if let Some(v) = lesson(&l, Some(owner), &assigned, log, &by_id, &me, reader, limit) {
                 owners.insert(owner.clone());
@@ -329,10 +334,13 @@ async fn full(
     if space != "mine" && person.is_none() {
         let team = Space::team();
         let listed = crate::advice::listed(session, store, reader.who, &team).await?;
+        crate::phases::mark("lessons team listed");
         if !listed.is_empty() {
             let assigned = crate::advice::assigned(session, store, reader.who, &team).await?;
+            crate::phases::mark("lessons team assigned");
             let bar = crate::sessions::evidence_bar(store, scope).await?;
             let tallies = crate::sessions::evidence(store, scope).await?;
+            crate::phases::mark("lessons team evidence");
             for l in listed {
                 if let Some(mut v) = lesson(&l, None, &assigned, log, &by_id, &me, reader, limit) {
                     // Ratified: by an admin, or backed by outcomes or people and past the evidence bar. Every
@@ -416,6 +424,7 @@ async fn count(
         }
         false => None,
     };
+    crate::phases::mark("lessons pinned");
     let noted = match at {
         Some(at) => {
             let key = format!(

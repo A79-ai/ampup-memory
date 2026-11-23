@@ -337,6 +337,7 @@ async fn list(
         .into_iter()
         .map(|o| (o.entity, o.user))
         .collect();
+    crate::phases::mark("conflicts owners");
     let me = auth::norm_id(who.user());
     let mine = req["mine"] == true;
     // Only the conflicts on what the caller owns, and they own nothing: none, without reading a fact.

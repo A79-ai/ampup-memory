@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Memory Replay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: an engineer's notebook. Graph-paper ground, ink-blue text, highlighter-yellow sticky notes for memory. One column, story order. */
+:root {
+  --paper: #f7f8fb;
+  --grid: #e3e7f0;
+  --ink: #17213d;
+  --ink-soft: #4a5577;
+  --rule: #cfd5e3;
+  --card: #ffffff;
+  --note: #ffe46b;
+  --note-ink: #3b3000;
+  --note-edge: #e9c933;
+  --accent: #2a47c9;
+  --k-read: #2a47c9;
+  --k-run: #d2551f;
+  --k-err: #c2185b;
+  --k-lookup: #0f8a6a;
+  --k-search: #7a4cc2;
+  --k-agent: #6b7280;
+  --cta-bg: #17213d; --cta-fg: #f2f4fb;
+  --good: #11804f;
+  --wait: #9a6a00;
+  --display: "Bricolage Grotesque", "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  --body: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --paper: #0f1426; --grid: #19203a; --ink: #e8ecf8; --ink-soft: #a3acc8; --rule: #2a3354; --card: #151c33;
+  --note: #f2d64b; --note-ink: #2b2300; --note-edge: #c9ad25; --accent: #8ea2ff;
+  --k-read: #8ea2ff; --k-run: #ff8a57; --k-err: #ff6fa5; --k-lookup: #3fd1a6; --k-search: #b892ff; --k-agent: #9aa3b2;
+  --good: #47d18f; --wait: #f0b93a; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --paper: #0f1426; --grid: #19203a; --ink: #e8ecf8; --ink-soft: #a3acc8; --rule: #2a3354; --card: #151c33;
+  --note: #f2d64b; --note-ink: #2b2300; --note-edge: #c9ad25; --accent: #8ea2ff;
+  --k-read: #8ea2ff; --k-run: #ff8a57; --k-err: #ff6fa5; --k-lookup: #3fd1a6; --k-search: #b892ff; --k-agent: #9aa3b2;
+  --good: #47d18f; --wait: #f0b93a; color-scheme: dark }
+
+* { box-sizing: border-box }
+body {
+  background-color: var(--paper);
+  background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 24px 24px;
+  color: var(--ink); font: 17px/1.6 var(--body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 40px 64px;
+}
+main { max-width: 960px; margin: 0 auto; display: flex; flex-direction: column; gap: 72px }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; line-height: 1.1 }
+h1 { font-size: clamp(2.2rem, 6vw, 3.8rem); font-weight: 800; letter-spacing: -0.02em }
+h2 { font-size: clamp(1.6rem, 3.5vw, 2.2rem); font-weight: 700 }
+h3 { font-size: 1.15rem; font-weight: 700 }
+p { margin: 0; max-width: 65ch }
+.eyebrow { font: 600 12px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent) }
+.lede { font-size: 1.15rem; color: var(--ink-soft) }
+section { display: flex; flex-direction: column; gap: 20px; min-width: 0 }
+.num { font-variant-numeric: tabular-nums }
+.mark { background: linear-gradient(transparent 55%, var(--note) 55%); color: inherit; padding: 0 2px }
+:root:not([data-theme="light"]) .mark { color: inherit }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .mark { background: linear-gradient(transparent 60%, color-mix(in srgb, var(--note) 45%, transparent) 60%) } }
+:root[data-theme="dark"] .mark { background: linear-gradient(transparent 60%, color-mix(in srgb, var(--note) 45%, transparent) 60%) }
+
+/* hero */
+.hero { display: grid; grid-template-columns: 1.4fr 1fr; gap: 32px; align-items: center }
+.hero > div { min-width: 0; display: flex; flex-direction: column; gap: 18px }
+.big { font: 800 clamp(3rem, 9vw, 5.5rem)/1 var(--display); letter-spacing: -0.03em; color: var(--accent) }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px }
+.stat { border-top: 2px solid var(--ink); padding-top: 8px }
+.stat b { display: block; font: 700 1.5rem/1.1 var(--display) }
+.stat span { font-size: .85rem; color: var(--ink-soft) }
+.fish { width: 100%; max-width: 340px; justify-self: center }
+
+/* how-it-works strip */
+.how { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px }
+.step { background: var(--card); border: 1.5px solid var(--rule); border-radius: 10px; padding: 18px; display: flex; flex-direction: column; gap: 10px; min-width: 0 }
+.step .n { font: 600 12px var(--mono); color: var(--ink-soft) }
+.step svg { width: 100%; height: 90px }
+
+/* timeline */
+.panel { background: var(--card); border: 1.5px solid var(--rule); border-radius: 12px; padding: 18px; min-width: 0 }
+.scroll { overflow-x: auto }
+#timeline { display: block; width: 100%; min-width: 640px; height: auto }
+.legend { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px }
+.chip { font: 600 13px var(--body); border: 1.5px solid var(--rule); background: var(--card); color: var(--ink); border-radius: 999px; padding: 4px 12px 4px 10px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px }
+.chip i { width: 10px; height: 10px; border-radius: 50%; display: inline-block }
+.chip[aria-pressed="true"] { border-color: var(--ink) }
+.chip:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+.caption { font-size: .9rem; color: var(--ink-soft) }
+
+/* bars */
+.bars { display: flex; flex-direction: column; gap: 14px }
+.bar { display: grid; grid-template-columns: 190px 1fr 90px; gap: 12px; align-items: center }
+.bar .lab { font-weight: 700 }
+.bar .lab small { display: block; font-weight: 400; color: var(--ink-soft); font-size: .8rem; line-height: 1.3 }
+.bar .track { height: 22px; background: var(--grid); border-radius: 4px; overflow: hidden }
+.bar .fill { height: 100%; border-radius: 4px }
+.bar .val { font: 600 14px var(--mono); text-align: right }
+details.ex { grid-column: 1 / -1; margin-top: -6px }
+details.ex summary { cursor: pointer; font-size: .85rem; color: var(--accent) }
+details.ex ul { margin: 8px 0 0; padding-left: 18px; font: 13px/1.5 var(--mono); color: var(--ink-soft) }
+details.ex li { overflow-wrap: anywhere }
+
+/* sticky notes */
+.notes { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 22px }
+.sticky { background: var(--note); color: var(--note-ink); border-bottom: 3px solid var(--note-edge); border-radius: 2px 2px 10px 2px; padding: 18px 18px 16px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 6px 14px -8px rgba(20, 20, 0, .45); min-width: 0 }
+.sticky:nth-child(3n+1) { transform: rotate(-.6deg) } .sticky:nth-child(3n+2) { transform: rotate(.5deg) }
+@media (prefers-reduced-motion: no-preference) { .sticky { transition: transform .2s } .sticky:hover { transform: rotate(0) translateY(-3px) } }
+.sticky .top { display: flex; justify-content: space-between; gap: 8px; font: 600 11px var(--mono); text-transform: uppercase; letter-spacing: .08em }
+.sticky h3 { font-size: 1.05rem; overflow-wrap: anywhere }
+.sticky p { font-size: .93rem; line-height: 1.5; overflow-wrap: anywhere }
+.sticky .helped { border-top: 1px dashed currentColor; padding-top: 8px; font-size: .85rem }
+.sticky .meta { font: 12px var(--mono); overflow-wrap: anywhere }
+.pill { border-radius: 999px; padding: 1px 8px; border: 1.5px solid currentColor }
+.tabs { display: flex; flex-wrap: wrap; gap: 8px }
+.more { align-self: flex-start; font: 700 14px var(--body); background: none; border: 1.5px solid var(--ink); color: var(--ink); border-radius: 8px; padding: 8px 14px; cursor: pointer }
+
+/* fact tables */
+.tables { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px }
+.tcard { background: var(--card); border: 1.5px solid var(--rule); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 10px; min-width: 0 }
+.tcard[data-on="true"] { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent) }
+.tcard .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px }
+.tcard code { font: 13px var(--mono) }
+.tcard .tok { font: 700 1.6rem/1 var(--display); color: var(--accent) }
+.tcard ul { margin: 0; padding-left: 16px; font: 12px/1.5 var(--mono); color: var(--ink-soft) }
+.tcard li { overflow-wrap: anywhere }
+.keep { font: 700 14px var(--body); border-radius: 8px; padding: 8px 12px; cursor: pointer; border: 1.5px solid var(--accent); background: transparent; color: var(--accent) }
+.tcard[data-on="true"] .keep { background: var(--accent); color: var(--card) }
+pre.schema { margin: 0; font: 12.5px/1.5 var(--mono); background: var(--card); border: 1.5px solid var(--rule); border-radius: 12px; padding: 16px; overflow-x: auto; max-height: 420px }
+.copyrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap }
+.local { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; border: 1.5px dashed var(--rule); border-radius: 10px; padding: 10px 14px; font-size: .9rem; color: var(--ink-soft); background: var(--card) }
+.local b { color: var(--ink) }
+.local .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--good); flex: none }
+.signup { border: 1.5px solid var(--rule); background: var(--cta-bg); color: var(--cta-fg); border-radius: 16px; padding: 28px; display: grid; grid-template-columns: 1.2fr 1fr; gap: 28px; align-items: start }
+.signup > div { min-width: 0; display: flex; flex-direction: column; gap: 14px }
+.signup h2 { color: var(--cta-fg) }
+.signup p, .signup li { color: color-mix(in srgb, var(--cta-fg) 82%, var(--cta-bg)) }
+.signup ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px }
+.signup .big2 { font: 800 2.4rem/1 var(--display); color: var(--note) }
+.signup .fine { font-size: .85rem }
+.signup .stat { border-color: var(--note) }
+.signup .stat b { color: var(--cta-fg) }
+.signup .stat span { color: color-mix(in srgb, var(--cta-fg) 75%, var(--cta-bg)) }
+@media (max-width: 720px) { .signup { grid-template-columns: 1fr; padding: 20px } }
+.holds { display: flex; flex-direction: column; gap: 0; padding: 4px 18px }
+.hrow { display: grid; grid-template-columns: 170px 1fr auto; gap: 6px 16px; align-items: baseline; padding: 14px 0; border-bottom: 1px solid var(--rule) }
+.hrow:last-child { border-bottom: 0 }
+.hrow .name { font-weight: 700 }
+.hrow .what { color: var(--ink-soft); font-size: .95rem; min-width: 0; overflow-wrap: anywhere }
+.hrow .tag { font: 600 12px var(--mono); border-radius: 999px; padding: 2px 10px; border: 1.5px solid currentColor; white-space: nowrap }
+.tag.covered, .tag.filled, .tag.recent { color: var(--good) } .tag.partial, .tag.stale { color: var(--wait) }
+.hrow details { grid-column: 1 / -1 } .hrow summary { cursor: pointer; font-size: .85rem; color: var(--accent) }
+.hrow ul { margin: 6px 0 0; padding-left: 18px; font: 12.5px/1.6 var(--mono); color: var(--ink-soft) } .hrow li { overflow-wrap: anywhere }
+@media (max-width: 720px) { .hrow { grid-template-columns: 1fr auto } .hrow .what { grid-column: 1 / -1; grid-row: 2 } }
+.foot { font-size: .85rem; color: var(--ink-soft); border-top: 1.5px solid var(--rule); padding-top: 16px; display: flex; flex-direction: column; gap: 8px }
+
+@media (max-width: 720px) {
+  .hero { grid-template-columns: 1fr } .fish { max-width: 220px }
+  .how { grid-template-columns: 1fr }
+  .bar { grid-template-columns: 1fr 80px } .bar .track { grid-column: 1 / -1; grid-row: 2 }
+  .stats { grid-template-columns: 1fr 1fr 1fr }
+}
+</style>
+</head><body>
+
+<main>
+  <div class="local" role="note"><span class="dot"></span><span id="where"><b>Made on this machine.</b> Your sessions were read here, and the notes were written by your own Claude Code.</span></div>
+  <header class="hero">
+    <div>
+      <span class="eyebrow">Memory Replay · your last <span id="days">14</span> days</span>
+      <h1>Your agents learned the same things <span class="mark">over and over</span>.</h1>
+      <p class="lede">Every coding session starts with a blank brain. It reads the same files, re-runs the same commands and trips on the same errors that an earlier session already figured out. We replayed your sessions to count it.</p>
+      <div class="stats">
+        <div class="stat"><b class="num" id="s-sessions">–</b><span>sessions replayed</span></div>
+        <div class="stat"><b class="num" id="s-read">–</b><span>tokens of tool output read</span></div>
+        <div class="stat"><b class="num" id="s-pct">–</b><span>was paid for twice</span></div>
+      </div>
+    </div>
+    <svg class="fish" viewBox="0 0 320 260" role="img" aria-label="A goldfish in a bowl next to a sticky note">
+      <ellipse cx="140" cy="150" rx="118" ry="100" fill="var(--card)" stroke="var(--ink)" stroke-width="3"/>
+      <path d="M40 120 Q140 100 240 120" fill="none" stroke="var(--accent)" stroke-width="3" stroke-dasharray="6 6"/>
+      <path d="M100 160 q30 -36 70 0 q-40 36 -70 0z" fill="var(--k-run)" stroke="var(--ink)" stroke-width="2.5"/>
+      <path d="M170 160 l26 -18 v36z" fill="var(--k-run)" stroke="var(--ink)" stroke-width="2.5"/>
+      <circle cx="118" cy="154" r="4" fill="var(--ink)"/>
+      <text x="88" y="214" font-family="var(--mono)" font-size="13" fill="var(--ink)">"wait, where's the README?"</text>
+      <g transform="translate(222 18) rotate(6)">
+        <rect width="92" height="86" fill="var(--note)" stroke="var(--note-edge)" stroke-width="2"/>
+        <text x="10" y="26" font-family="var(--display)" font-weight="700" font-size="14" fill="var(--note-ink)">memory</text>
+        <text x="10" y="46" font-family="var(--mono)" font-size="10" fill="var(--note-ink)">README is</text>
+        <text x="10" y="60" font-family="var(--mono)" font-size="10" fill="var(--note-ink)">at the repo</text>
+        <text x="10" y="74" font-family="var(--mono)" font-size="10" fill="var(--note-ink)">root ✓</text>
+      </g>
+    </svg>
+  </header>
+
+  <section id="holds-sec">
+    <span class="eyebrow">What your memory holds</span>
+    <h2>What's there, and what needs a backfill</h2>
+    <p>Every source your memory holds that you can read, by connector, against the last <span class="hdays">14</span> days. <b>Covered</b> goes back past the window's start. <b>Missing early days</b> begins inside it, so the days before need a backfill. <b>Quiet</b> has nothing in the window, so it may have stopped. Claude Code is counted from this machine: the sessions in the window, and which of them reached memory.</p>
+    <div class="panel holds" id="holds"></div>
+    <p class="caption" id="holds-note"></p>
+  </section>
+
+  <section>
+    <span class="eyebrow">Like you're five</span>
+    <h2>How memory fixes it</h2>
+    <div class="how">
+      <div class="step">
+        <span class="n">1 · Read</span>
+        <svg viewBox="0 0 200 90" aria-hidden="true">
+          <g fill="var(--card)" stroke="var(--ink)" stroke-width="2">
+            <rect x="20" y="14" width="50" height="62" rx="4"/><rect x="34" y="8" width="50" height="62" rx="4"/><rect x="48" y="2" width="50" height="62" rx="4"/></g>
+          <g stroke="var(--ink-soft)" stroke-width="2"><path d="M56 16h34M56 26h28M56 36h34M56 46h20"/></g>
+          <path d="M112 40h50" stroke="var(--accent)" stroke-width="3" marker-end="url(#ah)"/>
+          <defs><marker id="ah" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0L8 4L0 8z" fill="var(--accent)"/></marker></defs>
+          <circle cx="182" cy="40" r="12" fill="var(--accent)"/>
+        </svg>
+        <h3>Your old sessions go in</h3>
+        <p>Claude Code already saves every session on this machine. Memory Replay reads them there. Secrets are blanked out before anything leaves it.</p>
+      </div>
+      <div class="step">
+        <span class="n">2 · Spot</span>
+        <svg viewBox="0 0 200 90" aria-hidden="true">
+          <path d="M20 70 Q60 0 100 70" fill="none" stroke="var(--k-read)" stroke-width="3"/>
+          <path d="M100 70 Q140 10 180 70" fill="none" stroke="var(--k-err)" stroke-width="3"/>
+          <g fill="var(--ink)"><circle cx="20" cy="70" r="7"/><circle cx="100" cy="70" r="7"/><circle cx="180" cy="70" r="7"/></g>
+        </svg>
+        <h3>It finds the repeats</h3>
+        <p>When a later session goes back for something an earlier one already found, that's a repeat: the same file, the same command, the same error, the same docs page.</p>
+      </div>
+      <div class="step">
+        <span class="n">3 · Remember</span>
+        <svg viewBox="0 0 200 90" aria-hidden="true">
+          <rect x="30" y="10" width="64" height="64" fill="var(--note)" stroke="var(--note-edge)" stroke-width="2" transform="rotate(-5 62 42)"/>
+          <rect x="106" y="14" width="64" height="64" fill="var(--note)" stroke="var(--note-edge)" stroke-width="2" transform="rotate(4 138 46)"/>
+          <g stroke="var(--note-ink)" stroke-width="2"><path d="M40 30h40M40 42h32M40 54h38M116 34h40M116 46h30M116 58h36"/></g>
+        </svg>
+        <h3>It writes sticky notes</h3>
+        <p>Each repeat becomes a short note: advice, a skill, a fact. Your next session starts with the notes it needs, so it doesn't pay to learn the same thing again.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <span class="eyebrow">What happened</span>
+    <h2>Every arc is a lesson learned twice</h2>
+    <p>Each dot is one of your sessions, placed on the day it ran. Bigger dots did more tool calls. An arc goes from the session that first found something to a later session that went and found it again.</p>
+    <div class="panel">
+      <div class="scroll"><svg id="timeline" role="img" aria-label="Timeline of sessions with arcs for repeats"></svg></div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <p class="caption" id="tl-caption"></p>
+  </section>
+
+  <section>
+    <span class="eyebrow">What it cost</span>
+    <h2>What your agents paid for twice</h2>
+    <p>These are the tokens of tool output that a later session read again after an earlier session in the same repo had already read it. Treat it as an upper bound: a file being edited really does need re-reading.</p>
+    <div class="panel bars" id="bars"></div>
+  </section>
+
+  <section>
+    <span class="eyebrow">What memory would have written</span>
+    <h2>Notes that would have helped</h2>
+    <p>Each note was written from the first session that found it, and it lists the later sessions it would have helped. A note learned from 3 or more sessions is <b>ready</b>. One learned from fewer is a <b>candidate</b>: memory keeps it, but doesn't hand it out until more sessions show it works.</p>
+    <p class="caption" id="notes-how"></p>
+    <div class="tabs" id="note-tabs"></div>
+    <div class="notes" id="notes"></div>
+    <button class="more" id="more-notes" type="button">Show more notes</button>
+  </section>
+
+  <section>
+    <span class="eyebrow">Cheat sheets</span>
+    <h2>Fact tables worth keeping</h2>
+    <p>Some things are expensive to look up: a 2,000-line file, a slow test command, a docs page. A fact table is a cheat sheet. The agent reads one row instead of doing the whole lookup again. Pick the tables you want and memory fills them in from every session that ends from now on.</p>
+    <div class="tables" id="tables"></div>
+    <div class="copyrow">
+      <button class="keep" id="copy" type="button">Copy schema</button>
+      <span class="caption" id="copy-note">It covers the tables you picked. Its <code>extract</code> section tells memory to fill them from each Claude Code and Codex session from now on.</span>
+    </div>
+    <pre class="schema" id="schema"></pre>
+  </section>
+
+  <section class="signup" id="indexed">
+    <div>
+      <span class="eyebrow" style="color:var(--note)">Keep it working</span>
+      <h2>Stop paying for the same lesson twice</h2>
+      <p>This report looks back. AmpUp Memory does the same thing going forward: every Claude Code session starts with the notes it needs, and the notes get better as more sessions show what works.</p>
+      <div><span class="big2 num" id="su-tok">–</span> <span>tokens your agents re-spent in <span id="su-days">14</span> days</span></div>
+      <ul>
+        <li>Advice served at the right moment in a session, learned from sessions that went well</li>
+        <li>Fact tables your agents read instead of re-reading files and docs</li>
+        <li>Shared with your team once three people have learned the same thing</li>
+      </ul>
+    </div>
+    <div>
+      <div class="stats" id="ix-stats"></div>
+      <p class="fine" id="ix-note"></p>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <p><b>How these numbers are counted.</b> Tokens are estimated as characters ÷ 4 of what tools returned to the agent, not what you were billed. A repeat is the same file, the same command, the same error or the same lookup in a later session of the same repo. An error's cost is what it returned; the five steps after it rank which errors get a note, but count only as themselves, so nothing is counted twice. Git status checks and similar quick commands are left out. Headless runs (<code>claude -p</code>, SDK runs) are excluded.</p>
+    <p id="gen"></p>
+  </footer>
+</main>
+
+<script>
+const DATA = /*DATA*/null;
+const KINDS = { read: 'Files re-read', run: 'Commands re-run', err: 'Errors hit again', lookup: 'Lookups re-done', search: 'Searches re-run', agent: 'Sub-agents re-asked' };
+const TYPES = { advice: 'Advice', skill: 'Skill', note: 'Note', fact: 'Fact' };
+const SCHEMA = {
+  name: 'coding', version: 1,
+  description: 'Cheat sheets for what coding agents keep looking up again: files, commands, errors, outside lookups and where things live, so a session reads a row instead of redoing the lookup.',
+  default_type: 'file',
+  types: {
+    file: { description: 'A source file the agent keeps re-reading, named by its path from the repository root (file:src/main.rs).', predicates: {
+      purpose: { type: 'text', card: 'one', freshness_days: 30, description: 'What the file is for, in one or two sentences.' },
+      key_symbols: { type: 'text', card: 'many', list: true, description: 'The functions, types and routes in it that sessions went looking for.' },
+      entry_points: { type: 'text', card: 'many', description: 'Where to start reading for a given job, with line ranges.' },
+      gotcha: { type: 'text', card: 'many', freshness_days: 60, description: 'A trap in this file a past session fell into.' } } },
+    command: { description: 'A build, test, deploy or query command, named by its normalized form (command:cargo test).', predicates: {
+      what_it_checks: { type: 'text', card: 'one' },
+      typical_duration_s: { type: 'number', card: 'one' },
+      fails_when: { type: 'text', card: 'many', freshness_days: 60 },
+      output_summary: { type: 'text', card: 'one', description: "What its output says when it passes, so a session needn't read it all." },
+      cheaper_variant: { type: 'text', card: 'many', description: 'A narrower or faster form that answers the same question.' } } },
+    error: { description: 'A failure, named by its error text with numbers and paths stripped.', predicates: {
+      signature: { type: 'text', card: 'one' },
+      cause: { type: 'text', card: 'many' },
+      fix: { type: 'text', card: 'many', description: 'The fix that worked, as the session that found it did it.' },
+      seen_in: { type: 'text', card: 'many', list: true } } },
+    lookup: { description: 'An expensive outside read (docs, an API, an MCP tool, a web page) whose answer holds for a while.', predicates: {
+      question: { type: 'text', card: 'one' },
+      answer: { type: 'text', card: 'one', freshness_days: 14 },
+      source: { type: 'text', card: 'one' } } },
+    codebase_map: { description: 'Where something lives: the answer to a search the agent keeps re-running.', predicates: {
+      lives_in: { type: 'text', card: 'many', list: true },
+      how_to_find: { type: 'text', card: 'one' } } },
+  },
+  guidance: [
+    'Before reading a large file, running a slow command or fetching docs, check its row: the purpose, output summary or answer may be enough.',
+    'When a session learns something a row should hold (a fix, a cheaper command), it ends with it said plainly, so extraction keeps it.',
+  ],
+  extract: { sources: { prefixes: ['claude-code:', 'codex:'] }, facts_per_episode: 20 },
+};
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const fmt = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const $ = id => document.getElementById(id);
+
+function hero() {
+  $('days').textContent = DATA.days;
+  $('s-sessions').textContent = DATA.sessions;
+  $('s-read').textContent = fmt(DATA.tool_tokens);
+  $('s-pct').textContent = fmt(DATA.respent_tokens);
+  $('gen').textContent = `Generated ${DATA.generated} UTC from ${DATA.sessions} Claude Code sessions, ${DATA.prompts.toLocaleString()} prompts and ${DATA.calls.toLocaleString()} tool calls. Main repos: ${DATA.repos.map(r => r[0]).join(', ')}.`;
+  const I = DATA.indexed;
+  $('where').innerHTML = I.skipped
+    ? `<b>Made on this machine.</b> Your sessions were read here and stayed here (${esc(I.skipped)}). Notes were written by your own Claude Code.`
+    : I.sent
+      ? `<b>Made on this machine.</b> Your sessions were read here, notes were written by your own Claude Code, and the ${I.sent} sessions your memory didn't have yet went to it at <code>${esc(I.server)}</code>, secrets blanked out. This page is a file on your machine.`
+      : `<b>Made on this machine.</b> Your sessions were read here and notes were written by your own Claude Code. Your memory at <code>${esc(I.server)}</code> had every session already, so nothing new was sent. This page is a file on your machine.`;
+}
+
+let active = new Set(Object.keys(KINDS));
+function timeline() {
+  const svg = $('timeline'), W = 900, H = 260, padL = 96, padR = 16, top = 40, ns = 'http://www.w3.org/2000/svg';
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.innerHTML = '';
+  const tl = DATA.timeline; if (!tl.length) return;
+  const t0 = Math.min(...tl.map(s => s.t)), t1 = Math.max(...tl.map(s => s.t));
+  const day0 = new Date(t0 * 1000); day0.setHours(0, 0, 0, 0);
+  const span = Math.max(1, (t1 - day0 / 1000));
+  const x = t => padL + (t - day0 / 1000) / span * (W - padL - padR);
+  const rows = { 'claude-code': 210 };
+  const el = (n, a) => { const e = document.createElementNS(ns, n); for (const k in a) e.setAttribute(k, a[k]); svg.appendChild(e); return e; };
+  for (let d = new Date(day0); d / 1000 <= t1; d.setDate(d.getDate() + 1)) {
+    const xx = x(d / 1000);
+    el('line', { x1: xx, x2: xx, y1: top - 10, y2: H - 20, stroke: css('--grid'), 'stroke-width': 1 });
+    if (d.getDay() === 1 || +d === +day0) { const t = el('text', { x: xx + 3, y: H - 6, 'font-size': 11, 'font-family': css('--mono').split(',')[0], fill: css('--ink-soft') }); t.textContent = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }); }
+  }
+  for (const [h, y] of Object.entries(rows)) {
+    const t = el('text', { x: 0, y: y + 4, 'font-size': 13, 'font-weight': 700, fill: css('--ink'), 'font-family': 'inherit' });
+    t.textContent = 'Claude Code';
+  }
+  const pos = {}; tl.forEach(s => pos[s.id] = [x(s.t), rows[s.h] || 210, s]);
+  let shown = 0;
+  for (const a of DATA.arcs) {
+    if (!active.has(a.kind) || !pos[a.from] || !pos[a.to]) continue;
+    const [x1, y1] = pos[a.from], [x2, y2] = pos[a.to];
+    if (x2 - x1 < 2) continue;
+    const lift = Math.min(170, 20 + (x2 - x1) * 0.35);
+    el('path', { d: `M${x1} ${y1} C${x1} ${y1 - lift} ${x2} ${y2 - lift} ${x2} ${y2}`, fill: 'none', stroke: css('--k-' + (KINDS[a.kind] ? a.kind : 'agent')), 'stroke-width': 1.2, 'stroke-opacity': .45 });
+    shown++;
+  }
+  const maxc = Math.max(...tl.map(s => s.calls), 1);
+  for (const s of tl) {
+    const [xx, yy] = pos[s.id];
+    const c = el('circle', { cx: xx, cy: yy, r: 2.5 + 7 * Math.sqrt(s.calls / maxc), fill: css('--card'), stroke: css('--ink'), 'stroke-width': 1.5 });
+    const ti = document.createElementNS(ns, 'title'); ti.textContent = `${s.repo} · ${new Date(s.t * 1000).toLocaleString()} · ${s.calls} tool calls`; c.appendChild(ti);
+  }
+  $('tl-caption').textContent = `${shown.toLocaleString()} arcs shown across the ${tl.length} sessions that started in the last ${DATA.days} days. Use the buttons to show one kind of repeat at a time.`;
+}
+
+function legend() {
+  const box = $('legend'); box.innerHTML = '';
+  const kinds = [...new Set(DATA.arcs.map(a => a.kind))];
+  for (const k of kinds) {
+    const b = document.createElement('button');
+    b.className = 'chip'; b.type = 'button'; b.setAttribute('aria-pressed', active.has(k));
+    b.innerHTML = `<i style="background:var(--k-${KINDS[k] ? k : 'agent'})"></i>${esc(KINDS[k] || k)}`;
+    b.onclick = () => {
+      if (active.size === kinds.length) active = new Set([k]); else if (active.has(k) && active.size === 1) active = new Set(kinds); else active.has(k) ? active.delete(k) : active.add(k);
+      legend(); timeline();
+    };
+    box.appendChild(b);
+  }
+}
+
+function bars() {
+  const box = $('bars'), max = Math.max(...DATA.by_kind.map(k => k.tok), 1);
+  const blurbs = { read: 'Opening a file a past session already read', run: 'Running a command a past session already ran', err: 'Hitting an error a past session already hit', lookup: 'Fetching docs, an API or a tool result again', search: 'Grepping or listing to find where things live, again', agent: 'Asking a sub-agent the same question' };
+  box.innerHTML = DATA.by_kind.map(k => `
+    <div class="bar"><div class="lab">${esc(k.label)}<small>${esc(blurbs[k.kind] || '')}</small></div>
+      <div class="track"><div class="fill" style="width:${(k.tok / max * 100).toFixed(1)}%;background:var(--k-${KINDS[k.kind] ? k.kind : 'agent'})"></div></div>
+      <div class="val num">${fmt(k.tok)}</div>
+      ${(DATA.top[k.kind] || []).length ? `<details class="ex"><summary>Biggest repeats</summary><ul>${DATA.top[k.kind].map(t => `<li>${esc(t.key)} <span>· ${esc(t.repo)} · ${t.sessions} sessions · ${fmt(t.tok)}</span></li>`).join('')}</ul></details>` : ''}
+    </div>`).join('') || '<p>Nothing was repeated across sessions.</p>';
+}
+
+let noteFilter = 'all', noteLimit = 9;
+function notes() {
+  $('notes-how').textContent = `Notes: ${DATA.notes_written}`;
+  const items = DATA.items.filter(i => noteFilter === 'all' || i.type === noteFilter);
+  const tabs = $('note-tabs'), counts = {};
+  DATA.items.forEach(i => counts[i.type] = (counts[i.type] || 0) + 1);
+  tabs.innerHTML = '';
+  for (const t of ['all', ...Object.keys(TYPES).filter(t => counts[t])]) {
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'chip';
+    b.setAttribute('aria-pressed', noteFilter === t);
+    b.textContent = t === 'all' ? `All (${DATA.items.length})` : `${TYPES[t]} (${counts[t]})`;
+    b.onclick = () => { noteFilter = t; noteLimit = 9; notes(); };
+    tabs.appendChild(b);
+  }
+  $('notes').innerHTML = items.slice(0, noteLimit).map(i => `
+    <article class="sticky">
+      <div class="top"><span>${esc(TYPES[i.type] || i.type)}${i.table ? ' · ' + esc(i.table) : ''}</span><span class="pill">${i.status === 'ready' ? 'ready' : 'candidate'}</span></div>
+      <h3>${esc(i.title)}</h3>
+      <p>${esc(i.text)}</p>
+      <p class="helped"><b>Would have helped:</b> ${esc(i.would_have_helped)}</p>
+      <div class="meta">${esc(i.repo)} · first found ${esc(i.first_day || '?')} · repeated in ${i.sessions - 1} later session${i.sessions === 2 ? '' : 's'}${i.later_days && i.later_days.length ? ' (' + esc(i.later_days.slice(0, 4).join(', ')) + ')' : ''} · ~${fmt(i.saves_tokens_estimate || 0)} tokens</div>
+    </article>`).join('') || '<p>Nothing was repeated, so there is nothing to note yet.</p>';
+  $('more-notes').hidden = items.length <= noteLimit;
+}
+$('more-notes').onclick = () => { noteLimit += 12; notes(); };
+
+let keep = new Set();
+function tables() {
+  const ts = DATA.fact_tables.filter(t => t.tokens_absorbed > 0);
+  if (!keep.size) ts.slice(0, 3).forEach(t => keep.add(t.table));
+  $('tables').innerHTML = ts.map(t => `
+    <div class="tcard" data-on="${keep.has(t.table)}">
+      <div class="row"><code>${esc(t.table)}</code><span class="tok num">${fmt(t.tokens_absorbed)}</span></div>
+      <p class="caption">${esc(t.description)} Covers ${t.keys.toLocaleString()} things repeated ${t.repeats.toLocaleString()} times.</p>
+      <ul>${t.examples.slice(0, 4).map(e => `<li>${esc(e.slice(0, 90))}</li>`).join('')}</ul>
+      <button class="keep" type="button" data-t="${esc(t.table)}">${keep.has(t.table) ? 'Keeping ✓' : 'Keep this table'}</button>
+    </div>`).join('');
+  document.querySelectorAll('.tcard .keep').forEach(b => b.onclick = () => { const t = b.dataset.t; keep.has(t) ? keep.delete(t) : keep.add(t); tables(); });
+  const schema = JSON.parse(JSON.stringify(SCHEMA));
+  schema.types = {};
+  for (const t of Object.keys(SCHEMA.types)) if (keep.has(t)) schema.types[t] = SCHEMA.types[t];
+  if (!schema.types[schema.default_type]) schema.default_type = Object.keys(schema.types)[0];
+  $('schema').textContent = JSON.stringify(schema, null, 2);
+}
+$('copy').onclick = async () => {
+  const text = $('schema').textContent;
+  try { await navigator.clipboard.writeText(text); $('copy').textContent = 'Copied'; }
+  catch { const r = document.createRange(); r.selectNodeContents($('schema')); const s = getSelection(); s.removeAllRanges(); s.addRange(r); $('copy').textContent = 'Selected: press ⌘C'; }
+  setTimeout(() => $('copy').textContent = 'Copy schema', 2000);
+};
+
+function indexed() {
+  const I = DATA.indexed;
+  $('su-tok').textContent = fmt(DATA.respent_tokens); $('su-days').textContent = DATA.days;
+  $('ix-stats').innerHTML = [[I.sent, 'sessions sent to your memory now'], [I.already, 'it had already'], [I.failed, 'not sent']]
+    .map(([n, t]) => `<div class="stat"><b class="num">${n}</b><span>${t}</span></div>`).join('');
+  $('ix-note').textContent = I.skipped
+    ? `Nothing was sent to your memory: ${I.skipped}. Run /ampup-memory:index again without it to send them.`
+    : `Your memory reads each session it got as if it had just ended: it keeps what was decided and learned, grades how the task went, and writes advice once a kind of task has gone right or wrong enough times. From now on the plugin's hooks do this at the end of every session, so there is nothing to run again.`;
+}
+function holds() {
+  const H = DATA.holds || { connectors: [] };
+  document.querySelectorAll('.hdays').forEach(e => e.textContent = DATA.days);
+  const tags = { covered: 'Covered', filled: 'Filled now', partial: 'Missing early days', stale: 'Quiet', recent: 'Recent' };
+  const n = x => (x ?? 0).toLocaleString();
+  const what = c => {
+    if (c.kind === 'claude-code' && c.local) {
+      const l = c.local;
+      return `${n(l.on_disk)} sessions on this machine in the window: ${n(l.already)} were captured already by the plugin's hooks as they ended (or an earlier index), ` +
+        (l.skipped ? `the rest weren't sent (${esc(l.skipped)}).` : `${n(l.sent)} sent now${l.failed ? `, ${n(l.failed)} not sent` : ''}.`);
+    }
+    if (c.status === 'recent') return `${n(c.episodes)} episodes, the newest ${esc(c.last || '?')}. How far back it goes isn't known: your memory's server is older than this report.`;
+    if (c.status === 'stale') return `Nothing in the window. ${n(c.episodes)} episodes, the newest ${esc(c.last || '?')}.`;
+    if (c.status === 'partial') return `${n(c.in_window)} in the window, but it starts ${esc(c.first || '?')}: the ${c.missing_days} days before that aren't there.`;
+    return `${n(c.in_window)} in the window, ${n(c.episodes)} in all, back to ${esc(c.first || '?')}.`;
+  };
+  $('holds').innerHTML = H.error ? `<p>Couldn't read what your memory holds: ${esc(H.error)}.</p>` : H.connectors.map(c => `
+    <div class="hrow"><span class="name">${esc(c.label)}</span><span class="what">${what(c)}</span><span class="tag ${esc(c.status)}">${tags[c.status] || esc(c.status)}</span>
+      ${c.sources && c.sources.length > 1 ? `<details><summary>${c.sources.length + c.more_sources} sources</summary><ul>${c.sources.map(s => `<li>${esc(s.source)} · ${s.in_window == null ? '' : n(s.in_window) + ' in the window, '}${n(s.episodes)} in all · ${esc(s.first || '?')} to ${esc(s.last || '?')}</li>`).join('')}${c.more_sources ? `<li>and ${c.more_sources} more</li>` : ''}</ul></details>` : ''}
+    </div>`).join('');
+  $('holds-note').innerHTML = `A connector you connected that has nothing in your memory isn't listed: it hasn't sent anything you can read. A connector's own backfill is set where it is connected; a source this machine's server reads goes further back with <code>ampup-memory sources add … --since DATE</code>.`;
+}
+function render() { holds(); hero(); legend(); timeline(); bars(); notes(); tables(); indexed(); }
+if (DATA) render();
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', timeline);
+new MutationObserver(timeline).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+</script>
+</body></html>

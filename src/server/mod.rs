@@ -140,6 +140,8 @@ struct State {
     /// hard staleness limit while such lists come now and then (a plan page opened every few minutes), and stops when
     /// they don't.
     installations_listed_at: std::sync::Mutex<Option<Instant>>,
+    /// When `/admin` `show` was last asked: what it reads is kept warm for a while after ([`keep_warm`]).
+    shown_at: std::sync::Mutex<Option<Instant>>,
     /// Orgs' identity providers and service keys as last read from the directory: when, and the fold they were
     /// read from.
     providers: std::sync::Mutex<
@@ -672,6 +674,7 @@ pub async fn serve_with(
         served: Default::default(),
         read_at: Default::default(),
         installations_listed_at: Default::default(),
+        shown_at: Default::default(),
         providers: Default::default(),
         secret_key,
         secret_env: options.secret_env,
@@ -3830,6 +3833,7 @@ async fn installation_op(
             } else {
                 store.installation_events().await?
             };
+            crate::phases::mark("installations read");
             let now = inst::fold(&events);
             let list: Vec<_> = now
                 .values()
@@ -4625,6 +4629,16 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
         return;
     }
     let store = st.store.read().unwrap().clone();
+    // What `/admin` `show` (a plan's page) and a held installations list read beside the directory: two small
+    // tables, read here rather than by the first of them.
+    if !st.fixed() {
+        if let Err(e) = store.key_usage().await {
+            eprintln!("warm-up: the key usage not read (its first reader reads it): {e:#}");
+        }
+        if let Err(e) = store.installation_events_held().await {
+            eprintln!("warm-up: the installations not read (their first reader reads them): {e:#}");
+        }
+    }
     let t = Instant::now();
     if cell::mine(&st.scope) {
         match search::warm(&store, &st.scope).await {
@@ -4695,6 +4709,13 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
                         crate::metrics::process_memory()
                     );
                     warm_advice(store, &scope).await;
+                    // An org's episodes, as `show` counts them for a plan's page.
+                    if matches!(scope, Scope::NamedOrg(_))
+                        && let Some(org) = scope.org_name()
+                        && let Err(e) = count_org_episodes(store, org, false).await
+                    {
+                        eprintln!("warm-up: {org}'s episodes not counted (its first show counts them): {e:#}");
+                    }
                     // A request's read since keeps its own, later time.
                     read_at
                         .lock()
@@ -4811,6 +4832,14 @@ async fn keep_warm(st: Arc<State>) {
                 Store::refreshing_after(fresh_enough, store.installation_events_held()).await
         {
             eprintln!("keep-warm of the installations failed: {e:#}");
+        }
+        // What `show` reads beside the directory, while it is asked for: the keys' last uses, and the orgs' episodes.
+        let shown = *st.shown_at.lock().unwrap();
+        if shown.is_some_and(|at| at.elapsed() < keep_warm_idle()) {
+            if let Err(e) = Store::refreshing_after(fresh_enough, store.key_usage()).await {
+                eprintln!("keep-warm of the key usage failed: {e:#}");
+            }
+            keep_counts_fresh(&store, keep_warm_idle());
         }
         for scope in scopes {
             let t = Instant::now();
@@ -7475,6 +7504,10 @@ async fn handle(
     // What the request reads: the selected branch, pinned to the selected workspace snapshot if any.
     let pinning =
         crate::workspace::read_session(&store, &scope, view.branch.as_deref(), view.at.as_deref());
+    // Home on main answers from what was worked out ahead: its pin, only checked against that, doesn't wait for a
+    // build or a table read for this server's own writes, as it doesn't for another's ([`crate::behind_own_writes`]).
+    // It pins again (as here, without that) when it works its parts out itself.
+    let pinning = crate::behind_own_writes(view.is_main() && home::asked(&path, &body), pinning);
     // A session's start from a caller not counted at the cap here: their entries are counted beside the pin, and one
     // at the cap is refused as soon as that count says so, without waiting for the pin (a new server's first count
     // of them, or another server's writes since). The start counts them first thing anyway, so it waits for the
@@ -7951,7 +7984,13 @@ async fn handle(
             ));
         }
         let store = state.store.read().unwrap().clone();
-        let args = said_redacted(serde_json::from_slice(&body).unwrap_or(Value::Null));
+        let mut args = said_redacted(serde_json::from_slice(&body).unwrap_or(Value::Null));
+        // When a session happened is the hook client's to say, here as over MCP: anyone else's end is dated when it ends.
+        if !advice_calls::from_hook(&app)
+            && let Some(o) = args.as_object_mut()
+        {
+            o.remove("occurred_at");
+        }
         let began = Instant::now();
         let done = match path.as_str() {
             "/sessions/end" => end_session(&state, &store, &scope, &who, &via, &args).await,
@@ -9431,6 +9470,17 @@ async fn provisioner_directory(
     Directory::fresh(store).await
 }
 
+/// An `/admin` op's name as a slow request's line has it: one of the ops this server knows, else `admin op`.
+fn op_label(op: &str) -> &'static str {
+    LOCAL_ADMIN_OPS
+        .iter()
+        .chain(&DIRECTORY_KEY_OPS)
+        .chain(&PROVISIONER_OPS)
+        .find(|o| **o == op)
+        .copied()
+        .unwrap_or("admin op")
+}
+
 /// `show {org}`'s limits and usage: `"limits"` (each one, null where unset) and `"usage"` (this month's model tokens,
 /// every server's, and the episodes the org holds), beside its view and in it.
 async fn with_limits(
@@ -9440,7 +9490,7 @@ async fn with_limits(
     v: &mut Value,
 ) {
     let month = crate::limits::month_of(chrono::Utc::now());
-    let episodes = match crate::workspace::org_episodes(store, name).await {
+    let episodes = match org_episodes_held(store, name).await {
         Ok(n) => json!(n),
         Err(e) => {
             eprintln!("show {name}: its episodes uncounted: {e:#}");
@@ -9455,6 +9505,98 @@ async fn with_limits(
     if let Some(view) = v["view"].as_object_mut() {
         view.insert("limits".into(), limits);
         view.insert("usage".into(), usage);
+    }
+}
+
+/// Each org's episodes as last counted for `show` ([`org_episodes_held`]), when, and when `show` last asked for them.
+static ORG_EPISODES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, HeldCount>>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[derive(Clone, Copy)]
+struct HeldCount {
+    counted: Instant,
+    n: u64,
+    shown: Option<Instant>,
+}
+
+/// The orgs whose episodes are being counted again in the background, one count of each at a time.
+static COUNTING_EPISODES: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// How old an org's episode count may be before `show` counts it again behind the answer.
+const EPISODES_FRESH: Duration = Duration::from_secs(30);
+/// How old an org's episode count may be and still answer `show` while it is counted again; older, `show` waits.
+const EPISODES_HELD: Duration = Duration::from_secs(1800);
+
+/// The episodes `org` holds, for `show`'s usage (a plan's page): counting them reads the catalog's list of
+/// namespaces and loads each of the org's episodes tables, about half a second against a hosted catalog, on every
+/// view of the page. So the last count answers while one is counted again in the background, once it is
+/// [`EPISODES_FRESH`] old; a count is waited for only when there is none (the org's first `show` since this server
+/// started, unless the start counted it) or it is older than [`EPISODES_HELD`]. A count, never what was counted:
+/// at most one view of the page behind a write or a forget.
+async fn org_episodes_held(store: &Store, org: &str) -> Result<u64> {
+    let held = {
+        let mut all = ORG_EPISODES.lock().unwrap();
+        all.get_mut(org).map(|h| {
+            h.shown = Some(Instant::now());
+            *h
+        })
+    };
+    match held {
+        Some(h) if h.counted.elapsed() < EPISODES_HELD => {
+            if h.counted.elapsed() >= EPISODES_FRESH {
+                count_episodes_later(store, org);
+            }
+            Ok(h.n)
+        }
+        _ => count_org_episodes(store, org, true).await,
+    }
+}
+
+/// Counts `org`'s episodes in the background, unless they are being counted already.
+fn count_episodes_later(store: &Store, org: &str) {
+    if !COUNTING_EPISODES.lock().unwrap().insert(org.into()) {
+        return;
+    }
+    let (store, org) = (store.clone(), org.to_string());
+    tokio::spawn(crate::loads::later(async move {
+        if let Err(e) = count_org_episodes(&store, &org, false).await {
+            eprintln!("show {org}: its episodes not counted again: {e:#}");
+        }
+        COUNTING_EPISODES.lock().unwrap().remove(&org);
+    }));
+}
+
+/// Counts `org`'s episodes now, and holds the count for [`org_episodes_held`] (`shown`: for a `show` now).
+async fn count_org_episodes(store: &Store, org: &str, shown: bool) -> Result<u64> {
+    let n = crate::workspace::org_episodes(store, org).await?;
+    let mut all = ORG_EPISODES.lock().unwrap();
+    let was = all.get(org).and_then(|h| h.shown);
+    all.insert(
+        org.to_string(),
+        HeldCount {
+            counted: Instant::now(),
+            n,
+            shown: if shown { Some(Instant::now()) } else { was },
+        },
+    );
+    Ok(n)
+}
+
+/// Counts again, in the background, the episodes of the orgs `show` asked for within `idle` whose count is
+/// [`EPISODES_FRESH`] old ([`keep_warm`]): a plan's page viewed now and then never waits for one.
+fn keep_counts_fresh(store: &Store, idle: Duration) {
+    let due: Vec<String> = ORG_EPISODES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, h)| {
+            h.shown.is_some_and(|s| s.elapsed() < idle) && h.counted.elapsed() >= EPISODES_FRESH
+        })
+        .map(|(o, _)| o.clone())
+        .collect();
+    for org in due {
+        count_episodes_later(store, &org);
     }
 }
 
@@ -9555,6 +9697,8 @@ async fn directory_change(
     }
     let mut req: Value =
         serde_json::from_slice(body).map_err(|_| Invalid("body is not JSON".into()))?;
+    // The op, for a slow request's line: what it went on to wait on is marked after it.
+    crate::phases::mark(op_label(req["op"].as_str().unwrap_or_default()));
     // A provisioner key's ops, and nothing else, whatever comes below: what each may change is
     // `directory::provisioner_may`'s, and `show` only an org it created.
     if let Some(key) = &via.provisioner {
@@ -9567,6 +9711,7 @@ async fn directory_change(
             .into());
         }
         if op == "show" {
+            *state.shown_at.lock().unwrap() = Some(Instant::now());
             let org = req["org"].as_str().unwrap_or_default();
             let store = state.store.read().unwrap().clone();
             let dir = provisioner_directory(&store, org, key).await?;
@@ -9847,10 +9992,13 @@ async fn directory_change(
                          "loaded": {"events": folded.events, "from_snapshot": folded.snapshot_events}}));
     }
     if req["op"] == "show" {
-        // An admin key and an operator see every org; a person sees the orgs they belong to.
-        let dir = Directory::load(&store)
-            .await?
-            .with_usage(&state.key_usage(&store).await);
+        *state.shown_at.lock().unwrap() = Some(Instant::now());
+        // An admin key and an operator see every org; a person sees the orgs they belong to. A read, decided by the
+        // directory requests are signed in by (`Directory::behind`): this server's own changes show at once.
+        let dir = Directory::behind(&store).await?;
+        crate::phases::mark("directory read");
+        let dir = dir.with_usage(&state.key_usage(&store).await);
+        crate::phases::mark("key usage read");
         let access = dir.access(who.user(), via);
         let mine = |o: &str| superuser || via.operator || access.contains_key(o);
         // The whole org: the operator, its admins (a person: a file key in an admin's name manages nothing),
@@ -9868,6 +10016,7 @@ async fn directory_change(
                 let mut v = json!({"view": dir.orgs.get(o)});
                 if let Some(org) = dir.orgs.get(o) {
                     with_limits(&store, o, org, &mut v).await;
+                    crate::phases::mark("usage counted");
                 }
                 v
             }
@@ -10991,6 +11140,7 @@ async fn activity_kept(
     let now = store.lagging_visibility(scope, crate::MAIN).await?;
     let log = crate::kept_answers::Log::read(store, scope).await?;
     let at = crate::kept_answers::At::with_log(mark, &now, log);
+    crate::phases::mark("activity pinned");
     let key = format!(
         "{}\n{}\n{since_secs}\n{limit}\n{}",
         crate::kept_answers::reader_key(who),
@@ -11006,6 +11156,7 @@ async fn activity_kept(
             Ok(crate::activity::view(&log, user.as_deref(), since, limit))
         })
         .await?;
+    crate::phases::mark("activity read");
     Ok((*v).clone())
 }
 
@@ -12791,6 +12942,14 @@ async fn mcp(
                         o.remove(k);
                     }
                 }
+                // When a session happened is the hook client's to say (a backfill of past sessions): an agent's own
+                // end is dated when it ends.
+                if name == "end_session"
+                    && !(hook || advice_calls::from_hook(app))
+                    && let Some(o) = a.as_object_mut()
+                {
+                    o.remove("occurred_at");
+                }
                 a
             });
             let args = said.as_ref().unwrap_or(&req["params"]["arguments"]);
@@ -13936,6 +14095,18 @@ async fn skills_text(
 /// they may do there, whether a model extracts, routes advice and learns it, whether skills compile and advice is
 /// learned on its own there, and the notes the caller may read (how many passed the evidence bar), with the bar
 /// and the session arms.
+/// The console this deployment's org is managed in: `AMPUP_MEMORY_CONSOLE_URL`, else the control plane it enrolled
+/// with (which serves the console's pages on the same host), else none: a local or unenrolled server has no
+/// console to link to.
+fn console_url() -> Option<String> {
+    match std::env::var("AMPUP_MEMORY_CONSOLE_URL") {
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().trim_end_matches('/').to_string()),
+        _ => crate::deployment::Credential::load(&crate::deployment::Credential::default_path())
+            .ok()
+            .map(|c| c.control_plane.trim_end_matches('/').to_string()),
+    }
+}
+
 async fn doctor_report(
     state: &State,
     who: &Principal,
@@ -13994,6 +14165,8 @@ async fn doctor_report(
         "user": who.user(),
         "scope": scope.to_string(),
         "may": may,
+        // Where the org's console is, for the client's links to its pages (`<console>/o/<org>/studio#/advice`).
+        "console": console_url(),
         "extraction": set(Extractor::from_env()),
         // Whether what's remembered with no goal reading it (a Claude Code session, a note) becomes facts.
         "extract_unclaimed": crate::extract::goal_blind_in(&store, scope).await,

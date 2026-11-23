@@ -1146,6 +1146,27 @@ tokio::task_local! {
     static VIS_BACKGROUND: ();
     /// The state each scope's reads that may lag were served in this request ([`one_state_per_request`]).
     static REQUEST_STATES: Mutex<HashMap<(String, String), (Arc<Vis>, Arc<Added>)>>;
+    /// Set ([`behind_own_writes`]) while reads may be served as far behind this server's own writes as behind
+    /// another's.
+    static BEHIND_OWN_WRITES: bool;
+}
+
+/// `fut`, whose reads are served, when `yes`, as far behind this server's own writes as they may be behind another
+/// server's: a table's rows and the facts plan as held before an own write made them stale (younger than the hard
+/// staleness limit), and main's last state while the next is built when what changed since only adds memory
+/// ([`Vis::only_added`]); and whose state is not the request's ([`one_state_per_request`]). Only for a check of an
+/// answer kept against its mark ([`losses`], moved by every removal made here when it ends, read now): what is read
+/// under it may hold what an own removal took away, and nothing is worked out from it.
+pub fn behind_own_writes<F: std::future::Future>(
+    yes: bool,
+    fut: F,
+) -> tokio::task::futures::TaskLocalFuture<bool, F> {
+    BEHIND_OWN_WRITES.scope(yes, fut)
+}
+
+/// Whether this task's reads may be served behind this server's own writes ([`behind_own_writes`]).
+fn may_be_behind_own_writes() -> bool {
+    BEHIND_OWN_WRITES.try_with(|b| *b).unwrap_or(false)
 }
 
 /// `fut`, a request: its reads of a scope that may be served the last state ([`Store::pin_lagging`],
@@ -2891,8 +2912,11 @@ fn newest_rows(
 /// only the manifests appended after it ([`Planned`]).
 #[derive(Clone)]
 struct Plan {
-    /// When it was planned; none once an own write made it stale, after which it is never served, only planned on.
+    /// When it was planned; none once an own write made it stale, after which it is never served, only planned on
+    /// (but to a read [`behind_own_writes`]).
     at: Option<Instant>,
+    /// When it was planned, kept when an own write makes it stale: how far behind a read behind own writes is.
+    planned_at: Instant,
     table: Table,
     tasks: Vec<FileScanTask>,
     planned: Planned,
@@ -4002,6 +4026,15 @@ impl Store {
         self.touch(ns);
         if let Some(snap) = self.cached_rows(ns, name, &key) {
             return Ok(snap);
+        }
+        // A read behind own writes takes the rows an own write made stale, as it would those another server's write
+        // made stale ([`behind_own_writes`]); the next read that may not be behind loads them.
+        if may_be_behind_own_writes()
+            && let Some(e) = self.cache.entries.lock().unwrap().get(&key)
+            && e.fetched.is_none()
+            && e.loaded.elapsed() < self.hard_staleness
+        {
+            return Ok(e.snap.clone());
         }
         // Why this read waits, for its slow line: no rows yet, an own write since they were read, or older than
         // the hard limit.
@@ -7906,9 +7939,11 @@ impl Store {
                 ("group_ref", col(&|e| e.group_ref.as_deref())),
                 ("on_behalf_of", col(&|e| e.on_behalf_of.as_deref())),
             ];
-            match append(&*self.catalog(), &table, columns, OnConflict::Fail).await {
-                Ok(()) => {
-                    self.invalidate(SYSTEM_NS, INSTALLATIONS);
+            let before = self.generation(SYSTEM_NS, INSTALLATIONS);
+            match appended(&*self.catalog(), &table, columns, OnConflict::Fail).await {
+                Ok(after) => {
+                    // The cached rows move to the commit: a held list's next read doesn't wait for the catalog.
+                    self.wrote(SYSTEM_NS, INSTALLATIONS, after, before).await;
                     return Ok(events);
                 }
                 Err(e) if is_commit_conflict(&e) => {
@@ -8212,8 +8247,10 @@ impl Store {
             ))
         };
         let table = self.table(SYSTEM_NS, KEY_USAGE).await?;
-        append(
-            &*self.catalog(),
+        // The cached rows move to the commit: `show`'s next read of the keys' last uses doesn't wait for the catalog.
+        self.append_own(
+            SYSTEM_NS,
+            KEY_USAGE,
             &table,
             vec![
                 ("sha256", col(&|u| u.0.as_str())),
@@ -8224,7 +8261,6 @@ impl Store {
             OnConflict::Recommit,
         )
         .await?;
-        self.invalidate(SYSTEM_NS, KEY_USAGE);
         let written: BTreeSet<(String, String)> =
             uses.iter().map(|u| (u.1.clone(), u.0.clone())).collect();
         self.unwrite_gone(KEY_USAGE, written).await;
@@ -8359,7 +8395,7 @@ impl Store {
         }
         // Boxed: every read of memory awaits this, and its future nested in theirs is deep.
         let v = Box::pin(self.view_read(scope, branch, pinned, may_lag)).await?;
-        if per_request {
+        if per_request && !may_be_behind_own_writes() {
             let _ = REQUEST_STATES.try_with(|m| m.lock().unwrap().insert(key, v.clone()));
         }
         Ok(v)
@@ -8450,12 +8486,13 @@ impl Store {
         if let Some(every) = vis_refresh_every()
             && let Some((built_from, last)) = last
             && last.built_at.elapsed() < VIS_LAG_LIMIT
-            && self
-                .written
-                .lock()
-                .unwrap()
-                .get(&ns)
-                .is_none_or(|w| *w < last.built_at)
+            && (may_be_behind_own_writes()
+                || self
+                    .written
+                    .lock()
+                    .unwrap()
+                    .get(&ns)
+                    .is_none_or(|w| *w < last.built_at))
             && last.fresh_until.is_none_or(|t| now_micros() < t)
         {
             let checked = self
@@ -8509,6 +8546,14 @@ impl Store {
                 }
             }
         }
+        // A read behind own writes builds nothing from the rows it was served: a state built from them would be
+        // taken for one built after the own write. It reads the tables as any read does, and builds from them.
+        if may_be_behind_own_writes() {
+            return Box::pin(
+                BEHIND_OWN_WRITES.scope(false, self.view_read(scope, branch, pinned, may_lag)),
+            )
+            .await;
+        }
         metrics::VIS_READS.with_label_values(&["built"]).inc();
         // One build of this key at a time, on one gate however many readers wait for it ([`GateHeld`]).
         let held = GateHeld::take(&self.vis_builds, &key);
@@ -8559,12 +8604,13 @@ impl Store {
                 && vis_refresh_every().is_some()
                 && let Some((built_from, last)) = just_built
                 && last.built_at.elapsed() < VIS_LAG_LIMIT
-                && self
-                    .written
-                    .lock()
-                    .unwrap()
-                    .get(&ns)
-                    .is_none_or(|w| *w < last.built_at)
+                && (may_be_behind_own_writes()
+                    || self
+                        .written
+                        .lock()
+                        .unwrap()
+                        .get(&ns)
+                        .is_none_or(|w| *w < last.built_at))
                 && last.fresh_until.is_none_or(|t| now_micros() < t)
             {
                 let (of, on, now) = (last.clone(), ns.clone(), stamp.clone());
@@ -9236,6 +9282,16 @@ impl Store {
                         .remove(&format!("plan:{ns}"));
                 }));
             }
+            return Ok((p.table.clone(), p.tasks.clone()));
+        }
+        // A read behind own writes takes the plan an own write made stale, as it would one another server's write
+        // made stale, while it is younger than the hard staleness limit: a later plan is planned by the next reader
+        // that may not be behind.
+        if may_be_behind_own_writes()
+            && let Some(p) = &held
+            && p.at.is_none()
+            && p.planned_at.elapsed() < self.hard_staleness
+        {
             return Ok((p.table.clone(), p.tasks.clone()));
         }
         // One plan of a scope at a time: a reader that arrives meanwhile takes the plan it made.
@@ -12289,6 +12345,7 @@ async fn load_plan_once(
             let (tasks, planned) = plan_full(&table).await?;
             Plan {
                 at: Some(Instant::now()),
+                planned_at: Instant::now(),
                 table,
                 tasks,
                 planned,
@@ -12322,6 +12379,7 @@ async fn plan_on(table: &Table, base: &Plan) -> Result<Option<Plan>> {
     let since = base.snapshot().map(|s| s.snapshot_id());
     let plan = |tasks, planned| Plan {
         at: Some(Instant::now()),
+        planned_at: Instant::now(),
         table: table.clone(),
         tasks,
         planned,
