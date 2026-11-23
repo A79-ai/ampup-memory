@@ -53,6 +53,18 @@ pub fn norm_entry(entry: &str) -> String {
     }
 }
 
+/// The token of a reader who reads every episode some reader may ([`crate::Principal::reading_all`]): the
+/// platform's operators, as its support. No ACL entry is one (an entry is `*`, `user:`, `group:` or `role:`), so
+/// it matches nothing an episode names; [`AclIndex::visible`] and [`crate::Principal::can_see`] read it instead.
+pub const READS_ALL: &str = "operator:*";
+
+/// Whether an ACL entry is one of the engine's own, that no reader holds: a forgotten episode's, a conflict's, a
+/// restatement's, a dream's (an address under the reserved `.invalid` domain). Not even a reader of everything
+/// reads those: a forgotten episode stays forgotten.
+pub fn no_reader(entry: &str) -> bool {
+    entry.ends_with("@memstore.invalid")
+}
+
 /// The ACL entries a caller can match: `*`, `user:<id>`, `group:<g>`, `role:<r>`. A closure entry
 /// `role:<r>` is a held role and never matches a `group:` entry (mirrors `Principal::can_see`).
 pub fn tokens_of(user: &str, groups: &[String]) -> Vec<String> {
@@ -166,6 +178,14 @@ impl AclIndex {
             return b.clone();
         }
         let mut seen = RoaringBitmap::new();
+        if tokens.iter().any(|t| t == READS_ALL) {
+            // Every episode some reader may read: any entry but the engine's own.
+            for (entry, b) in &self.by_entry {
+                if !no_reader(entry) {
+                    seen |= b;
+                }
+            }
+        }
         for t in tokens {
             if let Some(b) = self.by_entry.get(t) {
                 seen |= b;

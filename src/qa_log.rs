@@ -933,6 +933,15 @@ pub async fn list(store: &Store, scope: &Scope, goal: Option<&str>) -> Result<Ve
     Ok(out)
 }
 
+/// Loads the log's rows of `scope` and decodes those not decoded before, as [`list`] reads them, without listing:
+/// for the warm-up, so the first page that lists sessions on a new server (the Learned page, a session start)
+/// doesn't load the table itself (7.7 s on staging, Nov 2026).
+pub async fn warm(store: &Store, scope: &Scope) -> Result<()> {
+    let rows = store.side_rows(&scope.namespace(), QA_LOG).await?;
+    let _ = decoded(scope, rows);
+    Ok(())
+}
+
 /// One row of the log as written, decoded.
 struct Row {
     commit: String,

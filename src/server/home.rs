@@ -736,7 +736,8 @@ async fn week(
     since: i64,
 ) -> Result<Value> {
     let (facts, advice, sources) = (
-        json!({"op": "facts", "valid_from": {"gte": since}, "limit": FACT_SAMPLE, "order": "newest"}),
+        // The facts as `entities/` counts them: a note's own fact is a note, counted under notes.
+        json!({"op": "facts", "valid_from": {"gte": since}, "limit": FACT_SAMPLE, "order": "newest", "notes": false}),
         json!({"op": "advice_usage", "days": WEEK_DAYS}),
         json!({"op": "ls", "path": ["sources"], "limit": 1000}),
     );
@@ -768,7 +769,8 @@ async fn week(
         json!({
             "times": used.iter().map(|x| n(&x["used"])).sum::<u64>(),
             "notes": used.len(),
-            "waiting": used.iter().filter(|x| x["ratified"] != true && x["held"] != true).count(),
+            // A person's own note is never ratified: none waits.
+            "waiting": used.iter().filter(|x| x["mine"] != true && x["ratified"] != true && x["held"] != true).count(),
         })
     });
     let sources = sources.ok().map(|s| {

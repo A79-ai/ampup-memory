@@ -1605,7 +1605,10 @@ impl Extractor {
     /// of what happened go under, so a text that carries one on files under it, and the facts already recorded,
     /// so a text that says them again (instructions repeated with every task, say) adds nothing.
     pub async fn facts_known(&self, ep: &Episode, known: &Known) -> Result<Vec<Fact>> {
-        let body = String::from_utf8_lossy(&ep.body);
+        let body = read_text(ep);
+        if body.trim().is_empty() {
+            return Ok(vec![]);
+        }
         let text = match body.char_indices().nth(MAX_TEXT) {
             Some((i, _)) => &body[..i],
             None => &body,
@@ -1702,16 +1705,34 @@ pub(crate) fn readers_hold_org_wide() -> bool {
         || std::env::var("AMPUP_MEMORY_DIRECTORY").is_ok_and(|v| v == "required")
 }
 
+/// The text extraction reads of `ep`: its body, but for a session's ([`session_source`]) only the turns that are the
+/// person's own words ([`crate::sessions::requests`]: what they asked, each mid-turn message unwrapped, nothing the
+/// harness sent in their place). The agent's replies, the tools' output and whatever the memory itself injected are
+/// what the agent did and was told, not what the person knows: read, they came back as facts about one session's
+/// script, its ports and exit codes, and about AmpUp Memory itself, recalled into every session after. The record
+/// keeps them whole for what reads the session as a run (advice, grading, its PRs).
+fn read_text(ep: &Episode) -> std::borrow::Cow<'_, str> {
+    let body = String::from_utf8_lossy(&ep.body);
+    if !session_source(&ep.source) {
+        return body;
+    }
+    crate::sessions::requests(&body)
+        .into_iter()
+        .map(|a| format!("User: {}", a.said))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        .into()
+}
+
 /// What extraction is told of a session's record ([`session_source`]), after the prompt and what memory holds, so
 /// the prompt (and the extractor's id) stays as every other text reads it. A coding session says where its work
 /// stands at every turn; that changes within days and the code host and CI keep it, so a fact of it misleads soon
 /// after. What stays true after the session is what its next ones need.
-const SESSION_RECORD: &str = "The text is the record of a coding session. Don't record where its work stood: \
-whether a pull request, branch, deploy or job was open, merged, pushed, pending, queued, blocked, in review or a \
-draft, a commit or merge hash, a test run's counts, or what was still to do. Don't record that the user asked for \
-something, or who did it, when that is only the user or the assistant. Record what stays true after the session: \
-how something works, a setting and its value, a cause that was found, a decision and why it was made, a \
-preference the user stated.\n\n";
+const SESSION_RECORD: &str = "The text is what a person typed to a coding agent in one session, their own words. \
+Don't record where its work stood: whether a pull request, branch, deploy or job was open, merged, pushed, pending, \
+queued, blocked, in review or a draft, a commit or merge hash, a test run's counts, or what was still to do. Don't \
+record that the user asked for something. Record what stays true after the session: how something works, a setting \
+and its value, a decision and why it was made, a preference or a convention the user stated.\n\n";
 
 /// Most names [`known`] offers.
 const RECORD_NAMES: usize = 8;
@@ -1731,7 +1752,7 @@ pub struct Known {
 /// What memory already holds that `ep`'s text is most like: only what every reader of `ep` may read, so nothing
 /// reaches a fact readers of its own couldn't see. Nothing on any error: it helps extraction, never stops it.
 async fn known(store: &Store, scope: &Scope, ep: &Episode) -> Known {
-    let body = String::from_utf8_lossy(&ep.body);
+    let body = read_text(ep);
     let text: String = body.chars().take(2_000).collect();
     let readers = known_readers(scope, ep);
     let Ok(session) = store.pin(scope, MAIN).await else {

@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
+use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::advice::{Listed, Space};
@@ -296,6 +297,9 @@ async fn full_kept(
     .await
 }
 
+/// How many people's lessons [`full`] reads at once.
+const PEOPLE_PARALLEL: usize = 8;
+
 /// Every lesson `reader` reads of `space` (and `person`'s), each with its trails, as [`Full`] holds them.
 async fn full(
     store: &Store,
@@ -310,37 +314,64 @@ async fn full(
     let scope = session.scope();
     let by_id: BTreeMap<&str, &Logged> = log.iter().map(|l| (l.answer_id.as_str(), l)).collect();
     let people = people_of(log, &me, reader.every_session, space, person);
+    let build_started = std::time::Instant::now();
     let mut out: Vec<Value> = vec![];
     let mut owners: BTreeSet<String> = BTreeSet::new();
-    for owner in &people {
-        // A person's own lessons are written for them alone: read as them (an admin reads them as `notes/` does).
-        let as_owner = Principal::from_parts(owner.clone(), vec![]);
-        let who = if *owner == me { reader.who } else { &as_owner };
-        let mine = Space::mine(owner);
-        let listed = crate::advice::listed(session, store, who, &mine).await?;
-        crate::phases::mark("lessons own listed");
-        if listed.is_empty() {
-            continue;
-        }
-        let assigned = crate::advice::assigned(session, store, who, &mine).await?;
-        crate::phases::mark("lessons own assigned");
+    // Each person's map and notes are read [`PEOPLE_PARALLEL`] people at a time: an admin reads everyone's, and
+    // one after another they took seconds on a server that hadn't kept the answer yet.
+    let me_ = me.as_str();
+    let each = futures::stream::iter(people.iter().cloned())
+        .map(|owner: String| async move {
+            // A person's own lessons are written for them alone: read as them (an admin reads them as `notes/`
+            // does).
+            let as_owner = Principal::from_parts(owner.clone(), vec![]);
+            let who = if owner == me_ { reader.who } else { &as_owner };
+            let started = std::time::Instant::now();
+            let (listed, assigned, times) =
+                crate::advice::listed_assigned(session, store, who, &Space::mine(&owner)).await?;
+            Ok::<_, anyhow::Error>((owner, listed, assigned, times, started.elapsed()))
+        })
+        .buffered(PEOPLE_PARALLEL)
+        .collect::<Vec<_>>()
+        .await;
+    let people_took = build_started.elapsed();
+    let mut read = PeopleRead::default();
+    for r in each {
+        let (owner, listed, assigned, times, took) = r?;
+        read.add(&owner, times, took);
         for l in listed {
-            if let Some(v) = lesson(&l, Some(owner), &assigned, log, &by_id, &me, reader, limit) {
+            if let Some(v) = lesson(&l, Some(&owner), &assigned, log, &by_id, &me, reader, limit) {
                 owners.insert(owner.clone());
                 out.push(v);
             }
         }
     }
+    let mut team_read: Option<String> = None;
     if space != "mine" && person.is_none() {
         let team = Space::team();
-        let listed = crate::advice::listed(session, store, reader.who, &team).await?;
-        crate::phases::mark("lessons team listed");
+        let team_started = std::time::Instant::now();
+        let (((listed, assigned, times), map_took), (bar, bar_took), (tallies, tallies_took)) = tokio::try_join!(
+            timed(crate::advice::listed_assigned(
+                session, store, reader.who, &team
+            )),
+            timed(crate::sessions::evidence_bar(store, scope)),
+            timed(crate::sessions::evidence(store, scope)),
+        )?;
+        team_read = Some(format!(
+            "team in {} ms (map {} ms, notes {} ms for {}, merged notes {} ms for {}, curation {} ms, all of it {} ms; \
+             evidence bar {} ms, tallies {} ms)",
+            team_started.elapsed().as_millis(),
+            times.map.as_millis(),
+            times.notes.as_millis(),
+            times.notes_read,
+            times.merged.as_millis(),
+            times.merged_read,
+            times.withheld.as_millis(),
+            map_took.as_millis(),
+            bar_took.as_millis(),
+            tallies_took.as_millis(),
+        ));
         if !listed.is_empty() {
-            let assigned = crate::advice::assigned(session, store, reader.who, &team).await?;
-            crate::phases::mark("lessons team assigned");
-            let bar = crate::sessions::evidence_bar(store, scope).await?;
-            let tallies = crate::sessions::evidence(store, scope).await?;
-            crate::phases::mark("lessons team evidence");
             for l in listed {
                 if let Some(mut v) = lesson(&l, None, &assigned, log, &by_id, &me, reader, limit) {
                     // Ratified: by an admin, or backed by outcomes or people and past the evidence bar. Every
@@ -364,10 +395,69 @@ async fn full(
         }
     }
     out.sort_by_key(order);
+    let took = build_started.elapsed();
+    if took >= SLOW_BUILD {
+        eprintln!(
+            "slow lessons build: {} in {} ms: {}; {}",
+            scope.namespace(),
+            took.as_millis(),
+            read.line(people.len(), people_took),
+            team_read.as_deref().unwrap_or("no team")
+        );
+    }
     Ok(Full {
         lessons: out,
         owners,
     })
+}
+
+/// A build of the lessons this long says where its time went.
+const SLOW_BUILD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `f`, and how long it took.
+async fn timed<T>(
+    f: impl std::future::Future<Output = Result<T>>,
+) -> Result<(T, std::time::Duration)> {
+    let started = std::time::Instant::now();
+    let v = f.await?;
+    Ok((v, started.elapsed()))
+}
+
+/// What reading each person's lessons took, summed over them, and the slowest person.
+#[derive(Default)]
+struct PeopleRead {
+    times: crate::advice::ListedTimes,
+    slowest: Option<(String, std::time::Duration)>,
+}
+
+impl PeopleRead {
+    fn add(&mut self, owner: &str, t: crate::advice::ListedTimes, took: std::time::Duration) {
+        self.times.map += t.map;
+        self.times.withheld += t.withheld;
+        self.times.notes += t.notes;
+        self.times.notes_read += t.notes_read;
+        self.times.merged += t.merged;
+        self.times.merged_read += t.merged_read;
+        if self.slowest.as_ref().is_none_or(|(_, s)| took > *s) {
+            self.slowest = Some((owner.to_string(), took));
+        }
+    }
+
+    fn line(&self, people: usize, took: std::time::Duration) -> String {
+        let t = &self.times;
+        format!(
+            "{people} people in {} ms, {PEOPLE_PARALLEL} at a time (summed over them: maps {} ms, notes {} ms for {}, \
+             merged notes {} ms for {}, curation {} ms; slowest {} ms)",
+            took.as_millis(),
+            t.map.as_millis(),
+            t.notes.as_millis(),
+            t.notes_read,
+            t.merged.as_millis(),
+            t.merged_read,
+            t.withheld.as_millis(),
+            self.slowest.as_ref().map_or(0, |(_, d)| d.as_millis()),
+        )
+    }
 }
 
 /// Whose own lessons a reader reads: their own, or for a reader of everyone's, everyone who ran or asked something
@@ -598,7 +688,8 @@ fn lesson(
             continue;
         };
         if crate::sessions::automated(x)
-            || !s.served.contains(&l.key)
+            || !(s.served.contains(&l.key)
+                || crate::advice_lookups::recalled(s).contains(l.key.as_str()))
             || owner.is_some_and(|o| norm_id(x.asker.trim()) != *o)
         {
             continue;
@@ -745,7 +836,10 @@ fn run_outcome(l: &Logged, at: Option<usize>) -> (Option<bool>, &'static str) {
 
 /// How a session went, and who said so, surest first: what came of its PRs, the person (their rating, or how their
 /// next messages graded its requests), a reward its agent or the person gave, then the judge's reading.
-fn session_outcome(l: &Logged, verdicts: Option<&Value>) -> (&'static str, &'static str) {
+pub(crate) fn session_outcome(
+    l: &Logged,
+    verdicts: Option<&Value>,
+) -> (&'static str, &'static str) {
     let s = l.session.as_ref();
     let mark = |ok: bool| if ok { "good" } else { "bad" };
     if let Some((r, _)) = s.and_then(|s| crate::session_prs::outcome(&s.prs, crate::now_micros())) {

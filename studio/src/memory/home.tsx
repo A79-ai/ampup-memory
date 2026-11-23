@@ -202,7 +202,7 @@ interface FactsPage {
   facts: { entity: string; sources?: { episode_id: string; source?: string | null }[] }[];
 }
 interface AdviceUsage {
-  advice: { used: number; people: number; ratified: boolean; held?: boolean }[];
+  advice: { used: number; people: number; ratified: boolean; held?: boolean; mine?: boolean }[];
 }
 interface Activity {
   people: { user: string; sessions: number; runs: number; answers: number }[];
@@ -310,7 +310,8 @@ export function Home({
   // The facts that took effect this week: how many, on how many entities, and from where.
   const factsGot = useGot(key, each, () =>
     browse<FactsPage>(
-      { op: "facts", valid_from: { gte: since }, limit: FACT_SAMPLE, order: "newest" },
+      // As `entities/` counts them: a note's own fact counts under notes.
+      { op: "facts", valid_from: { gte: since }, limit: FACT_SAMPLE, order: "newest", notes: false },
       sel,
     ),
   );
@@ -393,7 +394,7 @@ export function Home({
     return {
       times: used.reduce((n, a) => n + a.used, 0),
       notes: used.length,
-      waiting: advice.advice.filter((a) => a.used > 0 && !a.ratified && !a.held).length,
+      waiting: advice.advice.filter((a) => !a.mine && a.used > 0 && !a.ratified && !a.held).length,
     };
   }, [one, advice]);
 
@@ -599,7 +600,7 @@ export function Home({
                   href={href({ kind: "folder", path: ["sessions"] })}
                   n={count("sessions")}
                   label="of your session records kept"
-                  note="yours, all time"
+                  note="all time · one session can keep two"
                   title="Your own records in the sessions/ folder, since the memory began: an ended session's record and a coding session's hook notes each count, so one coding session can count twice"
                 />
               )}

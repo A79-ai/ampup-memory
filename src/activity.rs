@@ -107,7 +107,8 @@ fn gap(l: &Logged) -> Option<&'static str> {
 #[derive(Default)]
 struct Tally {
     sessions: usize,
-    /// Sessions served at least one note (their `served`, kept since sessions began).
+    /// Sessions served at least one note (their `served`, kept since sessions began), or handed one of the person's
+    /// own notes' learned preferences.
     sessions_served: usize,
     /// Sessions in the holdout arm that had advice withheld.
     sessions_withheld: usize,
@@ -120,7 +121,9 @@ impl Tally {
     fn session(&mut self, l: &Logged) {
         let Some(s) = &l.session else { return };
         self.sessions += 1;
-        self.sessions_served += usize::from(!s.served.is_empty());
+        // A session handed only a note's learned preferences was served it too.
+        self.sessions_served +=
+            usize::from(!s.served.is_empty() || !crate::advice_lookups::recalled(s).is_empty());
         self.sessions_withheld += usize::from(!s.withheld.is_empty());
     }
 
@@ -172,9 +175,10 @@ fn serving<'a>(entries: impl Iterator<Item = &'a Logged>, since: i64) -> Value {
         callers.entry(caller).or_default().session(l);
         people.entry(l.asker.clone()).or_default().session(l);
         harnesses.entry(harness.clone()).or_default().session(l);
-        for k in &s.served {
+        let handed = crate::advice_lookups::recalled(s);
+        for k in s.served.iter().map(String::as_str).chain(handed) {
             top_served
-                .entry(k.clone())
+                .entry(k.to_string())
                 .or_default()
                 .1
                 .insert(l.answer_id.as_str());
@@ -189,7 +193,10 @@ fn serving<'a>(entries: impl Iterator<Item = &'a Logged>, since: i64) -> Value {
             harnesses.entry(harness.clone()).or_default().lookup(o);
             if let Some(k) = &x.key {
                 match o {
-                    outcome::SERVED | outcome::SERVED_OWN | outcome::SERVED_PROCEDURES => {
+                    outcome::SERVED
+                    | outcome::SERVED_OWN
+                    | outcome::SERVED_PROCEDURES
+                    | outcome::RECALLED => {
                         top_served.entry(k.clone()).or_default().0 += 1;
                     }
                     outcome::NO_ADVICE => *no_advice.entry(k.clone()).or_default() += 1,

@@ -575,17 +575,21 @@ export function MemoryStudio({
     if (searched != null) setQuery(searched);
   }
 
-  // Below 900px the tree is a drawer, closed on every move.
+  // Below 900px the tree is a drawer over the page, closed on every move. Wider, it is a column beside the page
+  // (hosted, shown by the "Folders" button), and stays open while the user moves through it.
   const [drawer, setDrawer] = useState(false);
   // Whether the tree is on screen: always when wide, unless the host draws the sections (then the "Folders" button
   // shows it); narrow, only while its drawer is open. Hidden, it reads nothing.
   const wide = useMedia("(min-width: 901px)");
   const searchRef = useRef<HTMLInputElement>(null);
-  const go = useCallback((f: Focus) => {
-    setDrawer(false);
-    const h = toHash(f);
-    if (h !== location.hash) navigate(`${location.pathname}${location.search}${h}`);
-  }, []);
+  const go = useCallback(
+    (f: Focus) => {
+      if (!wide) setDrawer(false);
+      const h = toHash(f);
+      if (h !== location.hash) navigate(`${location.pathname}${location.search}${h}`);
+    },
+    [wide],
+  );
   // ⌘K (or Ctrl+K, or /) opens Search with its box focused, from anywhere but a text field.
   useEffect(() => {
     const on = (e: KeyboardEvent) => {

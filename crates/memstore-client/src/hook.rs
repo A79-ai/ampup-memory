@@ -1493,6 +1493,9 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
     // hook later.
     // Where the memory is the local server by default, the start starts it when nothing answers there, or says
     // how to install it.
+    // A first prompt that only tries the memory briefly ([`tries_first_prompt`]): past [`FIRST_PROMPT_TRY`] its
+    // lookups go on in a copy, as any other prompt's do.
+    let tries = !detached && tries_first_prompt(event, &input, harness);
     let mut local_note = None;
     if !detached && matches!(event, "session-start" | "prompt" | "pre-tool" | "post-tool") {
         // Nobody signed in to a team's server: every call would be refused, so the start says how to sign in.
@@ -1515,7 +1518,8 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
         }
         // Before a final answer (a run ends with it) the hook waits for what fires: told one hook later, the
         // agent is told nothing.
-        let waits = final_answer(event, &input, harness) || first_prompt(event, &input, harness);
+        let waits =
+            final_answer(event, &input, harness) || first_prompt(event, &input, harness) || tries;
         if !(has_work(event, &input) && due(event, &input))
             || (!waits && detach(&raw, event, harness).is_ok())
         {
@@ -1541,6 +1545,7 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
     }
     // What the person waits on is cut short: a slow memory adds nothing to the context rather than holding it up.
     let timeout = match (ending || event == "end", detached) {
+        _ if tries => FIRST_PROMPT_TRY,
         (_, true) => Duration::from_secs(30),
         (true, false) => Duration::from_millis(900),
         (false, false) => match event {
@@ -1704,8 +1709,13 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
                 note_said(&input, prompt);
             }
             let recall_now = every || first("recalled", session);
-            let (advised, recalled) =
-                tokio::join!(advise(&client, &input, harness, prompt), async {
+            // Once a session: a memory too slow for one try is not waited on again.
+            let tries = tries && first("tried", session);
+            // Each lookup by the try's deadline on its own: one that came back in time is kept when the other didn't.
+            let deadline = tokio::time::Instant::now() + FIRST_PROMPT_TRY;
+            let (advised, recalled) = tokio::join!(
+                by(tries, deadline, advise(&client, &input, harness, prompt)),
+                by(tries, deadline, async {
                     match recall_now {
                         true => {
                             recall(
@@ -1718,7 +1728,38 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
                         }
                         false => Ok(None),
                     }
-                });
+                })
+            );
+            // Not asked in time (too slow, or the session not open yet): the prompt goes on as any other does, with
+            // what is on this machine and what came back in time, and a copy asks again for the next hook to hand
+            // on. Quiet: nothing is said. Asked in time, the advice reaches the agent with the prompt it bears on.
+            let asked = advised.is_some() && marker("asked", session).is_some_and(|m| m.exists());
+            let late_recall = recall_now && recalled.is_none();
+            if late_recall && let Some(m) = marker("recalled", session) {
+                let _ = std::fs::remove_file(m);
+            }
+            if tries && !asked {
+                if let Some(m) = marker("asked", session) {
+                    let _ = std::fs::remove_file(m);
+                }
+                let _ = detach(&raw, event, harness);
+                let line = advised.and_then(|a| a.ok().flatten());
+                let left = (BUDGET - START_FACTS)
+                    .saturating_sub(line.as_deref().map_or(0, |l| l.chars().count() + 1));
+                let recalled = recalled
+                    .and_then(|r| r.ok().flatten())
+                    .and_then(|(t, _)| within(&t, left));
+                let mut parts = vec![line.or_else(|| opened_line(&input)), recalled];
+                let used: usize = parts.iter().flatten().map(|p| p.chars().count()).sum();
+                parts.push(take_inbox(session, CONTEXT_CHARS.saturating_sub(used)));
+                return say(harness, &input, harness.event(false), &parts);
+            }
+            // The advice in time but not the notes: a copy recalls them for the next hook (its advice asked already).
+            if tries && late_recall {
+                let _ = detach(&raw, event, harness);
+            }
+            let advised = advised.unwrap_or(Ok(None));
+            let recalled = recalled.unwrap_or(Ok(None));
             let advised = advised.unwrap_or_else(|e| {
                 // A first prompt that waited ([`Harness::first_prompt_waits`]) on a memory too slow for it: a copy
                 // asks again, as any other prompt's does, and the next hook hands its answer on.
@@ -2826,6 +2867,34 @@ fn first_prompt(event: &str, input: &Value, harness: Harness) -> bool {
         && marker("asked", session_of(input)).is_some_and(|m| !m.exists())
 }
 
+/// `lookup`'s answer, by `deadline` where the prompt only `tries` the memory ([`tries_first_prompt`]); none past it.
+async fn by<T>(
+    tries: bool,
+    deadline: tokio::time::Instant,
+    lookup: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match tries {
+        true => tokio::time::timeout_at(deadline, lookup).await.ok(),
+        false => Some(lookup.await),
+    }
+}
+
+/// How long Claude Code's first prompt tries the memory ([`tries_first_prompt`]): a lookup takes tens to a few
+/// hundred milliseconds, and the person barely notices this much before the agent starts.
+const FIRST_PROMPT_TRY: Duration = Duration::from_millis(1_500);
+
+/// Claude Code's first prompt of a session, which tries the memory for up to [`FIRST_PROMPT_TRY`] before going on
+/// as any other prompt does. Its copy's answer would reach the agent only at its first tool call's hook: after the
+/// first thing it did, which the session's notes and advice were about (a commit written one way, then amended to
+/// the one the person asked to be remembered).
+fn tries_first_prompt(event: &str, input: &Value, harness: Harness) -> bool {
+    event == "prompt"
+        && harness == Harness::ClaudeCode
+        && ["asked", "tried"]
+            .iter()
+            .all(|k| marker(k, session_of(input)).is_some_and(|m| !m.exists()))
+}
+
 fn due(event: &str, input: &Value) -> bool {
     !(event == "post-tool" && ends_step(input)) || claim_decision(input)
 }
@@ -3835,6 +3904,60 @@ enum Step {
     },
 }
 
+/// A person's turn in a trace, unless it is the one just before it again: a message sent while the agent worked
+/// ([`queued`]) that the harness also hands on as a prompt of its own once the turn ends.
+fn asked(steps: &mut Vec<Step>, said: &str) {
+    let said = said.trim();
+    let again = steps
+        .iter()
+        .rev()
+        .find_map(|s| match s {
+            Step::Asked(t) => Some(t == said),
+            _ => None,
+        })
+        .unwrap_or(false);
+    if !said.is_empty() && !again {
+        steps.push(Step::Asked(said.to_string()));
+    }
+}
+
+/// What the person typed while the agent worked, from Claude Code's transcript: not a user turn but an attachment
+/// (`queued_command`) the running turn is handed. A queued shell command (`!…`) is not something they said.
+fn queued(v: &Value) -> Option<&str> {
+    let a = &v["attachment"];
+    (v["type"] == "attachment"
+        && a["type"] == "queued_command"
+        && a["commandMode"].as_str().is_none_or(|m| m == "prompt"))
+    .then(|| a["prompt"].as_str())
+    .flatten()
+    .map(persons_part)
+    .filter(|t| !injected(t))
+}
+
+/// How each block AmpUp Memory adds to an agent's context begins: its recall, its advice, the session's line and
+/// the person's recent sessions.
+const OURS: [&str; 5] = [
+    RECALL_LEAD,
+    OLD_RECALL_LEAD,
+    ADVICE_LEAD,
+    "AmpUp Memory session: ",
+    "What this user worked on lately (AmpUp Memory",
+];
+
+/// A person's turn without what AmpUp Memory added to it. A harness that adds a hook's context to the prompt itself
+/// puts it after the person's words: the turn is cut at the first line one of its blocks begins, so what the memory
+/// said is never kept as something the person said.
+fn persons_part(text: &str) -> &str {
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        if OURS.iter().any(|o| line.trim_start().starts_with(o)) {
+            return text[..at].trim();
+        }
+        at += line.len();
+    }
+    text.trim()
+}
+
 /// `entries` as a run trace: each prompt, each answer (short) and each tool call (its name and compact
 /// arguments) with the start of its result, secret-looking words redacted, its start and end kept when it is
 /// long. Claude Code's transcripts carry the tool calls; another harness's give what was said.
@@ -3846,6 +3969,10 @@ fn segment(entries: &[Value], harness: Harness) -> Segment {
             .iter()
             .any(|f| f.as_bool() == Some(true))
         {
+            continue;
+        }
+        if let Some(said) = queued(v) {
+            asked(&mut steps, said);
             continue;
         }
         let v = match harness.claude_lines() {
@@ -3896,7 +4023,7 @@ fn segment(entries: &[Value], harness: Harness) -> Segment {
                 let text = typed.join("\n");
                 let text = text.trim();
                 if !injected(text) {
-                    steps.push(Step::Asked(text.to_string()));
+                    asked(&mut steps, persons_part(text));
                 }
             }
             Some("assistant") => {
@@ -3948,7 +4075,7 @@ fn segment(entries: &[Value], harness: Harness) -> Segment {
             }
             _ => match message_of(&v) {
                 Some(("user", text)) if !injected(text.trim()) => {
-                    steps.push(Step::Asked(text.trim().to_string()))
+                    asked(&mut steps, persons_part(text.trim()))
                 }
                 Some(("assistant" | "model", text)) if !text.trim().is_empty() => {
                     steps.push(Step::Said(text.trim().to_string()))
@@ -4040,7 +4167,11 @@ fn plain(text: &str) -> String {
     text.lines()
         .map(|l| {
             let t = l.trim_start();
-            match t.starts_with("tool ") || t.starts_with("-> ") {
+            // Nor a turn's heading: a line of the agent's own text starting `User:` would read as the person's.
+            match ["tool ", "-> ", "User:", "Outcome:"]
+                .iter()
+                .any(|h| t.starts_with(h))
+            {
                 true => format!("| {l}"),
                 false => l.to_string(),
             }
@@ -4522,6 +4653,13 @@ pub fn condense_in(
         if v["isMeta"].as_bool() == Some(true) || v["isSidechain"].as_bool() == Some(true) {
             continue;
         }
+        if let Some(said) = queued(&v) {
+            if turns.last() != Some(&format!("User: {said}")) {
+                asked += 1;
+                turns.push(format!("User: {said}"));
+            }
+            continue;
+        }
         // Another harness's line: its user and assistant text, wherever its format keeps them.
         if v["type"].as_str() != Some("user") && v["type"].as_str() != Some("assistant") {
             if let Some((role, text)) = message_of(&v) {
@@ -4529,7 +4667,7 @@ pub fn condense_in(
                 match role {
                     "user" if !injected(text) => {
                         asked += 1;
-                        turns.push(format!("User: {text}"));
+                        turns.push(format!("User: {}", persons_part(text)));
                     }
                     "assistant" | "model" if !text.is_empty() => {
                         turns.push(format!("{}: {text}", harness.label()));
@@ -4558,7 +4696,7 @@ pub fn condense_in(
                     continue;
                 }
                 asked += 1;
-                turns.push(format!("User: {text}"));
+                turns.push(format!("User: {}", persons_part(text)));
             }
             Some("assistant") => {
                 for b in content.as_array().into_iter().flatten() {

@@ -19,10 +19,13 @@ interface Session {
   at: number;
   /** True went well, false went wrong, null no outcome. */
   went_well: boolean | null;
-  /** Whose word the outcome is: the person's (rating, next message, PRs) or the session judge's. */
-  by: "person" | "judge" | null;
+  /** Whose word the outcome is: what came of its PRs, the person's (rating, next message), a reward given for the
+   * session (an eval's grader, a run's recorder), or the session judge's. */
+  by: "pr" | "person" | "reward" | "judge" | null;
   /** Only in an admin's view. */
   user?: string;
+  /** Handed the note's learned preferences with what the person asked to be remembered, not served the note. */
+  recalled?: boolean;
 }
 interface Advice {
   key: string;
@@ -42,6 +45,10 @@ interface Advice {
   approved: boolean;
   held?: boolean;
   needs_backing?: string;
+  /** The reader's own note (its key `mine:`): written for them alone, served to them at once, never ratified. */
+  mine?: boolean;
+  /** Of `used`, the sessions handed only its learned preferences, at their start. */
+  recalled?: number;
   sessions: Session[];
 }
 interface Usage {
@@ -60,7 +67,7 @@ const RANGES = [
 const RANGE_IDS = RANGES.map((r) => r.id);
 
 /** Waiting for an admin: used, and neither ratified nor held back. */
-const waiting = (a: Advice) => a.used > 0 && !a.ratified && !a.held;
+const waiting = (a: Advice) => !a.mine && a.used > 0 && !a.ratified && !a.held;
 
 function Bar({ a }: { a: Advice }) {
   const judged = a.went_well + a.went_wrong;
@@ -78,6 +85,12 @@ function Bar({ a }: { a: Advice }) {
 }
 
 function Status({ a }: { a: Advice }) {
+  if (a.mine)
+    return (
+      <span className="ap-badge ap-badge-ok" title="Learned from your own sessions, for you alone">
+        Yours
+      </span>
+    );
   if (a.held) return <span className="ap-badge ap-badge-held">Held back</span>;
   if (a.ratified)
     return (
@@ -97,7 +110,12 @@ function Status({ a }: { a: Advice }) {
 
 function Outcome({ s }: { s: Session }) {
   if (s.went_well === null) return <span className="ap-muted">No outcome</span>;
-  const who = s.by === "person" ? "the person said" : "the session judge";
+  const who = {
+    pr: "what came of its PRs",
+    person: "the person said",
+    reward: "the reward it was given",
+    judge: "the session judge",
+  }[s.by ?? "judge"];
   return (
     <span className={s.went_well ? "ap-ok" : "ap-bad"} title={`By ${who}`}>
       {s.went_well ? "✓ Went well" : "✗ Went wrong"}
@@ -206,7 +224,10 @@ export function AdvicePage({
       ) : !cur ? (
         <p className="ap-pad ap-muted">Reading the advice…</p>
       ) : all.length === 0 ? (
-        <p className="ap-pad ap-muted">No advice learned here yet, or none you may read.</p>
+        <p className="ap-pad ap-muted">
+          No advice learned here yet, or none you may read. Advice is learned from sessions whose outcome is
+          known: yours appears here after a few of them.
+        </p>
       ) : (
         <>
           <div className="ap-tiles">
@@ -290,6 +311,7 @@ export function AdvicePage({
                   <span className="ap-item-sub">
                     <span className="ap-muted ap-small">
                       {a.category}
+                      {a.mine ? " · yours" : ""}
                       {a.ratified ? " · ✓ ratified" : ""}
                       {a.held ? " · held back" : ""}
                     </span>
@@ -397,7 +419,7 @@ function Detail({
       <div className="ap-title">
         <h2>{a.situation}</h2>
         <Status a={a} />
-        {admin && (
+        {admin && !a.mine && (
           <div className="ap-actions">
             {!a.ratified || a.held ? (
               <button className="ap-btn" disabled={busy} onClick={() => ratify(true)}>
@@ -416,7 +438,15 @@ function Detail({
           {note.text}
         </p>
       )}
-      {admin && !a.ratified && !a.held && (
+      {a.mine && (
+        <p className="ap-muted ap-small">
+          Learned from your own sessions and given to you alone, from the next one on.
+          {a.recalled
+            ? ` ${a.recalled} of its ${a.used} ${a.used === 1 ? "use was" : "uses were"} its preferences, handed when a session started.`
+            : ""}
+        </p>
+      )}
+      {admin && !a.mine && !a.ratified && !a.held && (
         <p className="ap-muted ap-small">
           {a.needs_backing
             ? "Not served yet: it waits until people's outcomes back it. Ratifying serves it to the whole team now."
@@ -505,6 +535,7 @@ function Detail({
                     <span className="ap-muted ap-small">
                       {every ? `${s.user} · ` : ""}
                       {when(s.at)}
+                      {s.recalled ? " · its preferences, at the start" : ""}
                     </span>
                   </button>
                   <span className="ap-session-out">

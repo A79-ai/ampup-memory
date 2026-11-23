@@ -319,7 +319,8 @@ pub use retry::{is_transient, wait_hint};
 pub struct Principal {
     user: String,
     groups: Vec<String>,
-    /// The ACL entries this closure can match (`auth::tokens_of`), sorted.
+    /// The ACL entries this closure can match (`auth::tokens_of`), sorted; with [`auth::READS_ALL`] for a reader of
+    /// everything ([`Principal::reading_all`]).
     tokens: Arc<Vec<String>>,
     /// The episodes this closure may read, for the last visibility snapshot it was asked about.
     seen: Arc<Mutex<Option<SeenAt>>>,
@@ -334,12 +335,33 @@ impl Principal {
     }
 
     pub fn from_parts(user: String, groups: Vec<String>) -> Self {
+        Self::with_tokens(user, groups, false)
+    }
+
+    fn with_tokens(user: String, groups: Vec<String>, all: bool) -> Self {
+        let mut tokens = auth::tokens_of(&user, &groups);
+        if all {
+            tokens.push(auth::READS_ALL.to_string());
+            tokens.sort_unstable();
+        }
         Principal {
-            tokens: Arc::new(auth::tokens_of(&user, &groups)),
+            tokens: Arc::new(tokens),
             user,
             groups,
             seen: Default::default(),
         }
+    }
+
+    /// This reader, reading every episode some reader may read, whatever its ACL names, but none that no reader
+    /// holds (a forgotten one: [`auth::no_reader`]). Only for the platform's operators, as its support: the server
+    /// makes one of an operator's own sign-in in an org it selected, and of nothing a request says.
+    pub fn reading_all(self) -> Self {
+        Self::with_tokens(self.user, self.groups, true)
+    }
+
+    /// Whether this reader reads every episode some reader may ([`Principal::reading_all`]).
+    pub fn reads_all(&self) -> bool {
+        self.tokens.iter().any(|t| t == auth::READS_ALL)
     }
 
     pub fn user(&self) -> &str {
@@ -358,9 +380,11 @@ impl Principal {
     /// Adds groups to the closure.
     pub fn add_groups(&mut self, more: impl IntoIterator<Item = String>) {
         self.groups.extend(more);
-        *self = Self::from_parts(
+        let all = self.reads_all();
+        *self = Self::with_tokens(
             std::mem::take(&mut self.user),
             std::mem::take(&mut self.groups),
+            all,
         );
     }
 
@@ -369,7 +393,9 @@ impl Principal {
     /// case-sensitive, so case folding would let `ALICE` read what was meant for `"alice"`. Writers store
     /// unquoted names upper-case, as Snowflake does.
     pub fn can_see(&self, acl: &[String]) -> bool {
+        let all = self.reads_all();
         acl.iter().any(|a| match a.split_once(':') {
+            _ if all && !auth::no_reader(a) => true,
             _ if a == "*" => true,
             Some(("user", u)) => auth::norm_id(u) == auth::norm_id(&self.user),
             // held roles share `groups` as `role:<NAME>`; a group entry never matches one

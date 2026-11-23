@@ -107,6 +107,9 @@ pub struct Metrics {
     pub requests: IntCounterVec,
     /// Seconds from a request's headers being read to its response, by route template.
     pub request_seconds: prometheus::HistogramVec,
+    /// Seconds an MCP `tools/call` took to answer, by tool (one the server knows, else `other`) and outcome
+    /// (`ok`, `error`, `tool-error`): the route histogram lumps every tool under `/mcp`.
+    pub mcp_tool_seconds: prometheus::HistogramVec,
     /// 401s, 403s and 429s by reason code.
     pub refusals: IntCounterVec,
     /// Service keys' authenticated uses by their org (`-` unless the directory holds it) and role.
@@ -147,6 +150,20 @@ impl Metrics {
         registry
             .register(Box::new(request_seconds.clone()))
             .unwrap();
+        let mcp_tool_seconds = prometheus::HistogramVec::new(
+            HistogramOpts::new(
+                "memstore_mcp_tool_seconds",
+                "Seconds an MCP tools/call took to answer, by tool and outcome",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+            ]),
+            &["tool", "outcome"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(mcp_tool_seconds.clone()))
+            .unwrap();
         let refusals = vec(
             "memstore_auth_refusals_total",
             "Refused requests (401, 403, 429) by reason code",
@@ -178,6 +195,7 @@ impl Metrics {
             registry,
             requests,
             request_seconds,
+            mcp_tool_seconds,
             refusals,
             key_uses,
             rate_limited,

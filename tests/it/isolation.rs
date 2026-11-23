@@ -2677,6 +2677,105 @@ async fn asking_to_join_grants_nothing_until_an_admin_approves() {
         reads_acme(&orgless_key).await,
         "an org-less personal key once acme required nothing"
     );
+
+    // An operator, as the platform's support, reads all of any org's memory: what a member keeps to themselves
+    // too, which the org's own admin doesn't. Never a forgotten episode, though, and none of it shows in the org's
+    // audit: the operator's sign-ins and reads are the operator's view.
+    let private = |tag: &str| {
+        Episode::new(
+            &format!("note:{tag}"),
+            format!("{tag} kept to himself").as_bytes(),
+            &["user:bob@acme.com"],
+        )
+    };
+    for org in ["acme", "beta"] {
+        let scope = Scope::org(org).unwrap();
+        let gone = private(&format!("xgone{org}"));
+        let f = Fact::new(&format!("deal:xgone{org}"), "owner", &format!("xgone{org}"))
+            .from_episodes(&[&gone]);
+        store
+            .commit(&scope, "test", std::slice::from_ref(&gone), &[f])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .forget(&scope, "bob@acme.com", &gone.episode_id, |_| true)
+                .await
+                .unwrap()
+        );
+        // Committed after the forget, so a read that sees it sees the forget too.
+        let mine = private(&format!("xbobs{org}"));
+        let f = Fact::new(&format!("deal:xbobs{org}"), "owner", &format!("xbobs{org}"))
+            .from_episodes(&[&mine]);
+        store.commit(&scope, "test", &[mine], &[f]).await.unwrap();
+    }
+    let finds = async |t: &str, org: &str, tag: &str| -> bool {
+        let (status, body) = mcp_call(
+            s,
+            &format!("?org={org}"),
+            t,
+            "search_memory",
+            json!({"query": tag}),
+        )
+        .await;
+        assert_eq!(status, 200, "{org}: {body}");
+        // The fact's entity, not the tag: an answer that finds nothing repeats the query.
+        body.contains(&format!("deal:{tag}"))
+    };
+    for org in ["acme", "beta"] {
+        let t = Instant::now();
+        while !finds(&operator, org, &format!("xbobs{org}")).await {
+            assert!(
+                t.elapsed() < Duration::from_secs(15),
+                "the operator never read bob's own memory in {org}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            !finds(&operator, org, &format!("xgone{org}")).await,
+            "the operator read a forgotten episode in {org}"
+        );
+    }
+    assert!(
+        finds(&ann_in_acme, "acme", "xacmeonly").await,
+        "acme's admin reads what is shared with acme"
+    );
+    assert!(
+        !finds(&ann_in_acme, "acme", "xbobsacme").await,
+        "acme's admin read what bob keeps to himself"
+    );
+    // The org's audit holds none of the operator's sign-ins or reads (its change above is the org's); the
+    // operator's view holds its reads, naming the org's memory it read.
+    let (status, b) = changes(
+        &ann_in_acme,
+        json!({"op": "audit", "org": "acme", "since_secs": 3600}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    let rows = b["events"].as_array().unwrap();
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r["actor"] == "olivia@ops.test"
+                && (r["kind"] == "signin" || r["kind"] == "read")),
+        "acme's audit shows the operator: {b}"
+    );
+    let (status, b) = changes(
+        ADMIN_KEY,
+        json!({"op": "audit", "operator": true, "since_secs": 3600}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    assert!(
+        b["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["actor"] == "olivia@ops.test"
+                && r["kind"] == "read"
+                && r["scope"] == "org:acme"),
+        "the operator's view lacks the operator's read of acme: {b}"
+    );
 }
 
 /// `/agent/run` (the console's Ask, on its arms) answers with what the tools its caller names returned, run as

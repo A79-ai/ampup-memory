@@ -315,6 +315,45 @@ pub const MCP_WRITES: [&str; 3] = [
     "/mcp close_memory",
 ];
 
+/// The routes a request is timed and counted under besides [`ROUTES`] (`memstore_http_request_seconds`,
+/// `memstore_http_requests_total` and the slow-request line), so a latency dashboard tells the console's pages and
+/// the hooks apart. Not in [`ROUTES`]: the audit log's routes are what analytics reads (the control plane's
+/// funnel counts `other` as a hook's call and `/document` as an upload), so they stay as they are.
+const METRIC_ROUTES: [&str; 20] = [
+    "/mcp/hook",
+    "/lessons",
+    "/facts",
+    "/facts/list",
+    "/advice/list",
+    "/advice/seed",
+    "/document",
+    "/learn",
+    "/learn/status",
+    "/remember",
+    "/forget",
+    "/sessions/prs",
+    "/installations",
+    "/tenants",
+    "/transcripts",
+    "/feedback",
+    "/pin",
+    "/close",
+    "/doctor",
+    "/digest/preview",
+];
+
+/// A request path as a metric's `route` label: one of the server's routes ([`route`], or one only metrics name),
+/// never the caller's own text.
+pub fn metric_route(path: &str) -> &'static str {
+    match route(path) {
+        "other" => METRIC_ROUTES
+            .into_iter()
+            .find(|r| *r == path)
+            .unwrap_or("other"),
+        r => r,
+    }
+}
+
 /// The path an MCP tool call is recorded under (`/mcp other` for a tool the server doesn't offer).
 pub fn mcp_path(tool: &str) -> &'static str {
     MCP_TOOLS
@@ -809,10 +848,8 @@ impl Recorder {
         items: usize,
         episodes: &[String],
     ) {
-        let Some(org) = org_name(org) else {
-            return;
-        };
-        let mut e = Entry::new(now_us(), Kind::Read, Some(org), clean(actor));
+        // No org: the operator's view (an operator's read, `scope` naming what it read).
+        let mut e = Entry::new(now_us(), Kind::Read, org_name(org), clean(actor));
         e.scope = Some(clean(scope));
         e.path = Some(route.to_string());
         e.reads = items as i64;

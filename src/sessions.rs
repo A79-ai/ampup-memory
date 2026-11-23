@@ -6,8 +6,9 @@
 //!
 //! A session is an entry of the answer log ([`crate::qa_log`], kind `session`), one row per step, the newest
 //! the session as it stands: its opening context as the question, the harness, its arm, the situations whose
-//! advice it was served (each once) and, in the holdout arm, the ones routed but withheld for comparison
-//! (`AMPUP_MEMORY_ADVICE_HOLDOUT`, the share of sessions in it, default 0), the conversation so far, and once
+//! advice it was served (each once) and, in the holdout arm, the team's notes routed but withheld for comparison
+//! (`AMPUP_MEMORY_ADVICE_HOLDOUT`, the share of sessions in it, default 0; never in an org of one person, and a
+//! person's own `mine:` note is served in it all the same), the conversation so far, and once
 //! ended its outcome, its transcript (an episode of the caller's own, readable by them alone, like a run's
 //! trace) and an explicit reward, if given, which advice learns from as it does a run's.
 //!
@@ -85,6 +86,29 @@ fn max_per_day() -> usize {
 /// The share of new sessions in the holdout arm: `AMPUP_MEMORY_ADVICE_HOLDOUT`, 0 to 1, default 0.
 pub fn holdout_share() -> f64 {
     share("AMPUP_MEMORY_ADVICE_HOLDOUT", 0.0)
+}
+
+/// The arm a session withholds the team's advice in ([`holdout_share`]).
+pub const HOLDOUT: &str = "holdout";
+
+/// Whether `scope` holds more than one person. The holdout measures a team note's effect against the sessions it
+/// was withheld from, so where no team note can be learned (an org of one person, or no org) no session is in it.
+/// A directory that can't be read now gives no holdout: what was learned is served rather than held back.
+async fn several_people(store: &Store, scope: &Scope) -> bool {
+    let Some(org) = scope.org_name() else {
+        return false;
+    };
+    let Ok(d) = store.directory().await else {
+        return false;
+    };
+    d.dir.orgs.get(org).is_some_and(|o| {
+        o.members
+            .keys()
+            .filter(|u| d.dir.holds_member(u, org, None))
+            .take(2)
+            .count()
+            > 1
+    })
 }
 
 fn share(var: &str, default: f64) -> f64 {
@@ -526,8 +550,8 @@ pub async fn start(
     let random = uuid::Uuid::new_v4();
     let draw =
         u32::from_be_bytes(random.as_bytes()[..4].try_into().unwrap()) as f64 / u32::MAX as f64;
-    let arm = if draw < holdout_share() {
-        "holdout"
+    let arm = if draw < holdout_share() && several_people(store, scope).await {
+        HOLDOUT
     } else {
         "advice"
     };
@@ -1444,7 +1468,7 @@ pub enum Served {
     },
     /// A note the session was served before.
     Again { situation: String },
-    /// Withheld: the session is in the holdout arm.
+    /// Withheld: the session is in the holdout arm, and the team's note was all it was routed.
     Withheld,
     /// No situation fits.
     None,
@@ -1622,22 +1646,22 @@ async fn serve(
         }
         None => (None, None),
     };
-    // The holdout arm is served neither: both are recorded as withheld.
-    if s.arm == "holdout" {
-        let mut changed = false;
-        for a in own.iter().chain(found.iter()) {
+    let mut changed = false;
+    // The holdout arm is not served the team's answer, which is recorded as withheld. A person's own note is served
+    // there all the same: it is theirs, its effect is not measured against a holdout, and one held back just after
+    // it was learned looks to them like memory that didn't learn.
+    let mut withheld = false;
+    let found = match found {
+        Some(a) if s.arm == HOLDOUT && !a.key.starts_with(crate::advice::MINE_KEY) => {
             if !s.withheld.contains(&a.key) {
-                s.withheld.push(a.key.clone());
+                s.withheld.push(a.key);
                 changed = true;
             }
+            withheld = true;
+            None
         }
-        let served = match found.is_some() || own.is_some() {
-            true => Served::Withheld,
-            false => Served::None,
-        };
-        return Ok((served, changed));
-    }
-    let mut changed = false;
+        found => found,
+    };
     // Theirs first, unless this session was served it already.
     let own = match own {
         Some(o) if !s.served.contains(&o.key) => {
@@ -1654,7 +1678,10 @@ async fn serve(
         }
         _ => None,
     };
-    let (served, team_changed) = serve_team(store, scope, s, found).await?;
+    let (served, team_changed) = match serve_team(store, scope, s, found).await? {
+        (Served::None, c) if withheld => (Served::Withheld, c),
+        served => served,
+    };
     let Some(mine) = own else {
         return Ok((served, changed || team_changed));
     };
@@ -2420,8 +2447,10 @@ pub enum Useful {
 
 /// Whether `advice`, found for the agent's `task` and the end of its `conversation`, is relevant to what it is
 /// doing now and would help it next: a decisions model answers, and advice below `AMPUP_MEMORY_ADVICE_USEFUL_MIN`
-/// (0.4) is dropped. With no decisions model, or none that answers, nothing is served: advice no one checked
-/// stays out of the way.
+/// (0.5) is dropped. With no decisions model, or none that answers, nothing is served: advice no one checked
+/// stays out of the way. The bar was 0.4: on one production org from 11-04 to 11-19, 14 of the 25 hand-ons a judge
+/// read with the message they were handed at were for another task (a request to resolve review comments handed a
+/// note on investigating incidents), 8 of them scored 0.40 to 0.49, and every one judged to fit scored 0.5 or more.
 ///
 /// With the `When` of the note the advice comes from, the same call also asks whether the agent's step is in that
 /// situation and the work asked for in none of its `Withhold when` cases, read with `asked`: what happened since the
@@ -2443,7 +2472,7 @@ pub async fn useful(
     let min = std::env::var("AMPUP_MEMORY_ADVICE_USEFUL_MIN")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(0.4);
+        .unwrap_or(0.5);
     let recent: String = {
         let n = conversation.chars().count();
         conversation.chars().skip(n.saturating_sub(3_000)).collect()
@@ -4685,7 +4714,7 @@ pub async fn outcomes(store: &Store, scope: &Scope) -> Result<Outcomes> {
         *o.by_harness
             .entry(s.harness.clone().unwrap_or_default())
             .or_default() += 1;
-        if s.arm == "holdout" {
+        if s.arm == HOLDOUT {
             o.holdout += 1;
         }
         match (s.ended_at, s.ended_by.as_deref()) {

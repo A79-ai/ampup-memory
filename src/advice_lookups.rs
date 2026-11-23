@@ -109,12 +109,16 @@ pub mod outcome {
     pub const FOLLOW_UP: &str = "follow_up";
     /// The lookup failed.
     pub const ERROR: &str = "error";
+    /// Not routed: the person's own note's learned preferences, handed with what they asked to be remembered (at a
+    /// session's start, or a hook's first ask of it), its key the note's (`mine:`). Advice given all the same, so
+    /// counted as served, but never judged: the session's `served` doesn't list it ([`recalled`](super::recalled)).
+    pub const RECALLED: &str = "recalled";
 
     /// Whether `o` gave the agent advice.
     pub fn served(o: &str) -> bool {
         matches!(
             o,
-            SERVED | SERVED_OWN | SERVED_PROCEDURES | REVISITED | STEP_HANDED
+            SERVED | SERVED_OWN | SERVED_PROCEDURES | REVISITED | STEP_HANDED | RECALLED
         )
     }
 }
@@ -340,6 +344,26 @@ pub fn failed(e: &anyhow::Error) -> Option<Lookup> {
 }
 
 /// Adds `l` to a session's lookups, keeping the newest [`MAX`].
+/// The notes (`mine:` keys) session `s` was handed the learned preferences of ([`outcome::RECALLED`]), each once.
+pub fn recalled(s: &crate::qa_log::SessionPart) -> std::collections::BTreeSet<&str> {
+    s.lookups
+        .iter()
+        .filter(|l| l.outcome == outcome::RECALLED)
+        .filter_map(|l| l.key.as_deref())
+        .collect()
+}
+
+/// The lookup that says a session was handed note `key`'s learned preferences at `moment` ([`outcome::RECALLED`]).
+pub fn recall(moment: &str, key: String) -> Lookup {
+    Lookup {
+        at: crate::now_micros(),
+        moment: moment.into(),
+        outcome: outcome::RECALLED.into(),
+        key: Some(key),
+        ..Default::default()
+    }
+}
+
 pub fn keep(lookups: &mut Vec<Lookup>, l: Lookup) {
     lookups.push(l);
     if lookups.len() > MAX {

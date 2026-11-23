@@ -10,6 +10,7 @@
 //! - `status`: `open` (no end), `ended`, or `any` (default); `valid_from`: `{gte, gt, lte, lt}`, each a time in
 //!   microseconds, an RFC 3339 time or a `YYYY-MM-DD` date;
 //! - `text`: a case-insensitive substring of the value or its quote;
+//! - `notes: false`: without the fact each note is kept as (the facts `entities/` files);
 //!
 //! newest `valid_from` first (`order: "oldest"` reverses it). Each fact says which episodes it cites and their
 //! sources. `limit` is 50 by default and at most 500.
@@ -149,6 +150,8 @@ pub async fn facts(
     };
     let from = window(req, "valid_from")?;
     let text = req["text"].as_str().map(str::to_lowercase);
+    // `notes: false`: the facts `entities/` files, without the one each note is kept as ([`crate::is_note_fact`]).
+    let notes = req["notes"].as_bool() != Some(false);
     let (limit, after) = (limit(req, MAX_FACTS)?, cursor(req)?);
 
     // The episodes the caller may read, for the sources filter and to say what each fact cites.
@@ -212,6 +215,7 @@ pub async fn facts(
     };
     let mut facts: Vec<Fact> = once_each(found)
         .into_iter()
+        .filter(|f| notes || !crate::is_note_fact(f))
         .filter(|f| types.is_empty() || types.contains(&type_of(f)))
         .filter(|f| {
             text.as_ref().is_none_or(|t| {

@@ -69,7 +69,7 @@ none is installed, and checks once a day for a newer one. With a client built fr
   the evidence contradicts it. The call runs in the background; the advice reaches Claude with the next hook.
 - **Advice at each step.** After a turn with tool calls, or a tool call that usually ends a step (a commit, a push,
   a build or test run), the hook asks for the `next` moment. The note already served is re-read (no model call) and
-  passed on only if a decisions model finds it useful now (`AMPUP_MEMORY_ADVICE_USEFUL_MIN`, 0.4). At most one ask
+  passed on only if a decisions model finds it useful now (`AMPUP_MEMORY_ADVICE_USEFUL_MIN`, 0.5). At most one ask
   per 30 seconds and 12 pieces of advice per session.
 - **Recall.** Facts the memory held about the repo are added at session start; the first prompt's best-matching
   facts come with the advice.

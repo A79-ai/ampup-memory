@@ -265,7 +265,8 @@ fn a_slow_memory_holds_up_no_hook() {
         "prompt",
         with(json!({"prompt": "deploy the api"})),
     );
-    assert!(took < Duration::from_secs(2), "prompt took {took:?}");
+    // A first prompt tries the memory for 1.5 s at most, then goes on.
+    assert!(took < Duration::from_secs(3), "prompt took {took:?}");
     // A session served a note: its tool calls have triggers to fire.
     std::fs::create_dir_all(markers(home.path())).unwrap();
     std::fs::write(markers(home.path()).join(format!("session-{sid}")), "s-1").unwrap();
@@ -292,7 +293,8 @@ fn a_slow_memory_holds_up_no_hook() {
 fn what_a_copy_finds_reaches_the_next_hook() {
     let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
-    let port = fake_memory(Duration::from_millis(300));
+    // Slower than the first prompt's try: the session opens and the advice is asked past it.
+    let port = fake_memory(Duration::from_millis(1_000));
     let sid = "fast-1";
     let base = json!({"session_id": sid, "cwd": home.path(), "transcript_path": home.path().join("t.jsonl")});
     let with = |extra: Value| {
@@ -308,17 +310,17 @@ fn what_a_copy_finds_reaches_the_next_hook() {
         "session-start",
         with(json!({"source": "startup"})),
     );
-    // The prompt doesn't wait for the session to open, nor for the advice.
-    let (said, took) = hook(
+    // The prompt waits for the session to open and for the advice no longer than its try (1.5 s).
+    let (prompted, took) = hook(
         port,
         home.path(),
         "prompt",
         with(json!({"prompt": "deploy the api"})),
     );
-    assert!(took < Duration::from_secs(2), "prompt took {took:?}");
+    assert!(took < Duration::from_secs(3), "prompt took {took:?}");
     assert!(
-        !said.contains("smoke test"),
-        "the prompt waited for the advice: {said}"
+        !prompted.contains("smoke test"),
+        "the prompt waited for the advice: {prompted}"
     );
     until("the advice reaching the inbox", || {
         inbox_has_mail(home.path(), sid)
@@ -327,10 +329,18 @@ fn what_a_copy_finds_reaches_the_next_hook() {
     let tool = json!({"tool_name": "Bash", "tool_input": {"command": "make deploy"}});
     let (said, _) = hook(port, home.path(), "pre-tool", with(tool.clone()));
     let v: Value = serde_json::from_str(said.trim()).expect("the pre-tool hook said nothing");
+    let said = prompted;
     let context = v["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
-    assert!(context.contains("AmpUp Memory session: s-1"), "{context}");
+    // The session's line comes with the prompt where the session opened within its try, else with this hook: once.
+    assert_eq!(
+        format!("{said}{context}")
+            .matches("AmpUp Memory session: s-1")
+            .count(),
+        1,
+        "{said}{context}"
+    );
     assert!(context.contains("Always run the smoke test."), "{context}");
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
     // That tool call fired the note's triggers in a copy: its inform comes with the next hook.
@@ -360,7 +370,7 @@ fn input(sid: &str, cwd: &Path, extra: Value) -> Value {
 }
 
 #[test]
-fn a_prompt_hands_on_the_open_session_at_once() {
+fn a_first_prompt_hands_on_the_open_session_and_its_advice() {
     let home = temp_home();
     std::fs::create_dir_all(home.path().join("tmp")).unwrap();
     let port = fake_memory(Duration::from_millis(10));
@@ -374,29 +384,27 @@ fn a_prompt_hands_on_the_open_session_at_once() {
     until("the session opening", || {
         markers(cwd).join(format!("session-{sid}")).exists()
     });
-    // Its line is on this machine: the prompt hands it on itself, before the agent's first turn.
-    let (said, _) = hook(
+    // A memory that answers in time: the first prompt hands on the session's line and its advice itself, before the
+    // agent's first turn, not a hook later.
+    let (said, took) = hook(
         port,
         cwd,
         "prompt",
         input(sid, cwd, json!({"prompt": "deploy the api"})),
     );
+    assert!(took < Duration::from_secs(3), "prompt took {took:?}");
     assert!(said.contains("AmpUp Memory session: s-1"), "{said}");
-    // The prompt's copy asks for advice and posts it, with the session's line, to the inbox: the next prompt hands
-    // that on. Waited for, so the next prompt always finds it and never races it.
-    until("the advice reaching the inbox", || inbox_has_mail(cwd, sid));
+    assert!(said.contains("Situation: deploy"), "no advice: {said}");
+    // The next prompt hands on neither again: each is handed on once.
     let (said, _) = hook(
         port,
         cwd,
         "prompt",
         input(sid, cwd, json!({"prompt": "and the worker"})),
     );
-    // The advice comes, and the line doesn't again: the first prompt handed it on, and it is handed on once.
-    assert!(said.contains("Situation: deploy"), "no advice: {said}");
-    assert_eq!(
-        said.matches("AmpUp Memory session: s-1").count(),
-        0,
-        "the line handed on twice: {said}"
+    assert!(
+        !said.contains("AmpUp Memory session: s-1") && !said.contains("Situation: deploy"),
+        "handed on twice: {said}"
     );
 }
 
@@ -587,7 +595,7 @@ fn a_prompt_the_memory_couldnt_answer_is_asked_again() {
     });
     // Its copy lets go of the ask a moment after the refusal.
     std::thread::sleep(Duration::from_millis(500));
-    // The memory is back: the next prompt asks.
+    // The memory is back.
     down.store(false, Ordering::SeqCst);
     hook(
         port,
@@ -595,9 +603,16 @@ fn a_prompt_the_memory_couldnt_answer_is_asked_again() {
         "prompt",
         input(sid, cwd, json!({"prompt": "and the worker"})),
     );
-    until("the next prompt asked", || {
+    // Asked again once the memory is back: by the first prompt's copy (a first prompt that tried and was refused
+    // hands its ask to one), or by the next prompt.
+    until("the ask made again", || {
         seen.lock().unwrap().iter().any(|(p, _, c)| {
-            !p.starts_with("503") && c["params"]["arguments"]["question"] == "and the worker"
+            !p.starts_with("503")
+                && ["deploy the api", "and the worker"].contains(
+                    &c["params"]["arguments"]["question"]
+                        .as_str()
+                        .unwrap_or_default(),
+                )
         })
     });
 }

@@ -167,6 +167,9 @@ Callers are the ones in the review's threat model. In the table, ✓ means allow
   `superuser` is true only for these two.
 - **Auth0 op** is a person signed in through the platform's Auth0 tenant (`AMPUP_MEMORY_AUTH0_ISSUER`) for
   the operators' Organization (`AMPUP_MEMORY_AUTH0_OPERATORS_ORG`): `SignIn::operator`, never `superuser`.
+  In an org it selects it reads every episode some reader may (`Principal::reading_all`, `auth::READS_ALL`), never
+  one whose ACL holds only entries no reader holds (`auth::no_reader`: a forgotten episode); its sign-ins and reads
+  are audited under no org (the operator's view), not the org's.
   A person signed in through Auth0 for an org's Organization is a Member or Admin of that org only.
 - **Catalog write** is anyone with write access to `memory_system`. It bypasses every check, because it
   appends rows itself.

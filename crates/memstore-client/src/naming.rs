@@ -6,8 +6,8 @@
 //! - the release archives, install.sh and the images put a `memstore` (and `memstore-client`) link beside the
 //!   binary, which behaves the same under either name;
 //! - [`startup`], first thing in each binary's `main`, reads every `MEMSTORE_X` as `AMPUP_MEMORY_X` (the new
-//!   name wins where both are set), says once which old names it found, and moves an old `~/.memstore` to
-//!   `~/.ampup-memory`, leaving a link where it was.
+//!   name wins where both are set), says once which old names it read or overrode (not one set to the new
+//!   name's value), and moves an old `~/.memstore` to `~/.ampup-memory`, leaving a link where it was.
 //!
 //! So everything else reads only the new names. CI refuses `"MEMSTORE_…"` outside the few places listed in
 //! `.github/scripts/old-env-names.sh`: this module, and the names other programs (an engine image older than
@@ -81,7 +81,7 @@ fn home() -> PathBuf {
 pub struct OldEnv {
     /// Old names read as their new ones.
     pub adopted: Vec<String>,
-    /// Old names set beside their new ones, so not read.
+    /// Old names set beside their new ones to a different value, so not read.
     pub ignored: Vec<String>,
 }
 
@@ -132,8 +132,12 @@ pub unsafe fn adopt_old_env() -> OldEnv {
         .collect();
     for (name, value) in old {
         let new = env_name(&name).into_owned();
-        if std::env::var_os(&new).is_some() {
-            found.ignored.push(name.clone());
+        if let Some(current) = std::env::var_os(&new) {
+            // The same value under both names is the documented way through the rename (managed settings set
+            // both until every machine has moved): nothing is lost, so nothing to say.
+            if current != value {
+                found.ignored.push(name.clone());
+            }
         } else {
             // SAFETY: the caller's: no other thread runs yet.
             unsafe { std::env::set_var(&new, value) };

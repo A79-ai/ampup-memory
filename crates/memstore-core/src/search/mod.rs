@@ -10,6 +10,7 @@
 //! erasure) is scanned directly. So the index can be stale but never serves a deleted row, and
 //! freshness never waits on indexing (NFR-3). Every hit is post-filtered like a read.
 
+mod bm25f;
 mod cache;
 pub mod embed;
 pub mod embed_cache;
@@ -785,6 +786,24 @@ fn fact_text(entity: &str, predicate: &str, value: &str) -> String {
     format!("{entity} {} {value}", predicate.replace('_', " "))
 }
 
+/// A fact's keyword fields' texts, in [`FTS_FIELDS`] order: what the index holds in `t_value`, `t_subject`,
+/// `t_quote`, `t_pred` and `t_date`, and what a row held in memory is scored by ([`bm25f`]).
+fn fts_texts(
+    entity: &str,
+    predicate: &str,
+    value: &str,
+    quote: Option<&str>,
+    valid_from: i64,
+) -> [String; 5] {
+    [
+        normalize_text(value),
+        subject_text(entity),
+        normalize_text(quote.unwrap_or_default()),
+        predicate.replace('_', " "),
+        date_text(valid_from),
+    ]
+}
+
 /// Facts table rows of one Iceberg data file, as Lance rows, and how many of their texts had a vector to reuse.
 /// `reuse` holds vectors already computed for fact texts; only other texts are embedded (or found in the
 /// embedding cache, `embed_cache`).
@@ -795,9 +814,25 @@ async fn to_lance(data_file: &str, b: &RecordBatch, reuse: &Reuse) -> Result<(Re
     let text: Vec<String> = (0..n)
         .map(|i| fact_text(&ent[i], &pred[i], &val[i]))
         .collect();
-    let t_value: Vec<String> = val.iter().map(|v| normalize_text(v)).collect();
-    let t_subject: Vec<String> = ent.iter().map(|e| subject_text(e)).collect();
-    let t_pred: Vec<String> = pred.iter().map(|p| p.replace('_', " ")).collect();
+    let (quote, valid_from) = (
+        crate::optional_strings(b, "quote"),
+        crate::timestamps(b, "valid_from"),
+    );
+    // Per keyword field (FTS_FIELDS), its text in each row.
+    let mut fields: [Vec<String>; 5] = Default::default();
+    for i in 0..n {
+        let texts = fts_texts(
+            &ent[i],
+            &pred[i],
+            &val[i],
+            quote[i].as_deref(),
+            valid_from[i].unwrap_or(0),
+        );
+        for (field, text) in fields.iter_mut().zip(texts) {
+            field.push(text);
+        }
+    }
+    let [t_value, t_subject, t_quote, t_pred, t_date] = fields;
     let ekey: Vec<String> = (0..n)
         .map(|i| Key::Entity(&ent[i], &pred[i]).text())
         .collect();
@@ -860,15 +895,9 @@ async fn to_lance(data_file: &str, b: &RecordBatch, reuse: &Reuse) -> Result<(Re
             Arc::new(StringArray::from(crate::optional_strings(b, "tags"))),
             st(t_value),
             st(t_subject),
-            st(crate::optional_strings(b, "quote")
-                .into_iter()
-                .map(|q| normalize_text(&q.unwrap_or_default()))
-                .collect()),
+            st(t_quote),
             st(t_pred),
-            st(crate::timestamps(b, "valid_from")
-                .into_iter()
-                .map(|t| date_text(t.unwrap_or(0)))
-                .collect()),
+            st(t_date),
         ],
     )?;
     Ok((batch, known.len()))
@@ -3948,7 +3977,7 @@ async fn ranked(
         .collect()
     };
     let fetch = pool;
-    // Whether candidates only vector lists found are scored by keyword too (below), from the whole any-terms lists.
+    // Whether candidates only vector lists found are scored by keyword too (below), from their own text.
     let rescore = !rank.classic;
     // Every ranked list of every part, in the order its rows are taken: per part each keyword ranking and the
     // vector one; with a time named, also the best keyword and nearest matches stated in it, so the facts of
@@ -3983,15 +4012,13 @@ async fn ranked(
     let fts = |q: &lance_index::scalar::inverted::query::FtsQuery| {
         FullTextSearchQuery::new_query(q.clone())
     };
-    // One list's row ids, by keyword ranking `signal` or (None) by the query vector `q`; a keyword list's every
-    // match, best first, when `whole` (it is cut to `fetch` where it is taken).
+    // One list's row ids, by keyword ranking `signal` or (None) by the query vector `q`.
     let list = async |ds: &Dataset,
                       part: usize,
                       signal: Option<usize>,
                       filter: Option<String>,
                       keyword: &[(lance_index::scalar::inverted::query::FtsQuery, f32)],
-                      q: Option<&Float32Array>,
-                      whole: bool|
+                      q: Option<&Float32Array>|
            -> Result<Vec<(u64, Option<f32>)>> {
         let t = std::time::Instant::now();
         // Over-fetch: visibility filtering happens after ranking. The keyword limit must be on
@@ -4008,8 +4035,7 @@ async fn ranked(
                 rows::nearest_flat(ds, "vec", q, fetch, filter.as_deref()).await?
             }
             (Some(s), _) => {
-                let limit = (!whole).then_some(fetch as i64);
-                scan.full_text_search(fts(&keyword[s].0).limit(limit))?;
+                scan.full_text_search(fts(&keyword[s].0).limit(Some(fetch as i64)))?;
                 None
             }
             (None, None) => anyhow::bail!("a vector list without a query vector"),
@@ -4037,9 +4063,10 @@ async fn ranked(
     // embedding). A side that fails drops its sender, and the other stops waiting on it.
     let (setup_tx, setup_rx) =
         tokio::sync::oneshot::channel::<(Vec<(Dataset, Option<String>)>, usize)>();
-    // Per part, the ids the keyword lists named, and the whole any-terms list (its rows are scored by keyword below).
-    type Whole = Option<Arc<Vec<(u64, Option<f32>)>>>;
-    let (named_tx, named_rx) = tokio::sync::oneshot::channel::<Vec<(HashSet<u64>, Whole)>>();
+    // Per part, the ids the keyword lists named, and the any-terms query's scorer (the rows only vector lists found
+    // are scored by keyword with it, below).
+    type Scorer = Option<Arc<std::sync::Mutex<bm25f::KeywordScorer>>>;
+    let (named_tx, named_rx) = tokio::sync::oneshot::channel::<Vec<(HashSet<u64>, Scorer)>>();
     let (vector_side, found) = tokio::join!(
         async {
             // None without an embedder (the local model not fetched, and offline): keyword lists alone.
@@ -4064,7 +4091,6 @@ async fn ranked(
                             filter.clone(),
                             &[],
                             Some(q),
-                            false,
                         )
                     },
                 ))
@@ -4088,33 +4114,42 @@ async fn ranked(
                         .collect::<HashSet<u64>>()
                         .into_iter()
                         .collect();
-                    // Those the any-terms list holds too are scored by keyword below, by vector from their embedding
-                    // as every keyword hit is, so they are read with it.
-                    let listed: HashSet<u64> = ids.iter().copied().collect();
-                    let in_whole: HashSet<u64> = named[part]
-                        .1
-                        .iter()
-                        .flat_map(|all| all.iter().map(|(id, _)| *id))
-                        .filter(|id| listed.contains(id))
-                        .collect();
-                    let (scored, ids): (Vec<u64>, Vec<u64>) =
-                        ids.into_iter().partition(|id| in_whole.contains(id));
+                    let scorer = named[part].1.clone();
                     async move {
                         let t = std::time::Instant::now();
-                        let (asked, embedded) = (ids.len(), scored.len());
-                        let ((mut rows, taken), (with, (taken_with, vecs_with))) = tokio::try_join!(
-                            keyed_rows_counted(ds, ids),
-                            fact_rows_counted(ds, scored)
-                        )?;
+                        let asked = ids.len();
+                        let (mut rows, taken) = keyed_rows_counted(ds, ids).await?;
+                        // Their keyword scores, from their text: those the any-terms query matches are scored by
+                        // keyword below, and by vector from their embedding as every keyword hit is, so their
+                        // embeddings are read too.
+                        let mut scores: Option<HashMap<u64, Option<f32>>> = None;
+                        if let Some(scorer) = scorer {
+                            let mut scorer = scorer.lock().unwrap();
+                            let scores = scores.insert(HashMap::new());
+                            for (id, row) in &rows {
+                                let f = &row.fact;
+                                let texts =
+                                    fts_texts(&f.entity, &f.predicate, &f.value, f.quote.as_deref(), f.valid_from);
+                                scores.insert(*id, scorer.score(&texts));
+                            }
+                        }
+                        let scored: Vec<u64> = scores
+                            .iter()
+                            .flatten()
+                            .filter_map(|(id, x)| x.map(|_| *id))
+                            .collect();
+                        let embedded = scored.len();
+                        let (with, (taken_with, vecs_with)) = fact_rows_counted(ds, scored).await?;
                         rows.extend(with);
                         if let Ok(mut l) = slow.lists.lock() {
                             l.push(format!(
-                                "part {part} vector rows {} ms {taken} of {asked} taken from storage without the embedding, \
-                                 {taken_with} of {embedded} with it, {vecs_with} embeddings",
+                                "part {part} vector rows {} ms {taken} of {asked} taken from storage, \
+                                 {taken_with} of {embedded} matched by keyword with the embedding, {vecs_with} embeddings{}",
                                 t.elapsed().as_millis(),
+                                if scores.is_none() { ", no keyword scorer" } else { "" },
                             ));
                         }
-                        anyhow::Ok(rows)
+                        anyhow::Ok((rows, scores))
                     }
                 },
             ))
@@ -4170,15 +4205,31 @@ async fn ranked(
             let parts = parts_of(&index);
             let wanted = lists_of(&parts, keyword.len());
             let _ = setup_tx.send((parts.clone(), keyword.len()));
-            // Each part's any-terms list under the part's own filter is read whole: its scores are every
-            // keyword score the rescoring below needs (BM25's statistics are the index's, whatever a list's filter),
-            // so no second keyword query is run for the candidates only vector lists found. Scoring every match is
-            // the list's cost either way (Lance's combined-fields search scores every row holding a term); keeping
-            // them all adds a sort.
-            let whole = |part: usize, signal: Option<usize>, filter: &Option<String>| {
-                rescore && signal == Some(0) && *filter == parts[part].1
+            // Each part's any-terms query's scorer, read beside the lists: the rows only vector lists found are scored
+            // by it from their text, the scores the query would give them (no second keyword query, and no list of
+            // every match). None where it can't be read exactly; those rows ask the index (below).
+            let scorers = async {
+                let any_terms = match keyword.first() {
+                    Some((
+                        lance_index::scalar::inverted::query::FtsQuery::CombinedFields(q),
+                        _,
+                    )) if rescore => q,
+                    _ => return vec![None; parts.len()],
+                };
+                futures::future::join_all(parts.iter().map(async |(ds, _)| {
+                    match bm25f::KeywordScorer::of(ds, any_terms).await {
+                        Ok(s) => s.map(|s| Arc::new(std::sync::Mutex::new(s))),
+                        Err(e) => {
+                            eprintln!(
+                                "memstore: keyword scores asked of the index (no scorer: {e:#})"
+                            );
+                            None
+                        }
+                    }
+                }))
+                .await
             };
-            let mut by_keyword: Vec<Vec<(u64, Option<f32>)>> =
+            let (by_keyword, scorers) = tokio::join!(
                 futures::future::try_join_all(wanted.iter().filter(|l| l.1.is_some()).map(
                     |(part, signal, filter)| {
                         list(
@@ -4188,24 +4239,12 @@ async fn ranked(
                             filter.clone(),
                             &keyword,
                             None,
-                            whole(*part, *signal, filter),
                         )
                     },
-                ))
-                .await?;
-            // Each part's whole any-terms list, and that list cut to `fetch` as the query's limit would have cut it
-            // (both are best first, ties by row id).
-            let mut matched: Vec<Whole> = vec![None; parts.len()];
-            for ((part, signal, filter), ids) in wanted
-                .iter()
-                .filter(|l| l.1.is_some())
-                .zip(by_keyword.iter_mut())
-            {
-                if whole(*part, *signal, filter) && matched[*part].is_none() {
-                    matched[*part] = Some(Arc::new(ids.clone()));
-                    ids.truncate(fetch);
-                }
-            }
+                )),
+                scorers
+            );
+            let by_keyword: Vec<Vec<(u64, Option<f32>)>> = by_keyword?;
             slow.mark("keyword lists");
             let _ = named_tx.send(
                 (0..parts.len())
@@ -4217,7 +4256,7 @@ async fn ranked(
                             .filter(|(l, _)| l.0 == part)
                             .flat_map(|(_, ids)| ids.iter().map(|(id, _)| *id))
                             .collect();
-                        (named, matched[part].clone())
+                        (named, scorers[part].clone())
                     })
                     .collect(),
             );
@@ -4254,14 +4293,17 @@ async fn ranked(
                 keyword,
                 by_keyword,
                 keyword_rows,
-                matched,
+                scorers,
             ))
         }
     );
-    let (index, current, tail_facts, tail_vecs, keyword, by_keyword, mut fetched, matched) = found?;
+    let (index, current, tail_facts, tail_vecs, keyword, by_keyword, mut fetched, scorers) = found?;
     let (q_vec, by_vector, vector_rows) = vector_side?;
-    for (part, rows) in vector_rows.into_iter().enumerate() {
+    // Per part, the keyword scores of the rows only vector lists found (None where the any-terms query doesn't match).
+    let mut scores: Vec<Option<HashMap<u64, Option<f32>>>> = vec![None; fetched.len()];
+    for (part, (rows, s)) in vector_rows.into_iter().enumerate() {
         fetched[part].extend(rows);
+        scores[part] = s;
     }
     slow.mark("rows");
     let current = index.trusted(current);
@@ -4361,9 +4403,9 @@ async fn ranked(
         take(&listed, *signal);
     }
     // Candidates the any-terms keyword ranking didn't reach (the vector list found them) that share a word
-    // with the query: their keyword score too, so both signals rank every candidate. Their scores are in the part's
-    // whole any-terms list (`matched`), by the rows the lists read them from; a part without one (a classic ranking,
-    // no keyword list) asks the index (a keyword search over just them).
+    // with the query: their keyword score too, so both signals rank every candidate. Their scores were computed from
+    // their text with the part's scorer (`scores`), by the rows the vector lists read them from; a part without one (a
+    // classic ranking, an index that doesn't cover the part whole) asks the index (a keyword search over just them).
     let unscored: Vec<Lit> = hits
         .lock()
         .unwrap()
@@ -4383,16 +4425,38 @@ async fn ranked(
         let scored =
             futures::future::try_join_all(parts.iter().enumerate().map(|(part, (ds, _))| {
                 let (only, n, any_terms) = (&only, unscored.len(), &keyword[0].0);
-                let (matched, fetched, wanted_ids) = (&matched[part], &fetched[part], &wanted_ids);
+                let (scored, fetched, wanted_ids) = (&scores[part], &fetched[part], &wanted_ids);
+                let scorer = &scorers[part];
                 async move {
-                    // The rows the lists read already, with their embedding (read with the vector lists' rows), with
-                    // their scores.
-                    if let Some(all) = matched {
+                    // Every row the lists read of those facts (with its embedding: keyword rows are read with it, and
+                    // the vector lists' rows the query matches were), with its score: computed already for the vector
+                    // lists' rows, from its text for the others. Best first, ties by row id, as the index lists them.
+                    if let Some(scorer) = scorer {
+                        let mut scorer = scorer.lock().unwrap();
+                        let mut rows: Vec<(u64, Arc<FactRow>, f32)> = fetched
+                            .iter()
+                            .filter(|(_, r)| wanted_ids.contains(r.fact.fact_id.as_str()))
+                            .filter_map(|(id, r)| {
+                                let x = match scored.as_ref().and_then(|s| s.get(id)) {
+                                    Some(x) => (*x)?,
+                                    None => {
+                                        let f = &r.fact;
+                                        scorer.score(&fts_texts(
+                                            &f.entity,
+                                            &f.predicate,
+                                            &f.value,
+                                            f.quote.as_deref(),
+                                            f.valid_from,
+                                        ))?
+                                    }
+                                };
+                                Some((*id, r.clone(), x))
+                            })
+                            .collect();
+                        rows.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
                         return anyhow::Ok(
-                            all.iter()
-                                .filter_map(|(id, x)| Some((fetched.get(id)?, *x)))
-                                .filter(|(r, _)| wanted_ids.contains(r.fact.fact_id.as_str()))
-                                .map(|(r, x)| (r.clone(), x))
+                            rows.into_iter()
+                                .map(|(_, r, x)| (r, Some(x)))
                                 .collect::<Vec<_>>(),
                         );
                     }

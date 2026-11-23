@@ -1388,7 +1388,7 @@ pub async fn for_session(
     for p in crate::advice::own_preferences(session, store, who).await? {
         let read = Said::of(&p);
         if !noted.iter().any(|n| n.says(&read) || read.says(n)) {
-            mine.push(format!("(learned) {p}"));
+            mine.push(format!("{}{p}", crate::advice::LEARNED_MARK));
             learned.push(read);
         }
     }

@@ -95,7 +95,12 @@ fn token(v: Option<&str>) -> &str {
 ///
 /// `outcome` is `ok`, `error` (a JSON-RPC error), `tool-error` (the tool answered `isError`) or `-` (a
 /// notification, which has no answer).
+///
+/// A tool call's time also goes to `memstore_mcp_tool_seconds`, labelled by the tool when the server knows it
+/// (`super::MCP_TOOL_MARKS`) and `other` when not, so a caller can't mint series by naming tools.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn mcp_call(
+    metrics: &crate::metrics::Metrics,
     org: Option<&str>,
     user: &str,
     app: &str,
@@ -117,6 +122,16 @@ pub(super) fn mcp_call(
         Some(v) if v["result"]["isError"] == true => "tool-error",
         Some(_) => "ok",
     };
+    if method == "tools/call" && outcome != "-" {
+        let known = super::MCP_TOOL_MARKS
+            .iter()
+            .find(|(name, _)| *name == tool)
+            .map_or("other", |(name, _)| name);
+        metrics
+            .mcp_tool_seconds
+            .with_label_values(&[known, outcome])
+            .observe(took.as_secs_f64());
+    }
     eprintln!(
         "mcp call: org={} user={user} app={app} via={via} method={method} tool={tool} outcome={outcome} {} ms",
         org.unwrap_or("-"),

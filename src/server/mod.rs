@@ -2237,12 +2237,9 @@ async fn listen(
                         Some(Err(_)) if !probe => return Ok(busy(StatusCode::SERVICE_UNAVAILABLE)),
                         a => a,
                     };
-                    // Counted and timed by route template and status: never the caller's own path.
-                    // `/mcp/hook` is `/mcp` (the hooks' address for it), counted with it.
-                    let route = match req.uri().path() {
-                        "/mcp/hook" => "/mcp",
-                        p => audit::route(p),
-                    };
+                    // Counted and timed by route template and status: never the caller's own path. The hooks'
+                    // `/mcp/hook` apart from `/mcp`, and each console page's route apart from `other`.
+                    let route = audit::metric_route(req.uri().path());
                     let started = Instant::now();
                     // Its lines name the org it selected, then the one its scope is in (`log_org`).
                     let selected = selection(&req).0;
@@ -4709,6 +4706,7 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
                         crate::metrics::process_memory()
                     );
                     warm_advice(store, &scope).await;
+                    warm_qa_log(store, &scope).await;
                     // An org's episodes, as `show` counts them for a plan's page.
                     if matches!(scope, Scope::NamedOrg(_))
                         && let Some(org) = scope.org_name()
@@ -4843,7 +4841,11 @@ async fn keep_warm(st: Arc<State>) {
         }
         for scope in scopes {
             let t = Instant::now();
-            match Store::refreshing_after(fresh_enough, search::warm(&store, &scope)).await {
+            let touched = async {
+                search::warm(&store, &scope).await?;
+                crate::qa_log::warm(&store, &scope).await
+            };
+            match Store::refreshing_after(fresh_enough, touched).await {
                 Ok(()) if t.elapsed() > Duration::from_secs(5) => {
                     eprintln!("keep-warm of {scope} took {} ms", t.elapsed().as_millis())
                 }
@@ -4899,6 +4901,18 @@ async fn warm_advice(store: &Store, scope: &Scope) {
         ),
         Ok(_) => {}
         Err(e) => eprintln!("warming {scope}'s advice lines failed (routing embeds them): {e:#}"),
+    }
+}
+
+/// Loads `scope`'s QA log ([`crate::qa_log::warm`]): logged when it took a while or failed.
+async fn warm_qa_log(store: &Store, scope: &Scope) {
+    let t = Instant::now();
+    match crate::qa_log::warm(store, scope).await {
+        Ok(()) if t.elapsed() > Duration::from_millis(500) => {
+            eprintln!("warmed {scope}'s QA log in {} ms", t.elapsed().as_millis())
+        }
+        Ok(()) => {}
+        Err(e) => eprintln!("warming {scope}'s QA log failed (its first read loads it): {e:#}"),
     }
 }
 
@@ -6853,6 +6867,12 @@ async fn handle(
                 if !w.groups().contains(&all) {
                     w.add_groups([all]);
                 }
+                // An operator, as the platform's support, reads all of the org's memory: what its people keep to
+                // themselves or share with a few too, not only what is shared with the whole org. Its own sign-in
+                // only, never a key made from it.
+                if operator_reads(&via) {
+                    w = w.reading_all();
+                }
             }
             Some(w)
         }
@@ -7598,6 +7618,7 @@ async fn handle(
         )
         .await;
         advice_calls::mcp_call(
+            &state.metrics,
             scope.org_name(),
             who.user(),
             &app,
@@ -8962,11 +8983,23 @@ fn member_org_in(
         .then(|| (org.to_string(), o.created_at))
 }
 
+/// Whether this sign-in is an operator's own (through the operators' Organization, not a key made from it): it reads
+/// all of any org's memory it selects ([`Principal::reading_all`]), and its sign-ins and reads are audited in the
+/// operator's view rather than the org's.
+fn operator_reads(via: &SignIn) -> bool {
+    via.operator && via.key.is_none()
+}
+
 /// A person's sign-in into `org`, for the audit, if they belong to it: recorded beside the request rather than on its
 /// way, since whether they belong is the directory's, which a request in a burst may otherwise wait on another's
 /// reading of. Nothing the request answers depends on it.
 fn record_signin(state: &Arc<State>, who: &Principal, via: &SignIn, org: Option<&str>) {
     if !via.person {
+        return;
+    }
+    // An operator's sign-in is the platform's to know of, not the org's: the operator's view (no org).
+    if operator_reads(via) {
+        state.audit.signin(None, who.user(), provider_of(via));
         return;
     }
     let (state, who, via, org) = (
@@ -11756,14 +11789,15 @@ async fn audit_read(
         return;
     };
     let (items, episodes) = reads.took();
-    state.audit.read(
-        Some((&org, incarnation)),
-        &actor,
-        &scope.to_string(),
-        route,
-        items,
-        &episodes,
-    );
+    // An operator's read is in the operator's view (no org), with the scope it read: the platform keeps who of
+    // its support read what, and the org's own audit doesn't show it.
+    let org: crate::audit::OrgOf = match operator_reads(via) {
+        true => None,
+        false => Some((&org, incarnation)),
+    };
+    state
+        .audit
+        .read(org, &actor, &scope.to_string(), route, items, &episodes);
 }
 
 /// A service key's use, counted by its org (only an org the directory holds; `-` otherwise) and role.
@@ -13419,6 +13453,7 @@ async fn mcp(
                                 &l.answer_id,
                                 later.is_some_and(|(m, t)| m + t > 0),
                             );
+                            note_recalled(&store, session, who, &l.answer_id, "start", &remembered.0);
                             let out =
                                 session_started(&l, &served, session.vis().episode_type_counts(who));
                             (l.answer_id.clone(), crate::keep::with_remembered(out, remembered, later))
@@ -14985,7 +15020,14 @@ async fn session_advice(
             // hands its lines on (it was, and 7 of the 21 notes judged unapplied on one production org from
             // 11-06 to 11-10 went out so).
             let found = match found {
-                Some(a) if decide && arm.as_deref() != Some("holdout") => {
+                // The holdout arm withholds a team note without asking, but serves a person's own note, which
+                // is asked about as in the other arm.
+                Some(a)
+                    if decide
+                        && (arm.as_deref() != Some(crate::sessions::HOLDOUT)
+                            || a.key.starts_with(crate::advice::MINE_KEY)
+                            || a.own.is_some()) =>
+                {
                     use crate::advice_lookups::outcome;
                     let withheld = if !crate::sessions::under_cap(session.scope(), who, id) {
                         Some(outcome::STEP_NOTHING)
@@ -15245,7 +15287,11 @@ async fn public_suggestions(
         let Ok(logged) = crate::sessions::find(store, scope, who, id).await else {
             return vec![];
         };
-        if logged.session.as_ref().is_none_or(|s| s.arm == "holdout") {
+        if logged
+            .session
+            .as_ref()
+            .is_none_or(|s| s.arm == crate::sessions::HOLDOUT)
+        {
             return vec![];
         }
     }
@@ -15389,6 +15435,45 @@ async fn hand_late(
     if let Some(late) = late {
         crate::sessions::hand_late(scope, who, id, late);
     }
+}
+
+/// Records in open session `id` which of `who`'s own notes the notes `handed` to it carry learned preferences of
+/// (`crate::advice_lookups::outcome::RECALLED`), at `moment`: their use, as the advice page counts it. On a task of
+/// its own, after the answer: the hook never waits for it.
+fn note_recalled(
+    store: &Store,
+    session: &Session,
+    who: &Principal,
+    id: &str,
+    moment: &'static str,
+    handed: &[String],
+) {
+    if !handed
+        .iter()
+        .any(|h| h.starts_with(crate::advice::LEARNED_MARK))
+    {
+        return;
+    }
+    let (store, session, who, id, handed) = (
+        store.clone(),
+        session.clone(),
+        who.clone(),
+        id.to_string(),
+        handed.to_vec(),
+    );
+    crate::log_org::spawn(async move {
+        let keys = match crate::advice::recalled(&session, &store, &who, &handed).await {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("advice: session {id}'s recalled preferences weren't recorded: {e:#}");
+                return;
+            }
+        };
+        for k in keys {
+            let lookup = crate::advice_lookups::recall(moment, k);
+            crate::sessions::note_lookup(&store, session.scope(), &who, &id, Some(lookup)).await;
+        }
+    });
 }
 
 /// Where in its session an advice call was asked (`crate::advice_lookups::Lookup::moment`): the moment it names,
@@ -15660,6 +15745,9 @@ async fn advise_tool(
     }
     if let Some((mine, team)) = notes {
         still_owed.id = None;
+        if let Some(sid) = resolved.as_deref().or(id) {
+            note_recalled(store, session, who, sid, lookup_moment(args), &mine);
+        }
         if !hook_first {
             return Ok(crate::keep::text_with_notes(text, (mine, team)));
         }
