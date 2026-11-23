@@ -177,6 +177,17 @@ async fn reads(s: &str, sel: &str, bearer: &str, ids: &[&str]) -> Option<String>
         assert_eq!(status, 200, "{path}{sel}: {text}");
         out.push_str(&text);
     }
+    // The Explorer's deals, kept per reader by memory state (twice: the second from what was kept): a deal whose
+    // facts went is gone from them.
+    for _ in 0..2 {
+        let ls = json!({"op": "ls", "path": ["entities", "deal"]});
+        let (status, text) = post(&format!("{s}/browse{sel}"), bearer, &ls).await;
+        if status == 401 || status == 403 {
+            return None;
+        }
+        assert!(status == 200 || status == 404, "/browse{sel}: {text}");
+        out.push_str(&text);
+    }
     let call = |name: &str, args: Value| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
     let mut tools = vec![call("search_memory", json!({"query": "owner note deal"}))];
     for id in ids {

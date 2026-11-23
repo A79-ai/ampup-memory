@@ -38,6 +38,8 @@ pub(super) struct Reads {
 struct Seen {
     items: usize,
     episodes: Vec<String>,
+    /// The facts of the caller's own scope these reads served, for `crate::served_checks`.
+    facts: Vec<String>,
 }
 
 impl Deref for Reads {
@@ -45,6 +47,108 @@ impl Deref for Reads {
     fn deref(&self) -> &Session {
         &self.own
     }
+}
+
+/// One scope's fact search: its hits and, with `explain`, its misses; and whether it ranked with every vector it
+/// would have had given longer ([`search::unembedded`]).
+struct Searched {
+    hits: Vec<search::Hit>,
+    misses: Vec<search::Miss>,
+    whole: bool,
+}
+
+/// Each scope's fact searches, kept per reader, ask and memory state ([`crate::kept_answers`]): a search asked again
+/// at the same state is answered at once. Only an answer ranked with all its vectors is kept.
+static SEARCHES: std::sync::LazyLock<crate::kept_answers::Kept<Searched>> =
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::new_if(500, |s| s.whole));
+
+/// [`Session::search_why`], answered from [`SEARCHES`] when the same reader asked the same of the same memory state.
+///
+/// Kept only for main as it is now, the state read being the newest this server serves (pinned after the scope's loss
+/// count and facts table were read, [`crate::kept_answers::Mark`]), and answered again only at exactly that state: the
+/// same visibility state (its build, heads and removals), loss count, facts table snapshot and generation, and the
+/// facts index's versions. A forget, a delete, a retraction or a narrowed ACL moves the loss count before it returns,
+/// and any write moves the state, so a search asked after either is worked out again. The key names the reader
+/// exactly ([`crate::kept_answers::reader_key`]) and everything the ranking reads from the ask: the query, `k`, the
+/// valid time, the filter, and the ranking (its time as the day it falls on, today without one: the day is all a
+/// ranking reads of it, unless it ranks by recency, which is never kept). An explanation, a cursor's page and a snapshot's read are worked
+/// out as before.
+#[allow(clippy::too_many_arguments)]
+async fn kept_search(
+    store: &Store,
+    s: &Session,
+    who: &Principal,
+    query: &str,
+    k: usize,
+    valid_at: Option<i64>,
+    filter: Option<&search::Filter>,
+    rank: search::Rank,
+    explain: bool,
+) -> Result<(Vec<search::Hit>, Vec<search::Miss>)> {
+    let direct = || s.search_why(store, who, query, k, valid_at, filter, rank, explain);
+    let recency = rank.classic || search::knob("RECENCY", 0.0) > 0.0;
+    if explain || recency || !s.on_main_now() || s.index_pin().is_some() {
+        return direct().await;
+    }
+    let mark = crate::kept_answers::Mark::read(store, s.scope()).await?;
+    let now = store.lagging_visibility(s.scope(), MAIN).await?;
+    if !std::ptr::eq(s.vis(), &*now) {
+        return direct().await;
+    }
+    let mut at = crate::kept_answers::At::of(mark, &now);
+    at.heads.push(format!(
+        "facts index {:?}",
+        search::current_versions(store, s.scope()).await?
+    ));
+    // The day a query's relative time words are read as of: the ranking's, else today (as the ranking reads it).
+    let day = rank
+        .as_of
+        .filter(|&t| t > 0 && t < i64::MAX)
+        .and_then(chrono::DateTime::from_timestamp_micros)
+        .map(|d| d.date_naive())
+        .unwrap_or_else(|| chrono::Utc::now().date_naive());
+    let key = format!(
+        "{}\n{k}\n{valid_at:?}\n{filter:?}\n{day}\n{}\n{}\n{query}",
+        crate::kept_answers::reader_key(who),
+        rank.group,
+        rank.diverse,
+    );
+    let (store2, s2, who2, query2, filter2) = (
+        store.clone(),
+        s.clone(),
+        who.clone(),
+        query.to_string(),
+        filter.cloned(),
+    );
+    let got = SEARCHES
+        .get(
+            &s.scope().namespace(),
+            &key,
+            at,
+            false,
+            move || async move {
+                let before = search::unembedded();
+                let (hits, misses) = s2
+                    .search_why(
+                        &store2,
+                        &who2,
+                        &query2,
+                        k,
+                        valid_at,
+                        filter2.as_ref(),
+                        rank,
+                        false,
+                    )
+                    .await?;
+                Ok(Searched {
+                    hits,
+                    misses,
+                    whole: search::unembedded() == before,
+                })
+            },
+        )
+        .await?;
+    Ok((got.hits.clone(), got.misses.clone()))
 }
 
 /// Items read across scopes, best first, and the scope each came from where it isn't the caller's own (by fact id
@@ -65,14 +169,15 @@ impl Reads {
         }
     }
 
-    /// The caller's scope and those its `reads` setting names, each this cell's, pinned on main as it is now. A
+    /// The caller's scope and those its `reads` setting names (in the directory requests are signed in by:
+    /// [`Store::directory_behind`]), each this cell's, pinned on main as it is now. A
     /// session on a branch or a snapshot reads its own scope alone. A scope that can't be opened now is left out
     /// (and said in the log): the caller's own memory is still answered.
     pub async fn of(state: &State, store: &Store, own: Session) -> Self {
         if !own.on_main_now() {
             return Reads::alone(own);
         }
-        let scopes: Vec<Scope> = match store.directory().await {
+        let scopes: Vec<Scope> = match store.directory_behind().await {
             Ok(d) => d.dir.reads(own.scope()),
             Err(e) => {
                 eprintln!(
@@ -133,6 +238,11 @@ impl Reads {
     pub fn took(&self) -> (usize, Vec<String>) {
         let s = self.seen.lock().unwrap();
         (s.items, s.episodes.clone())
+    }
+
+    /// The facts of the caller's own scope the reads so far served (`crate::served_checks`).
+    pub fn served_facts(&self) -> Vec<String> {
+        self.seen.lock().unwrap().facts.clone()
     }
 
     /// The scopes read besides the caller's own, in the setting's order: what `get_advice` also routes over.
@@ -234,10 +344,7 @@ impl Reads {
     ) -> Result<(Scoped<search::Hit>, Vec<(usize, search::Miss)>)> {
         let one = move |s: &Session| {
             let s = s.clone();
-            async move {
-                s.search_why(store, who, query, k, valid_at, filter, rank, explain)
-                    .await
-            }
+            async move { kept_search(store, &s, who, query, k, valid_at, filter, rank, explain).await }
         };
         if !self.fans_out() {
             let (items, missed) = one(&self.own).await?;
@@ -469,18 +576,18 @@ impl Reads {
         who: &Principal,
         ids: &[String],
     ) -> Result<HashMap<String, (usize, Episode)>> {
+        // Every scope at once: each reads only the episodes it holds and the caller may read there, so an episode
+        // is read twice only where two scopes hold it. Each keeps the first scope's.
+        let found = futures::future::try_join_all(
+            self.sessions()
+                .map(|s| s.episodes(store, who, ids))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
         let mut out: HashMap<String, (usize, Episode)> = HashMap::new();
-        for (i, s) in self.sessions().enumerate() {
-            let todo: Vec<String> = ids
-                .iter()
-                .filter(|id| !out.contains_key(*id))
-                .cloned()
-                .collect();
-            if todo.is_empty() {
-                break;
-            }
-            for (id, ep) in s.episodes(store, who, &todo).await? {
-                out.insert(id, (i, ep));
+        for (i, eps) in found.into_iter().enumerate() {
+            for (id, ep) in eps {
+                out.entry(id).or_insert((i, ep));
             }
         }
         self.note(out.len(), out.keys().map(String::as_str));
@@ -496,11 +603,14 @@ impl Reads {
         values: &[String],
         valid_at: Option<i64>,
     ) -> Result<Vec<Fact>> {
-        let mut out = self.own.read_in(store, who, col, values, valid_at).await?;
-        for s in &self.also {
-            out.extend(s.read_in(store, who, col, values, valid_at).await?);
-        }
-        Ok(out)
+        // Every scope at once, the caller's own first in the answer.
+        let found = futures::future::try_join_all(
+            self.sessions()
+                .map(|s| s.read_in(store, who, col, values, valid_at))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        Ok(found.into_iter().flatten().collect())
     }
 
     /// [`Session::read_where`] in every scope read, the caller's own first.
@@ -511,11 +621,14 @@ impl Reads {
         filter: &search::Filter,
         valid_at: Option<i64>,
     ) -> Result<Vec<Fact>> {
-        let mut out = self.own.read_where(store, who, filter, valid_at).await?;
-        for s in &self.also {
-            out.extend(s.read_where(store, who, filter, valid_at).await?);
-        }
-        Ok(out)
+        // Every scope at once, the caller's own first in the answer.
+        let found = futures::future::try_join_all(
+            self.sessions()
+                .map(|s| s.read_where(store, who, filter, valid_at))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        Ok(found.into_iter().flatten().collect())
     }
 
     /// The first scope read (its index) holding episode `id` where the caller may read it.
@@ -576,6 +689,16 @@ impl Reads {
         who: &Principal,
         facts: &[(String, Vec<String>)],
     ) -> Result<HashMap<String, crate::feedback::Tally>> {
+        // These are the facts a read serves: noted for a check against what came of them (`crate::served_checks`),
+        // which flags only those of the caller's own scope (feedback is per scope).
+        if crate::served_checks::on() {
+            let mut s = self.seen.lock().unwrap();
+            for (id, _) in facts {
+                if !s.facts.contains(id) {
+                    s.facts.push(id.clone());
+                }
+            }
+        }
         let mut out = crate::feedback::tallies(store, self.own.scope(), who, facts).await?;
         for s in &self.also {
             for (id, t) in crate::feedback::tallies(store, s.scope(), who, facts).await? {

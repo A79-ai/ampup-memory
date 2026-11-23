@@ -28,7 +28,7 @@ use crate::{
 /// Longest reason kept, in characters.
 const MAX_REASON: usize = 500;
 /// Most votes (changes included) one person may give in a scope in a day.
-const MAX_PER_DAY: usize = 100;
+pub(crate) const MAX_PER_DAY: usize = 100;
 /// The signals, best to worst.
 pub const SIGNALS: [&str; 3] = ["positive", "negative", "very_negative"];
 

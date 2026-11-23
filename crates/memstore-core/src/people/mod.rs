@@ -5,3 +5,4 @@ pub use memstore_client::client;
 pub mod directory;
 pub mod installations;
 pub mod team;
+pub mod tenants;

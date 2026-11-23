@@ -6,9 +6,10 @@
 //!   the next write (it answers how many it recorded, and the first page of them): two open facts of one thing and attribute that holds one value at a time, with different
 //!   values from different sources, are recorded in conflict ([`crate::conflicts`]), as write-time reconcile records
 //!   them. Only facts the admin may read are compared, and a read marks a conflict only for readers of both facts;
-//! - `list_conflicts` (a member): the conflicts between facts the caller may read, with the owner of each thing
-//!   and whether the caller may settle it, a page at a time (`limit`, at most 200; `after`, the last page's `next`)
-//!   with the `total`;
+//! - `list_conflicts` (a member): the conflicts between facts the caller may read, one per thing and attribute
+//!   (every value of it in dispute, and the pairs of them recorded in conflict), with the owner of each thing and
+//!   whether the caller may settle it, a page at a time (`limit`, at most 200; `after`, the last page's `next`)
+//!   with the `total`, and `total_groups` and `total_pairs` beside it; `by: "pair"` lists one per pair instead;
 //! - `resolve_conflict` (the thing's owner, or an org admin): keep one fact, or state the value, which ends both.
 //!   What loses is ended, not deleted: history keeps it. The ending cites the engine's record of the resolution (ids
 //!   only), and where the thing is owned it goes through owner review, approved by the one resolving it.
@@ -306,7 +307,8 @@ async fn check(store: &Store, who: &Principal, scope: &Scope) -> Result<Value> {
     }))
 }
 
-/// The conflicts between open facts `who` may read, each once, with the owner of its thing.
+/// The conflicts between open facts `who` may read, one per thing and attribute (or per pair), with the owner of
+/// its thing.
 /// Most conflicts one page lists, and how many when the caller doesn't say.
 const MAX_PAGE: usize = 200;
 const PAGE: usize = 50;
@@ -343,24 +345,26 @@ async fn list(
     }
     // Main's last visibility state while the next is built: a list never waits for a build of what another
     // conversation just wrote, and never holds what was taken away (a resolution's ending of a fact included).
+    let mark = crate::kept_answers::Mark::read(store, scope).await?;
     let session = store.pin_lagging(scope, MAIN).await?;
+    crate::phases::mark("conflicts pinned");
     let vis = session.vis();
-    let schema = session.schema();
-    // Only the facts recorded in conflict, not every fact of the scope.
-    let ids: Vec<String> = vis.conflicted().map(String::from).collect();
-    let facts = match ids.is_empty() {
-        true => vec![],
-        false => {
-            session
-                .read_in(store, who, search::Col::FactId, &ids, Some(i64::MAX))
-                .await?
-        }
-    };
-    let open: HashMap<&str, &Fact> = facts
-        .iter()
-        .filter(|f| f.valid_to.is_none() && conflicts::one_value(schema.as_deref(), f))
-        .map(|f| (f.fact_id.as_str(), f))
-        .collect();
+    // The caller's open facts in conflict, kept by memory state ([`crate::kept_answers`]): reading them reads every
+    // fact of the scope.
+    let facts = CONFLICTED
+        .get(
+            &scope.namespace(),
+            &crate::kept_answers::reader_key(who),
+            crate::kept_answers::At::of(mark, vis),
+            true,
+            || {
+                let (store, session, who) = (store.clone(), session.clone(), who.clone());
+                async move { open_conflicted(&store, &session, &who).await }
+            },
+        )
+        .await?;
+    crate::phases::mark("conflicts read");
+    let open: HashMap<&str, &Fact> = facts.iter().map(|f| (f.fact_id.as_str(), f)).collect();
     let entity = req["entity"].as_str().filter(|e| !e.is_empty());
     let mut pairs: Vec<(String, &Fact, &Fact)> = vec![];
     for a in open.values() {
@@ -386,19 +390,61 @@ async fn list(
         }
     }
     pairs.sort_by(|x, y| x.0.cmp(&y.0));
-    let total = pairs.len();
-    let from = after.map_or(0, |a| pairs.partition_point(|p| p.0.as_str() <= a));
-    let page = &pairs[from..(from + limit).min(total)];
-    let next = (from + limit < total)
-        .then(|| page.last().map(|p| p.0.clone()))
-        .flatten();
+    // One conflict per thing and attribute, whatever how many values disagree on it: an attribute nine sources
+    // give nine values of is one dispute to settle, not the 36 pairs among them (`by: "pair"` lists the pairs).
+    // Each group is what the caller may read of it: only the pairs whose both sides they read.
+    let mut groups: Vec<(String, Vec<(&Fact, &Fact)>)> = vec![];
+    for &(_, a, b) in &pairs {
+        let key = [&a.entity, &a.predicate].map(|s| s.as_str()).join("\u{1f}");
+        if let Some((_, g)) = groups.last_mut().filter(|(k, _)| *k == key) {
+            g.push((a, b));
+        } else {
+            groups.push((key, vec![(a, b)]));
+        }
+    }
+    let (total_pairs, total_groups) = (pairs.len(), groups.len());
+    let by_pair = match req["by"].as_str().unwrap_or_default() {
+        "" | "group" => false,
+        "pair" => true,
+        _ => return Err(Invalid("by is group (the default) or pair".into()).into()),
+    };
+    // Each listed conflict: its sides, the older first, and the pairs among them recorded in conflict. A group's
+    // first two sides are its first recorded pair, so a reader that settles the first two settles it all
+    // (`resolve_conflict` ends every other open value of the attribute).
+    let mut listed: Vec<Listed> = match by_pair {
+        true => pairs
+            .iter()
+            .map(|(k, a, b)| (k.clone(), vec![*a, *b], vec![(*a, *b)]))
+            .collect(),
+        false => groups
+            .into_iter()
+            .map(|(k, g)| {
+                let mut sides: Vec<&Fact> = vec![g[0].0, g[0].1];
+                let mut rest: Vec<&Fact> = g
+                    .iter()
+                    .flat_map(|(a, b)| [*a, *b])
+                    .filter(|f| !sides.iter().any(|s| s.fact_id == f.fact_id))
+                    .collect();
+                rest.sort_by(|x, y| (x.valid_from, &x.fact_id).cmp(&(y.valid_from, &y.fact_id)));
+                rest.dedup_by(|x, y| x.fact_id == y.fact_id);
+                sides.extend(rest);
+                (k, sides, g)
+            })
+            .collect(),
+    };
+    let total = listed.len();
+    let from = after.map_or(0, |a| listed.partition_point(|p| p.0.as_str() <= a));
+    let to = (from + limit).min(total);
+    let next = (to < total).then(|| listed[to - 1].0.clone());
+    let page: Vec<_> = listed.drain(from..to).collect();
     // Where each side was said, for the page's facts only.
     let eps: Vec<String> = page
         .iter()
-        .flat_map(|(_, a, b)| [a, b])
+        .flat_map(|(_, sides, _)| sides.iter())
         .filter_map(|f| f.source_episodes.first().cloned())
         .collect();
     let sources = session.episode_sources(store, who, &eps).await?;
+    crate::phases::mark("conflicts sources");
     let side = |f: &Fact| {
         let ep = f.source_episodes.first();
         json!({"fact_id": f.fact_id, "value": f.value, "since": f.valid_from,
@@ -407,17 +453,42 @@ async fn list(
     };
     let out: Vec<Value> = page
         .iter()
-        .map(|(_, a, b)| {
+        .map(|(_, sides, recorded)| {
+            let a = sides[0];
             let owner = owners.get(&a.entity);
             json!({
                 "entity": a.entity, "predicate": a.predicate, "owner": owner,
                 "can_resolve": admin || owner == Some(&me),
-                "facts": [side(a), side(b)],
+                "facts": sides.iter().map(|f| side(f)).collect::<Vec<_>>(),
+                "pairs": recorded.iter().map(|(a, b)| [&a.fact_id, &b.fact_id]).collect::<Vec<_>>(),
             })
         })
         .collect();
-    Ok(json!({"conflicts": out, "total": total, "next": next}))
+    Ok(json!({"conflicts": out, "total": total, "next": next,
+        "total_groups": total_groups, "total_pairs": total_pairs}))
 }
+
+/// Each reader's open facts recorded in conflict, by memory state.
+static CONFLICTED: std::sync::LazyLock<crate::kept_answers::Kept<Vec<Fact>>> =
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(500));
+
+/// The facts recorded in conflict that `who` may read and that are open, of an attribute that holds one value.
+async fn open_conflicted(store: &Store, session: &Session, who: &Principal) -> Result<Vec<Fact>> {
+    // Only the facts recorded in conflict, not every fact of the scope.
+    let ids: Vec<String> = session.vis().conflicted().map(String::from).collect();
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let schema = session.schema();
+    let mut facts = session
+        .read_in(store, who, search::Col::FactId, &ids, Some(i64::MAX))
+        .await?;
+    facts.retain(|f| f.valid_to.is_none() && conflicts::one_value(schema.as_deref(), f));
+    Ok(facts)
+}
+
+/// A listed conflict: its cursor key, its sides (the first two a recorded pair) and the pairs recorded among them.
+type Listed<'a> = (String, Vec<&'a Fact>, Vec<(&'a Fact, &'a Fact)>);
 
 enum Choice<'a> {
     /// Keep this fact: the other ends.

@@ -18,6 +18,8 @@ struct ApiKeyRow {
     id: String,
     /// sha256 of the key, hex. The key itself is never stored.
     sha256: String,
+    /// Whose key it is. A platform key's is its platform (`platform:<name>`), so its row needs none.
+    #[serde(default)]
     user: String,
     #[serde(default)]
     groups: Vec<String>,
@@ -29,6 +31,12 @@ struct ApiKeyRow {
     /// orgs it created (`directory::provisioner_may`). Never an admin key too.
     #[serde(default)]
     provisioner: bool,
+    /// A platform key: one service serving many tenants, named by the platform it is (`"platform": "<name>"`, the
+    /// name `[a-z0-9_]`, at most 24 characters). It reaches only the orgs made for that platform's tenants, each
+    /// request naming one (`x-memstore-tenant`). The name is its identity: a key rotated under the same name keeps
+    /// its tenants. Never an admin or provisioner key too.
+    #[serde(default)]
+    platform: Option<String>,
 }
 
 /// A verified API key's caller.
@@ -40,6 +48,8 @@ pub struct KeyCaller {
     pub admin: bool,
     /// A provisioner key ([`ApiKeyRow::provisioner`]).
     pub provisioner: bool,
+    /// A platform key's platform ([`ApiKeyRow::platform`]).
+    pub platform: Option<String>,
     /// The key's sha256, hex.
     pub sha256: String,
 }
@@ -334,6 +344,8 @@ pub struct Caller {
     pub admin: bool,
     /// Holds a provisioner key ([`KeyCaller::provisioner`]).
     pub provisioner: bool,
+    /// Holds a platform key: its platform ([`KeyCaller::platform`]).
+    pub platform: Option<String>,
     /// Every id the credential names them by (a JWT's `sub` and email, `key:<id>` for an API key).
     pub aliases: Vec<String>,
     /// Signed in through an identity provider (a person).
@@ -701,9 +713,15 @@ struct KeysFile {
 
 /// A keys file's rows, checked: every sha256 64 hex characters, no id twice.
 fn parse_keys(json: &str) -> Result<Vec<ApiKeyRow>> {
-    let keys: Vec<ApiKeyRow> = serde_json::from_str(json).context("AMPUP_MEMORY_API_KEYS")?;
+    let mut keys: Vec<ApiKeyRow> = serde_json::from_str(json).context("AMPUP_MEMORY_API_KEYS")?;
+    for k in keys.iter_mut().filter(|k| k.user.is_empty()) {
+        if let Some(p) = &k.platform {
+            k.user = crate::people::tenants::service_user(p);
+        }
+    }
     let mut seen = HashSet::new();
     for k in &keys {
+        anyhow::ensure!(!k.user.is_empty(), "api key {}: missing field `user`", k.id);
         anyhow::ensure!(
             k.sha256.len() == 64 && k.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
             "api key {}: sha256 must be 64 hex chars",
@@ -715,6 +733,18 @@ fn parse_keys(json: &str) -> Result<Vec<ApiKeyRow>> {
             "api key {}: a key is an admin key or a provisioner key, not both",
             k.id
         );
+        if let Some(p) = &k.platform {
+            anyhow::ensure!(
+                crate::people::tenants::valid_platform(p),
+                "api key {}: platform {p:?} is lower-case letters, digits and _, at most 24 characters",
+                k.id
+            );
+            anyhow::ensure!(
+                !k.admin && !k.provisioner,
+                "api key {}: a platform key is neither an admin nor a provisioner key",
+                k.id
+            );
+        }
     }
     Ok(keys)
 }
@@ -861,6 +891,7 @@ impl TokenAuth {
                 groups: k.groups.clone(),
                 admin: k.admin,
                 provisioner: k.provisioner,
+                platform: k.platform.clone(),
                 sha256: k.sha256.to_ascii_lowercase(),
             })
             .collect()
@@ -963,7 +994,9 @@ impl TokenAuth {
         let keys = self.file_keys();
         (
             keys.len(),
-            keys.iter().filter(|k| k.admin || k.provisioner).count(),
+            keys.iter()
+                .filter(|k| k.admin || k.provisioner || k.platform.is_some())
+                .count(),
         )
     }
 
@@ -1007,6 +1040,7 @@ impl TokenAuth {
                     groups: k.groups.clone(),
                     admin: k.admin,
                     provisioner: k.provisioner,
+                    platform: k.platform.clone(),
                     sha256: digest.clone(),
                 });
             }
@@ -1026,6 +1060,7 @@ impl TokenAuth {
                 groups: k.groups,
                 admin: k.admin,
                 provisioner: k.provisioner,
+                platform: k.platform,
                 ..Default::default()
             });
         }

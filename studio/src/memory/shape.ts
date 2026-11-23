@@ -134,7 +134,7 @@ export function shapeOf(type: string, types: Map<string, OrgType>): Shape | null
     return pick("issue", `text (${s.text[0]!.key}) and a status that ends (${s.ends.key})`);
   if (preds.length && preds.every((p) => p.type === "text"))
     return pick("notes", `only text (${names(preds)})`);
-  return pick("grid", "no other layout fits its predicates");
+  return pick("grid", "predicates no other layout fits");
 }
 
 /**

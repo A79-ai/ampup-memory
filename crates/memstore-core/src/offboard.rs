@@ -363,6 +363,19 @@ fn may_manage(dir: &Directory, actor: &Actor, org: &str, what: &str) -> Result<(
         return Ok(());
     }
     let me = &actor.user;
+    // A platform key manages its own tenants' orgs only (forgetting a member it vouched for), nothing else.
+    if let Some(p) = &actor.via.platform {
+        return match dir
+            .orgs
+            .get(org)
+            .is_some_and(|o| o.platform() == Some(p.as_str()))
+        {
+            true => Ok(()),
+            false => Err(refused(format!(
+                "{me} may not {what} in org {org}: it isn't one of its tenants"
+            ))),
+        };
+    }
     if actor.via.key.is_some() {
         return Err(refused(format!("{me} is a service key: it may not {what}")));
     }
@@ -404,6 +417,7 @@ impl Store {
     /// table with purge (manifests, snapshots, metadata), then whatever is left under its location; then
     /// the namespace and its search indexes. Missing pieces are skipped, so it can be run again.
     pub async fn purge_namespace(&self, ns: &str) -> Result<usize> {
+        let _losing = crate::Losing::of(ns);
         let ident = NamespaceIdent::new(ns.into());
         let mut tables = 0;
         if self.catalog().namespace_exists(&ident).await? {
@@ -447,6 +461,7 @@ impl Store {
     /// Remove every ledger row of `org`'s scopes from the system ledger (after its memory is purged): the
     /// ledger then holds nothing of it either. Returns how many rows went.
     pub async fn forget_ledger(&self, org: &str) -> Result<usize> {
+        let _losing = crate::Losing::under(Scope::org(org)?.namespace());
         let own = Scope::org(org)?.namespace();
         let teams = format!("{own}__team_");
         let mut keep = |b: &arrow_array::RecordBatch| -> Result<arrow_array::BooleanArray> {
@@ -1892,6 +1907,18 @@ impl Store {
     /// their author), the facts citing any of those episodes, the backfilled quotes of those facts, the
     /// closures those episodes are evidence for, the episodes' bodies and the namespace's search indexes.
     pub async fn forget_in(&self, ns: &str, user: &str) -> Result<Forgotten> {
+        self.forget_in_with(ns, user, false).await
+    }
+
+    /// [`Self::forget_in`], and with `sole_reader` also the episodes no one but `user` may read (every entry of
+    /// their ACL names them), whoever wrote them: what a platform ingested for one of its users is theirs.
+    pub async fn forget_in_with(
+        &self,
+        ns: &str,
+        user: &str,
+        sole_reader: bool,
+    ) -> Result<Forgotten> {
+        let _losing = crate::Losing::of(ns);
         self.sweep_rewrites(ns).await?;
         let ident = TableIdent::new(NamespaceIdent::new(ns.into()), EPISODES.into());
         if !self.catalog().table_exists(&ident).await? {
@@ -1944,21 +1971,38 @@ impl Store {
             crate::auth::acl::norm_id(user.trim())
         );
         let authored = |source: &str| crate::remembered_by(source, user) || source == mine;
+        // Every entry names them: `user:<id>` as the ACL holds it.
+        let only_theirs = |acl: &str| {
+            let entries = crate::split_list(acl);
+            !entries.is_empty() && entries.iter().all(|e| theirs.contains(e))
+        };
         let episodes = self.table(ns, EPISODES).await?;
         let rows = read_files(&episodes, HashMap::new()).await?;
-        let (mut theirs, mut others) = (HashSet::new(), HashSet::new());
+        let (mut theirs_ids, mut others) = (HashSet::new(), HashSet::new());
+        // Ids with a row only they may read, and ids with a row someone else may read too.
+        let (mut sole, mut shared) = (HashSet::new(), HashSet::new());
         for b in rows.values().flat_map(|v| v.iter()) {
-            for (id, source) in strings(b, "episode_id")
+            for ((id, source), acl) in strings(b, "episode_id")
                 .into_iter()
                 .zip(strings(b, "source"))
+                .zip(strings(b, "acl"))
             {
+                if sole_reader {
+                    match only_theirs(&acl) {
+                        true => sole.insert(id.clone()),
+                        false => shared.insert(id.clone()),
+                    };
+                }
                 match authored(&source) {
-                    true => theirs.insert(id),
+                    true => theirs_ids.insert(id),
                     false => others.insert(id),
                 };
             }
         }
-        if theirs.is_empty() {
+        // Theirs alone in every row: gone whoever wrote it.
+        let sole: HashSet<String> = sole.difference(&shared).cloned().collect();
+        let theirs = theirs_ids;
+        if theirs.is_empty() && sole.is_empty() {
             return Ok(Forgotten {
                 answers: asked,
                 feedback: voted,
@@ -1967,12 +2011,13 @@ impl Store {
         }
         // An id another source shares (an episode written before `remember_memory` ids covered their
         // source, whose body someone else wrote too) stays, with its body; only the rows this person wrote go.
-        let gone: HashSet<String> = theirs.difference(&others).cloned().collect();
-        let authored_rows = |_: &str, source: &str| authored(source);
+        let mut gone: HashSet<String> = theirs.difference(&others).cloned().collect();
+        gone.extend(sole.iter().cloned());
+        let authored_rows = |id: &str, source: &str| authored(source) || sole.contains(id);
         let mut out = self
             .erase_in(ns, Erasure::rows(gone, &authored_rows))
             .await?;
-        out.episodes = theirs.len();
+        out.episodes = theirs.union(&sole).count();
         out.answers += asked;
         out.feedback += voted;
         Ok(out)
@@ -2307,6 +2352,7 @@ impl Store {
     /// rows out, the facts first and the episodes last, so a run stopped halfway finds the same episodes again.
     /// `episodes` is left as the erasure holds it.
     async fn erase_in(&self, ns: &str, mut erasure: Erasure<'_>) -> Result<Forgotten> {
+        let _losing = crate::Losing::of(ns);
         for name in ERASED_TABLES {
             self.rewrite_ns(ns, None, name, false, Some(&mut erasure), &quiet)
                 .await?;
@@ -2326,6 +2372,9 @@ impl Store {
         erasure: Option<&mut Erasure<'_>>,
         progress: Progress<'_>,
     ) -> Result<Option<Compacted>> {
+        let _losing = erasure
+            .is_some()
+            .then(|| crate::Losing::of(scope.map_or(SYSTEM_NS.to_string(), Scope::namespace)));
         let ns = scope.map_or(SYSTEM_NS.to_string(), Scope::namespace);
         self.rewrite_ns(&ns, scope, name, compact, erasure, progress)
             .await
@@ -3113,9 +3162,11 @@ pub async fn forget_user(
             })
         };
         let mut total = Forgotten::default();
+        // A platform's user: what it ingested for them alone is theirs too.
+        let sole_reader = actor.via.platform.is_some();
         for ns in store.org_namespaces(o).await? {
             still(&Directory::fresh(store).await?)?;
-            total.add(&store.forget_in(&ns, &user).await?);
+            total.add(&store.forget_in_with(&ns, &user, sole_reader).await?);
         }
         let detail = serde_json::to_string(&total)?;
         let tomb = store

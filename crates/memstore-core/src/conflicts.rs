@@ -77,11 +77,12 @@ pub fn from_env() -> bool {
 }
 
 /// Whether `scope` records conflicts and its reads mark them: its team's `conflicts` setting, else its org's, else
-/// [`ENV`]. Off unless one of them turns it on. A directory that can't be read now answers as this server last read
+/// [`ENV`]. Off unless one of them turns it on, as the directory requests are signed in by has it
+/// ([`Store::directory_behind`]). A directory that can't be read now answers as this server last read
 /// it, and off before it ever has: never [`ENV`] alone, which a scope's own setting may contradict, so an error can't
 /// turn the setting over for one run.
 pub async fn on(store: &Store, scope: &crate::Scope) -> bool {
-    match store.directory().await {
+    match store.directory_behind().await {
         Ok(d) => d.dir.marks_conflicts(scope),
         Err(_) => store
             .directory_held()
@@ -105,9 +106,16 @@ pub fn record_of(ep: &crate::Episode) -> Option<(&str, &str)> {
 
 // What a conflict is ever about: one answer two sources can disagree on. Two values of an attribute that holds
 // several (a thing's requirements, a summary, free text) are both true, never in conflict: reconcile records no
-// conflict on one, and marks and lists leave out one recorded before it checked.
-/// Whether `f` is one answer two sources can disagree on: a schema predicate holding one value that is not free
-/// text or a reference, or an undeclared one whose value is a short label. Never one the engine keeps (`_alias`).
+// conflict on one, and marks, lists and an entity's page leave out one recorded before it checked.
+//
+// Where an attribute is declared decides it, as the facts were typed: the scope's schema first, then the episode
+// types' catalogs that extraction lays over it ([`crate::episode_types::catalog`]), which declare most of what calls,
+// emails and threads say (a deal's pains and requirements, many each). An attribute neither declares, in a scope
+// with a schema, accumulates, as the schema's own reads take it ([`crate::query::schema::Schema::card`]): only a
+// scope with no schema at all has nothing to go by but the value's shape.
+/// Whether `f` is one answer two sources can disagree on: a predicate the scope's schema, else the episode types'
+/// catalogs, declare as holding one value that is not free text or a reference; in a scope with no schema, an
+/// undeclared one whose value is a short label. Never one the engine keeps (`_alias`).
 pub fn one_value(schema: Option<&crate::query::schema::Schema>, f: &Fact) -> bool {
     if f.predicate.starts_with('_') {
         return false;
@@ -127,15 +135,49 @@ pub fn one_value(schema: Option<&crate::query::schema::Schema>, f: &Fact) -> boo
                 .unwrap_or("")
                 .into()
         });
-    use crate::query::schema::{Card, ValueType};
     match schema.and_then(|s| s.predicate(&ty, &f.predicate)) {
-        // Free text and references are notes and links, not one answer that two sources can disagree on.
-        Some(p) => {
-            !p.list && p.card != Card::Many && !matches!(p.value, ValueType::Text | ValueType::Ref)
-        }
-        // Undeclared: only a short label (a date, an amount, a name), never a sentence.
-        None => short_label(&f.value),
+        Some(p) => holds_one(&p),
+        None => match catalogs_hold_one(&ty, &f.predicate) {
+            Some(one) => one,
+            // Declared nowhere: in a schema's scope it accumulates; with no schema, only a short label (a date, an
+            // amount, a name) is taken for one answer, never a sentence.
+            None => schema.is_none() && short_label(&f.value),
+        },
     }
+}
+
+/// Whether a declared predicate holds one answer: one value at a time, not a list, and not free text or a reference
+/// (notes and links, not one answer that two sources can disagree on).
+fn holds_one(p: &crate::query::schema::PredicateDef) -> bool {
+    use crate::query::schema::{Card, ValueType};
+    !p.list && p.card != Card::Many && !matches!(p.value, ValueType::Text | ValueType::Ref)
+}
+
+/// Whether the episode types' catalogs take `(ty, predicate)` for one answer, if any declares it: only where every one
+/// that declares it does (one that keeps several values of it says they can all be true).
+fn catalogs_hold_one(ty: &str, predicate: &str) -> Option<bool> {
+    static DECLARED: std::sync::LazyLock<HashMap<(String, String), bool>> =
+        std::sync::LazyLock::new(|| {
+            let mut out: HashMap<(String, String), bool> = HashMap::new();
+            for kind in crate::episode_types::all() {
+                // A catalog that doesn't parse types nothing it would have declared.
+                let Ok(catalog) = crate::episode_types::catalog(*kind) else {
+                    continue;
+                };
+                for (t, def) in &catalog.types {
+                    for (p, pd) in &def.predicates {
+                        let one = holds_one(pd);
+                        out.entry((t.clone(), p.clone()))
+                            .and_modify(|o| *o &= one)
+                            .or_insert(one);
+                    }
+                }
+            }
+            out
+        });
+    DECLARED
+        .get(&(ty.to_string(), predicate.to_string()))
+        .copied()
 }
 
 /// A value short enough to be one answer: one line, at most six words and sixty characters.

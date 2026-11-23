@@ -143,6 +143,9 @@ export function fitView(nodes: Sim[], w: number, h: number): View {
   return { x: w / 2 - ((left + right) / 2) * k, y: (h - 24) / 2 - ((top + bottom) / 2) * k, k };
 }
 
+/** A dot this large on screen, in pixels, may always get a label; smaller ones only if among the largest fifth. */
+const MIN_LABELLED_R = 6;
+
 /** Keep labels legible at every zoom, giving selected/search results first choice of space. */
 export function labelIds(
   nodes: Sim[],
@@ -154,13 +157,38 @@ export function labelIds(
 ): Set<string> {
   const labels = new Set<string>();
   const boxes: { x: number; y: number; w: number; h: number }[] = [];
+  // Every dot on screen, so a label never sits over another entity's middle.
+  const dots = nodes.map((n) => ({
+    id: n.id,
+    x: n.x * view.k + view.x,
+    y: n.y * view.k + view.y,
+    // Its middle: a label may cross a large dot's rim, never cover what marks it.
+    core: Math.max(2, n.r * view.k * 0.5),
+  }));
   const ranked = [...nodes].sort((a, b) => priority(b.id) - priority(a.id) || b.facts - a.facts);
+  // Zoomed out, every dot is small: the largest fifth still get labels, and zooming in shows the rest.
+  const radii = nodes.map((n) => n.r).sort((a, b) => b - a);
+  const fifth = radii[Math.floor(radii.length / 5)] ?? 0;
+  const minR = Math.min(MIN_LABELLED_R, fifth * view.k);
   for (const n of ranked) {
+    // A small dot (one with few facts, or any while zoomed out) goes unlabelled unless it is picked or found.
+    if (priority(n.id) === 0 && n.r * view.k < minR) continue;
     const width = Math.min(32, Array.from(name(n.id)).length) * 7 + 8;
     const x = n.x * view.k + view.x - width / 2;
     const y = (n.y + n.r) * view.k + view.y + 4;
     if (x < 4 || x + width > w - 4 || y < 4 || y + 16 > h - 30) continue;
     if (boxes.some((b) => x < b.x + b.w && x + width > b.x && y < b.y + b.h && y + 16 > b.y))
+      continue;
+    if (
+      dots.some(
+        (d) =>
+          d.id !== n.id &&
+          d.x + d.core > x &&
+          d.x - d.core < x + width &&
+          d.y + d.core > y &&
+          d.y - d.core < y + 16,
+      )
+    )
       continue;
     labels.add(n.id);
     boxes.push({ x, y, w: width, h: 16 });

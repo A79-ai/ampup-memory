@@ -10,9 +10,10 @@ use serde_json::Value;
 
 use crate::{Scope, Store};
 
-/// Whether `scope` asks for the purpose-only wording. A directory that can't be read serves the server's own.
+/// Whether `scope` asks for the purpose-only wording, as the directory requests are signed in by has it
+/// ([`Store::directory_behind`]). A directory that can't be read serves the server's own.
 pub(super) async fn asks(store: &Store, scope: &Scope) -> bool {
-    match store.directory().await {
+    match store.directory_behind().await {
         Ok(d) => d.dir.purpose_instructions(scope),
         Err(_) => crate::people::directory::purpose_from_env(),
     }

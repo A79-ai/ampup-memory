@@ -640,6 +640,12 @@ pub async fn from_user_but(
 /// Who writes what [`share`] shares: no person's id (those are emails or `key:<org>/<name>`), under the
 /// remembered-note prefix no key may ingest under, so it is searched and extracted as any note is.
 pub const SHARER: &str = "memstore";
+/// Who ends a shared note fewer than [`SHARED_AT`] people still back ([`share`]): not [`SHARER`] nor a person, so a
+/// share ended so is told from one a person undid or forgot, which never comes back.
+pub const UNBACKER: &str = "memstore:unbacked";
+/// The setting that lets [`share`] end a shared note fewer than [`SHARED_AT`] people still back. Off, it only logs
+/// each it would end.
+pub const END_ON_BASIS_LOSS: &str = "AMPUP_MEMORY_SHARE_END_ON_BASIS_LOSS";
 /// What the reason kept for a share names it by in the answer log, `keep/shared/<episode>`.
 pub const SHARED_KEY: &str = "keep/shared/";
 /// The most notes one pass reads, newest first.
@@ -647,9 +653,28 @@ const SHARE_NOTES: usize = 300;
 /// The most of one note it reads.
 const SHARE_NOTE_CHARS: usize = 400;
 
-/// What each scope's last pass saw (its notes and shared ones), in this process: a scope with nothing new isn't
-/// read again by a model.
-static SHARE_SEEN: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Default::default);
+/// What each scope's last pass saw (a fingerprint of its notes and shared ones, and which of those the team reads),
+/// in this process: a scope with nothing new isn't read again by a model. Not a count: one note forgotten and
+/// another kept in the same hour is a change.
+static SHARE_SEEN: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Default::default);
+
+/// Whether [`END_ON_BASIS_LOSS`] is on (`1`, `true`, `on` or `yes`). Off unless it is.
+fn ends_on_basis_loss() -> bool {
+    std::env::var(END_ON_BASIS_LOSS).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+/// The fingerprint [`SHARE_SEEN`] keeps of a pass's state.
+fn fingerprint(state: &BTreeSet<String>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    state.hash(&mut h);
+    h.finish()
+}
 
 /// Share with everyone in `scope` what at least [`SHARED_AT`] people each said the same of in their own memory:
 /// what the server kept from what they said, for them alone (`source` `keep`, `acl` exactly their own `user:`
@@ -659,14 +684,26 @@ static SHARE_SEEN: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Defau
 /// readable by everyone in the scope. Answers how many were shared.
 pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor) -> Result<usize> {
     use crate::aggregate::StoreAggregates;
-    let view = store.aggregation_view(scope).await?;
+    let (view, vis) = tokio::try_join!(
+        store.aggregation_view(scope),
+        store.visibility(scope, crate::MAIN)
+    )?;
     let prefix = format!("{}:", crate::REMEMBER_SOURCE);
     let shared_source = format!("{prefix}{}", crate::origin::SHARED);
     let mut notes: Vec<(String, String)> = vec![];
     let mut shared_ids = vec![];
+    // Those the team reads now (everyone's), which end once what they rest on is gone ([`backing`]).
+    let mut standing = vec![];
+    // Those no one reads: undone, forgotten, or ended as fewer than SHARED_AT people still said them.
+    let mut gone: HashSet<String> = HashSet::new();
     for e in &view.episodes {
         if e.source == shared_source {
             shared_ids.push(e.id.clone());
+            if e.acl == ["*"] {
+                standing.push(e.id.clone());
+            } else if !e.acl.is_empty() && e.acl.iter().all(|a| a == crate::FORGOTTEN) {
+                gone.insert(e.id.clone());
+            }
             continue;
         }
         // By its author, for them alone.
@@ -686,10 +723,80 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
         }
     }
     let authors: HashSet<&str> = notes.iter().map(|(_, a)| a.as_str()).collect();
-    let seen = notes.len() + shared_ids.len();
+    let mut state: BTreeSet<String> = notes
+        .iter()
+        .map(|(id, _)| format!("note {id}"))
+        .chain(shared_ids.iter().map(|id| format!("shared {id}")))
+        .chain(standing.iter().map(|id| format!("standing {id}")))
+        .collect();
     let key = scope.to_string();
-    if SHARE_SEEN.lock().unwrap().get(&key) == Some(&seen) {
+    if SHARE_SEEN.lock().unwrap().get(&key) == Some(&fingerprint(&state)) {
         return Ok(0);
+    }
+    // Of those no one reads, the ones ended for want of people still saying them: they may come back. One a person
+    // undid or forgot never does.
+    let unbacked: HashSet<String> = store
+        .episode_changers(scope, &gone)
+        .await?
+        .into_iter()
+        .filter(|(_, by)| by == UNBACKER)
+        .map(|(id, _)| id)
+        .collect();
+    let (lost, regained) = backing(store, &notes, &standing, &unbacked, scope).await?;
+    // A shared note fewer than SHARED_AT people still say (what it rests on forgotten or deleted) ends: no longer
+    // readable by the team. Only when the setting says so; until then, each it would end is logged.
+    let mut ended: Vec<String> = vec![];
+    if !lost.is_empty() {
+        match ends_on_basis_loss() {
+            true => {
+                let targets: Vec<crate::AclTarget> = lost
+                    .iter()
+                    .cloned()
+                    .map(crate::AclTarget::Episode)
+                    .collect();
+                store
+                    .change_acl_all(scope, UNBACKER, &targets, &[crate::FORGOTTEN.to_string()])
+                    .await?;
+                for id in &lost {
+                    eprintln!(
+                        "keep: share in {scope}: ended shared note {id}, fewer than {SHARED_AT} people still say it"
+                    );
+                    state.remove(&format!("standing {id}"));
+                }
+                eprintln!("keep: share in {scope}: {} shared notes ended", lost.len());
+                ended = lost;
+            }
+            false => {
+                for id in &lost {
+                    eprintln!(
+                        "keep: share in {scope}: would end shared note {id}, fewer than {SHARED_AT} people still say it \
+                         ({END_ON_BASIS_LOSS} is off)"
+                    );
+                }
+                eprintln!(
+                    "keep: share in {scope}: {} shared notes would end",
+                    lost.len()
+                );
+            }
+        }
+    }
+    // One ended so that SHARED_AT people say again is the team's again.
+    if !regained.is_empty() {
+        let targets: Vec<crate::AclTarget> = regained
+            .iter()
+            .cloned()
+            .map(crate::AclTarget::Episode)
+            .collect();
+        store
+            .change_acl_all(scope, SHARER, &targets, &["*".to_string()])
+            .await?;
+        for id in &regained {
+            eprintln!(
+                "keep: share in {scope}: shared note {id} back, {SHARED_AT} people say it again"
+            );
+            state.insert(format!("standing {id}"));
+            standing.push(id.clone());
+        }
     }
     // Counts only, logged once each time what there is to share changes: never what anyone said.
     if authors.len() < SHARED_AT {
@@ -698,7 +805,7 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
             notes.len(),
             authors.len()
         );
-        SHARE_SEEN.lock().unwrap().insert(key, seen);
+        SHARE_SEEN.lock().unwrap().insert(key, fingerprint(&state));
         return Ok(0);
     }
     // The newest.
@@ -727,10 +834,21 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
                 .join(" ")
         })
     };
+    // Every shared note, the team's to read or not, none written again in other words: but one ended as fewer than
+    // SHARED_AT people said it, which a fresh SHARED_AT may share again.
     let already: Vec<String> = ids[notes.len()..]
         .iter()
+        .filter(|id| !unbacked.contains(*id) || regained.contains(*id))
         .filter_map(|id| text(id))
         .collect();
+    // Of those, what the model is told is shared: only what the team reads now. One undone or ended is compared
+    // here alone, as is one someone deleted (`removed`): never shown to the model, what was taken back reaches no one.
+    let reads: Vec<String> = standing
+        .iter()
+        .filter(|id| !ended.contains(*id))
+        .filter_map(|id| text(id))
+        .collect();
+    let removed = removed_shares(store, scope, &vis, &shared_source).await;
     let mut people: HashMap<&str, usize> = HashMap::new();
     let mut lines = vec![];
     let mut by_line = vec![];
@@ -744,9 +862,9 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
     }
     let joined = lines.join("\n");
     let fence = crate::extract::fence(&[&joined]);
-    let listed = match already.is_empty() {
+    let listed = match reads.is_empty() {
         true => "(nothing)".to_string(),
-        false => already
+        false => reads
             .iter()
             .map(|a| format!("- {a}"))
             .collect::<Vec<_>>()
@@ -825,6 +943,7 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
         }
         if already
             .iter()
+            .chain(&removed)
             .chain(&written)
             .any(|a| same(a, &text) || says_same(a, &text))
         {
@@ -832,6 +951,12 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
             continue;
         }
         let ep = crate::Episode::sourced(&shared_source, text.as_bytes(), &["*"]);
+        // An episode the scope holds already, current, ended or deleted (its text's body couldn't be read, say): written
+        // again it would change nothing a reader sees, and make the next read wait for a full rebuild.
+        if vis.acls.contains_key(&ep.episode_id) || vis.is_retracted(&ep.episode_id) {
+            repeated += 1;
+            continue;
+        }
         let facts = crate::note_facts::facts_of(std::slice::from_ref(&ep));
         store
             .commit(scope, SHARER, std::slice::from_ref(&ep), &facts)
@@ -854,6 +979,8 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
             "keep: shared with {scope} what {} people said: {text}",
             who.len()
         );
+        state.insert(format!("shared {}", ep.episode_id));
+        state.insert(format!("standing {}", ep.episode_id));
         written.push(text);
         wrote += 1;
     }
@@ -865,8 +992,125 @@ pub async fn share(store: &crate::Store, scope: &crate::Scope, model: &Extractor
         people.len(),
         groups_n
     );
-    SHARE_SEEN.lock().unwrap().insert(key, seen + wrote);
+    SHARE_SEEN.lock().unwrap().insert(key, fingerprint(&state));
     Ok(wrote)
+}
+
+/// Which shared notes fewer than [`SHARED_AT`] people back now, of those the team reads (`standing`), and which
+/// [`SHARED_AT`] people back again, of those ended for want of them (`unbacked`). A note is backed when each word of
+/// its sentence ([`checked`], the share's own check) is in the current notes of [`SHARED_AT`] people. `notes` are the
+/// people's current notes (id, author): one forgotten or deleted is no longer among them. A share was written only
+/// when each of its words was in the notes of [`SHARED_AT`] of the people it cites, so it loses its backing once the
+/// notes that said it are taken back, and keeps it while enough people still say it. A note whose text doesn't read
+/// is in neither: nothing says what it rests on changed.
+async fn backing(
+    store: &crate::Store,
+    notes: &[(String, String)],
+    standing: &[String],
+    unbacked: &HashSet<String>,
+    scope: &crate::Scope,
+) -> Result<(Vec<String>, Vec<String>)> {
+    if standing.is_empty() && unbacked.is_empty() {
+        return Ok((vec![], vec![]));
+    }
+    let mut bodies = HashMap::new();
+    let ids: Vec<String> = notes
+        .iter()
+        .map(|(id, _)| id.clone())
+        .chain(standing.iter().cloned())
+        .chain(unbacked.iter().cloned())
+        .collect();
+    for chunk in ids.chunks(64) {
+        bodies.extend(store.episode_bodies(scope, chunk.to_vec()).await?);
+    }
+    let text = |id: &str| {
+        bodies
+            .get(id)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    };
+    // Each word, by the people whose notes use it.
+    let mut by: HashMap<String, HashSet<&str>> = HashMap::new();
+    for (id, author) in notes {
+        if let Some(t) = text(id) {
+            for w in checked(&t) {
+                by.entry(w).or_default().insert(author.as_str());
+            }
+        }
+    }
+    let backed = |t: &str| {
+        checked(t)
+            .iter()
+            .all(|w| by.get(w).map_or(0, HashSet::len) >= SHARED_AT)
+    };
+    let lost = standing
+        .iter()
+        .filter(|id| text(id).is_some_and(|t| !backed(&t)))
+        .cloned()
+        .collect();
+    let mut regained: Vec<String> = unbacked
+        .iter()
+        .filter(|id| text(id).is_some_and(|t| backed(&t)))
+        .cloned()
+        .collect();
+    regained.sort();
+    Ok((lost, regained))
+}
+
+/// The texts of the shared notes deleted from `scope` (retracted, committed on main), whose bodies still read. Best
+/// effort: none when they don't read, as the pass still never writes the same episode again.
+async fn removed_shares(
+    store: &crate::Store,
+    scope: &crate::Scope,
+    vis: &crate::Vis,
+    shared_source: &str,
+) -> Vec<String> {
+    match removed_texts(store, scope, vis, shared_source).await {
+        Ok(texts) => texts,
+        Err(e) => {
+            eprintln!("keep: share in {scope}: deleted shared notes not read: {e:#}");
+            vec![]
+        }
+    }
+}
+
+async fn removed_texts(
+    store: &crate::Store,
+    scope: &crate::Scope,
+    vis: &crate::Vis,
+    shared_source: &str,
+) -> Result<Vec<String>> {
+    let rows = store.rows(&scope.namespace(), crate::EPISODES).await?;
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    for b in rows.rows.iter() {
+        let (commits, eps, sources) = (
+            crate::strings(b, "commit_id"),
+            crate::strings(b, "episode_id"),
+            crate::strings(b, "source"),
+        );
+        for i in 0..eps.len() {
+            if sources[i] == shared_source
+                && vis.committed.contains(&commits[i])
+                && vis.is_retracted(&eps[i])
+            {
+                ids.insert(eps[i].clone());
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let bodies = store
+        .episode_bodies(scope, ids.into_iter().collect())
+        .await?;
+    Ok(bodies
+        .values()
+        .map(|b| {
+            String::from_utf8_lossy(b)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect())
 }
 
 /// A text's content words, lowercased, a plural's `s` dropped: its words of four letters or more but the commonest,

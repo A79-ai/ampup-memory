@@ -7,7 +7,7 @@ import { ApiError } from "./api";
 import { addedBy, day, entityName, humanize, personName, sourceKind, sourceTitle, when } from "./format";
 import { fitView, seed, step, type Sim } from "./graphLayout";
 import type { GraphEdge, GraphNode } from "./graphTypes";
-import { EntityLink } from "./layouts";
+import { EntityLink, FactText } from "./layouts";
 import { DreamCard } from "./review";
 import {
   entityFocus,
@@ -58,28 +58,42 @@ export type EntityPage = {
 
 const norm = (s: string) => s.trim().toLowerCase();
 
-/** Who may read an episode, in plain words. */
+/** Who may read an episode, in plain words. Groups read as who is in them: the org's own (`<org>.all`, which
+ * everyone the org admits holds) as everyone in it, a private Slack channel's (`<org>.slack.<id>`) as its members;
+ * another group by its name. */
 function audience(
   acl: string[],
   me: string | undefined,
-  team: string | undefined,
+  sel: Selection,
 ): { label: string; open: boolean } {
   if (acl.includes("*"))
-    return { label: team ? `Everyone in ${team}` : "Everyone in the org", open: true };
+    return { label: sel.team ? `Everyone in ${sel.team}` : "Everyone in the org", open: true };
   const users = acl.filter((a) => a.startsWith("user:")).map((a) => a.slice(5));
   const groups = acl
     .filter((a) => a.startsWith("group:") || a.startsWith("role:"))
     .map((a) => a.slice(a.indexOf(":") + 1));
+  const org = norm(sel.org);
+  if (groups.some((g) => norm(g) === `${org}.all`))
+    return { label: "Everyone in the org", open: true };
   if (!groups.length && users.length) {
     if (users.length === 1 && me && norm(users[0]!) === norm(me))
       return { label: "Only you", open: false };
     return { label: `Only ${users.map((u) => personName(`_:${u}`)).join(", ")}`, open: false };
   }
-  if (groups.length)
+  if (groups.length) {
+    const channel = (g: string) => norm(g).startsWith(`${org}.slack.`);
+    const channels = groups.filter(channel).length;
+    const named = [
+      ...groups.filter((g) => !channel(g)),
+      ...(channels ? [channels === 1 ? "a private Slack channel" : `${channels} private Slack channels`] : []),
+    ];
     return {
-      label: `People in ${groups.join(", ")}${users.length ? ` and ${users.length} more` : ""}`,
+      label: `${channels === groups.length ? "Members of" : "People in"} ${named.join(", ")}${
+        users.length ? ` and ${users.length} more` : ""
+      }`,
       open: false,
     };
+  }
   return { label: "Restricted", open: false };
 }
 
@@ -88,12 +102,12 @@ function factAudience(
   f: EntityFact,
   eps: Record<string, EntityEpisode>,
   me: string | undefined,
-  team: string | undefined,
+  sel: Selection,
 ) {
   const each = f.source_episodes
     .map((e) => eps[e])
     .filter((e): e is EntityEpisode => !!e)
-    .map((e) => audience(e.readers, me, team));
+    .map((e) => audience(e.readers, me, sel));
   if (!each.length) return null;
   const closed = [...new Set(each.filter((a) => !a.open).map((a) => a.label))];
   return closed.length ? { label: closed.join(" and "), open: false } : each[0]!;
@@ -122,16 +136,16 @@ function Provenance({
   f,
   eps,
   me,
-  team,
+  sel,
   onFocus,
 }: {
   f: EntityFact;
   eps: Record<string, EntityEpisode>;
   me?: string;
-  team?: string;
+  sel: Selection;
   onFocus: (f: Focus) => void;
 }) {
-  const aud = factAudience(f, eps, me, team);
+  const aud = factAudience(f, eps, me, sel);
   const n = f.corroboration ?? 0;
   return (
     <div className="en-prov">
@@ -229,18 +243,18 @@ export function EntityFacts({
                   {f.value_ref || named.has(f.value) ? (
                     <EntityLink entity={f.value_ref ?? f.value} onFocus={onFocus} />
                   ) : (
-                    f.value
+                    <FactText value={f.value} />
                   )}
                 </div>
                 {f.quote && f.quote !== f.value && <div className="quote">“{f.quote}”</div>}
                 {page.episodes && (
-                  <Provenance f={f} eps={eps} me={me} team={sel.team} onFocus={onFocus} />
+                  <Provenance f={f} eps={eps} me={me} sel={sel} onFocus={onFocus} />
                 )}
                 {fixing === f.fact_id && (
                   <Correct
                     f={f}
                     values={closedValues(schema, f.entity, f.predicate)}
-                    open={factAudience(f, eps, me, sel.team)?.open ?? true}
+                    open={factAudience(f, eps, me, sel)?.open ?? true}
                     sel={sel}
                     onDone={(disputed) => {
                       setFixing(null);

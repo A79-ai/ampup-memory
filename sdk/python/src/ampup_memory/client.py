@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypedDict, cast
+from urllib.parse import quote
 
 import httpx
 
@@ -77,19 +78,23 @@ class AmpUpMemory:
         *,
         org: str | None = None,
         team: str | None = None,
+        tenant: str | None = None,
+        tenant_name: str | None = None,
+        user: str | None = None,
+        user_email: str | None = None,
+        user_name: str | None = None,
         timeout: float = 60,
     ) -> None:
+        """A client for `server`. A platform key names a `tenant` (its own id for one of its customers) and,
+        optionally, the `user` acting in it; see `for_tenant` and `for_user`."""
         headers = {}
         if token:
             headers["authorization"] = f"Bearer {token}"
-        # The wire names keep the engine's original prefix: headers are an interface, not what a person types.
-        if org:
-            headers["x-memstore-org"] = org
-        if team:
-            if not org:
-                raise ValueError("team needs an org")
-            headers["x-memstore-team"] = team
         self._http = httpx.Client(base_url=server.rstrip("/"), headers=headers, timeout=timeout)
+        self._owns_http = True
+        self._headers = _identity(org, team, tenant, tenant_name, user, user_email, user_name)
+        self._tenant, self._tenant_name = tenant, tenant_name
+        self.tenants = Tenants(self)
 
     @classmethod
     def from_profile(cls, context: str | None = None, *, timeout: float = 60) -> AmpUpMemory:
@@ -97,8 +102,32 @@ class AmpUpMemory:
         p = credentials.load_profile(context)
         return cls(p.server, p.token, org=p.org, team=p.team, timeout=timeout)
 
+    def for_tenant(self, tenant: str, *, name: str | None = None) -> AmpUpMemory:
+        """A copy of this client for another tenant, as the tenant itself (no user). `name` labels the tenant
+        when this request creates it. The copy shares this client's connections: close this one, not the copy."""
+        return self._copy(_identity(None, None, tenant, name, None, None, None), tenant, name)
+
+    def for_user(self, user: str, *, email: str | None = None, name: str | None = None) -> AmpUpMemory:
+        """A copy of this client for another user of the same tenant. `email` and `name` describe the user (they
+        are stored and kept up to date, never the user's identity). The copy shares this client's connections."""
+        if self._tenant is None:
+            raise ValueError("for_user needs a client with a tenant")
+        headers = _identity(None, None, self._tenant, self._tenant_name, user, email, name)
+        return self._copy(headers, self._tenant, self._tenant_name)
+
+    def _copy(self, headers: dict[str, str], tenant: str, tenant_name: str | None) -> AmpUpMemory:
+        c = object.__new__(AmpUpMemory)
+        c._http = self._http
+        c._owns_http = False
+        c._headers = headers
+        c._tenant, c._tenant_name = tenant, tenant_name
+        c.tenants = Tenants(c)
+        return c
+
     def close(self) -> None:
-        self._http.close()
+        """Close the connections; a copy from `for_tenant` or `for_user` leaves them to the client it came from."""
+        if self._owns_http:
+            self._http.close()
 
     def __enter__(self) -> AmpUpMemory:  # noqa: PYI034 (typing.Self needs 3.11)
         return self
@@ -106,8 +135,11 @@ class AmpUpMemory:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def _call(self, method: str, path: str, body: Any = None) -> Any:
-        r = self._http.request(method, path, json=body)
+    def _call(
+        self, method: str, path: str, body: Any = None, *, params: dict[str, Any] | None = None, scoped: bool = True
+    ) -> Any:
+        """One request. `scoped=False` leaves out the org, team, tenant and user headers."""
+        r = self._http.request(method, path, json=body, params=params, headers=self._headers if scoped else None)
         try:
             data = r.json()
         except ValueError:
@@ -170,7 +202,8 @@ class AmpUpMemory:
         """Start a session for `task`; its opening advice is `session.opening`.
 
         `harness` names what runs the session (your app, say). A name ending in ":sdk" marks the session a
-        program's: advice isn't learned from it, nor served to it unless the org turns that on.
+        program's: advice isn't learned from it, nor served to it unless the org turns that on. A platform's agent
+        sessions use their own harness name, never one ending in ":sdk".
         """
         req: dict[str, Any] = {"context": task}
         if harness is not None:
@@ -191,6 +224,89 @@ class AmpUpMemory:
         if reason is not None:
             req["reason"] = reason
         return cast(str, self._call("POST", "/runs/reward", req)["run_id"])
+
+
+def _identity(
+    org: str | None,
+    team: str | None,
+    tenant: str | None,
+    tenant_name: str | None,
+    user: str | None,
+    user_email: str | None,
+    user_name: str | None,
+) -> dict[str, str]:
+    """The headers that say which org or tenant, and which user, a request is for."""
+    if team and not org:
+        raise ValueError("team needs an org")
+    if tenant is not None and org:
+        raise ValueError("pass a tenant or an org, not both: a platform key reaches its tenants by their own ids")
+    if tenant is None and (tenant_name or user is not None):
+        raise ValueError("tenant_name and user need a tenant")
+    if user is None and (user_email or user_name):
+        raise ValueError("user_email and user_name need a user")
+    # The wire names keep the engine's original prefix: headers are an interface, not what a person types.
+    h: dict[str, str] = {}
+    if org:
+        h["x-memstore-org"] = org
+    if team:
+        h["x-memstore-team"] = team
+    # Ids go as they are, checked; the tenant's name and the user's email and name are attributes, sent as
+    # percent-encoded UTF-8 (RFC 3986, everything outside the unreserved set encoded) so any text travels.
+    for header, param, value, is_id in (
+        ("x-memstore-tenant", "tenant", tenant, True),
+        ("x-memstore-tenant-name", "tenant_name", tenant_name, False),
+        ("x-memstore-user", "user", user, True),
+        ("x-memstore-user-email", "user_email", user_email, False),
+        ("x-memstore-user-name", "user_name", user_name, False),
+    ):
+        if is_id and value is not None:
+            h[header] = _id(param, value)
+        elif value:
+            h[header] = quote(value, safe="")
+    return h
+
+
+def _id(param: str, value: str) -> str:
+    """A tenant or user id: 1 to 128 printable ASCII characters."""
+    if not (1 <= len(value) <= 128 and all(" " <= c <= "~" for c in value)):
+        raise ValueError(f"{param} must be 1 to 128 printable ASCII characters: {value!r}")
+    return value
+
+
+class Tenants:
+    """A platform key's tenants: `AmpUpMemory.tenants`. Each call names its tenant in the path, so it sends no
+    tenant or user headers, whatever the client was made for."""
+
+    def __init__(self, memory: AmpUpMemory) -> None:
+        self._memory = memory
+
+    def ensure(self, tenant: str, name: str | None = None) -> dict[str, Any]:
+        """Create the tenant if it doesn't exist: `{tenant, org, created}`. `name` labels it when it is created."""
+        body = {} if name is None else {"name": name}
+        return cast(dict[str, Any], self._memory._call("PUT", _tenant_path(tenant), body, scoped=False))
+
+    def get(self, tenant: str) -> dict[str, Any]:
+        """`{tenant, org, created_at, limits, usage}`; raises a 404 for a tenant that doesn't exist."""
+        return cast(dict[str, Any], self._memory._call("GET", _tenant_path(tenant), scoped=False))
+
+    def list(self, after: str | None = None, limit: int | None = None) -> dict[str, Any]:
+        """A page of the platform's tenants with their usage, after the tenant id `after` (up to 500 a page)."""
+        params = {k: v for k, v in (("after", after), ("limit", limit)) if v is not None}
+        return cast(dict[str, Any], self._memory._call("GET", "/tenants", params=params or None, scoped=False))
+
+    def delete(self, tenant: str) -> dict[str, Any]:
+        """Purge the tenant and everything in it. `{purging: true}` while the purge runs: call again to finish it.
+        The same id later starts a new, empty tenant."""
+        return cast(dict[str, Any], self._memory._call("DELETE", _tenant_path(tenant), scoped=False) or {})
+
+    def forget_user(self, tenant: str, user: str) -> dict[str, Any]:
+        """Forget one of the tenant's users: take them out of it and delete what they wrote there."""
+        path = f"{_tenant_path(tenant)}/users/{quote(_id('user', user), safe='')}/forget"
+        return cast(dict[str, Any], self._memory._call("POST", path, scoped=False) or {})
+
+
+def _tenant_path(tenant: str) -> str:
+    return f"/tenants/{quote(_id('tenant', tenant), safe='')}"
 
 
 class Session:

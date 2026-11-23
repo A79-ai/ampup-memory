@@ -29,6 +29,12 @@ pub mod schema;
 pub mod sql;
 mod views;
 
+/// `scope`'s facts generation for a read of its facts table's data `files` at snapshot `seq`
+/// ([`views::facts_generation`]).
+pub(crate) fn facts_generation(scope: &str, seq: i64, files: Vec<String>) -> u64 {
+    views::facts_generation(scope, seq, files)
+}
+
 /// Memory in `scope` (its namespace, on main) lost something: drop the metric answers kept past new
 /// writes from before ([`views::Key::lasting`]).
 pub(crate) fn drop_lasting(scope: &str, removals: u64) {

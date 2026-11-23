@@ -3,14 +3,14 @@ import { useEffect, useMemo, useState } from "react";
 import { ApiError, errorText } from "../transport";
 import { browse, call } from "../memory/api";
 import { when } from "../memory/format";
-import { useOption } from "../memory/hashOptions";
+import { useChoice, useOption } from "../memory/hashOptions";
 import { Markdown } from "../memory/markdown";
 import type { Selection } from "../memory/types";
 
 // Studio's Advice page: each team note agents were given, how often and to how many people, how those sessions
 // went, and the sessions themselves (memstore's `/browse {op: "advice_usage"}`). Everyone sees the org's counts;
 // the sessions are the reader's own, or everyone's for the org's admins. Admins ratify a note for the whole team
-// (`/admin {op: "ratify_advice"}`), and find the evidence and lookup tables under "Diagnostics". The note picked
+// (`/admin {op: "ratify_advice"}`), and find the evidence and lookup tables under "Details". The note picked
 // is in the link (`#/advice?note=<key>`); where a note was learned from, run by run, is on the Learned page.
 
 interface Session {
@@ -50,11 +50,14 @@ interface Usage {
   every: boolean;
 }
 
-const RANGES: { days: number | null; label: string }[] = [
-  { days: 30, label: "30 days" },
-  { days: 90, label: "90 days" },
-  { days: null, label: "All" },
-];
+/** The windows, as the link names them (`#/advice?days=7`; 30 days when it names none). */
+const RANGES = [
+  { id: "7", days: 7, label: "7 days" },
+  { id: "30", days: 30, label: "30 days" },
+  { id: "90", days: 90, label: "90 days" },
+  { id: "all", days: null, label: "All" },
+] as const;
+const RANGE_IDS = RANGES.map((r) => r.id);
 
 /** Waiting for an admin: used, and neither ratified nor held back. */
 const waiting = (a: Advice) => a.used > 0 && !a.ratified && !a.held;
@@ -119,7 +122,9 @@ export function AdvicePage({
   /** The evidence and lookup tables, for admins. */
   diagnostics?: React.ReactNode;
 }) {
-  const [days, setDays] = useState<number | null>(30);
+  // In the link, so Home's "this week" opens it at 7 days, and the diagnostics under it read the same window.
+  const [range, setRange] = useChoice("days", RANGE_IDS, "30");
+  const days = (RANGES.find((r) => r.id === range) ?? RANGES[1]).days;
   const [n, setN] = useState(0);
   const [got, setGot] = useState<{ key: string; data?: Usage; error?: unknown } | null>(null);
   const key = JSON.stringify([sel.org, sel.team, sel.branch, days, n]);
@@ -178,10 +183,10 @@ export function AdvicePage({
         <div className="ap-seg" role="group" aria-label="Time range">
           {RANGES.map((r) => (
             <button
-              key={r.label}
-              aria-pressed={days === r.days}
-              className={days === r.days ? "on" : ""}
-              onClick={() => setDays(r.days)}
+              key={r.id}
+              aria-pressed={range === r.id}
+              className={range === r.id ? "on" : ""}
+              onClick={() => setRange(r.id)}
             >
               {r.label}
             </button>
@@ -207,19 +212,20 @@ export function AdvicePage({
           <div className="ap-tiles">
             <div>
               <dt>Advice used</dt>
-              <dd>{totals.used} times</dd>
+              <dd>{totals.used.toLocaleString()} times</dd>
             </div>
             <div>
               <dt>Advice in use</dt>
               <dd>
-                {totals.inUse} <span className="ap-muted ap-small">of {all.length}</span>
+                {totals.inUse.toLocaleString()}{" "}
+                <span className="ap-muted ap-small">of {all.length.toLocaleString()}</span>
               </dd>
             </div>
             <div>
               <dt>Sessions that went well</dt>
               <dd>
                 {totals.judged
-                  ? `${totals.well} of ${totals.judged} · ${Math.round((100 * totals.well) / totals.judged)}%`
+                  ? `${totals.well.toLocaleString()} of ${totals.judged.toLocaleString()} · ${Math.round((100 * totals.well) / totals.judged)}%`
                   : "—"}
               </dd>
             </div>
@@ -319,9 +325,7 @@ export function AdvicePage({
             onClick={() => setShowDiag(!showDiag)}
             aria-expanded={showDiag}
           >
-            {showDiag
-              ? "Hide diagnostics"
-              : "Diagnostics: evidence against the holdout, and lookups"}
+            {showDiag ? "Hide the details" : "Details: does advice help, and when is it given"}
           </button>
           {showDiag && <div className="ap-diag-in">{diagnostics}</div>}
         </section>
@@ -422,7 +426,7 @@ function Detail({
       <dl className="ap-tiles ap-tiles-4">
         <div>
           <dt>Used</dt>
-          <dd>{a.used} times</dd>
+          <dd>{a.used.toLocaleString()} times</dd>
         </div>
         <div>
           <dt>By</dt>
@@ -432,11 +436,11 @@ function Detail({
         </div>
         <div>
           <dt>Went well</dt>
-          <dd className="ap-ok">{a.went_well}</dd>
+          <dd className="ap-ok">{a.went_well.toLocaleString()}</dd>
         </div>
         <div>
           <dt>Went wrong</dt>
-          <dd className="ap-bad">{a.went_wrong}</dd>
+          <dd className="ap-bad">{a.went_wrong.toLocaleString()}</dd>
         </div>
       </dl>
       <div className="ap-tabs" role="tablist">

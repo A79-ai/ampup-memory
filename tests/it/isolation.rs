@@ -989,6 +989,12 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
                     json!({"op": "ls", "path": ["entities", "deal"]}),
                     &mine_facts,
                 ),
+                // Again, answered from what was kept for this caller: never another's.
+                (
+                    "/browse",
+                    json!({"op": "ls", "path": ["entities", "deal"]}),
+                    &mine_facts,
+                ),
                 // Narrowed to what a source taught, and what each source taught: counted and named only from
                 // what the caller may read.
                 (
@@ -1000,6 +1006,28 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
                     "/browse",
                     json!({"op": "sources", "top": 20}),
                     &mine_facts,
+                ),
+                // The sessions folder and the advice page, each twice: the second answered from what was
+                // kept for this caller, never another's.
+                (
+                    "/browse",
+                    json!({"op": "ls", "path": ["sessions"], "limit": 500}),
+                    &no_documents,
+                ),
+                (
+                    "/browse",
+                    json!({"op": "ls", "path": ["sessions"], "limit": 500}),
+                    &no_documents,
+                ),
+                (
+                    "/browse",
+                    json!({"op": "advice_usage", "days": 30}),
+                    &no_documents,
+                ),
+                (
+                    "/browse",
+                    json!({"op": "advice_usage", "days": 30}),
+                    &no_documents,
                 ),
                 // The filterable lists: every fact the caller may read (each with the sources of the episodes
                 // it cites, which are the caller's to see too), and the advice (none is learned here).
@@ -3812,4 +3840,482 @@ async fn a_claim_of_absence_counts_only_what_its_reader_may_read() {
         dave.iter().all(|n| !n.contains("Linear tickets")),
         "dave's note, contradicted by his tickets: {dave:?}"
     );
+}
+
+/// Two platforms' keys (acme's twice: a rotated key keeps its platform's tenants) beside the operator's.
+pub(crate) const ACME_KEY: &str = "msk_platform_key_for_acme_tenants";
+pub(crate) const ACME_KEY_ROTATED: &str = "msk_platform_key_for_acme_rotated";
+pub(crate) const GLOBEX_KEY: &str = "msk_platform_key_for_globex_tenants";
+
+/// `servers` servers on one catalog (as replicas are on one warehouse), each taking the operator's key and the
+/// platform keys above. Answers their URLs and the store they share.
+pub(crate) async fn platform_servers(
+    dir: &std::path::Path,
+    servers: usize,
+) -> (Vec<String>, Store) {
+    let catalog = platform::local(&format!("file://{}", dir.join("warehouse").display()))
+        .await
+        .unwrap();
+    let store =
+        Store::new(catalog.clone()).with_index_base(dir.join("index").display().to_string());
+    store.ensure_scope(&Scope::Org).await.unwrap();
+    let sha = |k: &str| auth::hex(&sha2::Sha256::digest(k.as_bytes()));
+    // A platform row names its platform and nothing else.
+    let keys = json!([{"id": "operator", "sha256": sha(ADMIN_KEY), "user": "svc:platform", "admin": true},
+                      {"id": "acme", "sha256": sha(ACME_KEY), "platform": "acme"},
+                      {"id": "acme_rotated", "sha256": sha(ACME_KEY_ROTATED), "platform": "acme"},
+                      {"id": "globex", "sha256": sha(GLOBEX_KEY), "platform": "globex"}]);
+    let mut urls = vec![];
+    for _ in 0..servers {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_with(
+            port,
+            Scope::Org,
+            vec![],
+            Options {
+                listener: Some(listener),
+                catalog: Some(catalog.clone()),
+                index_base: Some(store.index_base().to_string()),
+                token_auth: Some(TokenAuth::new(Some(&keys.to_string()), None).unwrap()),
+                ..Default::default()
+            },
+        ));
+        let s = format!("http://127.0.0.1:{port}");
+        let up = Instant::now();
+        while CLIENT.get(&s).send().await.is_err() {
+            assert!(
+                up.elapsed() < Duration::from_secs(30),
+                "server never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        urls.push(s);
+    }
+    (urls, store)
+}
+
+/// A platform's request: `method` to `path` with `key` and `headers` (the tenant's and user's), and a body.
+pub(crate) async fn platform_call(
+    s: &str,
+    method: reqwest::Method,
+    path: &str,
+    key: &str,
+    headers: &[(&str, &str)],
+    body: Option<&Value>,
+) -> (u16, String) {
+    let mut r = CLIENT
+        .request(method, format!("{s}{path}"))
+        .bearer_auth(key);
+    for (k, v) in headers {
+        r = r.header(*k, *v);
+    }
+    if let Some(b) = body {
+        r = r.body(b.to_string());
+    }
+    let r = r.send().await.unwrap_or_else(|e| panic!("{path}: {e}"));
+    let status = r.status().as_u16();
+    (status, r.text().await.unwrap())
+}
+
+/// The tags among `tags` that `answer` holds.
+pub(crate) fn tags_in<'a>(answer: &str, tags: &[&'a str]) -> Vec<&'a str> {
+    tags.iter()
+        .copied()
+        .filter(|t| answer.contains(t))
+        .collect()
+}
+
+/// A platform key reaches only the tenants it names, each its own org: a tenant's user reads what is shared with
+/// the tenant and what names them there, never another tenant's or platform's; a platform that names no tenant
+/// reads and writes nothing; it never reaches an org the operator made; and replicas racing a tenant's first
+/// requests make it one org.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_platform_key_reaches_only_the_tenants_it_names() {
+    use reqwest::Method;
+    let dir = tempfile::tempdir().unwrap();
+    let (servers, _store) = platform_servers(dir.path(), 2).await;
+    let s = servers[0].as_str();
+    admin(
+        s,
+        json!({"op": "create_org", "org": "opsorg", "admin": "alice@acme.com"}),
+    )
+    .await;
+    let as_user = |tenant: &'static str, user: &'static str| -> Vec<(&'static str, &'static str)> {
+        let mut h = vec![("x-memstore-tenant", tenant)];
+        if !user.is_empty() {
+            h.push(("x-memstore-user", user));
+        }
+        h
+    };
+
+    // Replicas racing a tenant's first requests, each naming another user: one org, every user its member.
+    let first = (0..8).map(|i| {
+        let (s, user) = (servers[i % 2].clone(), format!("u{i}"));
+        async move {
+            let h = [
+                ("x-memstore-tenant", "t_race"),
+                ("x-memstore-user", user.as_str()),
+            ];
+            platform_call(
+                &s,
+                Method::POST,
+                "/sessions",
+                ACME_KEY,
+                &h,
+                Some(&json!({"task": "x"})),
+            )
+            .await
+        }
+    });
+    for (status, body) in futures::future::join_all(first).await {
+        assert_eq!(status, 200, "a tenant's first request: {body}");
+    }
+    // Read on one server, which sees the other's writes once its directory catches up (within a second).
+    let up = Instant::now();
+    loop {
+        let (_, all) = post(&format!("{s}/admin"), ADMIN_KEY, &json!({"op": "show"})).await;
+        let orgs: Vec<String> = serde_json::from_str::<Value>(&all).unwrap()["view"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o.as_str().unwrap().to_string())
+            .collect();
+        let mut raced = vec![];
+        for org in &orgs {
+            let (_, one) = post(
+                &format!("{s}/admin"),
+                ADMIN_KEY,
+                &json!({"op": "show", "org": org}),
+            )
+            .await;
+            let v: Value = serde_json::from_str(&one).unwrap();
+            if v["view"]["tenant"] == "t_race" {
+                assert_eq!(v["view"]["created_by"], "platform:acme");
+                raced.push(v["view"]["members"].as_object().unwrap().len());
+            }
+        }
+        assert_eq!(raced.len(), 1, "one org for the raced tenant: {orgs:?}");
+        if raced == [8] {
+            break;
+        }
+        assert!(
+            up.elapsed() < Duration::from_secs(10),
+            "the raced tenant's 8 users: {raced:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Memory in two of acme's tenants and in globex's tenant of the same id as one of them. The platform's
+    // ACLs name its own user ids and the tenant's `group:all`.
+    let now = chrono::Utc::now().timestamp_micros();
+    let ep = |tag: &str, acl: &str| {
+        json!({"source": format!("note:{tag}"), "body": format!("{tag} owner"),
+                                           "occurred_at": now, "acl": [acl]})
+    };
+    let mut ids = vec![];
+    for (key, tenant, episodes) in [
+        (
+            ACME_KEY,
+            "t_x",
+            vec![ep("xtxuoneonly", "user:u1"), ep("xtxshared", "group:all")],
+        ),
+        (
+            ACME_KEY,
+            "t_y",
+            vec![ep("xtyuoneonly", "user:u1"), ep("xtyshared", "group:all")],
+        ),
+        (GLOBEX_KEY, "t_x", vec![ep("xglobexshared", "group:all")]),
+    ] {
+        let (status, body) = platform_call(
+            s,
+            Method::POST,
+            "/ingest",
+            key,
+            &as_user(tenant, ""),
+            Some(&json!({"episodes": episodes})),
+        )
+        .await;
+        assert_eq!(status, 200, "ingest into {tenant}: {body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        ids.extend(
+            v["episode_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| json!([i])),
+        );
+    }
+    // Entries the platform doesn't write: another group, everyone, a role.
+    for acl in ["group:sales", "*", "role:admin"] {
+        let (status, body) = platform_call(
+            s,
+            Method::POST,
+            "/ingest",
+            ACME_KEY,
+            &as_user("t_x", ""),
+            Some(&json!({"episodes": [ep("xrefused", acl)]})),
+        )
+        .await;
+        assert_eq!(status, 400, "an ACL of {acl}: {body}");
+    }
+
+    let tags = [
+        "xtxuoneonly",
+        "xtxshared",
+        "xtyuoneonly",
+        "xtyshared",
+        "xglobexshared",
+    ];
+    let episodes = json!({"calls": ids});
+    let passages = json!({"calls": [[{"find": "passages", "text": "owner", "limit": 100}]]});
+    // Who reads what: u1's `user:` entry is theirs in the tenant it was written in only; acme's u1 in t_x is not
+    // globex's; the tenant's service identity reads what the whole tenant may.
+    for (key, tenant, user, want) in [
+        (ACME_KEY, "t_x", "u1", vec!["xtxuoneonly", "xtxshared"]),
+        (
+            ACME_KEY_ROTATED,
+            "t_x",
+            "u1",
+            vec!["xtxuoneonly", "xtxshared"],
+        ),
+        (ACME_KEY, "t_x", "u2", vec!["xtxshared"]),
+        (ACME_KEY, "t_x", "", vec!["xtxshared"]),
+        (ACME_KEY, "t_y", "u1", vec!["xtyuoneonly", "xtyshared"]),
+        (GLOBEX_KEY, "t_x", "u1", vec!["xglobexshared"]),
+    ] {
+        let who = format!("{key} {tenant}/{user}");
+        let (status, body) = platform_call(
+            s,
+            Method::POST,
+            "/episode",
+            key,
+            &as_user(tenant, user),
+            Some(&episodes),
+        )
+        .await;
+        assert_eq!(status, 200, "{who} /episode: {body}");
+        assert_eq!(tags_in(&body, &tags), want, "{who} /episode: {body}");
+        // Passages are indexed as they come in: read until the caller's own are there, then nothing else is.
+        let up = Instant::now();
+        loop {
+            let (status, body) = platform_call(
+                s,
+                Method::POST,
+                "/query",
+                key,
+                &as_user(tenant, user),
+                Some(&passages),
+            )
+            .await;
+            assert_eq!(status, 200, "{who} /query: {body}");
+            let seen = tags_in(&body, &tags);
+            assert!(
+                seen.iter().all(|t| want.contains(t)),
+                "{who} /query: {body}"
+            );
+            if seen == want {
+                break;
+            }
+            assert!(
+                up.elapsed() < Duration::from_secs(60),
+                "{who} /query never saw {want:?}: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    // Without a tenant a platform key reads and writes nothing; it says who it is, and lists its tenants.
+    for path in [
+        "/search",
+        "/query",
+        "/episode",
+        "/ingest",
+        "/remember",
+        "/sessions",
+        "/mcp",
+    ] {
+        let (status, body) = platform_call(
+            s,
+            Method::POST,
+            path,
+            ACME_KEY,
+            &[],
+            Some(&json!({"calls": [["owner", 10]]})),
+        )
+        .await;
+        assert_eq!(status, 403, "{path} with no tenant: {body}");
+        assert!(body.contains("tenant_required"), "{path}: {body}");
+    }
+    let (status, me) = platform_call(s, Method::GET, "/me", ACME_KEY, &[], None).await;
+    assert_eq!(
+        (
+            status,
+            serde_json::from_str::<Value>(&me).unwrap()["platform"].clone()
+        ),
+        (200, json!("acme"))
+    );
+    let (status, list) = platform_call(s, Method::GET, "/tenants", GLOBEX_KEY, &[], None).await;
+    assert_eq!(status, 200, "{list}");
+    let listed: Vec<Value> = serde_json::from_str::<Value>(&list).unwrap()["tenants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["tenant"].clone())
+        .collect();
+    assert_eq!(
+        listed,
+        vec![json!("t_x")],
+        "globex lists its own tenants only: {list}"
+    );
+
+    // A tenant's request selects nothing else: no org, no team, no scope.
+    let tx = as_user("t_x", "u1");
+    for (path, extra) in [
+        ("/episode", ("x-memstore-org", "opsorg")),
+        ("/episode", ("x-memstore-team", "a1")),
+    ] {
+        let mut h = tx.clone();
+        h.push(extra);
+        let (status, body) =
+            platform_call(s, Method::POST, path, ACME_KEY, &h, Some(&episodes)).await;
+        assert_eq!(status, 400, "{extra:?}: {body}");
+    }
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/episode?scope=org:opsorg",
+        ACME_KEY,
+        &tx,
+        Some(&episodes),
+    )
+    .await;
+    assert_eq!(status, 400, "?scope: {body}");
+    // The directory: a platform shows the tenant it names, and changes nothing but its template.
+    for (change, want) in [
+        (json!({"op": "show", "org": "opsorg"}), 403),
+        (json!({"op": "delete_org", "org": "opsorg"}), 403),
+        (
+            json!({"op": "invite", "org": "opsorg", "members": [{"user": "mallory@example.com"}]}),
+            403,
+        ),
+        (
+            json!({"op": "set_tenant_template", "settings": {"extract_model": "any"}}),
+            403,
+        ),
+        (
+            json!({"op": "set_tenant_template", "settings": {"require_sso": true}}),
+            400,
+        ),
+        // Limits spend the deployment's budget: the operator's alone.
+        (
+            json!({"op": "set_tenant_template", "limits": {"monthly_model_tokens": 5}}),
+            403,
+        ),
+        // Checked as set_settings checks them.
+        (
+            json!({"op": "set_tenant_template", "settings": {"compile_batch": 100000}}),
+            400,
+        ),
+    ] {
+        let (status, body) = platform_call(
+            s,
+            Method::POST,
+            "/admin",
+            ACME_KEY,
+            &as_user("t_x", ""),
+            Some(&change),
+        )
+        .await;
+        assert_eq!(status, want, "{change}: {body}");
+    }
+    // A platform's `clear` starts over only what it may set: the operator's limits and model stay.
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/admin",
+        ADMIN_KEY,
+        &[],
+        Some(&json!({"op": "set_tenant_template", "platform": "acme",
+                     "limits": {"monthly_model_tokens": 1000000}, "settings": {"extract_model": "acme/model-x"}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    for change in [
+        json!({"op": "set_tenant_template", "settings": {"advice": true}}),
+        json!({"op": "set_tenant_template", "clear": true}),
+    ] {
+        let (status, body) =
+            platform_call(s, Method::POST, "/admin", ACME_KEY, &[], Some(&change)).await;
+        assert_eq!(status, 200, "{change}: {body}");
+    }
+    let (_, body) = platform_call(
+        s,
+        Method::POST,
+        "/admin",
+        ACME_KEY,
+        &[],
+        Some(&json!({"op": "get_tenant_template"})),
+    )
+    .await;
+    let template = &serde_json::from_str::<Value>(&body).unwrap()["template"];
+    assert_eq!(
+        (
+            &template["limits"]["monthly_model_tokens"],
+            &template["settings"]
+        ),
+        (&json!(1000000), &json!({"extract_model": "acme/model-x"})),
+        "{body}"
+    );
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/admin",
+        ADMIN_KEY,
+        &[],
+        Some(&json!({"op": "set_tenant_template", "platform": "acme", "clear": true})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // Another platform's tenant is no tenant of this one's, by any route.
+    let (status, _) =
+        platform_call(s, Method::PUT, "/tenants/t_gonly", GLOBEX_KEY, &[], None).await;
+    assert_eq!(status, 200);
+    for method in [Method::GET, Method::DELETE] {
+        let (status, body) =
+            platform_call(s, method.clone(), "/tenants/t_gonly", ACME_KEY, &[], None).await;
+        assert_eq!(status, 404, "{method} another platform's tenant: {body}");
+    }
+    // A path names one tenant, after exactly one `/tenants`: `tenantst_gonly` is another id, and so is `tenants`.
+    for (method, path) in [
+        (Method::DELETE, "/tenants/tenantst_gonly"),
+        (Method::GET, "/tenants/tenants"),
+    ] {
+        let (status, body) = platform_call(s, method, path, GLOBEX_KEY, &[], None).await;
+        assert_eq!(status, 404, "{path}: {body}");
+    }
+    let (status, body) =
+        platform_call(s, Method::GET, "/tenants/t_gonly", GLOBEX_KEY, &[], None).await;
+    assert_eq!(status, 200, "t_gonly is still there: {body}");
+    // The operator's key and a person's names no tenant, and reaches no `/tenants`.
+    let (status, body) =
+        platform_call(s, Method::POST, "/episode", ADMIN_KEY, &tx, Some(&episodes)).await;
+    assert_eq!(status, 400, "the operator naming a tenant: {body}");
+    let (status, body) = platform_call(s, Method::GET, "/tenants", ADMIN_KEY, &[], None).await;
+    assert_eq!(status, 403, "the operator's /tenants: {body}");
+    // Ids are printable ASCII as sent; attributes are percent-encoded UTF-8.
+    for h in [
+        vec![
+            ("x-memstore-tenant", "t_x"),
+            ("x-memstore-user-name", "%FF%FE"),
+        ],
+        vec![
+            ("x-memstore-tenant", "t_x"),
+            ("x-memstore-user-email", "%E2%82"),
+        ],
+    ] {
+        let (status, body) =
+            platform_call(s, Method::POST, "/episode", ACME_KEY, &h, Some(&episodes)).await;
+        assert_eq!(status, 400, "{h:?}: {body}");
+    }
 }

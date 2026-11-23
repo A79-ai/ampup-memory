@@ -304,6 +304,17 @@ async fn reads(s: &str, sel: &str, bearer: &str, ids: &[&str]) -> Option<String>
         assert_eq!(status, 200, "{path}{sel}: {text}");
         out.push_str(&text);
     }
+    // The Explorer's deals, kept per reader by memory state (twice: the second from what was kept): a deal whose
+    // facts went is gone from them.
+    for _ in 0..2 {
+        let ls = json!({"op": "ls", "path": ["entities", "deal"]});
+        let (status, text) = post(&format!("{s}/browse{sel}"), bearer, &ls).await;
+        if status == 401 || status == 403 {
+            return None;
+        }
+        assert!(status == 200 || status == 404, "/browse{sel}: {text}");
+        out.push_str(&text);
+    }
     let call = |name: &str, args: Value| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
     let mut tools = vec![call("search_memory", json!({"query": "owner note deal"}))];
     for id in ids {
@@ -1621,6 +1632,19 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         json!({"op": "add_member", "org": "acme", "user": "alice@acme.com", "role": "admin"}),
     )
     .await;
+    // The Explorer's deals as bob reads them, kept for him: the one her note backs among them.
+    let ls = json!({"op": "ls", "path": ["entities", "deal"]});
+    let (status, text) = post(&format!("{s}/browse?org=acme"), &bob, &ls).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("xqmixedfact"), "{text}");
+    // Her activity as alice reads it, and alice's advice page (no note here: kept_notes puts one on it), kept for
+    // her: Carol's ask among the activity.
+    let (status, body) = admin_as(s, &alice, activity.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("xqcarolasked"), "{body}");
+    let usage = json!({"op": "advice_usage", "days": 30});
+    let (status, text) = post(&format!("{s}/browse?org=acme"), &alice, &usage).await;
+    assert_eq!(status, 200, "{text}");
     // Acme's admin forgets Carol.
     let (status, body) = admin_as(
         s,
@@ -1629,6 +1653,28 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
+    // What was kept of her activity and of the advice page is never answered again: none of hers right after.
+    let (status, text) = admin_as(s, &alice, activity.clone()).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(
+        !text.contains("xqcarolasked") && !text.to_lowercase().contains("carol@acme.com"),
+        "her activity read right after the forget: {text}"
+    );
+    let (status, text) = post(&format!("{s}/browse?org=acme"), &alice, &usage).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(
+        !text.contains("xqcarolasked") && !text.to_lowercase().contains("carol@acme.com"),
+        "her sessions on the advice page right after the forget: {text}"
+    );
+    // What was kept of them for bob is never answered again: none of hers is listed now.
+    let (status, text) = post(&format!("{s}/browse?org=acme"), &bob, &ls).await;
+    assert!(status == 200 || status == 404, "{text}");
+    for t in &carol_tags {
+        assert!(
+            !text.contains(t),
+            "{t} listed for bob right after the forget: {text}"
+        );
+    }
     let done: Value = serde_json::from_str(&body).unwrap();
     // Her four notes, both parts of her advice trace, her session transcript's three versions of two parts (the
     // two she forgot too) and her session's conversation so far.
@@ -2192,22 +2238,32 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     // Nor its audit: the new acme's admin sees the new org's history only, never who ran the old one,
     // whom it forgot or which keys it had (the directory's log keeps the old org's changes forever),
     // whenever a server wrote it.
-    let (status, body) = admin_as(
-        s,
-        &zed,
-        json!({"op": "audit", "org": "acme", "since_secs": 86_400}),
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    let events: Value = serde_json::from_str(&body).unwrap();
-    let events = events["events"].as_array().unwrap();
-    // The new acme's own rows are there: its creation, and zed's sign-in this server recorded for it.
-    assert!(
-        events
+    // The new acme's own rows are there: its creation, and zed's sign-in this server recorded for it
+    // (the sign-in is recorded beside the request, so it may land a moment after the answer).
+    let mut body = String::new();
+    let mut signed_in = false;
+    for _ in 0..50 {
+        let (status, got) = admin_as(
+            s,
+            &zed,
+            json!({"op": "audit", "org": "acme", "since_secs": 86_400}),
+        )
+        .await;
+        assert_eq!(status, 200, "{got}");
+        body = got;
+        let events: Value = serde_json::from_str(&body).unwrap();
+        if events["events"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|e| e["kind"] == "signin" && e["actor"] == "zed@acme.com"),
-        "{body}"
-    );
+            .any(|e| e["kind"] == "signin" && e["actor"] == "zed@acme.com")
+        {
+            signed_in = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(signed_in, "{body}");
     for old in ["alice@acme.com", "carol@acme.com", "bob@acme.com", "dash"] {
         assert!(
             !body.contains(old),
@@ -2750,4 +2806,381 @@ async fn a_fold_racing_a_forget_leaves_nothing_of_what_was_forgotten() {
         !in_files("xpracebobkeeps").is_empty(),
         "bob's note went with her"
     );
+}
+
+/// A platform forgets a tenant's user and deletes a tenant for good: what the user wrote, and what the platform
+/// ingested for them alone, goes and they are no longer a member, while the rest of the tenant stays; named again
+/// they are a new member, who reads nothing shared with the forgotten one. A deleted tenant's org and every file
+/// of its memory go, a second delete finds nothing, and the same tenant id later starts a new, empty org under a
+/// name never used, even with the same name. A member an admin removed isn't enrolled again by being named.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_user_is_forgotten_and_a_tenant_deleted_for_good() {
+    use crate::isolation::{
+        ACME_KEY, ADMIN_KEY, GLOBEX_KEY, platform_call, platform_servers, tags_in,
+    };
+    use reqwest::Method;
+    let dir = tempfile::tempdir().unwrap();
+    let (servers, _store) = platform_servers(dir.path(), 1).await;
+    let s = servers[0].as_str();
+    let user = |u: &'static str| vec![("x-memstore-tenant", "t_gone"), ("x-memstore-user", u)];
+
+    // Two users of one tenant (made by its first request, with a name) each remember a note the whole tenant
+    // reads; u1 also starts and ends a session. The platform ingests a third note.
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/sessions",
+        ACME_KEY,
+        &[
+            ("x-memstore-tenant", "t_gone"),
+            ("x-memstore-user", "u1"),
+            ("x-memstore-tenant-name", "Gone%20Co"),
+            ("x-memstore-user-email", "xtenantuoneemail%40example.com"),
+        ],
+        Some(&json!({"task": "draft the renewal"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let session: Value = serde_json::from_str(&body).unwrap();
+    // After a turn, a stop with the conversation so far and no question: kept on the session, nothing to say.
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/advice",
+        ACME_KEY,
+        &user("u1"),
+        Some(
+            &json!({"session_id": session["session_id"], "event": {"kind": "stop"},
+                     "conversation_so_far": "user: draft it\nassistant: xtenantstopconvo"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["op"],
+        "none",
+        "{body}"
+    );
+    let mut ids = vec![];
+    for (u, tag) in [("u1", "xtenantuonenote"), ("u2", "xtenantutwonote")] {
+        let (status, body) = platform_call(
+            s,
+            Method::POST,
+            "/remember",
+            ACME_KEY,
+            &user(u),
+            Some(&json!({"source": format!("note:{tag}"), "body": format!("{tag} owner"), "acl": ["group:all"]})),
+        )
+        .await;
+        assert_eq!(status, 200, "{u} remembers: {body}");
+        ids.push(json!([
+            serde_json::from_str::<Value>(&body).unwrap()["episode_id"]
+        ]));
+    }
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/sessions/end",
+        ACME_KEY,
+        &user("u1"),
+        Some(&json!({"session_id": session["session_id"], "transcript": "xtenantsessionbody", "outcome": "success"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let now = chrono::Utc::now().timestamp_micros();
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/ingest",
+        ACME_KEY,
+        &[("x-memstore-tenant", "t_gone")],
+        Some(
+            &json!({"episodes": [{"source": "note:xtenantingested", "body": "xtenantingested owner",
+                                   "occurred_at": now, "acl": ["group:all"]}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    ids.extend(
+        serde_json::from_str::<Value>(&body).unwrap()["episode_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| json!([i])),
+    );
+    let episodes = json!({"calls": ids});
+    let tags = ["xtenantuonenote", "xtenantutwonote", "xtenantingested"];
+    // The platform ingests a note only u1 reads, and one u1 and u2 read.
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/ingest",
+        ACME_KEY,
+        &[("x-memstore-tenant", "t_gone")],
+        Some(&json!({"episodes": [
+            {"source": "note:xtenantsoleone", "body": "xtenantsoleone owner", "occurred_at": now, "acl": ["user:u1"]},
+            {"source": "note:xtenantshared", "body": "xtenantshared owner", "occurred_at": now,
+             "acl": ["user:u1", "user:u2"]}]})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let theirs = json!({"calls": serde_json::from_str::<Value>(&body).unwrap()["episode_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| json!([i]))
+        .collect::<Vec<_>>()});
+    let their_tags = ["xtenantsoleone", "xtenantshared"];
+    let (_, body) = platform_call(
+        s,
+        Method::POST,
+        "/episode",
+        ACME_KEY,
+        &user("u1"),
+        Some(&theirs),
+    )
+    .await;
+    assert_eq!(tags_in(&body, &their_tags), their_tags, "{body}");
+    let (_, body) = platform_call(
+        s,
+        Method::POST,
+        "/episode",
+        ACME_KEY,
+        &user("u2"),
+        Some(&episodes),
+    )
+    .await;
+    assert_eq!(tags_in(&body, &tags), tags, "{body}");
+    let (_, body) = platform_call(s, Method::GET, "/tenants/t_gone", ACME_KEY, &[], None).await;
+    let org = serde_json::from_str::<Value>(&body).unwrap()["org"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(org.starts_with("gone_co_"), "{body}");
+    let members = |shown: &str| -> Vec<String> {
+        let v: Value = serde_json::from_str(shown).unwrap();
+        v["view"]["members"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let show = json!({"op": "show", "org": org});
+    let (_, shown) = post(&format!("{s}/admin"), ADMIN_KEY, &show).await;
+    assert_eq!(members(&shown).len(), 2, "{shown}");
+    assert!(shown.contains("xtenantuoneemail@example.com"), "{shown}");
+    let before = members(&shown);
+
+    // Another platform can't forget or delete it: it has no such tenant.
+    for (method, path) in [
+        (Method::POST, "/tenants/t_gone/users/u1/forget"),
+        (Method::DELETE, "/tenants/t_gone"),
+    ] {
+        let (status, body) = platform_call(s, method, path, GLOBEX_KEY, &[], None).await;
+        assert_eq!(status, 404, "globex {path}: {body}");
+    }
+
+    assert!(
+        !files_with(dir.path(), "xtenantstopconvo").is_empty(),
+        "the stop's conversation is kept"
+    );
+    // u1 is forgotten: their note and session go, they are no longer a member, and u2's note and the ingested
+    // one stay.
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/tenants/t_gone/users/u1/forget",
+        ACME_KEY,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let forgotten: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        forgotten["forgotten"][&org]["episodes"].as_u64() >= Some(2),
+        "{body}"
+    );
+    let (_, body) = platform_call(
+        s,
+        Method::POST,
+        "/episode",
+        ACME_KEY,
+        &user("u2"),
+        Some(&episodes),
+    )
+    .await;
+    assert_eq!(
+        tags_in(&body, &tags),
+        ["xtenantutwonote", "xtenantingested"],
+        "{body}"
+    );
+    let (_, shown) = post(&format!("{s}/admin"), ADMIN_KEY, &show).await;
+    assert_eq!(members(&shown).len(), 1, "{shown}");
+    assert!(!shown.contains("xtenantuoneemail"), "{shown}");
+    // What the platform ingested for u1 alone goes; what u2 reads too stays theirs.
+    assert_eq!(
+        files_with(dir.path(), "xtenantsoleone"),
+        Vec::<PathBuf>::new()
+    );
+    let (_, body) = platform_call(
+        s,
+        Method::POST,
+        "/episode",
+        ACME_KEY,
+        &user("u2"),
+        Some(&theirs),
+    )
+    .await;
+    assert_eq!(tags_in(&body, &their_tags), ["xtenantshared"], "{body}");
+    // u1 named again is another member, who reads what the whole tenant does and nothing the forgotten one did.
+    let (_, body) = platform_call(
+        s,
+        Method::POST,
+        "/episode",
+        ACME_KEY,
+        &user("u1"),
+        Some(&theirs),
+    )
+    .await;
+    assert!(tags_in(&body, &their_tags).is_empty(), "{body}");
+    let (_, body) = platform_call(
+        s,
+        Method::POST,
+        "/episode",
+        ACME_KEY,
+        &user("u1"),
+        Some(&episodes),
+    )
+    .await;
+    assert_eq!(
+        tags_in(&body, &tags),
+        ["xtenantutwonote", "xtenantingested"],
+        "{body}"
+    );
+    let (_, shown) = post(&format!("{s}/admin"), ADMIN_KEY, &show).await;
+    let now_members = members(&shown);
+    assert_eq!(now_members.len(), 2, "{shown}");
+    assert!(
+        now_members.iter().filter(|m| !before.contains(m)).count() == 1,
+        "u1 is a member under a new name: {before:?} then {now_members:?}"
+    );
+
+    // A path names one tenant, after exactly one `/tenants`.
+    let (status, body) = platform_call(
+        s,
+        Method::DELETE,
+        "/tenants/tenantst_gone",
+        ACME_KEY,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+
+    // The tenant is deleted: its org and its files go, and a second delete finds nothing.
+    assert!(
+        !files_with(dir.path(), "xtenantingested").is_empty(),
+        "the tenant's memory is in its files"
+    );
+    let (status, body) =
+        platform_call(s, Method::DELETE, "/tenants/t_gone", ACME_KEY, &[], None).await;
+    assert_eq!(
+        (
+            status,
+            serde_json::from_str::<Value>(&body).unwrap()["deleted"].clone()
+        ),
+        (200, json!(true)),
+        "{body}"
+    );
+    for (method, what) in [
+        (Method::DELETE, "a second delete"),
+        (Method::GET, "the tenant"),
+    ] {
+        let (status, body) = platform_call(s, method, "/tenants/t_gone", ACME_KEY, &[], None).await;
+        assert_eq!(status, 404, "{what}: {body}");
+    }
+    let (_, shown) = post(&format!("{s}/admin"), ADMIN_KEY, &show).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&shown).unwrap()["view"],
+        Value::Null,
+        "{shown}"
+    );
+    for tag in tags
+        .iter()
+        .chain(&their_tags)
+        .chain(&["xtenantsessionbody", "xtenantstopconvo"])
+    {
+        let held = files_with(dir.path(), tag);
+        assert!(held.is_empty(), "{tag} is still in {held:?}");
+    }
+
+    // The same tenant id later, with the same name: a new org under a name never used, with nothing of the old
+    // one's in it.
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/sessions",
+        ACME_KEY,
+        &[
+            ("x-memstore-tenant", "t_gone"),
+            ("x-memstore-user", "u2"),
+            ("x-memstore-tenant-name", "Gone%20Co"),
+        ],
+        Some(&json!({"task": "anything left?"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, body) = platform_call(s, Method::GET, "/tenants/t_gone", ACME_KEY, &[], None).await;
+    let again = serde_json::from_str::<Value>(&body).unwrap()["org"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(again, format!("{org}_2"), "{body}");
+    let (_, body) = platform_call(
+        s,
+        Method::POST,
+        "/episode",
+        ACME_KEY,
+        &user("u2"),
+        Some(&episodes),
+    )
+    .await;
+    assert!(tags_in(&body, &tags).is_empty(), "{body}");
+    let (_, body) = platform_call(
+        s,
+        Method::POST,
+        "/query",
+        ACME_KEY,
+        &user("u2"),
+        Some(&json!({"calls": [[{"find": "passages", "text": "owner", "limit": 100}]]})),
+    )
+    .await;
+    assert!(tags_in(&body, &tags).is_empty(), "{body}");
+
+    // An admin removes u2 there: named again, they are refused, not enrolled.
+    let (_, shown) = post(
+        &format!("{s}/admin"),
+        ADMIN_KEY,
+        &json!({"op": "show", "org": again}),
+    )
+    .await;
+    let u2 = members(&shown).pop().unwrap();
+    let (status, body) = post(
+        &format!("{s}/admin"),
+        ADMIN_KEY,
+        &json!({"op": "remove_member", "org": again, "user": u2}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/episode",
+        ACME_KEY,
+        &user("u2"),
+        Some(&episodes),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("member_removed"), "{body}");
 }

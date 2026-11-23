@@ -37,6 +37,7 @@ mod dream_review;
 mod episode_page;
 mod file_keys;
 mod governance;
+mod home;
 mod join;
 mod learn;
 mod lobby;
@@ -49,6 +50,7 @@ pub(crate) use reports::standalone;
 mod routing;
 mod signin;
 pub mod studio;
+mod tenants;
 mod unsubscribe;
 mod upload;
 pub mod writer;
@@ -134,8 +136,19 @@ struct State {
     /// loaded only the scopes someone reads: a new server's first caller finds them as warm as the last one found
     /// the old server's, and a scope nobody has read for [`keep_warm_idle`] is left to its next reader.
     read_at: std::sync::Mutex<HashMap<Scope, Instant>>,
-    /// Orgs' identity providers and service keys as last read from the directory, and when.
-    providers: std::sync::Mutex<Option<(std::time::Instant, DirectoryAuth)>>,
+    /// When `/installations` last gave a held list, so [`keep_warm`] keeps the cached installations from passing the
+    /// hard staleness limit while such lists come now and then (a plan page opened every few minutes), and stops when
+    /// they don't.
+    installations_listed_at: std::sync::Mutex<Option<Instant>>,
+    /// Orgs' identity providers and service keys as last read from the directory: when, and the fold they were
+    /// read from.
+    providers: std::sync::Mutex<
+        Option<(
+            std::time::Instant,
+            Arc<crate::people::directory::Folded>,
+            DirectoryAuth,
+        )>,
+    >,
     /// Seals orgs' provider client secrets for the directory, and opens them (`AMPUP_MEMORY_SECRET_KEY`).
     secret_key: Option<auth::secret::SecretKey>,
     /// Where `env:` client secrets are looked up: the process environment unless the embedder gave one.
@@ -362,12 +375,6 @@ struct DirectoryAuth {
     /// Orgs bound to an Auth0 Organization, each with its id.
     auth0_orgs: Vec<(String, String)>,
 }
-
-/// Orgs' providers and keys are re-read from the directory at most this often (and after a change made
-/// here): a stream of tokens from unknown issuers, or of unknown keys, doesn't turn into a stream of
-/// catalog reads. So a key revoked through another server stops working here within this long, or, while the
-/// catalog can't be read, within the store's hard staleness limit ([`directory_auth`]).
-const PROVIDERS_TTL: Duration = Duration::from_secs(5);
 
 impl State {
     /// Audiences a signature-intact Google token may be minted for: `AMPUP_MEMORY_ID_AUDIENCE` plus this service's URLs.
@@ -663,6 +670,7 @@ pub async fn serve_with(
             || std::env::var("AMPUP_MEMORY_DIRECTORY").is_ok_and(|v| v == "required"),
         served: Default::default(),
         read_at: Default::default(),
+        installations_listed_at: Default::default(),
         providers: Default::default(),
         secret_key,
         secret_env: options.secret_env,
@@ -725,6 +733,10 @@ pub async fn serve_with(
         Err(_) => Duration::from_secs(60),
     };
     tokio::spawn(reports::run(state.clone(), usage_persist));
+    // Another cell's orgs can't be opened by the sender: such a cell measures what they hold itself, for its reports.
+    if !cell::is_default() {
+        tokio::spawn(reports::measure_cell(state.clone(), inventory_every()?));
+    }
     // Sources this machine reads by itself (`serve --local`): GitHub repositories with the token it already holds,
     // Linear teams with the key in its environment, Sentry projects with a token it finds.
     if let Some(dir) = options.sources_dir.clone() {
@@ -734,7 +746,7 @@ pub async fn serve_with(
             let st = st.clone();
             Box::pin(async move {
                 let bytes = serde_json::to_vec(&body)?;
-                let out = ingest_episodes(&st, &st.scope, "sources", &bytes, None).await?;
+                let out = ingest_episodes(&st, &st.scope, "sources", &bytes, None, false).await?;
                 Ok(out["committed"].as_u64().unwrap_or(0) as usize)
             })
         };
@@ -756,14 +768,7 @@ pub async fn serve_with(
             ),
             Err(_) => Duration::from_secs(60),
         };
-        let inventory_every = match std::env::var("AMPUP_MEMORY_TELEMETRY_INVENTORY_SECS") {
-            Ok(v) => Duration::from_secs(
-                v.parse::<u64>()
-                    .context("AMPUP_MEMORY_TELEMETRY_INVENTORY_SECS")?
-                    .max(60),
-            ),
-            Err(_) => Duration::from_secs(3600),
-        };
+        let inventory_every = inventory_every()?;
         let alerts_every = match std::env::var("AMPUP_MEMORY_ALERTS_EVAL_SECS") {
             Ok(v) => Duration::from_secs(
                 v.parse::<u64>()
@@ -910,6 +915,12 @@ pub async fn serve_with(
                     )
                     .await
                     {
+                        // Served facts waiting to be checked keep the scope gone over.
+                        Ok(d) if d.facts_waiting + d.facts_checked > 0
+                            && d.ended + d.judged + d.graded + d.unrewarded == 0 =>
+                        {
+                            settled = false
+                        }
                         Ok(d) if d.ended + d.judged + d.graded + d.unrewarded > 0 => {
                             settled = false;
                             eprintln!(
@@ -1863,6 +1874,10 @@ pub async fn serve_with(
                 ),
             }
             st.ready.store(true, std::sync::atomic::Ordering::Release);
+            tokio::spawn(crate::loads::by(
+                "keep_directory",
+                keep_directory_fresh(st.clone()),
+            ));
             tokio::spawn(crate::loads::by("keep_warm", keep_warm(st)));
         });
     }
@@ -2282,9 +2297,15 @@ async fn listen(
                                     Ok(studio::route(req.method(), req.uri().path()))
                                 }
                                 Err(req) => {
+                                    // Its reads of a scope wait for one state of it at most
+                                    // (`one_state_per_request`).
                                     let (r, limit) = crate::limits::watching(crate::loads::by(
                                         "request",
-                                        handle(state.clone(), req, internal),
+                                        crate::one_state_per_request(handle(
+                                            state.clone(),
+                                            req,
+                                            internal,
+                                        )),
                                     ))
                                     .await;
                                     // A write or a model call an org's limits refused, which the handler
@@ -2700,31 +2721,56 @@ async fn request_principal(
                 .and_then(|f| f.as_ref())
                 .filter(|k| k.provisioner)
                 .map(|k| k.id.clone());
-            // A provisioner key is the keys file's alone too, as an admin key is, and binds to no org.
-            let c = if let Some(file_key) = file_key
-                && file_key.as_ref().is_none_or(|k| !k.admin && !k.provisioner)
-            {
-                let d = directory_auth(state).await?;
-                match file_key {
-                    Some(f) if !d.keys.iter().any(|k| k.sha256 == f.sha256) => {
-                        anyhow::ensure!(
-                            !state.directory_only,
-                            "api key {} is a keys-file key, which this server doesn't take (it reads every request through the directory): an org's memory takes one of the org's keys",
-                            f.id
-                        );
-                        bound_to_none = true;
-                        auth.authenticate(token).await?
-                    }
-                    _ => auth::org_key_caller(token, &d.keys)?,
+            // A provisioner or platform key is the keys file's alone too, as an admin key is, and binds to no org.
+            // Signed in by the directory as this server holds it (`directory_auth`), and, when that refuses
+            // the bearer and is more than the max staleness old, again by the directory read now: a key, a
+            // provider or an org made through another server just now is taken here as soon as before.
+            let mut strict = false;
+            let c = loop {
+                let store = state.store.read().unwrap().clone();
+                let lagging = !strict
+                    && store
+                        .directory_age()
+                        .is_none_or(|a| a >= store.max_staleness());
+                let signed: Result<auth::Caller> = async {
+                    Ok(
+                        if let Some(file_key) = &file_key
+                            && file_key
+                                .as_ref()
+                                .is_none_or(|k| !k.admin && !k.provisioner && k.platform.is_none())
+                        {
+                            let d = directory_auth(state, strict).await?;
+                            match file_key {
+                                Some(f) if !d.keys.iter().any(|k| k.sha256 == f.sha256) => {
+                                    anyhow::ensure!(
+                                        !state.directory_only,
+                                        "api key {} is a keys-file key, which this server doesn't take (it reads every request through the directory): an org's memory takes one of the org's keys",
+                                        f.id
+                                    );
+                                    bound_to_none = true;
+                                    auth.authenticate(token).await?
+                                }
+                                _ => auth::org_key_caller(token, &d.keys)?,
+                            }
+                        } else {
+                            let d = if auth.wants_org_providers(token) {
+                                directory_auth(state, strict).await?
+                            } else {
+                                DirectoryAuth::default()
+                            };
+                            auth.authenticate_any(token, &d.providers, &d.auth0_orgs)
+                                .await?
+                        },
+                    )
                 }
-            } else {
-                let d = if auth.wants_org_providers(token) {
-                    directory_auth(state).await?
-                } else {
-                    DirectoryAuth::default()
-                };
-                auth.authenticate_any(token, &d.providers, &d.auth0_orgs)
-                    .await?
+                .await;
+                match signed {
+                    Err(_) if lagging => {
+                        strict = true;
+                        bound_to_none = false;
+                    }
+                    signed => break signed?,
+                }
             };
             anyhow::ensure!(!state.closures.any_disabled(&c.aliases), "user is disabled");
             if let Some(k) = &c.key {
@@ -2736,7 +2782,7 @@ async fn request_principal(
             };
             let via = SignIn {
                 person: c.person,
-                orgs: match bound_to_none || c.provisioner {
+                orgs: match bound_to_none || c.provisioner || c.platform.is_some() {
                     true => Some(Default::default()),
                     false => c.orgs,
                 },
@@ -2752,7 +2798,18 @@ async fn request_principal(
                 recorded: false,
                 // A token proves a caller of a server with sign-in, never a local server's own caller.
                 local_admin: None,
+                platform: c.platform.clone(),
+                tenant: None,
             };
+            // A platform key is its platform, holding none of its row's groups: in a tenant it reads as the tenant or
+            // its member does (`tenants::enter`), never as anything the keys file says.
+            if let Some(p) = &c.platform {
+                return Ok(Authed {
+                    who: Principal::from_parts(crate::people::tenants::service_user(p), vec![]),
+                    via,
+                    admin: false,
+                });
+            }
             let who = if c.person || via.key.is_some() {
                 // Anyone an identity provider knows can sign in, and an org's key reads its own scope:
                 // they hold nothing until the directory says so, not even the deployment's groups.
@@ -2824,24 +2881,24 @@ async fn keys_file_watch(state: Arc<State>) {
 }
 
 /// The identity providers orgs connected (`memstore auth setup`) and their service keys (`memstore
-/// apikey create`).
-async fn directory_auth(state: &State) -> Result<DirectoryAuth> {
-    if let Some((at, d)) = &*state.providers.lock().unwrap()
-        && at.elapsed() < PROVIDERS_TTL
-    {
-        return Ok(d.clone());
-    }
-    // Read now (with any request already reading it): what this server's fold says right now, so a key
-    // revoked through another server stops working here within the TTL, not the TTL and the fold's age.
-    let asked = std::time::Instant::now();
+/// apikey create`), from the directory requests are signed in by ([`Store::directory_behind`]): within its lag of
+/// what any server changed, and at once of what this one did. Worked out again only when that fold is a new one.
+///
+/// `strict`: from the directory at most the max staleness old ([`Store::directory`]), for a bearer the lagging one
+/// refused.
+async fn directory_auth(state: &State, strict: bool) -> Result<DirectoryAuth> {
     let store = state.store.read().unwrap().clone();
-    let folded = match store.directory_loaded_after(Some(asked)).await {
+    let read = match strict {
+        true => store.directory().await,
+        false => store.directory_behind().await,
+    };
+    let folded = match read {
         Ok(f) => f,
         // The catalog is throttling or down (as when every server restarts at once): the providers and keys read
         // last stand for up to the hard staleness limit, so callers already known here aren't refused or told to
         // retry for it. What changed in the directory since takes effect once it is read again.
         Err(e) if upstream_failure(&e) => match &*state.providers.lock().unwrap() {
-            Some((at, d)) if at.elapsed() < store.hard_staleness() => {
+            Some((at, _, d)) if at.elapsed() < store.hard_staleness() => {
                 static SAID: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
                 let mut said = SAID.lock().unwrap();
                 if said.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
@@ -2857,6 +2914,11 @@ async fn directory_auth(state: &State) -> Result<DirectoryAuth> {
         },
         Err(e) => return Err(e),
     };
+    if let Some((_, f, d)) = &*state.providers.lock().unwrap()
+        && Arc::ptr_eq(f, &folded)
+    {
+        return Ok(d.clone());
+    }
     let dir = &folded.dir;
     let keys = dir
         .orgs
@@ -2896,7 +2958,7 @@ async fn directory_auth(state: &State) -> Result<DirectoryAuth> {
         keys,
         auth0_orgs,
     };
-    *state.providers.lock().unwrap() = Some((std::time::Instant::now(), d.clone()));
+    *state.providers.lock().unwrap() = Some((std::time::Instant::now(), folded.clone(), d.clone()));
     Ok(d)
 }
 
@@ -3757,7 +3819,17 @@ async fn installation_op(
                 ))
                 .into());
             }
-            let now = inst::fold(&store.installation_events().await?);
+            // `held: true` asks for a count shown to a person (a plan's connected apps), read from the cached table
+            // (`Store::installation_events_held`): a change on another server shows within the hard staleness limit.
+            // Without it a list is read as the table is now, as `get`, `register` and `revoke` are, for a caller that
+            // acts on what it lists or shows a change it just made.
+            let events = if req["held"] == true {
+                *state.installations_listed_at.lock().unwrap() = Some(Instant::now());
+                store.installation_events_held().await?
+            } else {
+                store.installation_events().await?
+            };
+            let now = inst::fold(&events);
             let list: Vec<_> = now
                 .values()
                 .filter(|i| {
@@ -3790,7 +3862,7 @@ async fn installations_caller(
         state.token_auth().is_some(),
         "this needs AMPUP_MEMORY_CALLER_IDENTITY=token"
     );
-    let d = directory_auth(state).await?;
+    let d = directory_auth(state, true).await?;
     // As `request_principal` resolves it: a bearer the directory holds is that org key, whatever a keys file
     // says; a non-admin file key the directory doesn't hold is bound to no org, so it manages none.
     let c = auth::org_key_caller(token, &d.keys)?;
@@ -4070,8 +4142,10 @@ async fn ingest_episodes(
     actor: &str,
     body: &[u8],
     key: Option<&auth::OrgKey>,
+    platform: bool,
 ) -> Result<Value> {
-    let org_key = key.is_some();
+    // An org's key, or a platform for its tenant: a service writing records, held off the server's own sources.
+    let org_key = key.is_some() || platform;
     let bad = |m: String| -> anyhow::Error { BadRequest(m).into() };
     let req: Value = serde_json::from_slice(body).map_err(|_| bad("body is not JSON".into()))?;
     let items = req["episodes"]
@@ -4729,6 +4803,14 @@ async fn keep_warm(st: Arc<State>) {
         // A touch reloads only what is half way to the hard limit: what a read refreshed lately (a scope in use) is
         // left as it is, and the rest is reloaded every other touch or so, never at each one.
         let fresh_enough = store.hard_staleness() / 2;
+        // The installations a held list reads, while such lists still come.
+        let listed = *st.installations_listed_at.lock().unwrap();
+        if listed.is_some_and(|at| at.elapsed() < keep_warm_idle())
+            && let Err(e) =
+                Store::refreshing_after(fresh_enough, store.installation_events_held()).await
+        {
+            eprintln!("keep-warm of the installations failed: {e:#}");
+        }
         for scope in scopes {
             let t = Instant::now();
             match Store::refreshing_after(fresh_enough, search::warm(&store, &scope)).await {
@@ -4745,6 +4827,32 @@ async fn keep_warm(st: Arc<State>) {
                 advice_at.insert(scope.clone(), Instant::now());
                 warm_advice(&store, &scope).await;
             }
+        }
+    }
+}
+
+/// Keeps the directory requests are signed in by ([`Store::directory_behind`]) loaded within a third of its lag
+/// while requests come through the directory here (within [`keep_warm_idle`]), so a request after a quiet spell is
+/// signed in and given its scope from it, never waiting for a directory read. A load others made since (a write's
+/// own, a flush's) counts: it is loaded only when no one did.
+async fn keep_directory_fresh(st: Arc<State>) {
+    if st.fixed() || st.role == Role::Worker {
+        return;
+    }
+    loop {
+        let store = st.store.read().unwrap().clone();
+        let every = store.directory_lag() / 3;
+        tokio::time::sleep(every).await;
+        let in_use = {
+            let idle = keep_warm_idle();
+            st.read_at
+                .lock()
+                .unwrap()
+                .values()
+                .any(|at| at.elapsed() < idle)
+        };
+        if in_use && store.directory_age().is_some_and(|age| age >= every) {
+            store.refresh_directory();
         }
     }
 }
@@ -5525,7 +5633,7 @@ async fn sync_closures(state: &State) -> Result<()> {
     }
     let store = state.store.read().unwrap().clone();
     let f = store
-        .directory()
+        .directory_behind()
         .await
         .context("the directory (who is disabled) can't be read")?;
     if let Some((version, _)) = f.blocked {
@@ -5844,6 +5952,13 @@ async fn handle(
             json!({"error": "x-memstore-as is taken on /runs, /runs/reward, /advice, /sessions, /sessions/end, /sessions/prs and /mcp only"}),
         ));
     }
+    // A platform key's tenant and user (`tenants`): ids as sent, attributes percent-encoded. Checked here, used
+    // once the caller is known to be a platform key, and refused from anyone else.
+    let tenant_headers = match tenants::Headers::of(req.headers()) {
+        Ok(h) => h,
+        Err(e) => return Ok(reply(StatusCode::BAD_REQUEST, json!({"error": e}))),
+    };
+    let method = req.method().clone();
     if path == "/mcp" && req.method() != hyper::Method::POST {
         // Stateless server: no server-initiated stream to open.
         return Ok(reply(
@@ -5977,6 +6092,8 @@ async fn handle(
     };
     let browse = !internal && (path == "/browse" || list_op.is_some());
     let agent_route = !internal && path == "/agent/run";
+    // A platform's tenants (`tenants`): a platform key's alone.
+    let tenants_route = !internal && (path == "/tenants" || path.starts_with("/tenants/"));
     if agent_route && req.method() != hyper::Method::POST {
         return Ok(reply(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -6147,6 +6264,7 @@ async fn handle(
         && !seed_route
         && !sessions_route
         && !digest_route
+        && !tenants_route
     {
         return Ok(reply(StatusCode::OK, json!({"ok": true})));
     }
@@ -6200,7 +6318,13 @@ async fn handle(
             return Ok(unauthorized("unauthorized"));
         };
         match request_principal(&state, src, caller_token.as_deref(), via_iap, None).await {
-            Ok(a) => signed_in = Some(a),
+            // A platform key's requests are counted per tenant (`limit_key`).
+            Ok(mut a) => {
+                if a.via.platform.is_some() {
+                    a.via.tenant = tenant_headers.tenant.clone();
+                }
+                signed_in = Some(a)
+            }
             Err(e) if e.is::<NeedsSessionUser>() => {}
             Err(e) if upstream_failure(&e) => {
                 eprintln!("sign-in unavailable for {path} (header user {user}): {e:#}");
@@ -6262,7 +6386,7 @@ async fn handle(
             .into())
         } else {
             match operator_ingest_scope(&state, sel_org.as_deref(), sel_team.as_deref()).await {
-                Ok(scope) => ingest_episodes(&state, &scope, &actor, &body, None).await,
+                Ok(scope) => ingest_episodes(&state, &scope, &actor, &body, None, false).await,
                 Err(e) => Err(e),
             }
         };
@@ -6463,6 +6587,13 @@ async fn handle(
         Some(a) => (Some(a.who), a.via, a.admin),
         None => (None, SignIn::default(), false),
     };
+    // The tenant headers are a platform key's: from anyone else they are refused, never ignored.
+    if tenant_headers.any() && via.platform.is_none() {
+        return Ok(reply(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "x-memstore-tenant and x-memstore-user are a platform key's headers"}),
+        ));
+    }
     crate::phases::mark("signed in");
     // Each key and each person has a bucket, keyed by what authenticated them (a key's hash, the
     // verified identity), never by anything the request merely says.
@@ -6523,6 +6654,44 @@ async fn handle(
             json!({"error": "a provisioner key reaches /admin only"}),
         ));
     }
+    // `/tenants` is a platform key's; a platform key goes no further as itself. It is answered here (`/tenants`,
+    // `/me`, `/admin`, a refusal), or from here on the request is its tenant's member's, or the tenant's own, in the
+    // tenant's org, whatever else it names.
+    if tenants_route && via.platform.is_none() {
+        let w = who.as_ref().map_or("-", |w| w.user());
+        refused(None, w, 403, audit::Reason::AdminDenied);
+        return Ok(reply(
+            StatusCode::FORBIDDEN,
+            json!({"error": "/tenants is a platform key's"}),
+        ));
+    }
+    let (who, via, sel_org, sel_team, tenant_acting, body) = match via.platform.is_some() {
+        false => (who, via, sel_org, sel_team, None, body),
+        true => {
+            let selects = sel_org.is_some()
+                || sel_team.is_some()
+                || named_scope(&req_query).is_some()
+                || !view.is_main();
+            let r = tenants::Request {
+                path: &path,
+                method: &method,
+                query: &req_query,
+                headers: &tenant_headers,
+                selects,
+                route,
+            };
+            match Box::pin(tenants::enter(&state, r, via, body)).await {
+                tenants::Entered::Reply(r) => return Ok(r),
+                tenants::Entered::As {
+                    who,
+                    via,
+                    org,
+                    acting,
+                    body,
+                } => (Some(who), *via, Some(org), None, acting, body),
+            }
+        }
+    };
     if admin {
         let who = who.expect("public port");
         // An `/admin` request is about the org it names (else the one selected): the audit's only if the
@@ -6553,13 +6722,7 @@ async fn handle(
         return Ok(
             match directory_change(&state, &who, &via, superuser, &body).await {
                 Ok(v) => {
-                    if via.person
-                        && let Some((o, i)) = member_org(&state, Some(&who), &via, org).await
-                    {
-                        state
-                            .audit
-                            .signin(Some((&o, i)), who.user(), provider_of(&via));
-                    }
+                    record_signin(&state, &who, &via, org);
                     reply(StatusCode::OK, v)
                 }
                 // A dream job asked for an org past its limits (`dream_jobs::handle`).
@@ -6666,13 +6829,8 @@ async fn handle(
         (w, _) => w,
     };
     // The directory resolved the scope, so a person is a member of its org.
-    if let (Some(w), Ok(s)) = (&who, &scope)
-        && via.person
-        && let Some((o, i)) = member_org(&state, Some(w), &via, s.org_name()).await
-    {
-        state
-            .audit
-            .signin(Some((&o, i)), w.user(), provider_of(&via));
+    if let (Some(w), Ok(s)) = (&who, &scope) {
+        record_signin(&state, w, &via, s.org_name());
     }
     if me {
         let who = who.expect("public port");
@@ -6844,7 +7002,8 @@ async fn handle(
                 Err(r) => return Ok(r),
             }
         }
-        (_, w) => (w, via, None),
+        // A platform's member on the session, advice and runs routes is acted for as a recorder key acts for one.
+        (_, w) => (w, via, tenant_acting),
     };
     if doctor {
         let Some(who) = who else {
@@ -7006,7 +7165,15 @@ async fn handle(
             Some(t) => Scope::team(&k.org, t),
             None => Scope::org(&k.org),
         });
+        // A platform's tenant ingests into its own org: `tenants::enter` put the request there, and nowhere else.
+        let tenant_ingest = via.key.is_none()
+            && via.platform.is_some()
+            && named_scope(&req_query).is_none()
+            && scope
+                .org_name()
+                .is_some_and(|o| via.orgs.as_ref().is_some_and(|b| b.contains(o)));
         let refusal = match (&via.key, own) {
+            (None, _) if tenant_ingest => None,
             (None, _) => Some(format!(
                 "{who} can't ingest: /ingest takes an org's ingest key, or the operator's admin key"
             )),
@@ -7054,8 +7221,9 @@ async fn handle(
         if let Some(l) = crate::limits::write_gate(scope.org_name()) {
             return Ok(reply(limit_status(&l), l.body()));
         }
-        let (status, v) =
-            ingest_reply(ingest_episodes(&state, &scope, &who, &body, via.key.as_ref()).await);
+        let (status, v) = ingest_reply(
+            ingest_episodes(&state, &scope, &who, &body, via.key.as_ref(), tenant_ingest).await,
+        );
         return Ok(reply(status, v));
     }
     if remember_route || forget_route || close_route || facts_route || learn_route {
@@ -7295,16 +7463,45 @@ async fn handle(
             },
         });
     }
-    // What the request reads: the selected branch, pinned to the selected workspace snapshot if any.
+    // A session's start from a caller this server last counted at the day's most entries is refused here, before the
+    // request pins or reads anything: a hook at the cap tries again at each prompt, and each try cost seconds.
     let store = state.store.read().unwrap().clone();
-    let session = match crate::workspace::read_session(
-        &store,
-        &scope,
-        view.branch.as_deref(),
-        view.at.as_deref(),
-    )
-    .await
+    if let Some(who) = &who
+        && let Some(r) = capped_start(&store, &scope, who, &path, &body)
     {
+        return Ok(r);
+    }
+    // What the request reads: the selected branch, pinned to the selected workspace snapshot if any.
+    let pinning =
+        crate::workspace::read_session(&store, &scope, view.branch.as_deref(), view.at.as_deref());
+    // A session's start from a caller not counted at the cap here: their entries are counted beside the pin, and one
+    // at the cap is refused as soon as that count says so, without waiting for the pin (a new server's first count
+    // of them, or another server's writes since). The start counts them first thing anyway, so it waits for the
+    // count either way, and its own count then reads the log this one loaded.
+    let pinned = match &who {
+        Some(who) if a_start(&path, &body) => {
+            let counting = crate::qa_log::count_entries(&store, &scope, who.user(), Instant::now());
+            let (mut pinning, mut counting) = (Box::pin(pinning), Box::pin(counting));
+            let (mut counted, mut pinned) = (false, None);
+            while !counted || pinned.is_none() {
+                tokio::select! {
+                    c = &mut counting, if !counted => {
+                        counted = true;
+                        if let Err(e) = c {
+                            eprintln!("counting {}'s entries in {scope} failed: {e:#}", who.user());
+                        }
+                        if let Some(r) = capped_start(&store, &scope, who, &path, &body) {
+                            return Ok(r);
+                        }
+                    }
+                    s = &mut pinning, if pinned.is_none() => pinned = Some(s),
+                }
+            }
+            pinned.expect("pinned")
+        }
+        _ => pinning.await,
+    };
+    let session = match pinned {
         Ok(s) => {
             crate::phases::mark("pinned");
             s
@@ -7384,6 +7581,16 @@ async fn handle(
             audit_read(&state, Some(&who), &via, &scope, path, &reads).await;
             // And what it served, so a note its caller writes next can be told an echo (`crate::echo`).
             crate::echo::note(&scope, who.user(), &reads.took().1);
+            // And which facts, to check against how the session went (`crate::served_checks`).
+            crate::served_checks::note(&scope, who.user(), &reads.served_facts());
+        }
+        // A start refused at a most a day says when one more fits, as the next start (refused before it reads) will.
+        if answer
+            .as_ref()
+            .is_some_and(|v| v["result"]["isError"] == true)
+            && let Some(r) = capped_start(&store, &scope, &who, "/mcp", &body)
+        {
+            return Ok(r);
         }
         return Ok(match answer {
             Some(v) => reply(StatusCode::OK, v),
@@ -7772,6 +7979,13 @@ async fn handle(
         }
         return Ok(match done {
             Ok(v) => reply(StatusCode::OK, v),
+            // A start past the day's most says when one more fits, as the next start (refused before it reads) will.
+            Err(_)
+                if path == "/sessions"
+                    && let Some(r) = capped_start(&store, &scope, &who, &path, &body) =>
+            {
+                r
+            }
             Err(e) => sessions_reply(e),
         });
     }
@@ -7868,7 +8082,11 @@ async fn handle(
         let began = Instant::now();
         let logged = |answer: Result<&Value, ()>, session: Option<&str>| {
             let text = answer.map(Value::to_string);
-            let moment = args["moment"].as_str().unwrap_or("prompt");
+            // An event's call is logged as one, as over MCP: a stop after every turn isn't an advice ask.
+            let moment = match args["event"].is_null() {
+                true => args["moment"].as_str().unwrap_or("prompt"),
+                false => "event",
+            };
             advice_calls::log(
                 scope.org_name(),
                 who.user(),
@@ -7906,6 +8124,64 @@ async fn handle(
                 },
             });
         }
+        // `event` (`pre_tool`, `post_tool` or `stop`) in a session, as `get_advice`'s over MCP: an op from the note
+        // the session was served, and its `conversation_so_far` kept. A stop only keeps it, with no model call,
+        // and the session's end at idle takes it as the transcript.
+        if !args["event"].is_null() {
+            let event = match crate::sessions::Event::parse(&args["event"]) {
+                Ok(Some(e)) => e,
+                Ok(None) => unreachable!("a non-null event"),
+                Err(e) => {
+                    return Ok(reply(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": e.to_string()}),
+                    ));
+                }
+            };
+            let Some(id) = args["session_id"]
+                .as_str()
+                .map(str::trim)
+                .filter(|i| !i.is_empty())
+            else {
+                return Ok(reply(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "event needs session_id: the session it happened in"}),
+                ));
+            };
+            let writes = writes_for(
+                &state,
+                &via,
+                &scope,
+                sel_org.as_deref(),
+                sel_team.as_deref(),
+            );
+            if writes != Writes::Scope || !view.is_main() {
+                return Ok(reply(
+                    StatusCode::FORBIDDEN,
+                    json!({"error": format!("sessions on {scope} aren't kept here: keep them where its memory is read and written, on main")}),
+                ));
+            }
+            let fired = Box::pin(session_fire(
+                &session,
+                &store,
+                (&who, &via),
+                id,
+                &event,
+                args["conversation_so_far"].as_str(),
+                args["keep"].as_bool() != Some(false),
+            ))
+            .await
+            .map(|f| json!(f));
+            logged(fired.as_ref().map_err(|_| ()), Some(id));
+            return Ok(match fired {
+                Ok(f) => reply(StatusCode::OK, f),
+                Err(e) if e.downcast_ref::<ToolError>().is_some() => reply(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"error": e.to_string()}),
+                ),
+                Err(e) => sessions_reply(e),
+            });
+        }
         let question = args["question"]
             .as_str()
             .map(|q| q.trim().to_string())
@@ -7913,7 +8189,7 @@ async fn handle(
         let Some(question) = question else {
             return Ok(reply(
                 StatusCode::BAD_REQUEST,
-                json!({"error": "POST {question} to /advice"}),
+                json!({"error": "POST {question} (or {session_id, event}) to /advice"}),
             ));
         };
         // `max_chars` fits the answer to a caller's cap (a hook's context), leaving out what matters least first.
@@ -8177,7 +8453,7 @@ async fn handle(
         let every_session = via.key.is_none()
             && matches!(scope, Scope::Org | Scope::NamedOrg(_))
             && match scope.org_name() {
-                Some(org) => Box::pin(crate::people::directory::Directory::load(&store))
+                Some(org) => Box::pin(crate::people::directory::Directory::behind(&store))
                     .await
                     .is_ok_and(|d| {
                         d.shows_activity(org) && (superuser || d.is_admin(who.user(), &via, org))
@@ -8188,6 +8464,29 @@ async fn handle(
             who: &who,
             every_session,
         };
+        // Studio's Home: its numbers in one request (`home`).
+        if req["op"] == "home" {
+            return Ok(
+                match Box::pin(home::run(
+                    &state, &store, &session, reader, &via, superuser, &req,
+                ))
+                .await
+                {
+                    Ok(v) => {
+                        crate::usage::METER.op(crate::usage::Op::Read, who.user());
+                        reply(StatusCode::OK, v)
+                    }
+                    Err(e) => {
+                        eprintln!("home failed for {user}: {e:#}");
+                        crate::report::failure("home", &e);
+                        reply(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({"error": "browse failed"}),
+                        )
+                    }
+                },
+            );
+        }
         // Boxed: browse's future is large, and inline it would grow the handler's for every request.
         return Ok(
             match Box::pin(crate::browse::run(&store, &session, reader, &req)).await {
@@ -8218,12 +8517,17 @@ async fn handle(
         "/search" | "/episode" => Reads::of(&state, &store, session).await,
         _ => Reads::alone(session),
     };
+    let _turn = match (path.as_str(), &who) {
+        ("/search", Some(w)) => Some(state.limiter.search(&search_lane(&state, w, &via)).await),
+        _ => None,
+    };
     Ok(
         match search_rows(&state, &reads, who.as_ref(), &body, &path).await {
             Ok(v) => {
                 audit_read(&state, who.as_ref(), &via, &scope, route, &reads).await;
                 if let Some(w) = &who {
                     crate::echo::note(&scope, w.user(), &reads.took().1);
+                    crate::served_checks::note(&scope, w.user(), &reads.served_facts());
                 }
                 let mut r = reply(StatusCode::OK, v);
                 // server-side search time, for benchmarks that call through a tunnel
@@ -8586,6 +8890,16 @@ async fn member_org(
 ) -> Option<(String, i64)> {
     let store = state.store.read().unwrap().clone();
     let f = store.directory().await.ok()?;
+    member_org_in(&f, who, via, org)
+}
+
+/// [`member_org`] in the directory fold `f`.
+fn member_org_in(
+    f: &crate::people::directory::Folded,
+    who: Option<&Principal>,
+    via: &SignIn,
+    org: Option<&str>,
+) -> Option<(String, i64)> {
     if let Some(k) = &via.key {
         let o = f.dir.orgs.get(&k.org)?;
         return o
@@ -8600,6 +8914,28 @@ async fn member_org(
         .access(who.user(), via)
         .contains_key(org)
         .then(|| (org.to_string(), o.created_at))
+}
+
+/// A person's sign-in into `org`, for the audit, if they belong to it: recorded beside the request rather than on its
+/// way, since whether they belong is the directory's, which a request in a burst may otherwise wait on another's
+/// reading of. Nothing the request answers depends on it.
+fn record_signin(state: &Arc<State>, who: &Principal, via: &SignIn, org: Option<&str>) {
+    if !via.person {
+        return;
+    }
+    let (state, who, via, org) = (
+        state.clone(),
+        who.clone(),
+        via.clone(),
+        org.map(String::from),
+    );
+    tokio::spawn(async move {
+        if let Some((o, i)) = member_org(&state, Some(&who), &via, org.as_deref()).await {
+            state
+                .audit
+                .signin(Some((&o, i)), who.user(), provider_of(&via));
+        }
+    });
 }
 
 /// The routes a personal key reaches: its member's reads, notes, sessions and advice, as an app or a script
@@ -8698,8 +9034,21 @@ async fn select_scope(
         "this server doesn't identify callers, so it serves {} only",
         state.scope
     );
-    let dir = crate::people::directory::Directory::load(&store).await?;
-    let scope = dir.resolve(who.user(), via, org, team)?;
+    // Given by the directory as this server holds it, and, when that refuses and is more than the max staleness
+    // old, by the directory read now: a membership or an org made through another server just now is taken here
+    // as soon as before.
+    let lagging = store
+        .directory_age()
+        .is_none_or(|a| a >= store.max_staleness());
+    let mut dir = crate::people::directory::Directory::behind(&store).await?;
+    let scope = match dir.resolve(who.user(), via, org, team) {
+        Ok(s) => s,
+        Err(_) if lagging => {
+            dir = crate::people::directory::Directory::load(&store).await?;
+            dir.resolve(who.user(), via, org, team)?
+        }
+        Err(e) => return Err(e),
+    };
     if let Some(ws) = scope
         .org_name()
         .and_then(|o| crate::workspace::spec_of(&dir, o))
@@ -9270,6 +9619,22 @@ async fn directory_change(
         }
     }
     let store = state.store.read().unwrap().clone();
+    // A platform's template for its tenants: the operator's to set for any platform (a platform key sets its own,
+    // through `tenants`).
+    if matches!(
+        req["op"].as_str(),
+        Some("get_tenant_template" | "set_tenant_template")
+    ) {
+        if !superuser {
+            return Err(Refused(format!(
+                "{} may not set a platform's tenant template (an admin key or the platform's own key may)",
+                who.user()
+            ))
+            .into());
+        }
+        let platform = req["platform"].as_str().unwrap_or_default().to_string();
+        return tenants::template_op(state, who.user(), &platform, true, &req).await;
+    }
     if req["op"] == "decisions" {
         return decision_ops::handle(state, &store, who, via, &req)
             .await
@@ -9734,7 +10099,8 @@ async fn directory_change(
         // people asked is theirs and their admins' alone.
         let org = req["org"].as_str().unwrap_or_default();
         crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
-        let dir = Directory::load(&store).await?;
+        // Reads, decided by the directory requests are signed in by (`Directory::behind`).
+        let dir = Directory::behind(&store).await?;
         if !superuser && !dir.is_admin(who.user(), via, org) {
             return Err(Refused(format!(
                 "{} may not read org {org}'s activity (only its admins may)",
@@ -9756,6 +10122,14 @@ async fn directory_change(
                 .map_err(|e| Refused(format!("{e:#}")))?,
             None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
         };
+        // The activity page: kept per reader and what they asked for, by memory state and the answer log
+        // (`activity_kept`).
+        if req["op"] == "activity" {
+            let mut v = activity_kept(&store, &scope, who, &req).await?;
+            v["org"] = json!(org);
+            v["scope"] = json!(scope.to_string());
+            return Ok(v);
+        }
         // A page of the log: read through the last visibility state with what was recorded since, never waiting
         // for a build of what was just written.
         let log = crate::qa_log::list(&store, &scope, None).await?;
@@ -9766,7 +10140,8 @@ async fn directory_change(
             };
             eprintln!("conversation: {} read {id} in {scope}", who.user());
             v
-        } else if req["op"] == "user_facts" {
+        } else {
+            // `user_facts`.
             let user = req["user"].as_str().map(str::trim).unwrap_or_default();
             if user.is_empty() {
                 anyhow::bail!("user_facts needs the person's id (user)");
@@ -9799,12 +10174,6 @@ async fn directory_change(
                 .map(|f| crate::browse::fact_json(f))
                 .collect();
             json!({"user": user, "facts": shown, "more": hits.len() > limit, "conversations": also.len()})
-        } else {
-            let (since, _) = audit_window(
-                &json!({"since_secs": req["since_secs"].as_i64().unwrap_or(30 * 86_400)}),
-            )?;
-            let limit = req["limit"].as_u64().unwrap_or(100).clamp(1, 500) as usize;
-            crate::activity::view(&log, req["user"].as_str(), since, limit)
         };
         v["org"] = json!(org);
         v["scope"] = json!(scope.to_string());
@@ -10313,16 +10682,15 @@ async fn directory_change(
             sweep_train_log(&store, Some(org)).await;
             return Ok(done);
         }
-        let done = if req["op"] == "purge_retracted" {
-            let org = org.ok_or_else(|| Invalid("which org?".into()))?;
-            crate::offboard::purge_retracted(&store, &actor, org).await?
-        } else {
+        if req["op"] != "purge_retracted" {
             let user = req["user"].as_str().unwrap_or_default();
-            crate::offboard::forget_user(&store, &actor, user, org).await?
-        };
+            return forget_user_for_good(state, &actor, user, org).await;
+        }
+        let org = org.ok_or_else(|| Invalid("which org?".into()))?;
+        let done = crate::offboard::purge_retracted(&store, &actor, org).await?;
         // This server's own caches of what was rewritten go with a fresh store.
         renew_store(state);
-        sweep_train_log(&store, org).await;
+        sweep_train_log(&store, Some(org)).await;
         return Ok(done);
     }
     let deleting = match req["op"].as_str() {
@@ -10330,10 +10698,7 @@ async fn directory_change(
         _ => None,
     };
     if deleting.is_some() && req["dry_run"] != true {
-        // This server's buffered audit rows land before the org's rows are removed from the table.
-        if let Err(e) = state.audit.flush(&store).await {
-            eprintln!("audit: events not written before an org delete: {e:#}");
-        }
+        before_org_delete(state, &store).await;
     }
     let mut change: Change = match serde_json::from_value(req.clone()) {
         Ok(change) => change,
@@ -10375,6 +10740,7 @@ async fn directory_change(
                 groups: h.groups.clone(),
                 admin: h.admin,
                 provisioner: h.provisioner,
+                platform: h.platform.clone(),
             };
         }
     }
@@ -10494,20 +10860,68 @@ async fn directory_change(
         }
     }
     if let (Some(org), false) = (&deleting, dry_run) {
-        // Nothing of the org is served, indexed or counted here any more.
-        state
-            .served
-            .lock()
-            .unwrap()
-            .retain(|s| s.org_name() != Some(org.as_str()));
-        state.key_uses.lock().unwrap().retain(|_, u| &u.org != org);
-        renew_store(state);
-        if let Err(e) = crate::extract::train_log::purge_org(org).await {
-            eprintln!("training log: not purged of org {org}: {e:#}");
-        }
+        after_org_delete(state, org).await;
     }
     let changes: Vec<String> = events.iter().map(|e| e.describe()).collect();
     Ok(json!({"changes": changes, "dry_run": dry_run}))
+}
+
+/// What a delete of an org does on this server before the directory change: its buffered audit rows land, so the
+/// purge removes them with the rest of the org's rows instead of their outliving it.
+async fn before_org_delete(state: &State, store: &Store) {
+    if let Err(e) = state.audit.flush(store).await {
+        eprintln!("audit: events not written before an org delete: {e:#}");
+    }
+}
+
+/// What a delete of `org` does on this server after the directory change: nothing of the org is served, indexed or
+/// counted here any more, and the training log holds none of its calls.
+async fn after_org_delete(state: &State, org: &str) {
+    state
+        .served
+        .lock()
+        .unwrap()
+        .retain(|s| s.org_name() != Some(org));
+    state.key_uses.lock().unwrap().retain(|_, u| u.org != org);
+    renew_store(state);
+    if let Err(e) = crate::extract::train_log::purge_org(org).await {
+        eprintln!("training log: not purged of org {org}: {e:#}");
+    }
+}
+
+/// Deletes `org` for good as `actor` may (`delete_org` with its name confirmed): the directory change and the
+/// purge, with this server's part before and after them. A platform's `DELETE /tenants/{id}` is this. The caches
+/// go even when the purge stops partway: nothing of a deleted org is served, whatever is left to purge.
+async fn delete_org_for_good(
+    state: &State,
+    actor: &crate::people::directory::Actor,
+    org: &str,
+) -> Result<Vec<crate::people::directory::Event>> {
+    let store = state.store.read().unwrap().clone();
+    before_org_delete(state, &store).await;
+    let change = crate::people::directory::Change::DeleteOrg {
+        org: org.to_string(),
+        confirm: Some(org.to_string()),
+    };
+    let done = crate::people::directory::apply(&store, actor, &change).await;
+    after_org_delete(state, org).await;
+    done
+}
+
+/// Forgets `user` in `org` (every org with `None`, the operator's) as `actor` may ([`crate::offboard::forget_user`]),
+/// then drops this server's caches of what was rewritten and sweeps the training log of it: the operator's and
+/// an org admin's `forget_user`, and a platform's `POST /tenants/{id}/users/{user}/forget`.
+async fn forget_user_for_good(
+    state: &State,
+    actor: &crate::people::directory::Actor,
+    user: &str,
+    org: Option<&str>,
+) -> Result<Value> {
+    let store = state.store.read().unwrap().clone();
+    let done = crate::offboard::forget_user(&store, actor, user, org).await?;
+    renew_store(state);
+    sweep_train_log(&store, org).await;
+    Ok(done)
 }
 
 /// Removes from the training log, if there is one, what the memory has just lost: the calls that read an episode or a
@@ -10547,6 +10961,47 @@ fn renew_store(state: &State) {
     *state.store.write().unwrap() = fresh;
 }
 
+/// Each admin's activity page (`/admin {op: "activity"}`), by memory state and answer log.
+static ACTIVITY: std::sync::LazyLock<crate::kept_answers::Kept<Value>> =
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(200));
+
+/// `/admin {op: "activity"}` in `scope` for `who`, already let read it: every person's sessions and asks in the
+/// window, kept by memory state and the scope's answer log ([`crate::kept_answers`]), as it reads the whole log. Kept
+/// by the reader (who, and every group they read as), what they asked for (the person, the window, the page) and the
+/// span of time it was asked in ([`crate::kept_answers::span`]): the window ends when the answer was worked out, never
+/// more than [`crate::kept_answers::STALE`] before now.
+async fn activity_kept(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    req: &Value,
+) -> Result<Value> {
+    let since_secs = req["since_secs"].as_i64().unwrap_or(30 * 86_400);
+    audit_window(&json!({"since_secs": since_secs}))?;
+    let limit = req["limit"].as_u64().unwrap_or(100).clamp(1, 500) as usize;
+    let user = req["user"].as_str().map(String::from);
+    let mark = crate::kept_answers::Mark::read(store, scope).await?;
+    let now = store.lagging_visibility(scope, crate::MAIN).await?;
+    let log = crate::kept_answers::Log::read(store, scope).await?;
+    let at = crate::kept_answers::At::with_log(mark, &now, log);
+    let key = format!(
+        "{}\n{}\n{since_secs}\n{limit}\n{}",
+        crate::kept_answers::reader_key(who),
+        user.as_deref()
+            .map_or_else(String::new, |u| format!("user {u}")),
+        crate::kept_answers::span()
+    );
+    let (store2, scope2) = (store.clone(), scope.clone());
+    let v = ACTIVITY
+        .get(&scope.namespace(), &key, at, true, || async move {
+            let (since, _) = audit_window(&json!({"since_secs": since_secs}))?;
+            let log = crate::qa_log::list(&store2, &scope2, None).await?;
+            Ok(crate::activity::view(&log, user.as_deref(), since, limit))
+        })
+        .await?;
+    Ok((*v).clone())
+}
+
 /// An audit read's window: since when (µs since the epoch; `since_secs` ago, a day by default) and
 /// which kind of event.
 fn audit_window(req: &Value) -> Result<(i64, Option<audit::Kind>)> {
@@ -10575,6 +11030,21 @@ fn metrics_reply(state: &State) -> Response<Full<Bytes>> {
         .header("content-type", "text/plain; version=0.0.4")
         .body(Full::new(Bytes::from(state.metrics.render())))
         .unwrap()
+}
+
+/// How often the inventory is counted (`AMPUP_MEMORY_TELEMETRY_INVENTORY_SECS`, at least 60, default 3600), and
+/// another cell's orgs' storage measured ([`reports::measure_cell`]).
+fn inventory_every() -> Result<Duration> {
+    Ok(
+        match std::env::var("AMPUP_MEMORY_TELEMETRY_INVENTORY_SECS") {
+            Ok(v) => Duration::from_secs(
+                v.parse::<u64>()
+                    .context("AMPUP_MEMORY_TELEMETRY_INVENTORY_SECS")?
+                    .max(60),
+            ),
+            Err(_) => Duration::from_secs(3600),
+        },
+    )
 }
 
 /// Send this server's state to its control plane: every `every`, and as soon as its conditions change;
@@ -10779,7 +11249,16 @@ async fn export_telemetry(
                     .map(|r| r.usage.as_slice()),
             );
             let merged = crate::usage::merge(by_org, legacy, built);
-            let gauges = crate::usage::METER.last_gauges();
+            // Its own cell's as measured here, and each other cell's orgs' from that cell's newest measure.
+            let gauges = crate::usage::with_cells(
+                crate::usage::METER.last_gauges(),
+                cell::me(),
+                others
+                    .iter()
+                    .filter_map(|r| Some((r.cell.as_str(), r.stored.as_ref()?))),
+                cell::of_org,
+                built,
+            );
             let hours = crate::usage::rows(&merged, per_org, took, gauges.as_ref(), built);
             let sent = match crate::telemetry::DeploymentId::from_env() {
                 Ok(deployment) => {
@@ -11043,6 +11522,12 @@ async fn telemetry_advice(state: &State) -> Result<crate::telemetry::Envelope> {
 /// Whose bucket a request comes out of, and which limit holds it: a service key's own (by its hash), or a
 /// person's (by the identity verified; a keys-file key's user, apart from that person's sign-ins). None: the operator's admin key
 /// (the deployment's own, which can change anything anyway), or a server that doesn't identify callers.
+/// Whose searches a search waits with for its turn ([`ratelimit::Limiter::search`]): the caller its rate limit
+/// counts (the same key, or the same person), else the caller's name.
+fn search_lane(state: &State, who: &Principal, via: &SignIn) -> String {
+    limit_key(state, who, via, false).map_or_else(|| format!("user:{}", who.user()), |(_, id)| id)
+}
+
 fn limit_key(
     state: &State,
     who: &Principal,
@@ -11052,6 +11537,11 @@ fn limit_key(
     use crate::people::directory::KeyRole;
     if state.fixed() || superuser {
         return None;
+    }
+    // A platform key's bucket is per tenant: one tenant's load never spends another's.
+    if let Some(p) = &via.platform {
+        let tenant = via.tenant.as_deref().unwrap_or_default();
+        return Some((ratelimit::Class::Default, format!("platform:{p}/{tenant}")));
     }
     if let Some(k) = &via.key {
         let class = match k.role {
@@ -11088,11 +11578,17 @@ async fn audit_read(
     route: &'static str,
     reads: &Reads,
 ) {
-    let (org, actor) = match key_caller(state, via).await {
-        Some((org, key)) => (Some(org), key),
+    // The org it is recorded under, from the directory the request was signed in by ([`Store::directory_behind`]),
+    // so a read never waits on a directory read for its audit.
+    let store = state.store.read().unwrap().clone();
+    let Ok(f) = store.directory_behind().await else {
+        return;
+    };
+    let (org, actor) = match &via.key {
+        Some(k) => (member_org_in(&f, None, via, None), k.user()),
         None => match who {
             Some(w) => (
-                member_org(state, Some(w), via, scope.org_name()).await,
+                member_org_in(&f, Some(w), via, scope.org_name()),
                 w.user().to_string(),
             ),
             None => return,
@@ -11128,7 +11624,8 @@ async fn count_key_use(state: &State, via: &SignIn, org: &str) {
 }
 
 /// Row-at-a-time functions over HTTP. `/query` takes a query (see `query`) and returns its answer;
-/// `/search` takes (query, k?) and returns facts; `/episode`
+/// `/search` takes (query, k?) and returns facts (each `weak: true` where it only comes nearest a query
+/// nothing matches well, [`weak_match`]); `/episode`
 /// takes (episode_id, around?, max_chars?) and returns an excerpt of the episode's text centred on
 /// `around` (a fact's quote), or null when the episode doesn't exist or isn't visible.
 async fn search_rows(
@@ -11824,6 +12321,11 @@ async fn facts(
             v["conflict"] = c.to_json();
         }
         origin_json(&mut v, h.origin, h.fact.valid_from);
+        // Only the best of what matched poorly (`weak_match`): the score ranks this answer's facts against each
+        // other, so the nearest facts to a query nothing matches still score high.
+        if weak_match(h.terms_matched, h.distance) {
+            v["weak"] = json!(true);
+        }
         // How many independent sources say it (`crate::corroboration`): for the reader, never for ranking.
         let group: Vec<&crate::Fact> = h.group.iter().collect();
         v["corroboration"] = json!(reads.corroboration(who, &h.fact, &group));
@@ -11980,6 +12482,25 @@ async fn missed_json(
             v
         })
         .collect())
+}
+
+/// Whether a fact search's hit matches its query only weakly: it holds none of the query's informative words
+/// ([`search::fact_terms`]) and its meaning is no nearer the query's than what an unrelated text reaches with the
+/// embedding model (`unrelated_similarity`, or `AMPUP_MEMORY_RANK_WEAK_SIMILARITY`). A search always answers its best
+/// `k` and ranks them against each other, so a query nothing in memory matches still answers facts that score well;
+/// this says which are only the nearest of nothing. Said, never dropped: a paraphrase's best hit sits close above a
+/// nonsense word's. With OpenAI's text-embedding-3-small over one team's memory of 11k sources, a nonsense word's
+/// nearest facts shared none of its words, while every real query's hits shared a word with it.
+fn weak_match(terms_matched: usize, distance: Option<f32>) -> bool {
+    // Squared L2 between unit vectors: cosine is 1 - d/2.
+    let similarity = distance.map(|d| (1.0 - d / 2.0).max(0.0));
+    let floor = || {
+        search::knob(
+            "WEAK_SIMILARITY",
+            search::embed::provider().unrelated_similarity(),
+        )
+    };
+    terms_matched == 0 && similarity.is_none_or(|s| s < floor())
 }
 
 /// A fact's origin in a JSON answer ([`crate::origin`]): `origin`, and for an agent's the `origin_note` a text answer
@@ -12337,6 +12858,8 @@ async fn mcp(
             );
             let result = match name {
                 "search_memory" => {
+                    let _turn = state.limiter.search(&search_lane(state, who, via)).await;
+                    crate::phases::mark("search turn");
                     let json_format = match args["format"].as_str() {
                         None | Some("text") => false,
                         Some("json") => true,
@@ -12386,10 +12909,7 @@ async fn mcp(
                         only.push(search::Filter::In(search::Col::Predicate, preds));
                     }
                     if let Some(t) = args["type"].as_str().filter(|t| !t.is_empty()) {
-                        only.push(search::Filter::Eq(
-                            search::Col::EntityType,
-                            search::Lit::Str(t.into()),
-                        ));
+                        only.push(search::of_named_type(t));
                     }
                     let (valid_at, rank_at, window) = match search_dates(args, as_of) {
                         Ok(d) => d,
@@ -12688,7 +13208,8 @@ async fn mcp(
                     // session opens (its advice routes meanwhile), so the start waits for the slower of the two.
                     let context = args["context"].as_str().map(str::trim).filter(|c| !c.is_empty());
                     let agent = args["max_chars"].is_null();
-                    let (started, (remembered, later)) = tokio::join!(
+                    // A start refused (at the day's most, say) answers at once: the notes are not waited for.
+                    let started = tokio::try_join!(
                         Box::pin(start_session(state, session, &store, who, via, args, agent)),
                         Box::pin(async {
                             let remembered = crate::keep::for_session(session, &store, who, state.fixed())
@@ -12706,7 +13227,7 @@ async fn mcp(
                             // get_advice hands the ones that bear on its task. Where the scope's agents are told
                             // what memory is for, and not to ask for advice when a task starts (`purpose`), an
                             // agent's start hands the newest that fit instead: it may never ask.
-                            match context {
+                            let notes = match context {
                                 Some(c) => {
                                     let judge = crate::keep::judges(&store, scope).await;
                                     (crate::keep::bearing_on(c, remembered, judge).await, None)
@@ -12715,11 +13236,12 @@ async fn mcp(
                                     (crate::keep::newest(remembered), None)
                                 }
                                 None => (Default::default(), Some((remembered.0.len(), remembered.1.len()))),
-                            }
+                            };
+                            Ok::<_, anyhow::Error>(notes)
                         }),
                     );
                     started
-                        .map(|(l, served)| {
+                        .map(|((l, served), (remembered, later))| {
                             // What the person opened with, in their words: the preferences in it are kept.
                             if args["keep"].as_bool() != Some(false) {
                                 let said = args["context"].as_str().unwrap_or_default();
@@ -12749,7 +13271,8 @@ async fn mcp(
                         .map_err(runs_error)
                 }
                 "get_advice" => {
-                    Box::pin(get_advice_tool(state, session, &store, scope, who, via, writes, args)).await
+                    Box::pin(get_advice_tool(state, session, &store, scope, who, via, writes, args, hook))
+                        .await
                 }
                 "list_briefs" => list_briefs(session, &store, who, args)
                     .await
@@ -13242,7 +13765,7 @@ fn tools(schema: Option<&crate::query::schema::Schema>) -> Value {
                 "inputSchema": {"type": "object", "properties": {
                     "query": {"type": "string", "description": "Words to search for"},
                     "predicates": {"type": "array", "items": {"type": "string"}, "description": "Only facts with these predicates (the schema in query_memory lists them)"},
-                    "type": {"type": "string", "description": "Only facts about entities of this type"},
+                    "type": {"type": "string", "description": "Only facts about entities of this type (as the schema types them, or as their id starts: deal for deal:…)"},
                     "k": {"type": "integer", "description": "How many results (default 10, at most 50); with format \"json\", how many facts (default 10, at most 500)"},
                     "order": {"type": "string", "enum": ["relevance", "newest"], "description": "Results best match first (default), or newest first"},
                     "max_chars": {"type": "integer", "description": "How long the answer may be, in characters (default 8000, 1000 to 60000): results past it come on the next page"},
@@ -14545,7 +15068,7 @@ async fn public_suggestions(
 /// (`crate::sessions::useful`), and what isn't is answered as no new advice.
 #[allow(clippy::too_many_arguments)]
 async fn get_advice_tool(
-    state: &State,
+    state: &Arc<State>,
     session: &Session,
     store: &Store,
     scope: &Scope,
@@ -14553,14 +15076,130 @@ async fn get_advice_tool(
     via: &SignIn,
     writes: Writes,
     args: &Value,
+    hook: bool,
 ) -> Result<String> {
+    // A hook's call answers within its wait, whatever its step still waits on (a model, a read): see `advise_tool`.
+    // Not the event before a final answer, whose router has its own longer wait (`sessions::final_route_wait`).
+    let until = (hook && !before_final_answer(args)).then(|| Instant::now() + hook_advice_wait());
     crate::advice_lookups::traced(
         lookup_moment(args),
         Box::pin(advise_tool(
-            state, session, store, scope, who, via, writes, args,
+            state, session, store, scope, who, via, writes, args, until,
         )),
     )
     .await
+}
+
+/// How long a hook's `get_advice` takes at most, from when its tool starts (after sign-in and the read's pin):
+/// `AMPUP_MEMORY_HOOK_ADVICE_WAIT_MS` (default 2,000). What its step finds later is handed on with the session's next
+/// hook call that has nothing to say (`sessions::hand_late`).
+fn hook_advice_wait() -> Duration {
+    Duration::from_millis(
+        std::env::var("AMPUP_MEMORY_HOOK_ADVICE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2_000),
+    )
+}
+
+/// `text`, a hook's answer in session `id`, or where it says nothing, the session's advice found after an earlier
+/// call went on (`sessions::take_late`): as an event's inform, or as a step's advice.
+async fn late_or(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    id: &str,
+    args: &Value,
+    text: String,
+) -> String {
+    if args["event"].is_null() {
+        if text.starts_with("Situation: ") {
+            return text;
+        }
+        return match crate::sessions::take_late(store, scope, who, id, false).await {
+            Some(late) => late.text,
+            None => text,
+        };
+    }
+    let said = serde_json::from_str::<Value>(&text)
+        .ok()
+        .is_none_or(|f| f["op"].as_str().is_some_and(|o| o != "none"));
+    if said || args["event"]["kind"] == "stop" {
+        return text;
+    }
+    match crate::sessions::take_late(store, scope, who, id, true).await {
+        Some(late) => serde_json::to_string_pretty(&crate::sessions::Fired {
+            op: crate::sessions::Op::Inform,
+            situation: Some(late.situation),
+            text: late.text,
+        })
+        .unwrap_or(text),
+        None => text,
+    }
+}
+
+/// Whether a `get_advice` call is the event before a harness's final answer (`sessions::final_answer`).
+fn before_final_answer(args: &Value) -> bool {
+    args["event"]["kind"] == "pre_tool"
+        && args["event"]["tool"]
+            .as_str()
+            .is_some_and(crate::sessions::final_answer)
+}
+
+/// What a hook's call answers when its step found nothing in its wait: an event's op of none, or no new advice.
+fn nothing_yet(args: &Value) -> String {
+    match args["event"].is_null() {
+        true => NO_NEW_ADVICE.into(),
+        false => serde_json::to_string_pretty(&crate::sessions::Fired {
+            op: crate::sessions::Op::None,
+            situation: None,
+            text: String::new(),
+        })
+        .unwrap_or_default(),
+    }
+}
+
+/// A hook's step answered after its call went on (`text`, in session `id`): kept for the session's next hook call
+/// that has nothing to say, with the note it comes from. Only advice is kept (an event's op, or a step's text
+/// that starts `Situation: `), never "no new advice".
+async fn hand_late(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    id: &str,
+    event: bool,
+    text: String,
+) {
+    let late = match event {
+        true => serde_json::from_str::<Value>(&text).ok().and_then(|f| {
+            (f["op"].as_str().is_some_and(|o| o != "none"))
+                .then(|| f["situation"].as_str().map(String::from))
+                .flatten()
+                .map(|situation| crate::sessions::Late {
+                    situation,
+                    text: f["text"].as_str().unwrap_or_default().to_string(),
+                    op: true,
+                })
+        }),
+        false if text.starts_with("Situation: ") => {
+            // The note the step served is the session's last.
+            match crate::sessions::find(store, scope, who, id).await {
+                Ok(l) => l
+                    .session
+                    .and_then(|s| s.served.last().cloned())
+                    .map(|situation| crate::sessions::Late {
+                        situation,
+                        text,
+                        op: false,
+                    }),
+                Err(_) => None,
+            }
+        }
+        false => None,
+    };
+    if let Some(late) = late {
+        crate::sessions::hand_late(scope, who, id, late);
+    }
 }
 
 /// Where in its session an advice call was asked (`crate::advice_lookups::Lookup::moment`): the moment it names,
@@ -14599,9 +15238,11 @@ impl Drop for OwedNotes<'_> {
 }
 
 /// [`get_advice_tool`]'s work, its lookup traced.
+/// A hook's call (`until` set) answers by `until` with what it has: its step and the notes that bear on its task each
+/// run on, and one still going then is left out, the step's answer handed on later (`hand_late`).
 #[allow(clippy::too_many_arguments)]
 async fn advise_tool(
-    state: &State,
+    state: &Arc<State>,
     session: &Session,
     store: &Store,
     scope: &Scope,
@@ -14609,6 +15250,7 @@ async fn advise_tool(
     via: &SignIn,
     writes: Writes,
     args: &Value,
+    until: Option<Instant>,
 ) -> Result<String> {
     // A hook's first ask of a session (`remembered`) is answered with the notes that bear on its task, alongside the
     // advice: the session's start came before the task was known, and handed none. So is an agent's first ask in a
@@ -14660,13 +15302,18 @@ async fn advise_tool(
     // Where they come in the advice's text and the call names its budget (only a hook's may), they are read first
     // and the advice is fitted to what they leave of it. A call that hands none answers as it did without them.
     let max_chars = args["max_chars"].as_u64().map(|n| n as usize);
+    // `early` is Some(None) when they weren't read in a hook's wait: they stay owed (`still_owed`) for the next ask.
     let (early, fitted);
     let args = match max_chars {
         Some(m) if owed && !hook_first => {
-            let notes = read_notes().await;
-            let took = crate::keep::text_with_notes(String::new(), notes.clone())
-                .chars()
-                .count();
+            let notes = match until {
+                Some(u) => tokio::time::timeout_at(u.into(), read_notes()).await.ok(),
+                None => Some(read_notes().await),
+            };
+            let took =
+                crate::keep::text_with_notes(String::new(), notes.clone().unwrap_or_default())
+                    .chars()
+                    .count();
             early = Some(notes);
             if took == 0 {
                 args
@@ -14685,31 +15332,127 @@ async fn advise_tool(
     // The session the call's id stands for, once resolved: a harness may name its session by its own id
     // ([`open_named`]), and what follows (the step's lookup, the lines handed) is the session's, not the name's.
     let mut resolved = None;
-    let (text, notes) = tokio::join!(
-        Box::pin(get_advice_step(
-            state,
-            session,
-            store,
-            scope,
-            who,
-            via,
-            writes,
-            args,
-            &mut resolved,
-        )),
-        async {
-            match (early, remembered) {
-                (Some(n), _) => Some(n),
-                (None, true) => Some(read_notes().await),
-                (None, false) => None,
-            }
+    let notes = async {
+        match (early, remembered) {
+            (Some(n), _) => n,
+            (None, true) => match until {
+                Some(u) => tokio::time::timeout_at(u.into(), read_notes()).await.ok(),
+                None => Some(read_notes().await),
+            },
+            (None, false) => None,
         }
-    );
+    };
+    let (text, notes) = match until {
+        None => {
+            tokio::join!(
+                Box::pin(get_advice_step(
+                    state,
+                    session,
+                    store,
+                    scope,
+                    who,
+                    via,
+                    writes,
+                    args,
+                    &mut resolved,
+                )),
+                notes
+            )
+        }
+        Some(u) => {
+            // The step on a task of its own: past the wait it goes on, and what it answers is kept for the next call.
+            let step = {
+                let (state, session, store, who, via, args) = (
+                    state.clone(),
+                    session.clone(),
+                    store.clone(),
+                    who.clone(),
+                    via.clone(),
+                    args.clone(),
+                );
+                async move {
+                    let mut resolved = None;
+                    let text = Box::pin(get_advice_step(
+                        &state,
+                        &session,
+                        &store,
+                        session.scope(),
+                        &who,
+                        &via,
+                        writes,
+                        &args,
+                        &mut resolved,
+                    ))
+                    .await;
+                    (text, resolved, (store, session, who, args))
+                }
+            };
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            let began = Instant::now();
+            crate::log_org::spawn(crate::advice_lookups::carry(async move {
+                let out = step.await;
+                if let Err((text, resolved, (store, session, who, args))) = tx.send(out) {
+                    let id = resolved.or_else(|| {
+                        args["session_id"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|i| !i.is_empty())
+                            .map(String::from)
+                    });
+                    eprintln!(
+                        "get_advice: a hook's step took {} ms, past its wait{}",
+                        began.elapsed().as_millis(),
+                        if text.is_ok() { "" } else { " (and failed)" }
+                    );
+                    if let (Ok(text), Some(id)) = (text, id) {
+                        hand_late(
+                            &store,
+                            session.scope(),
+                            &who,
+                            &id,
+                            !args["event"].is_null(),
+                            text,
+                        )
+                        .await;
+                    }
+                }
+            }));
+            let stepped = async {
+                match tokio::time::timeout_at(u.into(), &mut rx).await {
+                    Ok(Ok((text, r, _))) => {
+                        resolved = r;
+                        text
+                    }
+                    Ok(Err(_)) => Ok(nothing_yet(args)),
+                    Err(_) => {
+                        // Closed first, so an answer that comes now is kept for the next call rather than lost.
+                        rx.close();
+                        match rx.try_recv() {
+                            Ok((text, r, _)) => {
+                                resolved = r;
+                                text
+                            }
+                            Err(_) => {
+                                crate::phases::mark("hook wait over");
+                                Ok(nothing_yet(args))
+                            }
+                        }
+                    }
+                }
+            };
+            tokio::join!(stepped, notes)
+        }
+    };
     // With no model to route advice with, a first ask still gets the notes that bear on its task (an agent's
     // advice step, routed on its own task, comes back as the error's text).
     let text = match text {
         Err(e) if remembered && format!("{e:#}").ends_with(NO_ROUTER) => NO_ROUTER.to_string(),
         t => t?,
+    };
+    // A hook's call with nothing to say hands on what an earlier one of the session's found after it went on.
+    let text = match (until, resolved.as_deref().or(id)) {
+        (Some(_), Some(sid)) => late_or(store, scope, who, sid, args, text).await,
+        _ => text,
     };
     let suggestions = public_suggestions(
         store,
@@ -15009,6 +15752,9 @@ async fn session_fire(
             crate::sessions::keep_later(store, session.scope(), &l, &signed, c, true);
         }
     }
+    if event.kind == "stop" {
+        return crate::sessions::stopped(&l);
+    }
     let Some(router) = crate::extract::Extractor::route_from_env()? else {
         return Err(ToolError(NO_ROUTER.into()).into());
     };
@@ -15232,6 +15978,62 @@ fn served_json(served: &crate::sessions::Served) -> Value {
             json!({"situation": null, "advice": null, "advice_pending": ADVICE_PENDING})
         }
     }
+}
+
+/// Whether a request is a session's start: `POST /sessions`, or `start_session` on `/mcp` or `/mcp/hook`.
+fn a_start(path: &str, body: &[u8]) -> bool {
+    match path {
+        "/sessions" => true,
+        "/mcp" => serde_json::from_slice::<Value>(body)
+            .is_ok_and(|v| v["method"] == "tools/call" && v["params"]["name"] == "start_session"),
+        _ => false,
+    }
+}
+
+/// The refusal of a session's start ([`a_start`]) from `who`, when this server last counted them at a most a day in
+/// `scope` ([`crate::qa_log::capped`]); None for any other request, or a caller not known to be capped. It reads
+/// nothing but the body; their entries are counted again in the background when that count is due
+/// ([`crate::qa_log::recount_later`]).
+/// - `/sessions`: 429, with when one more fits as `Retry-After` and `retry_after_secs`.
+/// - `/mcp`: the tool's own answer, an error (`isError`) saying so, with `retry_after_secs` in its `_meta`. Never an
+///   HTTP error: an MCP host can take one for the connection failing.
+fn capped_start(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    path: &str,
+    body: &[u8],
+) -> Option<Response<Full<Bytes>>> {
+    if path != "/sessions" && path != "/mcp" {
+        return None;
+    }
+    let (why, secs) = crate::qa_log::capped(scope, who.user())?;
+    let answer = Response::builder().header("content-type", "application/json");
+    if path == "/mcp" {
+        let v: Value = serde_json::from_slice(body).ok()?;
+        if v["method"] != "tools/call" || v["params"]["name"] != "start_session" {
+            return None;
+        }
+        crate::qa_log::recount_later(store, scope, who.user());
+        let call = json!({"jsonrpc": "2.0", "id": v["id"], "result": {
+            "content": [{"type": "text", "text": why}], "isError": true,
+            "_meta": {"retry_after_secs": secs, "daily_cap": true}}});
+        return Some(
+            answer
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from(call.to_string())))
+                .unwrap(),
+        );
+    }
+    crate::qa_log::recount_later(store, scope, who.user());
+    let refused = json!({"error": why, "retry_after_secs": secs, "daily_cap": true});
+    Some(
+        answer
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(hyper::header::RETRY_AFTER, secs.to_string())
+            .body(Full::new(Bytes::from(refused.to_string())))
+            .unwrap(),
+    )
 }
 
 /// A sessions route's error as its HTTP answer.
@@ -15551,7 +16353,7 @@ fn feedback_tool() -> Value {
         "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false},
         "description": "Say whether a fact helped: positive, or negative / very_negative when it was wrong or \
             stale, with a short reason. One vote per person per fact (a later one replaces yours). Search shows \
-            each fact's tally and the reasons given, never who gave them.",
+            each fact's tally, never who gave it; the reasons go to the memory's owners.",
         "inputSchema": {"type": "object", "properties": {
             "fact_id": {"type": "string"},
             "signal": {"type": "string", "enum": ["positive", "negative", "very_negative"]},
@@ -16237,19 +17039,6 @@ async fn commit_note(
         _ => return Err(ToolError("document is a key of at most 512 bytes".into()).into()),
     }
     let id = ep.episode_id.clone();
-    // What its writer's reads served them just before, recorded with it so reconcile can tell an echo of it
-    // (`crate::echo`).
-    let served = crate::echo::before(scope, who.user());
-    let mut eps = vec![ep];
-    if !served.is_empty() {
-        eps.push(crate::echo::record(&eps[0], who.user(), &served));
-    }
-    // A note theirs alone: their profile may be due a fold (`crate::profile`).
-    let note = eps[0].document.is_none()
-        && match entries.as_slice() {
-            [one] => *one == format!("user:{}", who.user()) || (state.fixed() && *one == "*"),
-            _ => false,
-        };
     // In a session, on its branch where its org gives each session one (`crate::sessions::branch_of`).
     let branch = match args["session_id"]
         .as_str()
@@ -16259,16 +17048,55 @@ async fn commit_note(
         Some(sid) => crate::sessions::branch_of(store, scope, who, sid, true).await?,
         None => None,
     };
+    // What its writer's reads served them just before, recorded with it so reconcile can tell an echo of it
+    // (`crate::echo`).
+    let served = crate::echo::before(scope, who.user());
+    let mut eps = vec![ep];
+    if !served.is_empty() {
+        eps.push(crate::echo::record(&eps[0], who.user(), &served));
+    }
+    // The same note sent again (a hook's write retried after it timed out, an agent remembering the same text twice)
+    // is the same episode with a new time: where main holds it already but for that time, it isn't written again,
+    // nor its facts or its record. Written, it would change only the time, and the next read would wait for a full
+    // build of the scope's state. A time the caller gave is theirs to change, and a session's branch is written.
+    // Copies sent at once are checked one after the other, each once the one before is written
+    // (`crate::sessions::one_write`), even when the request that wrote it was dropped (`crate::sessions::landed`).
+    let mut turn = match branch.is_none() && at.is_none() {
+        true => Some(crate::sessions::one_write(scope, &id).await),
+        false => None,
+    };
+    if turn.is_some() {
+        let held = store.held_but_time(scope, &eps).await?;
+        if held.contains(&id) {
+            eprintln!("remember into {scope}: {id} held on main already, not written again");
+            return Ok((id, readers));
+        }
+        eps.retain(|e| !held.contains(&e.episode_id));
+    }
+    // A note theirs alone: their profile may be due a fold (`crate::profile`).
+    let note = eps[0].document.is_none()
+        && match entries.as_slice() {
+            [one] => *one == format!("user:{}", who.user()) || (state.fixed() && *one == "*"),
+            _ => false,
+        };
     // A note is a fact too, citing it alone: read by who reads the note (`crate::note_facts`).
     let facts = crate::note_facts::facts_of(&eps[..1]);
-    let readers = match &branch {
-        Some(b) => {
+    let readers = match (&branch, turn.take()) {
+        (Some(b), _) => {
             store.commit_on(scope, b, who.user(), &eps, &facts).await?;
             format!(
                 "{readers}, on this session's branch {b} (it merges into main once the session ends)"
             )
         }
-        None => {
+        (None, Some(turn)) => {
+            let (store, scope_of, user) = (store.clone(), scope.clone(), who.user().to_string());
+            crate::sessions::landed(scope, turn, async move {
+                store.commit(&scope_of, &user, &eps, &facts).await
+            })
+            .await?;
+            readers
+        }
+        (None, None) => {
             store.commit(scope, who.user(), &eps, &facts).await?;
             readers
         }

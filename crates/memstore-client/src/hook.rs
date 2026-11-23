@@ -391,10 +391,28 @@ impl Client {
             ))
         })?;
         let status = res.status();
+        let retry_after = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
         let text = res
             .text()
             .await
             .map_err(|e| Unreached(format!("{}{path}: the answer broke off: {e:#}", self.url)))?;
+        // Past the day's most entries: no session's start or advice is sent again until the memory said one more fits
+        // (`Retry-After`). Not worth sending again sooner, so not kept in the outbox either.
+        if status.as_u16() == 429
+            && let Some(secs) = daily_cap(&text, retry_after)
+        {
+            self.back_off(secs);
+            return Err(Capped(format!(
+                "{}{path}: {status}: {}",
+                self.url,
+                text.chars().take(300).collect::<String>()
+            ))
+            .into());
+        }
         // Down, busy, or signed out for now: worth sending again later.
         if status.is_server_error() || [401, 408, 429].contains(&status.as_u16()) {
             return Err(Unreached(format!(
@@ -425,16 +443,109 @@ impl Client {
             .with_context(|| format!("{}{path} answered nothing", self.url))
     }
 
-    /// An MCP tool's text answer.
+    /// An MCP tool's text answer. A session's start is not sent while the memory said this caller is past the day's
+    /// most entries ([`Client::capped_until`]).
     async fn tool(&self, name: &str, args: Value) -> Result<String> {
+        if name == "start_session" {
+            self.unless_capped(name)?;
+        }
         let v = self.post("/mcp", &tool_call(name, &args)).await?;
-        tool_answer(name, &v)
+        self.capped_in(name, &v)?;
+        self.capped_by(name, tool_answer(name, &v))
+    }
+
+    /// A [`Capped`] refusal when the tool answered an error saying this caller is at a most a day (`daily_cap` in the
+    /// answer's `_meta`), backing off first until its `retry_after_secs`.
+    fn capped_in(&self, name: &str, v: &Value) -> Result<()> {
+        let result = &v["result"];
+        if result["isError"] != true || result["_meta"]["daily_cap"] != true {
+            return Ok(());
+        }
+        self.back_off(
+            result["_meta"]["retry_after_secs"]
+                .as_u64()
+                .unwrap_or(CAPPED_UNSAID_SECS),
+        );
+        Err(Capped(format!(
+            "{name}: {}",
+            result["content"][0]["text"].as_str().unwrap_or_default()
+        ))
+        .into())
+    }
+
+    /// Where this caller's back-off at the day's most entries is kept: one file per server, org, team and scope.
+    fn capped_file(&self) -> std::path::PathBuf {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for part in [
+            Some(self.url.as_str()),
+            self.org.as_deref(),
+            self.team.as_deref(),
+            self.scope.as_deref(),
+        ] {
+            h.update(part.unwrap_or_default());
+            h.update([0]);
+        }
+        let name: String = h.finalize()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        crate::client::config_dir().join("capped").join(name)
+    }
+
+    /// Until when (unix seconds) the memory said this caller is past the day's most entries, while that is ahead.
+    fn capped_until(&self) -> Option<u64> {
+        let until: u64 = std::fs::read_to_string(self.capped_file())
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        (until > unix_now()).then_some(until)
+    }
+
+    /// Sends no session's start or advice for `secs` (at most [`CAPPED_MOST_SECS`]: a cap an admin lifts sooner is
+    /// found again within the hour).
+    fn back_off(&self, secs: u64) {
+        let file = self.capped_file();
+        let until = unix_now() + secs.clamp(1, CAPPED_MOST_SECS);
+        let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        if let Err(e) = write_private(&dir, &file, &until.to_string()) {
+            warn(format!(
+                "the day's most entries wasn't kept to wait out: {e:#}"
+            ));
+        }
+    }
+
+    /// A [`Capped`] refusal of `name`, sent nowhere, while this caller backs off.
+    fn unless_capped(&self, name: &str) -> Result<()> {
+        match self.capped_until() {
+            Some(until) => Err(Capped(format!(
+                "{name} not sent: {} said this caller reached its daily cap; it is asked again in {} s",
+                self.url,
+                until.saturating_sub(unix_now())
+            ))
+            .into()),
+            None => Ok(()),
+        }
+    }
+
+    /// `answer` as is, backing off first when a session's start or advice was refused at a most a day in the tool's
+    /// own answer without saying until when (a server that doesn't say), for [`CAPPED_UNSAID_SECS`].
+    fn capped_by(&self, name: &str, answer: Result<String>) -> Result<String> {
+        if let Err(e) = &answer
+            && ["start_session", "get_advice"].contains(&name)
+            && format!("{e:#}").contains("the most a day")
+        {
+            self.back_off(CAPPED_UNSAID_SECS);
+        }
+        answer
     }
 
     /// `get_advice` as the hooks call it, on `/mcp/hook`: the server takes the arguments that keep or record what
     /// the call carries (`event`, `decide`, `remembered`, `keep`, `max_chars`) there only, never on the `/mcp` an
     /// agent's host calls. A server from before that route answers 404 (or 405): it is asked on `/mcp` instead.
     async fn hook_advice(&self, args: Value) -> Result<String> {
+        self.unless_capped("get_advice")?;
         let call = tool_call("get_advice", &args);
         let v = match self.post(HOOK_MCP, &call).await {
             Err(e)
@@ -446,7 +557,8 @@ impl Client {
             }
             v => v?,
         };
-        tool_answer("get_advice", &v)
+        self.capped_in("get_advice", &v)?;
+        self.capped_by("get_advice", tool_answer("get_advice", &v))
     }
 
     /// A client for where an outbox item was going (its server, org, team and scope), signed in with that
@@ -495,6 +607,40 @@ impl Client {
         }
     }
 }
+
+/// The longest a caller backs off at the day's most entries, whatever the memory said: an hour.
+const CAPPED_MOST_SECS: u64 = 3_600;
+
+/// How long a caller backs off when the memory refused at the day's most entries without saying until when.
+const CAPPED_UNSAID_SECS: u64 = 600;
+
+/// The seconds a 429 says to wait when it is the day's most entries (`daily_cap` in its body or its JSON-RPC error's
+/// data): its `Retry-After`, else the body's `retry_after_secs`, else [`CAPPED_UNSAID_SECS`]. None for any other 429
+/// (too many requests at once), which is worth sending again soon.
+fn daily_cap(text: &str, retry_after: Option<u64>) -> Option<u64> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let said = [&v, &v["error"]["data"]]
+        .into_iter()
+        .find(|d| d["daily_cap"] == true)?;
+    Some(
+        retry_after
+            .or_else(|| said["retry_after_secs"].as_u64())
+            .unwrap_or(CAPPED_UNSAID_SECS),
+    )
+}
+
+/// Not sent, or refused, because the caller has logged the day's most entries: not worth sending again before the
+/// memory said one more fits.
+#[derive(Debug)]
+struct Capped(String);
+
+impl std::fmt::Display for Capped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Capped {}
 
 /// A failure worth sending again: the memory unreachable, slow, down, busy or the sign-in stale. A refusal
 /// (bad arguments, a session that isn't the caller's) never is.
@@ -1419,8 +1565,11 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             if let Err(e) = kept {
                 warn(format!("the session's transcript wasn't kept: {e:#}"));
             }
-            // The rest of its markers: they outlive a compaction, not the harness session.
-            for kind in ["recalled", "remembered", "rated", "ratehint"] {
+            // The rest of its markers: they outlive a compaction, not the harness session. Not how far its note was
+            // remembered: an end that fires again with nothing said since (a run resumed and closed, a harness that
+            // ends a session more than once) would send the same note again, which the memory holds already
+            // (`prune_markers` takes it away with the rest a week on).
+            for kind in ["recalled", "rated", "ratehint"] {
                 if let Some(m) = marker(kind, session_of(&input)) {
                     let _ = std::fs::remove_file(m);
                 }

@@ -5,7 +5,8 @@
 //! model family (on the customer's own key apart), and the distinct callers of all of these. Each is counted
 //! against the org the work is for (the task's org, `crate::log_org`, as `crate::limits` counts an org's
 //! month), or [`SYSTEM`] when no org is in scope. The inventory count sets two gauges per org (facts stored,
-//! bytes stored). Counters go in an hourly bucket per org, the hour named by its start (UTC).
+//! bytes stored): the sender measures its own cell's orgs, and each other cell's processes measure theirs and
+//! write it in their reports ([`with_cells`]). Counters go in an hourly bucket per org, the hour named by its start (UTC).
 //!
 //! Every process (a server, a worker, a cell) counts what it served, and writes its book beside the system
 //! tables every minute. The process sending telemetry adds every process's book up ([`merge`], [`rows`]), a
@@ -102,10 +103,57 @@ pub type HourOrg = (DateTime<Utc>, String);
 /// Facts and bytes stored, per org, as last measured ([`Meter::gauges`]).
 pub type Gauges = BTreeMap<String, (u64, u64)>;
 
+/// One process's measure of what its cell's orgs hold, and when it was taken: what a process of a cell other than
+/// the sender's writes in its report, for the sender to add its cell's orgs' gauges ([`with_cells`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Measured {
+    pub at: DateTime<Utc>,
+    pub by_org: Gauges,
+}
+
+/// How old another cell's measure may be and still give its orgs' gauges: a cell measures every hour, so this
+/// leaves two measures missed before its orgs read as holding nothing.
+pub const CELL_GAUGES_MAX_AGE: TimeDelta = TimeDelta::hours(3);
+
+/// The gauges to send: the sender's own (`own`, as measured here, unchanged), and for each other cell, its orgs'
+/// from the newest of its processes' measures (`cells`: each report's cell and measure) taken within
+/// [`CELL_GAUGES_MAX_AGE`] of `now`. A measure is a level, not a count: every replica of a cell, and every
+/// stopped process's report, carries one, so a cell's measures are never added up, only its newest taken. Of a
+/// measure, only orgs `cell_of` maps to its cell are taken (an org moved since stays with its new cell's), never
+/// [`SYSTEM`] (a person's own memory is every cell's, counted by the sender's), and never an org `own` holds.
+/// None while the sender hasn't measured (`own` none): the current hour keeps what was sent, as before.
+pub fn with_cells<'a>(
+    own: Option<Gauges>,
+    own_cell: &str,
+    cells: impl IntoIterator<Item = (&'a str, &'a Measured)>,
+    cell_of: impl Fn(&str) -> &'static str,
+    now: DateTime<Utc>,
+) -> Option<Gauges> {
+    let mut out = own?;
+    let mut newest: BTreeMap<&str, &Measured> = BTreeMap::new();
+    for (cell, m) in cells {
+        if cell == own_cell || now - m.at > CELL_GAUGES_MAX_AGE {
+            continue;
+        }
+        let held = newest.entry(cell).or_insert(m);
+        if m.at > held.at {
+            *held = m;
+        }
+    }
+    for (cell, m) in newest {
+        for (org, g) in &m.by_org {
+            if org != SYSTEM && cell_of(org) == cell && !out.contains_key(org) {
+                out.insert(org.clone(), *g);
+            }
+        }
+    }
+    Some(out)
+}
+
 #[derive(Default)]
 struct Book {
     hours: BTreeMap<HourOrg, Bucket>,
-    /// The last facts and bytes measured per org, and the hour they were measured in.
+    /// The last facts and bytes measured per org, and when they were measured.
     gauges: Option<(DateTime<Utc>, Gauges)>,
 }
 
@@ -228,7 +276,17 @@ impl Meter {
     }
 
     pub fn gauges_at(&self, now: DateTime<Utc>, by_org: Gauges) {
-        self.book.lock().unwrap().gauges = Some((hour_of(now), by_org));
+        self.book.lock().unwrap().gauges = Some((now, by_org));
+    }
+
+    /// The facts and bytes per org as last measured here, and when; none before the first measure.
+    pub fn last_measured(&self) -> Option<Measured> {
+        let book = self.book.lock().unwrap();
+        let (at, by_org) = book.gauges.as_ref()?;
+        Some(Measured {
+            at: *at,
+            by_org: by_org.clone(),
+        })
     }
 
     /// The facts and bytes per org as last measured here; none before the first measure.
@@ -321,7 +379,7 @@ pub fn keep_taken(u: &Usage, now: DateTime<Utc>) -> bool {
 }
 
 /// Every process's book added up: counters added and callers joined, per hour and org (`by_org`) and per hour
-/// (`legacy`, books without orgs). Gauges in the books are left out: they are the sender's own ([`rows`]).
+/// (`legacy`, books without orgs). Gauges in the books are left out: they are the sender's own and other cells' measures ([`with_cells`], [`rows`]).
 /// Hours older than [`KEEP_DAYS`] before `now` are left out.
 pub fn merge<'a>(
     by_org: impl IntoIterator<Item = &'a [(HourOrg, Bucket)]>,

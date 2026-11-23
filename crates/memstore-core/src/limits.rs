@@ -375,6 +375,12 @@ pub async fn watching<F: std::future::Future>(fut: F) -> (F::Output, Option<Limi
         .await
 }
 
+/// A limit a task of the request's own ran into (run in [`watching`]), raised in the request as if it had run
+/// into it itself.
+pub fn raise(l: LimitReached) {
+    raised(Some(l));
+}
+
 /// A limit refusing something, for [`watching`].
 fn raised(l: Option<LimitReached>) -> Option<LimitReached> {
     if let Some(l) = &l {

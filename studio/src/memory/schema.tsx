@@ -21,6 +21,39 @@ export function schemaTypes(schema: Schema | null | undefined): Map<string, OrgT
   return types;
 }
 
+/**
+ * The entity types each built-in episode type's catalog declares (memstore's
+ * `crates/memstore-core/src/episode_types/<type>/catalog.json`; `doc` reads `schemas/engineering.json`).
+ * Extraction of that episode type writes them whatever the scope's schema declares, so a type the schema lacks
+ * came from one.
+ */
+const CATALOGS: Record<string, string[]> = {
+  crm_update: ["account", "contact", "deal"],
+  doc: ["feature", "finding"],
+  email: ["commitment", "contact", "deal", "meeting_plan", "rep"],
+  incident: ["incident"],
+  sales_call: ["account", "commitment", "contact", "deal", "meeting", "objection", "person", "rep"],
+  slack_thread: ["commitment", "contact", "deal", "rep"],
+};
+
+/** Where a type the schema doesn't declare comes from, in a few words: the episode types whose catalogs declare it
+ * ("the email catalog"), else just that the schema doesn't. */
+export function offSchemaOrigin(type: string): { short: string; long: string } {
+  const from = Object.entries(CATALOGS)
+    .filter(([, types]) => types.includes(type))
+    .map(([episodeType]) => episodeType.replace(/_/g, " "));
+  if (!from.length)
+    return { short: "not in the schema", long: "The schema doesn't declare this type." };
+  const names = from.join(", ");
+  const one = from.length === 1;
+  return {
+    short: `from the ${names} ${one ? "catalog" : "catalogs"}`,
+    long:
+      `Not in the schema: the ${names} episode ${one ? "type's catalog declares" : "types' catalogs declare"} ` +
+      `it, and extraction of ${one ? "that episode type" : "those episode types"} writes it.`,
+  };
+}
+
 /** The values `entity`'s `predicate` may take when the schema closes it (an enum with `values`); else undefined. */
 export function closedValues(
   types: Map<string, OrgType> | undefined,
@@ -175,6 +208,12 @@ export function SchemaView({
       </EmptyState>
     );
   const names = [...types.keys()].sort();
+  // Types the memory holds that the schema doesn't declare: what an episode type's catalog declares and its
+  // extraction wrote (a document's feature or finding, an email's meeting plan). Listed apart, so the schema's
+  // count and the Explorer's agree once added.
+  const held = Object.keys(counts)
+    .filter((n) => !types.has(n) && (counts[n] ?? 0) > 0)
+    .sort();
   const current = type && types.has(type) ? type : names[0]!;
   const t = types.get(current)!;
   const shape = shapeOf(current, types);
@@ -194,6 +233,11 @@ export function SchemaView({
           <div className="subtitle">
             {base?.mode && <span className="badge">{base.mode}</span>}
             <span>{types.size} types</span>
+            {held.length > 0 && (
+              <span title="The memory holds entities of these types, though the schema doesn't declare them">
+                {held.length} more held, not in it
+              </span>
+            )}
             {schema.versions != null && schema.versions > 1 && (
               <span>{schema.versions} versions on this branch</span>
             )}
@@ -221,6 +265,26 @@ export function SchemaView({
               {counts[n] != null && <span className="count">{counts[n].toLocaleString()}</span>}
             </button>
           ))}
+          {held.length > 0 && (
+            <>
+              <div className="schema-held" title="Open one in the Explorer">
+                Held, not in the schema
+              </div>
+              {held.map((n) => (
+                <button
+                  key={n}
+                  className="schema-type"
+                  title={offSchemaOrigin(n).long}
+                  onClick={() => onFocus({ kind: "folder", path: ["entities", n] })}
+                >
+                  <Icon name="explorer" size={14} />
+                  <span className="mono">{n}</span>
+                  <span className="schema-from">{offSchemaOrigin(n).short}</span>
+                  <span className="count">{counts[n]!.toLocaleString()}</span>
+                </button>
+              ))}
+            </>
+          )}
         </nav>
         <div className="card card-pad schema-type-card">
           <div className="schema-type-head">

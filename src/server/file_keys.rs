@@ -169,6 +169,7 @@ pub fn import(k: &KeyCaller, org: &str, file_keys: BTreeSet<String>) -> (Actor, 
             groups: k.groups.clone(),
             admin: false,
             provisioner: false,
+            platform: None,
         }],
     };
     (actor, change)
@@ -243,7 +244,7 @@ pub fn fates(
     was_directory_key: impl Fn(&str) -> bool,
 ) -> Vec<(KeyCaller, Fate)> {
     keys.into_iter()
-        .filter(|k| !k.admin && !k.provisioner)
+        .filter(|k| !k.admin && !k.provisioner && k.platform.is_none())
         .map(|k| {
             let f = fate(
                 dir,
@@ -290,7 +291,10 @@ pub(super) async fn pass(state: &super::State, memo: &mut Passes) {
         return;
     };
     let keys: Vec<KeyCaller> = auth.file_key_callers();
-    if keys.iter().all(|k| k.admin || k.provisioner) {
+    if keys
+        .iter()
+        .all(|k| k.admin || k.provisioner || k.platform.is_some())
+    {
         state.file_keys.record(&[]);
         return;
     }

@@ -1,14 +1,72 @@
 // How memory's names and times read on the page. Nothing here changes what is shown, only how: the raw id or
 // predicate is always kept beside it (in a title, or in mono under it).
 
+/** Words spelled their own way wherever they fall in a name: acronyms and product names. */
+const SPELLED: Record<string, string> = {
+  acl: "ACL",
+  ai: "AI",
+  aip: "AIP",
+  ampup: "AmpUp",
+  api: "API",
+  apis: "APIs",
+  arr: "ARR",
+  aws: "AWS",
+  b2b: "B2B",
+  chatgpt: "ChatGPT",
+  ci: "CI",
+  crm: "CRM",
+  csv: "CSV",
+  gcp: "GCP",
+  github: "GitHub",
+  gitlab: "GitLab",
+  hubspot: "HubSpot",
+  id: "ID",
+  ids: "IDs",
+  json: "JSON",
+  kpi: "KPI",
+  linkedin: "LinkedIn",
+  llm: "LLM",
+  mcp: "MCP",
+  meddpicc: "MEDDPICC",
+  mrr: "MRR",
+  okr: "OKR",
+  openai: "OpenAI",
+  pr: "PR",
+  prs: "PRs",
+  qa: "QA",
+  roi: "ROI",
+  saas: "SaaS",
+  sdk: "SDK",
+  sql: "SQL",
+  sso: "SSO",
+  ui: "UI",
+  url: "URL",
+  urls: "URLs",
+  ux: "UX",
+};
+/** Names of more than one word, as their makers spell them. */
+const PHRASES: [RegExp, string][] = [[/\bclaude code\b/gi, "Claude Code"]];
+
+/** An ISO date or time (`2026-10-26`, a UTC day folder), or an email: shown as it is, never as words. */
+const AS_IS = /^(\d{4}-\d{2}-\d{2}([T ].*)?|[^\s@]+@[^\s@]+\.[^\s@]+)$/;
+
 /** `close_date` as "Close date", `seats-target` as "Seats target"; a compiled skill's `review-a-pr~847aa47c` as
- * "Review a pr" (the `~` and hash after it tell versions apart, not what it is). */
+ * "Review a PR" (the `~` and hash after it tell versions apart, not what it is). Acronyms and product names keep
+ * their spelling (`claude_code` "Claude Code", `github` "GitHub", `meddpicc_champion` "MEDDPICC champion"); a date
+ * or an email is left as it is. */
 export function humanize(s: string): string {
+  if (AS_IS.test(s.trim())) return s;
   const t = s
     .replace(/~[0-9a-f]{6,}$/, "")
     .replace(/[_-]+/g, " ")
     .trim();
-  return t ? t.charAt(0).toUpperCase() + t.slice(1) : s;
+  if (!t) return s;
+  let out = t
+    .split(/\s+/)
+    .map((w) => (Object.hasOwn(SPELLED, w.toLowerCase()) ? SPELLED[w.toLowerCase()]! : w))
+    .join(" ");
+  for (const [re, name] of PHRASES) out = out.replace(re, name);
+  return out.charAt(0).toUpperCase() + out.slice(1);
 }
 
 /** What the server says of how an entity reads (`title`: a name from a fact the reader may read; `since`: when its
@@ -156,8 +214,23 @@ export function addedBy(source: string): string | undefined {
   return m?.[1] && !m[1].startsWith("key:") ? m[1] : undefined;
 }
 
-/** A source as a title: `slack:C04DEALS:1727790000.1` reads "Slack · C04DEALS", `hubspot:deal:globex-expansion`
- * reads "HubSpot deal · globex-expansion". */
+/** A Slack source's segments after `slack:` as a title: its channel's name where the source carries one
+ * (`C04DEALS:#deals:1727790000.1` reads "Slack #deals · Oct 1, 2024, 01:40 PM"), and when it was posted from the
+ * message's timestamp, never the channel's id or the raw timestamp (`ws:thread:C04DEALS:1727790000.1` reads "Slack
+ * thread · Oct 1, 2024, 01:40 PM"). */
+function slackTitle(rest: string[]): string {
+  const channel = rest.find((s) => s.startsWith("#") && s.length > 1);
+  const ts = [...rest].reverse().find((s) => /^\d{9,11}\.\d+$/.test(s));
+  const thread = rest.includes("thread");
+  const head = ["Slack", channel, thread ? "thread" : channel ? "" : "message"]
+    .filter(Boolean)
+    .join(" ");
+  const at = ts ? when(Number(ts) * 1_000_000) : "";
+  return at ? `${head} · ${at}` : head;
+}
+
+/** A source as a title: `slack:C04DEALS:#deals:1727790000.1` reads "Slack #deals · Oct 1, 2024, 01:40 PM",
+ * `hubspot:deal:globex-expansion` reads "HubSpot deal · globex-expansion". */
 export function sourceTitle(source: string): string {
   const by = addedBy(source);
   if (by) {
@@ -167,6 +240,7 @@ export function sourceTitle(source: string): string {
     return `${by} added it in Studio`;
   }
   const [p = "", ...rest] = source.split(":");
+  if (p.toLowerCase() === "slack" && rest.length) return slackTitle(rest);
   const brand: Record<string, string> = {
     slack: "Slack",
     hubspot: "HubSpot",

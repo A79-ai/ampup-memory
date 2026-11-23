@@ -7,7 +7,7 @@
 // shows. Modelled on an approvals inbox: requests, not rows; completed ones stay as the record.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiError } from "./api";
-import { useChoice, useFlag } from "./hashOptions";
+import { setOptions, useChoice, useFlag } from "./hashOptions";
 import { ago, entityName, humanize, when } from "./format";
 import {
   entityFocus,
@@ -87,6 +87,42 @@ function Author({ by, me }: { by: string; me?: string }) {
   );
 }
 
+/** Who records a decision the org's decisions model made (memstore's own reviewer, not a person). */
+const AUTO_REVIEWER = "memstore:auto-review";
+
+/** Who decided a proposal: a person, or the automatic review in words. */
+function Decider({ user, me }: { user: string; me?: string }) {
+  return user === AUTO_REVIEWER ? <span>The automatic review</span> : <Who user={user} me={me} />;
+}
+
+/** A decision's note as a reader takes it: the automatic review's record ("decided by <model>, 90% sure") says how
+ * sure it was, the model on hover; a person's note as they wrote it. */
+function DecisionNote({ d }: { d: { user: string; note?: string } }) {
+  if (!d.note) return null;
+  const auto = d.user === AUTO_REVIEWER ? /^decided by (.+), (\d+)% sure$/.exec(d.note) : null;
+  if (auto) return <span title={`Decided by the model ${auto[1]}`}> ({auto[2]}% sure)</span>;
+  return <>: “{d.note}”</>;
+}
+
+/** A proposal's draft branch in words. The engine names the branches it opens itself (resolving a conflict, an
+ * admin's fact, what extraction held for the owners); a person's branch keeps its name. */
+function BranchLabel({ branch }: { branch: string }) {
+  const said = branch.startsWith("resolve-")
+    ? "From resolving a conflict"
+    : branch.startsWith("fact-")
+      ? "A fact an admin added"
+      : branch.startsWith("held-")
+        ? "Held from extraction for its owners"
+        : null;
+  return said ? (
+    <span title={`Its draft branch: ${branch}`}>{said}</span>
+  ) : (
+    <span className="mono" title="Its draft branch">
+      {branch}
+    </span>
+  );
+}
+
 const STALE_TEXT: Record<string, string> = {
   draft_changed: "The draft changed after the review opened.",
   base_changed: "The memory under this draft changed on main.",
@@ -155,8 +191,10 @@ function Inbox({
 }) {
   const key = JSON.stringify([sel.org, sel.team]);
   const ps = useRead(() => review.proposals(sel), [key]);
-  // One page: its total counts the tab, and Needs you lists those on it the reader may settle.
-  const cs = useRead(() => review.conflicts(sel, { limit: 50 }), [key]);
+  // Every conflict the reader may see, for the tab: only its total.
+  const cs = useRead(() => review.conflicts(sel, { limit: 1 }), [key]);
+  // The conflicts on what the reader owns: Needs you lists a page of them and counts them all, as Home does.
+  const own = useRead(() => review.conflicts(sel, { mine: true, limit: CONFLICT_PAGE }), [key]);
   // The dream's decisions are its builders' (an org admin's): counts and the last pass, for the tabs and banner.
   const ds = useRead(
     () => (admin ? review.dream(sel, { status: "waiting", limit: 200 }) : Promise.resolve(null)),
@@ -192,9 +230,9 @@ function Inbox({
     if (ps.data && me && buckets.mine.length === 0 && filter === "mine") setFilter("all");
   }, [ps.data, me, buckets.mine.length, filter]);
 
-  const waitingDream = ds.data?.decisions ?? [];
-  const resolvable = (cs.data?.conflicts ?? []).filter((c) => c.can_resolve);
-  const needsN = buckets.mine.length + waitingDream.length + resolvable.length;
+  // What needs the reader, as Home counts it: the proposals waiting on them, every dream decision waiting, and every
+  // conflict on what they own. Each in all, not the page read.
+  const needsN = buckets.mine.length + (ds.data?.counts.waiting ?? 0) + (own.data?.total ?? 0);
   const tab = (id: typeof view, label: string, n?: number, nTitle?: string) => (
     <button
       role="tab"
@@ -213,6 +251,7 @@ function Inbox({
   const reloadAll = () => {
     ps.reload();
     cs.reload();
+    own.reload();
     ds.reload();
   };
   // Refresh also reads the dream's lists afresh (a card acted on otherwise stays put, showing its new state).
@@ -235,7 +274,9 @@ function Inbox({
         onClick={() => setView("proposals")}
       >
         Proposals
-        {buckets.mine.length > 0 && <span className="rv-n">{buckets.mine.length}</span>}
+        {buckets.mine.length > 0 && (
+          <span className="rv-n">{buckets.mine.length.toLocaleString()}</span>
+        )}
       </button>
       <button
         role="tab"
@@ -244,7 +285,9 @@ function Inbox({
         onClick={() => setView("conflicts")}
       >
         Conflicts
-        {cs.data && cs.data.total > 0 && <span className="rv-n">{cs.data.total}</span>}
+        {cs.data && cs.data.total > 0 && (
+          <span className="rv-n">{cs.data.total.toLocaleString()}</span>
+        )}
       </button>
     </div>
   );
@@ -266,7 +309,7 @@ function Inbox({
             <button className="btn" onClick={() => {
                 reloadAll();
                 setFresh((x) => x + 1);
-              }} disabled={ps.loading || cs.loading}>
+              }} disabled={ps.loading || cs.loading || own.loading}>
               <Icon name="refresh" size={14} /> Refresh
             </button>
           }
@@ -288,9 +331,13 @@ function Inbox({
             mine={buckets.mine}
             proposalsLoading={!ps.data}
             dream={ds}
-            conflicts={cs}
+            conflicts={own}
+            allConflicts={cs.data?.total}
             schema={schema}
-            onSeeConflicts={() => setView("conflicts")}
+            onSeeConflicts={(mine) => {
+              setView("conflicts");
+              setOptions({ mine: mine ? "1" : null });
+            }}
             onChanged={reloadAll}
             onFocus={onFocus}
           />
@@ -406,7 +453,9 @@ function Inbox({
                 onClick={() => setFilter(k)}
               >
                 {label}
-                {buckets[k].length > 0 && <span className="rv-n">{buckets[k].length}</span>}
+                {buckets[k].length > 0 && (
+                  <span className="rv-n">{buckets[k].length.toLocaleString()}</span>
+                )}
               </button>
             ))}
           </div>
@@ -465,6 +514,7 @@ function NeedsYou({
   proposalsLoading,
   dream,
   conflicts,
+  allConflicts,
   schema,
   onSeeConflicts,
   onChanged,
@@ -476,9 +526,13 @@ function NeedsYou({
   mine: ProposalSummary[];
   proposalsLoading: boolean;
   dream: Read<DreamList | null>;
+  /** A page of the conflicts on what the reader owns, with how many there are in all. */
   conflicts: Read<ConflictPage>;
+  /** How many conflicts the reader may see in all, theirs or not. */
+  allConflicts?: number;
   schema?: Map<string, OrgType>;
-  onSeeConflicts: () => void;
+  /** Opens Conflicts: those on what the reader owns, or all of them. */
+  onSeeConflicts: (mine: boolean) => void;
   onChanged: () => void;
   onFocus: (f: Focus) => void;
 }) {
@@ -486,15 +540,28 @@ function NeedsYou({
   const [decided, setDecided] = useState<DreamDecision[]>([]);
   const fresh = dream.data?.decisions ?? [];
   const waiting = [...fresh, ...decided.filter((d) => !fresh.some((w) => w.id === d.id))];
-  const mineToSettle = (conflicts.data?.conflicts ?? []).filter((c) => c.can_resolve);
-  const total = conflicts.data?.total ?? 0;
+  const waitingN = Math.max(dream.data?.counts.waiting ?? 0, fresh.length);
+  const mineToSettle = conflicts.data?.conflicts ?? [];
+  const ownN = conflicts.data?.total ?? 0;
+  // The conflicts on things others own (or no one does): not the reader's to do, though an admin may settle them.
+  const othersN = Math.max(0, (allConflicts ?? 0) - ownN);
   const loading = proposalsLoading || (admin && !dream.data && !dream.error) || !conflicts.data;
+  const others =
+    othersN > 0 ? (
+      <p className="muted rv-small">
+        {othersN.toLocaleString()} more {othersN === 1 ? "conflict is" : "conflicts are"} on things
+        you don't own{admin ? "; as an org admin you may settle them too" : ""}.{" "}
+        <button className="link" onClick={() => onSeeConflicts(false)}>
+          See all conflicts
+        </button>
+      </p>
+    ) : null;
   if (!loading && mine.length + waiting.length + mineToSettle.length === 0)
     return (
       <EmptyState icon="check" title="Nothing needs you">
-        {total > 0
-          ? `${total} ${total === 1 ? "conflict waits" : "conflicts wait"} for someone else to settle.`
-          : "When a change waits for your approval, the dream isn't sure of something, or two sources disagree, it shows here."}
+        {othersN > 0
+          ? others
+          : "When a change waits for your approval, the dream isn't sure of something, or two sources disagree about what you own, it shows here."}
       </EmptyState>
     );
   return (
@@ -515,10 +582,15 @@ function NeedsYou({
       )}
       {admin && (waiting.length > 0 || !dream.data) && (
         <div className="rv-group">
-          <div className="h-section">The dream wasn't sure</div>
+          <div className="h-section">
+            The dream wasn't sure
+            {waitingN > 0 && <span className="count">{waitingN.toLocaleString()}</span>}
+          </div>
           <p className="muted rv-small rv-group-lede">
             These aren't applied. Apply one if it's right; dismiss it and the dream won't suggest
             it again.
+            {waitingN > fresh.length &&
+              ` Showing the newest ${fresh.length.toLocaleString()} of ${waitingN.toLocaleString()}.`}
           </p>
           {dream.error && !dream.data ? (
             <ErrorState message={dream.error} onRetry={dream.reload} />
@@ -544,10 +616,11 @@ function NeedsYou({
       {(!conflicts.data || mineToSettle.length > 0) && (
         <div className="rv-group">
           <div className="h-section">
-            Facts that disagree
-            {total > mineToSettle.length && (
-              <button className="link rv-small rv-group-more" onClick={onSeeConflicts}>
-                all {total}
+            Facts that disagree about what you own
+            {ownN > 0 && <span className="count">{ownN.toLocaleString()}</span>}
+            {ownN > mineToSettle.length && (
+              <button className="link rv-small rv-group-more" onClick={() => onSeeConflicts(true)}>
+                all {ownN.toLocaleString()}
               </button>
             )}
           </div>
@@ -569,6 +642,7 @@ function NeedsYou({
           )}
         </div>
       )}
+      {!loading && others}
     </div>
   );
 }
@@ -641,7 +715,8 @@ export function dreamState(list: DreamList): DreamState {
   };
 }
 
-/** "ended 2, linked 1, named 1, 1 waiting for you", or that nothing needed changing. */
+/** "ended 2, linked 1, named 1, 1 new waiting for you" (that pass's, not all that wait), or that nothing needed
+ * changing. */
 export function dreamDid(p: DreamPass): string {
   return p.ended + p.linked + p.named + p.waiting === 0
     ? "nothing needed changing."
@@ -649,7 +724,7 @@ export function dreamDid(p: DreamPass): string {
         `ended ${p.ended}`,
         `linked ${p.linked}`,
         `named ${p.named}`,
-        p.waiting ? `${p.waiting} waiting for you` : null,
+        p.waiting ? `${p.waiting} new waiting for you` : null,
       ]
         .filter(Boolean)
         .join(", ") + ".";
@@ -683,7 +758,7 @@ export function appliedSaid(st: DreamState): string {
   return st.week === undefined ? all : `${st.week.toLocaleString()} this week, ${all}`;
 }
 
-/** "Dreamt 14:02: ended 2, linked 1, named 1, 1 waiting for you", and Dream now. */
+/** "Dreamt 14:02: ended 2, linked 1, named 1, 1 new waiting for you", and Dream now. */
 function DreamBanner({
   sel,
   list,
@@ -969,9 +1044,7 @@ export function DreamCard({
           ) : d.status === "released" ? (
             "Let go by the dream: what it rested on was forgotten or no longer stands."
           ) : (
-            <span className="mono" title={d.by}>
-              {d.kind === "share" ? "by the memory" : d.by.replace(/^dream:/, "dream · ")}
-            </span>
+            <span title={d.by}>{d.kind === "share" ? "By the memory" : "By the dream"}</span>
           )}
         </span>
         <span className="rv-dream-actions">
@@ -1041,8 +1114,10 @@ export function ProposalRow({
       className={`list-row rv-row rv-${p.status}`}
       onClick={() => onFocus({ kind: "review", proposal: p.id })}
     >
-      <div className="rv-when">
-        <span className="mono">{p.updated_at ? clock(p.updated_at) : ""}</span>
+      <div
+        className="rv-when"
+        title={p.updated_at ? `Last changed ${when(p.updated_at)}` : undefined}
+      >
         <span>{p.updated_at ? ago(p.updated_at) : ""}</span>
       </div>
       <StatusBadge status={p.status} />
@@ -1055,9 +1130,7 @@ export function ProposalRow({
           </div>
         )}
         <div className="list-sub rv-sub">
-          <span className="mono" title="Its draft branch">
-            {p.branch}
-          </span>
+          <BranchLabel branch={p.branch} />
           {p.entities.slice(0, 3).map((e) => (
             <span key={e} className="mono">
               {e}
@@ -1071,7 +1144,7 @@ export function ProposalRow({
       <div className="list-meta rv-owners">
         {p.status === "rejected" && p.rejected_by ? (
           <span className="rv-owner rv-bad">
-            <i /> <Who user={p.rejected_by} me={me} />
+            <i /> <Decider user={p.rejected_by} me={me} />
           </span>
         ) : p.status === "published" ? (
           <span>
@@ -1092,13 +1165,6 @@ export function ProposalRow({
     </button>
   );
 }
-
-const clock = (us: number) =>
-  new Date(us / 1000).toLocaleTimeString(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  });
 
 /* ---------- facts that disagree ---------- */
 
@@ -1913,17 +1979,52 @@ function TransferButton({
 
 /* ---------- one proposal ---------- */
 
+/** A change row's kind in a word. The engine names a row by its table (`episodes`, `fact_closures`). */
 const KIND_WORD: Record<string, string> = {
   fact: "fact",
+  facts: "fact",
   closure: "ends",
+  fact_closures: "ends",
   quote: "quote",
+  fact_quotes: "quote",
   retraction: "retracts",
+  episode_retractions: "retracts",
   schema: "schema",
   schemas: "schema",
   document: "document",
   episode: "episode",
+  episodes: "episode",
   aggregate: "aggregate",
+  aggregates: "aggregate",
 };
+
+/** What a change row that isn't a fact holds, in words, from the fields the engine gives it: an episode or document
+ * by its name and source, a quote by its words, what an ending or a retraction names. */
+function rowSaid(c: Change): { what: string; meta: string[] } {
+  const s = (k: string) => (typeof c[k] === "string" && c[k] ? (c[k] as string) : undefined);
+  const short = (k: string) => (s(k) ? `${s(k)!.slice(0, 12)}…` : undefined);
+  const word = KIND_WORD[c.kind] ?? c.kind;
+  const named = s("name") ?? s("document");
+  const [what, meta] =
+    word === "episode"
+      ? [
+          named ?? "An episode",
+          [s("document") && "a document", s("source") && `from ${s("source")}`, short("episode_id")],
+        ]
+      : word === "quote"
+        ? [s("quote") ? `“${s("quote")}”` : "A quote", [short("fact_id")]]
+        : word === "ends"
+          ? ["Ends a fact", [short("fact_id")]]
+          : word === "retracts"
+            ? ["Retracts an episode", [short("episode_id")]]
+            : [
+                [s("subject") ?? s("key") ?? named ?? s("source") ?? word, s("value")]
+                  .filter(Boolean)
+                  .join(": "),
+                [],
+              ];
+  return { what, meta: meta.filter((m): m is string => Boolean(m)) };
+}
 
 function ProposalPane({
   sel,
@@ -1964,6 +2065,12 @@ function ProposalPane({
   const decisions = v.decisions ?? [];
   const rejection = decisions.find((d) => !d.approve);
   const byAdmin = decisions.find((d) => d.approve && d.admin);
+  const byModel = decisions.find((d) => d.approve && d.user === AUTO_REVIEWER);
+  const title = titleOf({
+    entities,
+    changes: p.changes.length,
+    first: schemaChange && { predicate: "schema", value: schemaChange.value },
+  });
   const evidence: EvidenceRef[] =
     v.evidence_details ?? p.evidence.map((id) => ({ id, readable: true }));
   const withheld = evidence.filter((e) => !e.readable).length;
@@ -1997,7 +2104,9 @@ function ProposalPane({
       <nav className="crumbs" aria-label="Location">
         <button onClick={() => onFocus({ kind: "review" })}>Review</button>
         <Icon name="chevron" size={12} />
-        <button className="crumb-on mono">{p.id}</button>
+        <button className="crumb-on" title={`Proposal ${p.id}`}>
+          {title}
+        </button>
       </nav>
       <div className="head">
         <span className="kind k-entity">
@@ -2005,13 +2114,7 @@ function ProposalPane({
         </span>
         <div className="head-text">
           <div className="eyebrow">Proposal</div>
-          <h1 className="title">
-            {titleOf({
-              entities,
-              changes: p.changes.length,
-              first: schemaChange && { predicate: "schema", value: schemaChange.value },
-            })}
-          </h1>
+          <h1 className="title">{title}</h1>
           <div className="subtitle">
             <StatusBadge status={v.status} />
             <span>
@@ -2020,7 +2123,7 @@ function ProposalPane({
             {p.created_at ? (
               <span title={when(p.created_at)}>opened {ago(p.created_at)}</span>
             ) : null}
-            <span className="mono">{p.branch}</span>
+            <BranchLabel branch={p.branch} />
           </div>
         </div>
       </div>
@@ -2059,9 +2162,10 @@ function ProposalPane({
             <div className="banner banner-error rv-banner">
               <Icon name="close" size={14} />
               <span>
-                <Who user={rejection.user} me={me} /> rejected this
+                <Decider user={rejection.user} me={me} /> rejected this
                 {rejection.at ? ` ${ago(rejection.at)}` : ""}
-                {rejection.note ? <>: “{rejection.note}”</> : "."}
+                <DecisionNote d={rejection} />
+                {rejection.note && rejection.user !== AUTO_REVIEWER ? "" : "."}
               </span>
             </div>
           )}
@@ -2147,9 +2251,15 @@ function ProposalPane({
                           ? "rejected"
                           : v.status === "stale"
                             ? "must review again"
-                            : byAdmin && v.status === "published"
-                              ? "an admin approved"
-                              : "waiting"}
+                            : v.status === "published"
+                              ? byAdmin
+                                ? "an admin approved"
+                                : byModel
+                                  ? "approved automatically"
+                                  : "didn't decide"
+                              : v.status === "rejected"
+                                ? "didn't decide"
+                                : "waiting"}
                     </span>
                   </li>
                 );
@@ -2245,9 +2355,9 @@ function ProposalPane({
                   <li key={i}>
                     <span className="mono muted">{d.at ? ago(d.at) : ""}</span>
                     <span>
-                      <Who user={d.user} me={me} /> {d.approve ? "approved" : "rejected"}
+                      <Decider user={d.user} me={me} /> {d.approve ? "approved" : "rejected"}
                       {d.admin ? " as admin" : ""}
-                      {d.note ? <>: “{d.note}”</> : ""}
+                      <DecisionNote d={d} />
                     </span>
                   </li>
                 ))}
@@ -2313,6 +2423,27 @@ function SchemaChangeRow({ c }: { c: Change }) {
 
 function ChangeRow({ c, onFocus }: { c: Change; onFocus: (f: Focus) => void }) {
   if (c.kind === "schemas") return <SchemaChangeRow c={c} />;
+  // A row with no entity or attribute (an episode, a quote, an ending): what it holds, never "ended".
+  if (!c.entity && !c.predicate) {
+    const { what, meta } = rowSaid(c);
+    return (
+      <div className="rv-change">
+        <div className="rv-change-head">
+          <span className="badge">{KIND_WORD[c.kind] ?? c.kind}</span>
+        </div>
+        <div className="rv-diff">
+          <span className="rv-after">{what}</span>
+        </div>
+        {meta.length > 0 && (
+          <div className="rv-change-meta muted">
+            {meta.map((m) => (
+              <span key={m}>{m}</span>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
   const unchanged = c.before !== undefined && c.before !== null && c.before === c.value;
   const fresh = c.before === null;
   // A predicate that holds several values: the row adds one beside what main holds, never replaces it.

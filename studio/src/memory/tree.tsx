@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, browse, keptBrowse } from "./api";
 import { displayName } from "./format";
 import type { Child, Focus, Listing, Selection } from "./types";
@@ -27,19 +27,34 @@ function keptListing(path: string[], sel: Selection): Loaded | undefined {
   return l && { children: l.children, next: l.next, kept: true };
 }
 
+/** Whether `path` is the sessions' day folders, `sessions/ended/<day>`, each day as UTC names it. */
+export const isSessionDays = (path: string[]) =>
+  path.length === 2 && path[0] === "sessions" && path[1] === "ended";
+
+/** A folder's children in the order to show them: the sessions' days newest first (the memory lists every folder
+ * by name, so the oldest day comes first). Only a whole listing is turned; one still paging keeps the memory's
+ * order, so "Show more" carries on from where it stopped. */
+export function ordered(path: string[], children: Child[], next: string | null): Child[] {
+  return isSessionDays(path) && !next ? [...children].reverse() : children;
+}
+
 /** The memory as a tree: folders load their children when first opened, a page at a time. Mounted
- * afresh for each org or team selected. */
+ * afresh for each org or team selected. Hidden (`shown` false: a closed drawer), it reads nothing: the folders on
+ * the way to `reveal` are read once it shows. */
 export function Tree({
   sel,
   focus,
   onFocus,
   reveal,
+  shown = true,
 }: {
   sel: Selection;
   focus: Focus | null;
   onFocus: (f: Focus) => void;
   /** A path to open down to (when the inspector jumps somewhere). */
   reveal: string[] | null;
+  /** Whether the tree is on screen. */
+  shown?: boolean;
 }) {
   const [loaded, setLoaded] = useState<Record<string, Loaded>>(() => {
     const seen: Record<string, Loaded> = {};
@@ -57,21 +72,37 @@ export function Tree({
   );
   const isOpen = (path: string[]) => toggled[key(path)] ?? onTheWay.has(key(path));
 
-  // A folder's listing (or the next page of it), merged into what is loaded once it arrives.
+  // A folder's listing (or the next page of it), merged into what is loaded once it arrives. Opened by hand
+  // (`chain`), a folder whose only child is a folder opens that one too, and so on down (`slack` → its workspace →
+  // `thread`), so a run of single folders takes one click, not one each.
+  const live = useRef(true);
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+    };
+  }, []);
   const load = useCallback(
-    (path: string[], after?: string) =>
-      listing(path, after, sel).then((l) =>
+    (path: string[], after?: string, chain = false): Promise<void> =>
+      listing(path, after, sel).then((l) => {
+        if (!live.current) return;
         setLoaded((m) => {
           const prev = after ? (m[key(path)]?.children ?? []) : [];
           return { ...m, [key(path)]: { ...l, children: [...prev, ...l.children] } };
-        }),
-      ),
+        });
+        const only = !after && !l.next && l.children.length === 1 ? l.children[0] : undefined;
+        if (chain && only?.kind === "folder") {
+          setToggled((t) => (key(only.path) in t ? t : { ...t, [key(only.path)]: true }));
+          return load(only.path, undefined, true);
+        }
+      }),
     [sel],
   );
 
   // The root, then every folder on the way to `reveal` not read yet on this mount: a kept one shown
   // meanwhile is read again, and replaced unless more of it was paged in since.
   useEffect(() => {
+    if (!shown) return;
     const want = [[], ...(reveal ?? []).map((_, i) => reveal!.slice(0, i))].filter(
       (p) => !loaded[key(p)] || loaded[key(p)]!.kept,
     );
@@ -82,7 +113,7 @@ export function Tree({
           ...Object.fromEntries(got.filter(([k]) => !m[k] || m[k].kept)),
         })),
     );
-  }, [reveal, sel]);
+  }, [reveal, sel, shown]);
 
   const toggle = (path: string[]) => {
     const open = !isOpen(path);
@@ -90,7 +121,7 @@ export function Tree({
     if (open && (!loaded[key(path)] || loaded[key(path)]!.kept)) {
       const l = !loaded[key(path)] && keptListing(path, sel);
       if (l) setLoaded((m) => ({ ...m, [key(path)]: l }));
-      load(path);
+      load(path, undefined, true);
     }
   };
 
@@ -122,7 +153,7 @@ export function Tree({
       );
     return (
       <>
-        {l.children.map((c) => {
+        {ordered(path, l.children, l.next).map((c) => {
           const k = key(c.path) + (c.kind === "episode" ? c.episode_id : "");
           const opened = c.kind === "folder" && isOpen(c.path);
           return (
@@ -139,14 +170,20 @@ export function Tree({
                     onFocus({ kind: "skill", path: c.path });
                   else onFocus({ kind: "episode", id: c.episode_id! });
                 }}
-                title={c.when ? `${c.name}: ${c.when}` : c.name}
+                title={
+                  c.when
+                    ? `${c.name}: ${c.when}`
+                    : isSessionDays(path)
+                      ? `${c.name}, a day in UTC`
+                      : c.name
+                }
               >
                 <span className={`tree-caret ${opened ? "open" : ""}`}>
                   {c.kind === "folder" && <Icon name="chevron" size={12} />}
                 </span>
                 <Icon name={c.kind} size={15} />
                 <span className="tree-name">{label(c)}</span>
-                {c.count != null && <span className="tree-count">{c.count}</span>}
+                {c.count != null && <span className="tree-count">{c.count.toLocaleString()}</span>}
               </button>
               {opened && render(c.path, depth + 1)}
             </div>

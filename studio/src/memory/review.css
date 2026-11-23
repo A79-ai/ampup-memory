@@ -725,12 +725,15 @@
   .rv-views-gap {
     flex: 1;
   }
+  /* One column that never grows past the page: a long value or id in a card wraps instead of widening it. */
   .rv-needs {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: var(--s6);
   }
   .rv-group {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: var(--s2);
   }
   .rv-group .h-section {
@@ -748,6 +751,7 @@
   .rv-dreams,
   .rv-dreamlist {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: var(--s3);
   }
   .rv-more {
@@ -799,7 +803,10 @@
   .rv-dream {
     padding: var(--s3) var(--s4);
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: var(--s2);
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
   .rv-dream-waiting {
     border-color: var(--warn);
@@ -812,6 +819,7 @@
   }
   .rv-dream-head {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: var(--s2);
   }
@@ -855,6 +863,7 @@
     grid-template-columns: 96px minmax(0, 1fr);
     column-gap: var(--s2);
     align-items: baseline;
+    min-width: 0;
   }
   .rv-dfact-role {
     font-size: var(--t-xs);

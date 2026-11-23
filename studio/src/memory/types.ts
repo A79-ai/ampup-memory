@@ -42,7 +42,13 @@ export type AdviceView = {
   };
 };
 
-export type Listing = { path: string[]; children: Child[]; next: string | null };
+export type Listing = {
+  path: string[];
+  children: Child[];
+  next: string | null;
+  /** What the listed folder is called, where the console names it (a Slack channel's `#name` for its id). */
+  title?: string;
+};
 
 export type Fact = {
   fact_id: string;
@@ -54,6 +60,8 @@ export type Fact = {
   source_episodes: string[];
   quote: string | null;
   score?: number;
+  /** The search's mark on a hit that is not a close match; absent when it is one (or from a server before it). */
+  weak?: boolean;
 };
 
 export type EntityView = { path: string[]; entity: string; facts: Fact[] };
@@ -92,7 +100,7 @@ export type SkillView = {
 };
 
 /** A branch of the scope, with how many compiled skills the reader may read on it. */
-export type Branch = { name: string; skills: number };
+export type Branch = { name: string; skills: number | null };
 
 export type EpisodeView = {
   episode_id: string;

@@ -951,6 +951,8 @@ pub struct Vis {
     /// When the full build this state was made from read its tables ([`Vis::extended`]): past
     /// [`VIS_FULL_EVERY`], the next state is built in full.
     full_at: Instant,
+    /// Which build made this state ([`Vis::build`]): never the same for two states built apart.
+    build: u64,
 }
 
 /// The longest states are made from the last one ([`Vis::extended`]) before one is built in full again.
@@ -997,6 +999,87 @@ pub struct Added {
     fresh_until: Option<i64>,
     /// Episodes the state holds that were written again exactly as it holds them: nothing of them changed.
     rewritten: HashSet<String>,
+}
+
+/// Main's state a write is checked against ([`Store::held_state`]), with what was added since it was built and the
+/// tables that holds, when it is the last state rather than one built for the tables now.
+struct HeldState {
+    stamp: VisStamp,
+    vis: Arc<Vis>,
+    added: Option<(VisStamp, Added)>,
+}
+
+/// Why [`Vis::only_added`] refuses when all that may take memory away since the state is an episode written again:
+/// no side table, rewrite or merge.
+const WRITTEN_AGAIN: &str = "an episode written again";
+
+/// How long a store remembers an episode it committed to main ([`SentHere`]).
+const SENT_HERE_FOR: Duration = Duration::from_secs(600);
+
+/// How many episodes a store remembers committing to main at most ([`SentHere`]).
+const SENT_HERE_MAX: usize = 4096;
+
+/// The most episodes a commit may hold for [`SentHere`] to keep them: a note, a record and its echo.
+const SENT_HERE_COMMIT: usize = 16;
+
+/// The episodes this store committed to main lately, versions of a document aside, each with what its row said and
+/// when: for a copy sent again while main's state can't be used ([`Store::sent_again`]). A removal made here clears
+/// its scope; one made anywhere shows in the tables, which the check reads.
+#[derive(Default)]
+struct SentHere {
+    rows: HashMap<(String, String), (RowSays, Instant)>,
+}
+
+impl SentHere {
+    /// Keeps what a commit of `episodes` to `ns`'s main wrote, versions of a document aside. When full, the stale go
+    /// first, then the oldest quarter, so a full map is swept once in a while, not at every commit.
+    fn insert(&mut self, ns: &str, episodes: &[Episode]) {
+        if self.rows.len() + episodes.len() > SENT_HERE_MAX {
+            self.rows.retain(|_, (_, at)| at.elapsed() < SENT_HERE_FOR);
+        }
+        if self.rows.len() + episodes.len() > SENT_HERE_MAX {
+            let mut ages: Vec<(Instant, (String, String))> = self
+                .rows
+                .iter()
+                .map(|(k, (_, at))| (*at, k.clone()))
+                .collect();
+            ages.sort_unstable_by_key(|(at, _)| *at);
+            for (_, k) in ages.into_iter().take(SENT_HERE_MAX / 4 + episodes.len()) {
+                self.rows.remove(&k);
+            }
+        }
+        let now = Instant::now();
+        for e in episodes.iter().filter(|e| e.document.is_none()) {
+            self.rows.insert(
+                (ns.to_string(), e.episode_id.clone()),
+                (RowSays::of(e), now),
+            );
+        }
+    }
+
+    /// Whether this store committed one of `episodes` to `ns`'s main within [`SENT_HERE_FOR`].
+    fn holds_any(&self, ns: &str, episodes: &[Episode]) -> bool {
+        episodes.iter().any(|e| {
+            self.rows
+                .get(&(ns.to_string(), e.episode_id.clone()))
+                .is_some_and(|(_, at)| at.elapsed() < SENT_HERE_FOR)
+        })
+    }
+
+    fn clear(&mut self, ns: &str) {
+        self.rows.retain(|(of, _), _| of != ns);
+    }
+}
+
+/// What [`Store::held_state`] found to check a write against.
+enum Held {
+    /// No state, and nothing else: none is held.
+    None,
+    /// A state of main.
+    State(Box<HeldState>),
+    /// No usable state, but these episodes this store wrote a moment ago just as they are sent again
+    /// ([`Store::sent_again`]): held.
+    Sent(HashSet<String>),
 }
 
 /// What main holds already of a write ([`Store::held_as_is`]).
@@ -1060,6 +1143,64 @@ impl View {
 tokio::task_local! {
     /// Set while a visibility state is built in the background ([`Store::refresh_vis_later`]): no read waits for it.
     static VIS_BACKGROUND: ();
+    /// The state each scope's reads that may lag were served in this request ([`one_state_per_request`]).
+    static REQUEST_STATES: Mutex<HashMap<(String, String), (Arc<Vis>, Arc<Added>)>>;
+}
+
+/// `fut`, a request: its reads of a scope that may be served the last state ([`Store::pin_lagging`],
+/// [`Store::lagging_view`]) are all served the state the first of them was, as one pinned session's reads are, so
+/// the request waits for a build at most once however many of its steps read the scope. A write it makes to the
+/// scope ([`Store::invalidate`], a commit) ends that: its next read is served a state that holds the write.
+pub async fn one_state_per_request<F: std::future::Future>(fut: F) -> F::Output {
+    REQUEST_STATES.scope(Mutex::default(), fut).await
+}
+
+/// The state this request's reads of `key` were served, while it may still be: no older than [`VIS_LAG_LIMIT`]
+/// and nothing in it aged out.
+fn request_state(key: &(String, String)) -> Option<(Arc<Vis>, Arc<Added>)> {
+    let (v, added) = REQUEST_STATES
+        .try_with(|m| m.lock().unwrap().get(key).cloned())
+        .ok()
+        .flatten()?;
+    let now = now_micros();
+    (v.built_at.elapsed() < VIS_LAG_LIMIT
+        && v.fresh_until.is_none_or(|t| now < t)
+        && added.fresh_until.is_none_or(|t| now < t))
+    .then_some((v, added))
+}
+
+/// This request wrote to `ns` (every scope, for the shared ledger): its reads of it are served a state that holds
+/// the write ([`one_state_per_request`]).
+fn request_wrote(ns: &str) {
+    let _ = REQUEST_STATES.try_with(|m| {
+        m.lock()
+            .unwrap()
+            .retain(|(n, _), _| ns != SYSTEM_NS && n != ns)
+    });
+}
+
+/// This request wrote to `scope` from a task of its own, which [`one_state_per_request`] doesn't reach: its next read
+/// of the scope is served a state that holds the write, as after a commit it made itself.
+pub fn request_wrote_to(scope: &Scope) {
+    request_wrote(&scope.namespace());
+}
+
+/// Held for a write to a scope: [`request_wrote`] when it begins and again when it ends, so that no read the request
+/// made meanwhile stands for a state after it.
+struct RequestWrites(String);
+
+impl RequestWrites {
+    fn to(scope: &Scope) -> RequestWrites {
+        let ns = scope.namespace();
+        request_wrote(&ns);
+        RequestWrites(ns)
+    }
+}
+
+impl Drop for RequestWrites {
+    fn drop(&mut self) {
+        request_wrote(&self.0);
+    }
 }
 
 /// Whether each lagged visibility read is checked against a fresh build of the same tables, and fails if it held
@@ -1167,10 +1308,65 @@ fn ledger_print(batches: &[RecordBatch], ns: &str) -> LedgerPrint {
     (n, a, b)
 }
 
+/// The next [`Vis::build`]: each state built gets one never used before.
+fn next_build() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The next fresh [`Vis::removals`]: a state with no earlier one to compare with gets one never used before.
 fn fresh_removals() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many times each scope namespace's memory lost something, as this process knows it: a forget, a delete, a
+/// retraction, a narrowed ACL (owner approval needed or not), a version retired, a retention policy, a purge or
+/// an offboarding made here (counted when it ends, however it ends), and any loss a build of main's state found
+/// ([`Vis::removals`], which covers what aged out and what another process took away). What is kept past new
+/// writes is kept under this count, read before the state it reads is pinned, and is never answered once it moved.
+static LOSSES: std::sync::LazyLock<Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Scope namespace `ns`'s loss count ([`LOSSES`]). Read it before pinning the state an answer kept by it reads.
+pub fn losses(ns: &str) -> u64 {
+    *LOSSES.lock().unwrap().entry(ns.to_string()).or_insert(0)
+}
+
+/// `ns` lost something: and so did every namespace under it (`<ns>__…`, an org's teams), when `under`.
+fn lost(ns: &str, under: bool) {
+    let mut all = LOSSES.lock().unwrap();
+    *all.entry(ns.to_string()).or_insert(0) += 1;
+    if under {
+        for (k, n) in all.iter_mut() {
+            if k.strip_prefix(ns)
+                .is_some_and(|rest| rest.starts_with("__"))
+            {
+                *n += 1;
+            }
+        }
+    }
+}
+
+/// A removal from a scope namespace under way: its loss is counted when it ends, however it ends (a write made
+/// before an error counts too), so a read that pinned memory before it ended is never answered again after.
+pub(crate) struct Losing(String, bool);
+
+impl Losing {
+    pub(crate) fn of(ns: impl Into<String>) -> Losing {
+        Losing(ns.into(), false)
+    }
+
+    /// A removal from `ns` and every namespace under it (an org's teams).
+    pub(crate) fn under(ns: impl Into<String>) -> Losing {
+        Losing(ns.into(), true)
+    }
+}
+
+impl Drop for Losing {
+    fn drop(&mut self) {
+        lost(&self.0, self.1);
+    }
 }
 
 /// Documents kept in versions: each version's document, and each document's versions, newest
@@ -1249,6 +1445,15 @@ impl Vis {
     /// The heads this state sees from (sorted): two states with the same heads read the same commits.
     pub fn heads(&self) -> &[String] {
         &self.heads
+    }
+
+    /// Which build made this state, unique to it: what was worked out from one state holds for the same build, and
+    /// for no other. Two states with the same heads can hold different things: the tables a state is built from
+    /// are each read as this server last cached them, so one built while the episodes table lagged the ledger
+    /// holds a commit without its episodes (a conflict's record, say), which the next build of the same heads has.
+    /// A state kept as it is (only other scopes' ledger rows moved) keeps its build.
+    pub fn build(&self) -> u64 {
+        self.build
     }
 
     /// Why this main state, built from the tables `built_from`, must be built again before a read of the tables
@@ -1344,9 +1549,9 @@ impl Vis {
         // An episode readers have written again: a forget, a narrowed ACL or a new version, which its commit may
         // take away. Rows of a new commit are looked for in every file: one written before its commit lands
         // counts with it. Such a row is let through only when its episode is current here and the row says what
-        // the state's newest row of it says ([`RowSays`]: readers, time, document, source, subjects): a writer
-        // sending again what it sent before. Any other difference can take memory away in ways the state alone
-        // can't rule out.
+        // the state's newest row of it says ([`RowSays`]: readers, time, document, source, subjects), or all of it
+        // but the time: a writer sending again what it sent before. Any other difference can take memory away in
+        // ways the state alone can't rule out.
         let known = |e: &str| {
             self.acls.contains_key(e)
                 || self.retracted.contains(e)
@@ -1385,25 +1590,42 @@ impl Vis {
             };
             let ids: Vec<String> = again.iter().map(|(b, i)| id_of(b, *i)).collect();
             if ids.iter().any(|e| !self.acls.contains_key(e)) {
-                return Err("an episode written again");
+                return Err(WRITTEN_AGAIN);
             }
             let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
             let held = newest_rows(&built_from[1], &self.committed, &wanted);
             for ((b, i), e) in again.iter().zip(&ids) {
-                if held.get(e).and_then(Option::as_ref) != Some(&RowSays::at(b, *i)) {
-                    return Err("an episode written again");
+                let says = RowSays::at(b, *i);
+                match held.get(e).and_then(Option::as_ref) {
+                    Some(h) if *h == says => {}
+                    // The same record sent again with the time of this send (a hook's note after a retry, the
+                    // record of what its writer was served, a connector's record read again): a build holds it
+                    // under the same readers, kind and subjects, and differs only in when it ages out
+                    // ([`retimed`]) and, for a version of a document, where its time places it among the
+                    // document's versions ([`Vis::extended`] places it so). Not a record of a conflict or a
+                    // restatement (a restatement counts from its record's time), nor one a newer version or a
+                    // delete hid and that came back, whose return a build dates.
+                    Some(h)
+                        if h.but_time() == says.but_time()
+                            && !says.source.starts_with(conflicts::SOURCE)
+                            && !self.revived.contains_key(e) => {}
+                    _ => return Err(WRITTEN_AGAIN),
                 }
             }
             rewritten.extend(ids);
         }
+        let now_us = now_micros();
+        // A record sent again ages from every row of it, as a build ages it: one dated past its retention is hidden
+        // by a build, and one that ages out sooner than this state does makes the state stale sooner.
+        let retimed = retimed(&again, &self.retention, now_us)?;
         let deleted_sources: HashSet<&str> = self
             .retraction_targets
             .iter()
             .filter_map(|t| t.strip_prefix("source:"))
             .collect();
-        let now_us = now_micros();
         let mut added = Added {
             rewritten,
+            fresh_until: retimed,
             ..Added::default()
         };
         if commits.is_empty() {
@@ -1502,9 +1724,9 @@ impl Vis {
     /// before its commit landed); the ledger and episodes were only appended to; none of the scope's new commits
     /// is on this branch; each new commit on main follows only main's commits (no merge brings another branch's
     /// commits to main, where its deletes would hold here); and no new episode row is one of a commit this state
-    /// holds (read after its commit), is one this state knows (a row written again can narrow its ACL, which
-    /// main's newest row governs here), carries a deleted source, or ages out under retention before this state
-    /// would. Anything else is built.
+    /// holds (read after its commit), is one this state knows under readers other than those it holds it under (a
+    /// row written again can narrow its ACL, which main's newest row governs here), carries a deleted source, or
+    /// ages out under retention before this state would. Anything else is built.
     fn branch_unchanged(
         &self,
         ns: &str,
@@ -1572,7 +1794,7 @@ impl Vis {
         for b in &episodes {
             let text = |c: &str| b.column_by_name(c).expect(c).as_string::<i32>();
             let (id, source) = (text("episode_id"), text("source"));
-            let commit = text("commit_id");
+            let (commit, acl) = (text("commit_id"), text("acl"));
             for i in 0..b.num_rows() {
                 // The ledger and the episodes are read apart, so a state can be built from a ledger that holds a
                 // commit and episodes that don't hold its rows yet: they arrive later, as new rows of a commit
@@ -1580,7 +1802,16 @@ impl Vis {
                 if self.committed.contains(commit.value(i)) {
                     return Err("rows of a commit the branch holds, read after it");
                 }
-                if known(id.value(i)) {
+                // A row written again on main governs the branch's readers of it by its ACL alone (its document,
+                // kind and time count only on the commits the branch holds, which this one isn't): one naming the
+                // readers the branch holds it under (a record sent again) changes nothing here. Its source and
+                // its age are looked at below, as a new episode's are.
+                if known(id.value(i))
+                    && !self
+                        .acls
+                        .get(id.value(i))
+                        .is_some_and(|held| same_readers(held, &split_list(acl.value(i))))
+                {
                     return Err("an episode written again");
                 }
                 // A delete naming a source hides every episode that ever carried it, wherever it was written.
@@ -1690,7 +1921,11 @@ impl Vis {
             .collect();
         let now_us = now_micros();
         let mut hidden: HashSet<String> = HashSet::new();
-        let mut fresh_until = self.fresh_until;
+        // Records sent again but for their time age from their new rows too ([`Vis::only_added`]).
+        let mut fresh_until = match (self.fresh_until, added.fresh_until) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         // The committed rows among those, in table order: the new commits' wherever they are, and a new file's rows of
         // a commit main already held (written after it). Each is a new episode's (`only_added` refuses any other,
         // but one written again just as the state holds it, which changes nothing and is passed over).
@@ -1784,6 +2019,54 @@ impl Vis {
             let v = documents.versions.entry(d.to_string()).or_default();
             v.push((*at, e.to_string()));
             v.sort_by(|a, b| b.cmp(a));
+        }
+        // A version sent again but for its time takes the time of its newest committed row, as a build dates it
+        // ([`Documents::build`]): its rows are read again, those of the versions sent again alone.
+        let redated: HashSet<&str> = added
+            .rewritten
+            .iter()
+            .map(String::as_str)
+            .filter(|e| documents.of.contains_key(*e))
+            .collect();
+        if !redated.is_empty() {
+            let (mut of, mut newest) = (HashMap::new(), HashMap::new());
+            for b in now[1].iter() {
+                let docs = optional_strings(b, "document");
+                if docs.iter().all(Option::is_none) {
+                    continue;
+                }
+                let (commit, id) = (strings(b, "commit_id"), strings(b, "episode_id"));
+                let (occurred, recorded) =
+                    (timestamps(b, "occurred_at"), timestamps(b, "recorded_at"));
+                for i in 0..b.num_rows() {
+                    if let Some(d) = &docs[i]
+                        && redated.contains(id[i].as_str())
+                        && committed.contains(&commit[i])
+                    {
+                        Documents::keep(
+                            &mut of,
+                            &mut newest,
+                            &id[i],
+                            d,
+                            occurred[i].unwrap_or_default(),
+                            recorded[i].unwrap_or(i64::MIN),
+                        );
+                    }
+                }
+            }
+            for (e, (d, at)) in of {
+                if let Some(was) = documents.of.insert(e.clone(), d.clone())
+                    && let Some(v) = documents.versions.get_mut(&was)
+                {
+                    v.retain(|(_, x)| *x != e);
+                    if v.is_empty() {
+                        documents.versions.remove(&was);
+                    }
+                }
+                let v = documents.versions.entry(d).or_default();
+                v.push((at, e));
+                v.sort_by(|a, b| b.cmp(a));
+            }
         }
         let replaced_sources: HashSet<&String> = self.superseded.values().collect();
         let (mut kinds, mut merges, mut source_acls) = (
@@ -1883,6 +2166,7 @@ impl Vis {
             ledger_print: print,
             built_at: read_at,
             full_at: self.full_at,
+            build: next_build(),
         })
     }
 
@@ -2426,6 +2710,17 @@ impl RowSays {
         }
     }
 
+    /// What it says but when it occurred.
+    fn but_time(&self) -> (&str, &Option<String>, &[String], bool, &BTreeSet<String>) {
+        (
+            &self.source,
+            &self.document,
+            &self.about,
+            self.index_text,
+            &self.acl,
+        )
+    }
+
     /// Row `i` of an episodes batch (columns older files lack read as a new row of them would).
     fn at(b: &RecordBatch, i: usize) -> Self {
         let text = |c: &str| {
@@ -2457,9 +2752,95 @@ impl RowSays {
     }
 }
 
+/// A source's family, not its ids: `linear:…:<last>`; for what an author wrote ([`REMEMBER_SOURCE`]), its writer
+/// too, the author left out: `mcp:…:claude-code:…:<session>` (a hook's note), `mcp:…:memstore:session:…:<session>`
+/// (a session's record), `mcp:…:advice-trace:…:<session>`, `mcp:…:served`.
+fn source_family(s: &str) -> String {
+    let (Some((first, _)), Some((_, last))) = (s.split_once(':'), s.rsplit_once(':')) else {
+        return s.chars().take(24).collect();
+    };
+    if first == s || last == first {
+        return s.chars().take(24).collect();
+    }
+    // After the author: a service key's `key:<org>/<name>`, else an email.
+    let written = s
+        .strip_prefix(REMEMBER_SOURCE)
+        .and_then(|r| r.strip_prefix(':'))
+        .and_then(|r| match r.strip_prefix("key:") {
+            Some(k) => k.split_once(':').map(|(_, w)| w),
+            None => r.split_once(':').map(|(_, w)| w),
+        })
+        .filter(|w| *w != last);
+    let Some(written) = written else {
+        return format!("{first}:…:{last}");
+    };
+    let mut parts = written.split(':');
+    let mut kind = parts.next().unwrap_or_default().to_string();
+    // The engine's own records name what they are next: `memstore:session:`, `memstore:transcript:`.
+    if kind == "memstore"
+        && let Some(next) = parts.next()
+    {
+        kind = format!("{kind}:{next}");
+    }
+    format!("{first}:…:{kind}:…:{last}")
+}
+
+/// Says (at most once a minute a scope) why main doesn't hold an episode sent again but for its time
+/// ([`Store::held_but_time`]): what its newest row on main says otherwise, or that it is an older version of its
+/// document. Written, it makes the next read build the state in full ([`Vis::only_added`]).
+fn say_not_held(ns: &str, e: &Episode, held: &RowSays, newest_version: bool) {
+    static SAID: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+        std::sync::LazyLock::new(Mutex::default);
+    {
+        let mut said = SAID.lock().unwrap();
+        if said
+            .get(ns)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+        {
+            return;
+        }
+        said.insert(ns.to_string(), Instant::now());
+    }
+    let sent = RowSays::of(e);
+    let mut differs: Vec<&str> = vec![];
+    if held.source != sent.source {
+        differs.push("source");
+    }
+    if held.document != sent.document {
+        differs.push("document");
+    }
+    if held.about != sent.about {
+        differs.push("subjects");
+    }
+    if held.index_text != sent.index_text {
+        differs.push("text index");
+    }
+    if held.acl != sent.acl {
+        differs.push(
+            match (sent.acl.is_subset(&held.acl), held.acl.is_subset(&sent.acl)) {
+                (true, false) => "readers (fewer)",
+                (false, true) => "readers (more)",
+                _ => "readers",
+            },
+        );
+    }
+    if !newest_version {
+        differs.push("not its document's newest version");
+    }
+    eprintln!(
+        "held check on {ns} main: {} sent again but not held: {} ({})",
+        e.episode_id.chars().take(12).collect::<String>(),
+        differs.join(", "),
+        source_family(&e.source)
+    );
+}
+
 /// The newest committed row of each of `ids` in `episodes`, as a build ranks rows (the newest recorded wins; rows
-/// recorded at once are one state, their readers joined). `None` for one whose rows recorded at once say
-/// different things but their readers: a build's pick among them isn't one a rewrite can be said to match.
+/// recorded at once are one state, their readers joined). Rows recorded at once that differ only in their time
+/// (copies of one record sent at once, committed together) say it with no time: the record is held as the build
+/// holds it, its time is not one of theirs, so it matches a row sent again but for its time ([`RowSays::but_time`])
+/// and never one sent exactly. `None` for one whose rows recorded at once say different things but their readers
+/// and time: a build's pick among them isn't one a rewrite can be said to match.
 fn newest_rows(
     episodes: &[RecordBatch],
     committed: &HashSet<String>,
@@ -2490,6 +2871,9 @@ fn newest_rows(
                         let mut row = row;
                         let mut acl = std::mem::take(&mut h.acl);
                         acl.append(&mut row.acl);
+                        if h.occurred_at != row.occurred_at {
+                            (h.occurred_at, row.occurred_at) = (None, None);
+                        }
                         (h == row).then_some(RowSays { acl, ..h })
                     });
                 }
@@ -2506,25 +2890,57 @@ type Plan = (Instant, Table, Vec<FileScanTask>);
 type DecodedFiles = HashMap<String, Arc<Vec<RecordBatch>>>;
 /// The tables a visibility state was built from (see `Store::visibility_at`).
 type VisStamp = [Arc<Vec<RecordBatch>>; 8];
+/// Those tables as read ([`Store::vis_tables`]): ledger, episodes, quotes, schemas, closures, retractions,
+/// retention, governance.
+type VisTables = (
+    Snapshot,
+    Snapshot,
+    Snapshot,
+    Arc<Vec<RecordBatch>>,
+    Arc<Vec<RecordBatch>>,
+    Arc<Vec<RecordBatch>>,
+    Arc<Vec<RecordBatch>>,
+    Arc<Vec<RecordBatch>>,
+);
 type CachedVis = (VisStamp, Arc<Vis>);
 /// Held while one visibility state is built (see `Store::visibility_at`).
 type VisBuild = Arc<tokio::sync::Mutex<()>>;
+/// Per visibility key: its build's gate, and how many readers hold it ([`GateHeld`]).
+type VisBuilds = Arc<Mutex<HashMap<(String, String), (VisBuild, usize)>>>;
 
-/// Takes a visibility build's gate out of the map when dropped, if it is still that gate.
-struct GateGone<'a> {
-    builds: &'a Mutex<HashMap<(String, String), VisBuild>>,
+/// A reader's hold on a visibility key's build gate. The gate stays in the map while anyone holds it, so every
+/// reader of the key queues on the same gate and one build of it runs at a time; the last holder takes it out of
+/// the map, however it ends (built, failed, or dropped by a client that gave up). Keys include every followed
+/// cursor's pin, so none may stay behind.
+struct GateHeld {
+    builds: VisBuilds,
     key: (String, String),
     gate: VisBuild,
 }
 
-impl Drop for GateGone<'_> {
+impl GateHeld {
+    fn take(builds: &VisBuilds, key: &(String, String)) -> GateHeld {
+        let mut all = builds.lock().unwrap();
+        let (gate, holders) = all.entry(key.clone()).or_default();
+        *holders += 1;
+        GateHeld {
+            builds: builds.clone(),
+            key: key.clone(),
+            gate: gate.clone(),
+        }
+    }
+}
+
+impl Drop for GateHeld {
     fn drop(&mut self) {
-        let mut builds = self.builds.lock().unwrap();
-        if builds
-            .get(&self.key)
-            .is_some_and(|g| Arc::ptr_eq(g, &self.gate))
+        let mut all = self.builds.lock().unwrap();
+        if let Some((gate, holders)) = all.get_mut(&self.key)
+            && Arc::ptr_eq(gate, &self.gate)
         {
-            builds.remove(&self.key);
+            *holders -= 1;
+            if *holders == 0 {
+                all.remove(&self.key);
+            }
         }
     }
 }
@@ -3315,12 +3731,14 @@ pub struct Store {
     vis: Arc<Mutex<HashMap<(String, String), CachedVis>>>,
     /// Per visibility key: held while that state is built, so readers that miss it together wait for one
     /// build and take what it built rather than each building it again.
-    vis_builds: Arc<Mutex<HashMap<(String, String), VisBuild>>>,
+    vis_builds: VisBuilds,
     /// Per visibility key: its background build, while reads are served the last state.
     vis_refresh: Arc<Mutex<HashMap<(String, String), VisRefresh>>>,
     /// Per scope: when memory was last remembered or ingested into it through this store
     /// ([`Store::content_written`]): reads after it wait for a state that holds it.
     written: Arc<Mutex<HashMap<String, Instant>>>,
+    /// The episodes this store committed to main lately ([`SentHere`]).
+    sent_here: Arc<Mutex<SentHere>>,
     /// Per side table (`<ns>.<name>`: schemas, closures): when it was last found missing (a scope
     /// created before the table existed, not yet evolved by `ensure_scope`), so reads don't ask
     /// the catalog every time.
@@ -3377,6 +3795,11 @@ struct DirState {
     /// The fold, when it was loaded, and the directory table snapshot it was folded from (none: not
     /// known). Held across a load, so concurrent loads are one load.
     folded: tokio::sync::Mutex<Option<HeldFold>>,
+    /// The same fold, set whenever `folded` is: read without waiting on a load under way, so a caller the fold
+    /// already serves doesn't wait for another caller's load to finish.
+    latest: std::sync::Mutex<Option<HeldFold>>,
+    /// Whether a load started for [`Store::directory_behind`] is under way: one at a time.
+    refreshing: std::sync::atomic::AtomicBool,
     /// The last load's transient failure, when, and how long until the catalog is read again
     /// ([`retry::cooldown`]): meanwhile a load returns it at once rather than each request spending the quota.
     failed: std::sync::Mutex<Option<(Instant, Duration, String)>>,
@@ -3424,6 +3847,7 @@ impl Store {
             vis_builds: Arc::default(),
             vis_refresh: Arc::default(),
             written: Arc::default(),
+            sent_here: Arc::default(),
             no_side_table: Arc::default(),
             clock_offset_us: 0,
             index_base: search::default_index_base(),
@@ -3513,6 +3937,7 @@ impl Store {
         self.vis_builds = other.vis_builds.clone();
         self.vis_refresh = other.vis_refresh.clone();
         self.written = other.written.clone();
+        self.sent_here = other.sent_here.clone();
         self.no_side_table = other.no_side_table.clone();
         self
     }
@@ -3796,6 +4221,7 @@ impl Store {
     }
 
     pub fn invalidate(&self, ns: &str, name: &str) {
+        request_wrote(ns);
         if name == FACTS {
             *self
                 .plan_generation
@@ -4045,6 +4471,8 @@ impl Store {
         actor: &str,
         closures: &[(&str, i64, &Episode)],
     ) -> Result<String> {
+        // What this store wrote lately may be taken away: none of it is held as written here ([`SentHere`]).
+        self.sent_here.lock().unwrap().clear(&scope.namespace());
         not_held(branch)?;
         let id = self.write_closures(scope, branch, closures).await?;
         let branch_name = branch.to_string();
@@ -4924,6 +5352,7 @@ impl Store {
         closures: &[Closure],
         adds: Option<&schema::Schema>,
     ) -> Result<String> {
+        let _writes = RequestWrites::to(scope);
         self.check_fence()?;
         validate_write(episodes, facts)?;
         // An org past its expiry takes no new memory (`crate::limits`), whichever way it comes; what changes only
@@ -4986,7 +5415,8 @@ impl Store {
             store.fence = None;
             tokio::spawn(async move { store.lead_commits().await });
         }
-        wait.await
+        let committed = wait
+            .await
             .map_err(|_| anyhow::anyhow!("the group-commit leader stopped"))?
             // The leader hands each commit its outcome as text (one failure can be several commits'); an owner's
             // refusal is typed again here, so a caller can tell it apart (`commit_extracted_on`).
@@ -4995,7 +5425,19 @@ impl Store {
                     true => governance::OwnerApprovalRequired.into(),
                     false => anyhow::anyhow!(e),
                 },
-            )
+            );
+        // A bulk commit (an ingest, a load) is not a copy anyone sends again: only a few episodes at a time are kept.
+        if committed.is_ok()
+            && branch == MAIN
+            && !episodes.is_empty()
+            && episodes.len() <= SENT_HERE_COMMIT
+        {
+            self.sent_here
+                .lock()
+                .unwrap()
+                .insert(&scope.namespace(), episodes);
+        }
+        committed
     }
 
     /// Says (at most once a minute a scope) who writes on main episodes its last state already holds: each such
@@ -5035,14 +5477,7 @@ impl Store {
             }
             said.insert(ns.clone(), Instant::now());
         }
-        // A source's family, not its ids: `remember:…:conversation`, `linear:…`.
-        let family = |s: &str| match (s.split_once(':'), s.rsplit_once(':')) {
-            (Some((first, _)), Some((_, last))) if first != s && last != first => {
-                format!("{first}:…:{last}")
-            }
-            _ => s.chars().take(24).collect(),
-        };
-        let families: BTreeSet<String> = again.iter().map(|e| family(&e.source)).collect();
+        let families: BTreeSet<String> = again.iter().map(|e| source_family(&e.source)).collect();
         eprintln!(
             "episodes written again on {ns} main by {actor}: {} of {} (sources {})",
             again.len(),
@@ -5064,31 +5499,289 @@ impl Store {
         episodes: &[Episode],
         sources: &BTreeSet<String>,
     ) -> Result<HeldAsIs> {
+        self.held_on_main(scope, episodes, sources, false).await
+    }
+
+    /// Of `episodes`, about to be written on main, those main holds already as they are but for when they occurred
+    /// ([`Store::held_as_is`], the time aside): a record its writer sends again with the time of this send (a
+    /// session's transcript at its second end, a note a hook sent again after a timeout). Written, it would change
+    /// only that time, and the next read of the scope would wait for a full build of the state
+    /// ([`Vis::only_added`]). A version of a document counts only while it is the document's newest version: the
+    /// time orders a document's versions, so an older one sent again is current again and is written. Unlike
+    /// `held_as_is`, it reads main as of the tables now ([`Store::held_state`]), not the last state as long as it is
+    /// recent: in a quiet scope that state ages while it still serves, and what was forgotten since counts.
+    pub async fn held_but_time(
+        &self,
+        scope: &Scope,
+        episodes: &[Episode],
+    ) -> Result<HashSet<String>> {
+        Ok(self
+            .held_on_main(scope, episodes, &BTreeSet::new(), true)
+            .await?
+            .same)
+    }
+
+    /// Main's state as of the tables as they are now, for [`Store::held_but_time`], from the last one built
+    /// (`built_from`, `last`): none when getting it would take a full build, or when none of `episodes` can be on
+    /// main (the last state doesn't hold one and nothing was added since).
+    /// - Nothing changed since: the last state.
+    /// - Something since may take memory away ([`Vis::only_added`] refuses it): none. The next read builds the state
+    ///   in full whatever this write does, and the write goes ahead as sent: waiting for that build here would make
+    ///   the writer wait seconds in a large scope.
+    /// - Only additions since: the last state still says of each episode it holds what a build would (an episode
+    ///   it holds written again any other way is refused above), so it serves, with what was added since
+    ///   ([`Added`]): an episode a write since added (the same record sent twice, its first copy committed after
+    ///   the state was built) is held when that write's row says the same. But for a version of a document the
+    ///   state holds, where a newer version added since would be current: with one of those among `episodes`, the
+    ///   state is built for the tables now, the incremental build the next read would make, never a full one
+    ///   (unless a removal lands in between); none where the state is due its periodic full build.
+    async fn held_state(
+        &self,
+        scope: &Scope,
+        episodes: &[Episode],
+        built_from: VisStamp,
+        last: Arc<Vis>,
+    ) -> Result<Held> {
         let ns = scope.namespace();
-        let Some((stamp, vis)) = self
+        let (_, (ledger, rows, quotes, schemas, closures, retractions, retention, decisions), _) =
+            self.vis_tables(&ns).await?;
+        let now: VisStamp = [
+            ledger.rows,
+            rows.rows,
+            quotes.rows,
+            schemas,
+            closures,
+            retractions,
+            retention,
+            decisions,
+        ];
+        let known = episodes
+            .iter()
+            .any(|e| last.acls.contains_key(&e.episode_id));
+        if built_from.iter().zip(&now).all(|(a, b)| Arc::ptr_eq(a, b)) {
+            return Ok(match known {
+                true => Held::State(Box::new(HeldState {
+                    stamp: built_from,
+                    vis: last,
+                    added: None,
+                })),
+                false => Held::None,
+            });
+        }
+        let added = {
+            let (last, ns, built_from, now) =
+                (last.clone(), ns.clone(), built_from.clone(), now.clone());
+            tokio::task::spawn_blocking(move || last.only_added(&ns, &built_from, &now)).await?
+        };
+        let added = match added {
+            Ok(added) => added,
+            // Only episodes written again since: a copy this store wrote a moment ago, just as it is sent again, is
+            // held without the state. Written, it would land after the full build that is due read the tables, and
+            // the read after it would build in full again.
+            Err(WRITTEN_AGAIN) => {
+                let sent = self
+                    .sent_again(&ns, episodes, &built_from, &last, &now)
+                    .await?;
+                return Ok(match sent.is_empty() {
+                    true => Held::None,
+                    false => Held::Sent(sent),
+                });
+            }
+            Err(_) => return Ok(Held::None),
+        };
+        if !known
+            && !episodes
+                .iter()
+                .any(|e| added.episodes.contains_key(&e.episode_id))
+        {
+            return Ok(Held::None);
+        }
+        let documents = episodes
+            .iter()
+            .any(|e| e.document.is_some() && last.acls.contains_key(&e.episode_id));
+        if !documents {
+            return Ok(Held::State(Box::new(HeldState {
+                stamp: built_from,
+                vis: last,
+                added: Some((now, added)),
+            })));
+        }
+        // A state due its periodic full build would be built in full here: the next read builds it so anyway.
+        if last.full_at.elapsed() >= VIS_FULL_EVERY {
+            return Ok(Held::None);
+        }
+        let current = self.visibility(scope, MAIN).await?;
+        Ok(self
             .vis
             .lock()
             .unwrap()
-            .get(&(ns.clone(), MAIN.to_string()))
+            .get(&(ns, MAIN.to_string()))
+            .filter(|(_, v)| Arc::ptr_eq(v, &current))
             .cloned()
-        else {
+            .map_or(Held::None, |(stamp, vis)| {
+                Held::State(Box::new(HeldState {
+                    stamp,
+                    vis,
+                    added: None,
+                }))
+            }))
+    }
+
+    /// Of `episodes`, sent again while main's last state (`last`, built from `built_from`) can't be used because
+    /// episodes were written again since ([`WRITTEN_AGAIN`]: no side table, rewrite or merge), those this store
+    /// committed to main within [`SENT_HERE_FOR`] ([`SentHere`]) just as they are sent, but for the time, and still so:
+    /// - not a version of a document (an older version sent again is current again), nor retracted in the state;
+    /// - the last state holds it with its newest row saying the same, or doesn't hold it and this store committed it
+    ///   after the state was built, so nothing the state reflects took it away;
+    /// - every row of it in the tables now (`now`), written anywhere, committed or not, says the same: a forget or
+    ///   an ACL change made since, here or on another server, is a row that differs;
+    /// - no side row (a retraction, closure, retention, schema or decision) whose commit landed since.
+    async fn sent_again(
+        &self,
+        ns: &str,
+        episodes: &[Episode],
+        built_from: &VisStamp,
+        last: &Arc<Vis>,
+        now: &VisStamp,
+    ) -> Result<HashSet<String>> {
+        let candidates: HashMap<String, RowSays> = {
+            let sent = self.sent_here.lock().unwrap();
+            episodes
+                .iter()
+                .filter(|e| e.document.is_none())
+                .filter_map(|e| {
+                    let (row, at) = sent.rows.get(&(ns.to_string(), e.episode_id.clone()))?;
+                    let fresh = at.elapsed() < SENT_HERE_FOR;
+                    let same = row.but_time() == RowSays::of(e).but_time();
+                    let after = last.acls.contains_key(&e.episode_id) || *at > last.built_at;
+                    let retracted = last.retracted.contains(&e.episode_id);
+                    (fresh && same && after && !retracted)
+                        .then(|| (e.episode_id.clone(), RowSays::of(e)))
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let (built_from, last, now) = (built_from.clone(), last.clone(), now.clone());
+        Ok(tokio::task::spawn_blocking(move || {
+            // A side row written before its commit takes effect with it ([`Vis::only_added`] looks for one only once
+            // no episode was written again): one whose commit landed since, in any scope, may take memory away.
+            let Some(ledger) = added_batches(&built_from[0], &now[0]) else {
+                return HashSet::new();
+            };
+            let commits: HashSet<&str> = ledger
+                .iter()
+                .flat_map(|b| {
+                    let c = b
+                        .column_by_name("commit_id")
+                        .expect("commit_id")
+                        .as_string::<i32>();
+                    (0..b.num_rows()).map(move |i| c.value(i))
+                })
+                .collect();
+            let side_landed = now[2..].iter().flat_map(|t| t.iter()).any(|b| {
+                b.column_by_name("commit_id").is_some_and(|c| {
+                    let c = c.as_string::<i32>();
+                    (0..c.len()).any(|i| commits.contains(c.value(i)))
+                })
+            });
+            if side_landed {
+                return HashSet::new();
+            }
+            let known: HashSet<&str> = candidates
+                .keys()
+                .map(String::as_str)
+                .filter(|id| last.acls.contains_key(*id))
+                .collect();
+            let held = newest_rows(&built_from[1], &last.committed, &known);
+            let mut ok: HashSet<String> = candidates
+                .iter()
+                .filter(|(id, row)| {
+                    !known.contains(id.as_str())
+                        || held
+                            .get(*id)
+                            .and_then(Option::as_ref)
+                            .is_some_and(|h| h.but_time() == row.but_time())
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for b in now[1].iter() {
+                let ids = b
+                    .column_by_name("episode_id")
+                    .expect("episode_id")
+                    .as_string::<i32>();
+                for i in 0..b.num_rows() {
+                    let id = ids.value(i);
+                    if ok.contains(id) && RowSays::at(b, i).but_time() != candidates[id].but_time()
+                    {
+                        ok.remove(id);
+                    }
+                }
+            }
+            ok
+        })
+        .await?)
+    }
+
+    /// [`Store::held_as_is`], or, `any_time`, [`Store::held_but_time`].
+    async fn held_on_main(
+        &self,
+        scope: &Scope,
+        episodes: &[Episode],
+        sources: &BTreeSet<String>,
+        any_time: bool,
+    ) -> Result<HeldAsIs> {
+        let ns = scope.namespace();
+        let key = (ns.clone(), MAIN.to_string());
+        let Some((stamp, vis)) = self.vis.lock().unwrap().get(&key).cloned() else {
             return Ok(HeldAsIs::default());
         };
-        let written_since = self
-            .written
-            .lock()
-            .unwrap()
-            .get(&ns)
-            .is_some_and(|w| *w >= vis.built_at);
-        if vis.built_at.elapsed() >= VIS_LAG_LIMIT
-            || written_since
-            || vis.fresh_until.is_some_and(|t| now_micros() >= t)
-            || !episodes
-                .iter()
-                .any(|e| vis.acls.contains_key(&e.episode_id))
-        {
-            return Ok(HeldAsIs::default());
-        }
+        let known = episodes
+            .iter()
+            .any(|e| vis.acls.contains_key(&e.episode_id));
+        let since = |w: &Mutex<HashMap<String, Instant>>| {
+            w.lock()
+                .unwrap()
+                .get(&ns)
+                .is_some_and(|w| *w >= vis.built_at)
+        };
+        let written_since = since(&self.written);
+        let aged = vis.fresh_until.is_some_and(|t| now_micros() >= t);
+        let HeldState { stamp, vis, added } = match any_time {
+            false => {
+                if aged || !known || vis.built_at.elapsed() >= VIS_LAG_LIMIT || written_since {
+                    return Ok(HeldAsIs::default());
+                }
+                HeldState {
+                    stamp,
+                    vis,
+                    added: None,
+                }
+            }
+            // An aged state is rebuilt by the next read, and none of `episodes` in the last state, none of which this
+            // store wrote lately ([`SentHere`]), holds none: either way none is held, with no table read, as for any
+            // brand-new note.
+            true if aged
+                || (!known && !self.sent_here.lock().unwrap().holds_any(&ns, episodes)) =>
+            {
+                return Ok(HeldAsIs::default());
+            }
+            true => match self.held_state(scope, episodes, stamp, vis).await? {
+                Held::State(current) => *current,
+                Held::None => return Ok(HeldAsIs::default()),
+                Held::Sent(same) => {
+                    eprintln!(
+                        "held check on {ns} main: {} sent again while a full build is due, held as written here",
+                        same.len()
+                    );
+                    return Ok(HeldAsIs {
+                        same,
+                        current: HashMap::new(),
+                    });
+                }
+            },
+        };
         let (episodes, sources) = (episodes.to_vec(), sources.clone());
         Ok(tokio::task::spawn_blocking(move || {
             let ids: HashSet<&str> = episodes
@@ -5096,11 +5789,43 @@ impl Store {
                 .map(|e| e.episode_id.as_str())
                 .filter(|e| vis.acls.contains_key(*e))
                 .collect();
-            let newest = newest_rows(&stamp[1], &vis.committed, &ids);
+            let mut newest = newest_rows(&stamp[1], &vis.committed, &ids);
+            // An episode a write since the state added, not a version of a document: its newest row among what main
+            // holds now, that write's included.
+            if let Some((now, added)) = &added {
+                let since: HashSet<&str> = episodes
+                    .iter()
+                    .filter(|e| e.document.is_none() && !vis.acls.contains_key(&e.episode_id))
+                    .map(|e| e.episode_id.as_str())
+                    .filter(|e| added.episodes.contains_key(*e))
+                    .collect();
+                if !since.is_empty() {
+                    let committed: HashSet<String> =
+                        vis.committed.union(&added.commits).cloned().collect();
+                    newest.extend(newest_rows(&now[1], &committed, &since));
+                }
+            }
             let same: HashSet<String> = episodes
                 .iter()
                 .filter(|e| {
-                    newest.get(&e.episode_id).and_then(Option::as_ref) == Some(&RowSays::of(e))
+                    let Some(held) = newest.get(&e.episode_id).and_then(Option::as_ref) else {
+                        return false;
+                    };
+                    if !any_time {
+                        return *held == RowSays::of(e);
+                    }
+                    let newest_version = e.document.as_ref().is_none_or(|d| {
+                        vis.documents
+                            .versions
+                            .get(d)
+                            .and_then(|v| v.first())
+                            .is_some_and(|(_, id)| *id == e.episode_id)
+                    });
+                    let same = newest_version && held.but_time() == RowSays::of(e).but_time();
+                    if !same {
+                        say_not_held(&ns, e, held, newest_version);
+                    }
+                    same
                 })
                 .map(|e| e.episode_id.clone())
                 .collect();
@@ -5969,6 +6694,7 @@ impl Store {
         actor: &str,
         parents_of: &(dyn Fn(&Ledger) -> Result<Vec<String>> + Send + Sync),
     ) -> Result<()> {
+        let _writes = RequestWrites::to(scope);
         let ns = scope.namespace();
         let started = Instant::now();
         for attempt in 0u32.. {
@@ -6290,6 +7016,98 @@ impl Store {
         })
     }
 
+    /// [`Store::pin`] when it would build nothing: the branch's state already built is served only where
+    /// [`Store::pin`] would serve that same state (one built from the tables as they are now, or another branch's
+    /// state that a build of them gives unchanged, [`Vis::branch_unchanged`]). `None` where it would build: nothing
+    /// is built here, and nothing taken away since is ever counted.
+    pub async fn pin_if_built(&self, scope: &Scope, branch: &str) -> Result<Option<Session>> {
+        let ns = scope.namespace();
+        let key = (ns.clone(), branch.to_string());
+        let Some((built_from, last)) = self.vis.lock().unwrap().get(&key).cloned() else {
+            return Ok(None);
+        };
+        if last.fresh_until.is_some_and(|t| now_micros() >= t) {
+            return Ok(None);
+        }
+        let (_, tables, _) = self.vis_tables(&ns).await?;
+        let (ledger, episodes, quotes, schemas, closures, retractions, retention, decisions) =
+            tables;
+        let stamp: VisStamp = [
+            ledger.rows,
+            episodes.rows,
+            quotes.rows,
+            schemas,
+            closures,
+            retractions,
+            retention,
+            decisions,
+        ];
+        let current = built_from
+            .iter()
+            .zip(&stamp)
+            .all(|(a, b)| Arc::ptr_eq(a, b));
+        let same = current
+            || (branch != MAIN && {
+                let (of, on, b) = (last.clone(), ns.clone(), branch.to_string());
+                tokio::task::spawn_blocking(move || {
+                    of.branch_unchanged(&on, &b, &built_from, &stamp).is_ok()
+                })
+                .await?
+            });
+        Ok(same.then(|| Session {
+            scope: scope.clone(),
+            branch: branch.to_string(),
+            vis: last,
+            at: None,
+            index: None,
+        }))
+    }
+
+    /// Build `branches`' states of `scope` in the background, one after another, each once however many ask: what
+    /// a listing that waits for no build ([`Store::pin_if_built`]) found unbuilt is there for the next one.
+    pub fn build_later(&self, scope: &Scope, branches: Vec<String>) {
+        let ns = scope.namespace();
+        let todo: Vec<String> = {
+            let mut all = self.vis_refresh.lock().unwrap();
+            branches
+                .into_iter()
+                .filter(|b| {
+                    let r = all.entry((ns.clone(), b.clone())).or_default();
+                    !std::mem::replace(&mut r.scheduled, true)
+                })
+                .collect()
+        };
+        if todo.is_empty() {
+            return;
+        }
+        let (store, scope) = (self.clone(), scope.clone());
+        tokio::spawn(loads::later(async move {
+            for b in todo {
+                let started = Instant::now();
+                let built = VIS_BACKGROUND
+                    .scope((), store.visibility_of(&scope, &b, None, false))
+                    .await;
+                if let Some(r) = store
+                    .vis_refresh
+                    .lock()
+                    .unwrap()
+                    .get_mut(&(ns.clone(), b.clone()))
+                {
+                    r.scheduled = false;
+                }
+                match built {
+                    Ok(_) => eprintln!(
+                        "visibility of {ns} on {b} built in the background in {} ms",
+                        started.elapsed().as_millis()
+                    ),
+                    Err(e) => {
+                        eprintln!("visibility of {ns} on {b} not built in the background: {e:#}")
+                    }
+                }
+            }
+        }));
+    }
+
     /// Pin a read session to the branch's current ledger state (D-9).
     pub async fn pin(&self, scope: &Scope, branch: &str) -> Result<Session> {
         Ok(Session {
@@ -6459,15 +7277,6 @@ impl Store {
         .await
     }
 
-    /// Whether `memory_system.<name>` exists (see [`Store::has_table`]).
-    async fn system_table_exists(&self, name: &str) -> Result<bool> {
-        self.has_table(&TableIdent::new(
-            NamespaceIdent::new(SYSTEM_NS.into()),
-            name.into(),
-        ))
-        .await
-    }
-
     /// The directory table as it is now; none before the first change.
     async fn directory_table(&self) -> Result<Option<Table>> {
         let ident = TableIdent::new(NamespaceIdent::new(SYSTEM_NS.into()), DIRECTORY.into());
@@ -6496,7 +7305,7 @@ impl Store {
             Err(e) if retry::is_transient(&e) => e,
             Err(e) => return Err(e),
         };
-        let held = self.dir.folded.lock().await.clone();
+        let held = self.dir.latest.lock().unwrap().clone();
         match held {
             Some((at, _, f)) if at.elapsed() < self.hard_staleness => {
                 static SAID: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
@@ -6514,15 +7323,96 @@ impl Store {
         }
     }
 
+    /// The directory a request is signed in and given its scope by: who is disabled, orgs' keys and providers, who
+    /// belongs where and with which role. As [`Store::directory`], except that a fold this server loaded within
+    /// [`Store::directory_lag`] is served at once while a newer one is loaded in the background (one load at a
+    /// time), rather than the request reading the catalog. So a key revoked, a member removed, a role changed or a
+    /// user disabled through another server takes effect here within the lag at most (and, while requests come,
+    /// within about the max staleness and one directory read); through this server, at once, as its own changes are
+    /// kept as they are made.
+    pub async fn directory_behind(&self) -> Result<Arc<directory::Folded>> {
+        let held = self.dir.latest.lock().unwrap().clone();
+        if let Some((at, _, f)) = held {
+            if at.elapsed() < self.max_staleness {
+                return Ok(f);
+            }
+            if at.elapsed() < self.directory_lag() {
+                self.refresh_directory();
+                return Ok(f);
+            }
+        }
+        self.directory().await
+    }
+
+    /// How far behind other servers [`Store::directory_behind`] may serve the directory: `AMPUP_MEMORY_DIRECTORY_LAG_MS`,
+    /// default 5000, never less than the max staleness.
+    pub fn directory_lag(&self) -> Duration {
+        env_millis("AMPUP_MEMORY_DIRECTORY_LAG_MS", 5_000).max(self.max_staleness)
+    }
+
+    /// Loads the directory in the background, unless a load started so is under way: the fold it makes is kept and
+    /// published as any load's is.
+    pub fn refresh_directory(&self) {
+        if self
+            .dir
+            .refreshing
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        /// Lets the next load start once this one ends, however it ends (done, failed, dropped).
+        struct Ended(Store);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                self.0
+                    .dir
+                    .refreshing
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let ended = Ended(self.clone());
+        tokio::spawn(loads::later(async move {
+            let store = &ended.0;
+            if let Err(e) = store.directory_loaded_after(Some(Instant::now())).await {
+                eprintln!("memstore: background load of the directory failed: {e:#}");
+            }
+        }));
+    }
+
+    /// How long ago the directory this server holds began loading: None before its first load.
+    pub fn directory_age(&self) -> Option<Duration> {
+        self.dir
+            .latest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(at, _, _)| at.elapsed())
+    }
+
     /// The directory as this server last folded it, however long ago, without reading the catalog: None before its
     /// first load. What a setting falls back to when the catalog can't be read now.
     pub async fn directory_held(&self) -> Option<Arc<directory::Folded>> {
         self.dir
-            .folded
+            .latest
             .lock()
-            .await
+            .unwrap()
             .as_ref()
             .map(|(_, _, f)| f.clone())
+    }
+
+    /// The fold as of `since` (none: any), if this server holds one that new: no catalog read, no wait.
+    fn directory_fold_after(&self, since: Option<Instant>) -> Option<Arc<directory::Folded>> {
+        match &*self.dir.latest.lock().unwrap() {
+            Some((at, _, f)) if since.is_none_or(|s| *at >= s) => Some(f.clone()),
+            _ => None,
+        }
+    }
+
+    /// Keep `fold` as this server's directory (`folded` is held by the caller), and publish it to readers that
+    /// don't take that lock.
+    fn keep_directory(&self, held: &mut Option<HeldFold>, fold: HeldFold) {
+        *self.dir.latest.lock().unwrap() = Some(fold.clone());
+        *held = Some(fold);
     }
 
     /// The directory as loaded after `since` (none: any load will do), reading the catalog if this
@@ -6531,6 +7421,10 @@ impl Store {
         &self,
         since: Option<Instant>,
     ) -> Result<Arc<directory::Folded>> {
+        // A fold new enough is served at once, even while another caller's load is under way.
+        if let Some(f) = self.directory_fold_after(since) {
+            return Ok(f);
+        }
         let mut held = self.dir.folded.lock().await;
         if let Some((at, _, f)) = &*held
             && since.is_none_or(|s| *at >= s)
@@ -6572,7 +7466,7 @@ impl Store {
         crate::limits::observe(&f.dir);
         // Dated by when the read began, not when it ended: a caller asking for a load after some instant
         // never gets a fold that read the catalog before it, though it finished after.
-        *held = Some((t0, sid, f.clone()));
+        self.keep_directory(&mut held, (t0, sid, f.clone()));
         Ok(f)
     }
 
@@ -6744,7 +7638,7 @@ impl Store {
                 let (table, f) = self.fold_directory(held.as_ref()).await?;
                 let table = table.context("memory_system.directory is gone")?;
                 let sid = table.metadata().current_snapshot().map(|s| s.snapshot_id());
-                *held = Some((read_at, sid, f.clone()));
+                self.keep_directory(&mut held, (read_at, sid, f.clone()));
                 (table, f)
             };
             if let Some((after, events)) = tried.take() {
@@ -6838,7 +7732,7 @@ impl Store {
                 .as_ref()
                 .is_none_or(|(_, _, f)| f.events <= after.events)
             {
-                *held = Some((read_at, sid, after.clone()));
+                self.keep_directory(&mut held, (read_at, sid, after.clone()));
                 // A change this server made holds here at once: an org's limits set now refuse its next write.
                 crate::limits::observe(&after.dir);
             }
@@ -6868,14 +7762,28 @@ impl Store {
     /// they were recorded. Empty before the first. Read fresh, not from the cache: connectors check a
     /// delivery against it moments after the installation is registered, maybe on another server.
     pub async fn installation_events(&self) -> Result<Vec<people::installations::Event>> {
-        if !self.system_table_exists(INSTALLATIONS).await? {
-            return Ok(vec![]);
-        }
-        let ident = TableIdent::new(NamespaceIdent::new(SYSTEM_NS.into()), INSTALLATIONS.into());
-        let table = self.catalog().load_table(&ident).await?;
+        // As the catalog holds them now (the table loaded on every call, so a register or revoke on any server
+        // shows at once), decoded only from the files appended since this server last read them: the table gains a
+        // data file per change, and reading every one of them on every list or check cost seconds. No table yet:
+        // none. Concurrent reads take turns on the table's load lock, one catalog read each.
         let mut events = vec![];
-        for b in scan_rows(&table, None, None).await? {
-            events.extend(installation_batch(&b));
+        for b in self.side_rows_now(SYSTEM_NS, INSTALLATIONS).await?.iter() {
+            events.extend(installation_batch(b));
+        }
+        events.sort_by_key(|e| e.at);
+        Ok(events)
+    }
+
+    /// The installation events as [`Store::installation_events`] gives them, from the cached table as other side
+    /// tables are read ([`Store::side_rows`]): refreshed behind a read once `AMPUP_MEMORY_MAX_STALENESS_MS` old, and
+    /// waited for only when not cached yet or past `AMPUP_MEMORY_HARD_STALENESS_MS`. So a register or revoke on
+    /// another server shows here within the hard staleness limit at most, and on the read after the next refresh
+    /// behind one; this server's own changes show at once (they drop the cached rows). For a count shown to a person
+    /// (an org's connected apps), not for a check that acts on an installation: those read the table as it is now.
+    pub async fn installation_events_held(&self) -> Result<Vec<people::installations::Event>> {
+        let mut events = vec![];
+        for b in self.side_rows(SYSTEM_NS, INSTALLATIONS).await?.iter() {
+            events.extend(installation_batch(b));
         }
         events.sort_by_key(|e| e.at);
         Ok(events)
@@ -7368,6 +8276,10 @@ impl Store {
     }
 
     /// [`Store::visibility_of`], with what was added since when the state is the last one ([`Added`]).
+    ///
+    /// Within a request ([`one_state_per_request`]), a read that may lag is served the state the request's first
+    /// such read of the scope was, until the request writes: one request waits for a build once at most, not once
+    /// per read of the scope it makes (its pin, then the answer log, then its notes).
     async fn view_of(
         &self,
         scope: &Scope,
@@ -7375,47 +8287,92 @@ impl Store {
         pinned: Option<(&str, &[String])>,
         may_lag: bool,
     ) -> Result<(Arc<Vis>, Arc<Added>)> {
-        let ns = scope.namespace();
+        let per_request = may_lag && pinned.is_none();
+        let key = (scope.namespace(), branch.to_string());
+        if per_request && let Some(v) = request_state(&key) {
+            return Ok(v);
+        }
+        // Boxed: every read of memory awaits this, and its future nested in theirs is deep.
+        let v = Box::pin(self.view_read(scope, branch, pinned, may_lag)).await?;
+        if per_request {
+            let _ = REQUEST_STATES.try_with(|m| m.lock().unwrap().insert(key, v.clone()));
+        }
+        Ok(v)
+    }
+
+    /// The tables a visibility state of `ns` is built from, read now: when the read began, the tables, and when
+    /// it ended.
+    async fn vis_tables(&self, ns: &str) -> Result<(Instant, VisTables, Instant)> {
         // When the tables were read: a write after it isn't in what is built from them.
         let read_at = Instant::now();
-        let (ledger, episodes, quotes, schemas, closures, retractions, retention, decisions) = tokio::try_join!(
+        let tables = tokio::try_join!(
             self.rows(SYSTEM_NS, LEDGER),
-            self.rows(&ns, EPISODES),
-            self.rows(&ns, QUOTES),
-            self.side_rows(&ns, SCHEMAS),
-            self.side_rows(&ns, CLOSURES),
-            self.side_rows(&ns, RETRACTIONS),
-            self.side_rows(&ns, RETENTION),
-            self.side_rows(&ns, governance::TABLE)
+            self.rows(ns, EPISODES),
+            self.rows(ns, QUOTES),
+            self.side_rows(ns, SCHEMAS),
+            self.side_rows(ns, CLOSURES),
+            self.side_rows(ns, RETRACTIONS),
+            self.side_rows(ns, RETENTION),
+            self.side_rows(ns, governance::TABLE)
         )?;
-        let stamp = [
-            ledger.rows.clone(),
-            episodes.rows.clone(),
-            quotes.rows.clone(),
-            schemas.clone(),
-            closures.clone(),
-            retractions.clone(),
-            retention.clone(),
-            decisions.clone(),
-        ];
+        Ok((read_at, tables, Instant::now()))
+    }
+
+    /// [`Store::view_of`] without the request's state.
+    async fn view_read(
+        &self,
+        scope: &Scope,
+        branch: &str,
+        pinned: Option<(&str, &[String])>,
+        may_lag: bool,
+    ) -> Result<(Arc<Vis>, Arc<Added>)> {
+        let ns = scope.namespace();
+        let (mut read_at, tables, read_done) = self.vis_tables(&ns).await?;
+        let (
+            mut ledger,
+            mut episodes,
+            mut quotes,
+            mut schemas,
+            mut closures,
+            mut retractions,
+            mut retention,
+            mut decisions,
+        ) = tables;
+        let stamp_of =
+            |t: (&Snapshot, &Snapshot, &Snapshot), side: [&Arc<Vec<RecordBatch>>; 5]| -> VisStamp {
+                [
+                    t.0.rows.clone(),
+                    t.1.rows.clone(),
+                    t.2.rows.clone(),
+                    side[0].clone(),
+                    side[1].clone(),
+                    side[2].clone(),
+                    side[3].clone(),
+                    side[4].clone(),
+                ]
+            };
+        let mut stamp = stamp_of(
+            (&ledger, &episodes, &quotes),
+            [&schemas, &closures, &retractions, &retention, &decisions],
+        );
         let key = match pinned {
             None => (ns.clone(), branch.to_string()),
             // No branch name holds '@'.
             Some((pin, _)) => (ns.clone(), format!("{branch}@{pin}")),
         };
         // Episodes age out with no write to mark it: past `fresh_until` the state is rebuilt.
-        let cached = || {
+        let cached = |stamp: &VisStamp| {
             self.vis
                 .lock()
                 .unwrap()
                 .get(&key)
                 .filter(|(s, v)| {
-                    s.iter().zip(&stamp).all(|(a, b)| Arc::ptr_eq(a, b))
+                    s.iter().zip(stamp).all(|(a, b)| Arc::ptr_eq(a, b))
                         && v.fresh_until.is_none_or(|t| now_micros() < t)
                 })
                 .map(|(_, v)| v.clone())
         };
-        if let Some(v) = cached() {
+        if let Some(v) = cached(&stamp) {
             metrics::VIS_READS.with_label_values(&["current"]).inc();
             return Ok((v, Arc::default()));
         }
@@ -7468,27 +8425,8 @@ impl Store {
                     self.refresh_vis_later(scope, branch, key.clone(), last.built_at + every);
                     metrics::VIS_READS.with_label_values(&["lagged"]).inc();
                     if vis_oracle() {
-                        // A fresh build of the same tables: what the lagged read held, it must hold too.
-                        let fresh =
-                            Box::pin(self.visibility_of(scope, branch, None, false)).await?;
-                        let same_tables =
-                            self.vis.lock().unwrap().get(&key).is_some_and(|(s, v)| {
-                                Arc::ptr_eq(v, &fresh)
-                                    && s.iter().zip(&stamp).all(|(a, b)| Arc::ptr_eq(a, b))
-                            });
-                        let view = View {
-                            vis: last.clone(),
-                            added: added.clone(),
-                        };
-                        if same_tables && let Some(why) = view.lost_in(&fresh) {
-                            metrics::VIS_ORACLE_DIVERGENCE.inc();
-                            eprintln!(
-                                "visibility oracle: a lagged read of {ns} held what a fresh build took away: {why}"
-                            );
-                            anyhow::bail!(
-                                "visibility oracle: a lagged read of {ns} held what a fresh build took away: {why}"
-                            );
-                        }
+                        self.lag_checked(scope, branch, &key, &stamp, &last, &added)
+                            .await?;
                     }
                     return Ok((last, added));
                 }
@@ -7507,27 +8445,178 @@ impl Store {
             }
         }
         metrics::VIS_READS.with_label_values(&["built"]).inc();
-        // One build of this state at a time: a reader that waited for another's build takes it, if it was
-        // built from the same tables this reader read.
-        let gate = self
-            .vis_builds
-            .lock()
-            .unwrap()
-            .entry(key.clone())
-            .or_default()
-            .clone();
-        // However this reader ends (built, failed, or dropped mid-build by a client that gave up), the gate
-        // leaves the map: a reader waiting on it still holds it, and one arriving later finds the state cached
-        // or builds it under a new gate. Keys include every followed cursor's pin, so none may stay behind.
-        let _gone = GateGone {
-            builds: &self.vis_builds,
-            key: key.clone(),
-            gate: gate.clone(),
+        // One build of this key at a time, on one gate however many readers wait for it ([`GateHeld`]).
+        let held = GateHeld::take(&self.vis_builds, &key);
+        let (building, waited) = match held.gate.clone().try_lock_owned() {
+            Ok(g) => (g, false),
+            Err(_) => (held.gate.clone().lock_owned().await, true),
         };
-        let _building = gate.lock().await;
-        if let Some(v) = cached() {
+        if waited {
+            // A reader that waited for another's build takes the newest state built since it read its tables: one
+            // built from tables read after them holds every change they hold, a removal included (a table's cached
+            // rows only move forward). Otherwise it reads the tables again, so that its build serves every reader
+            // that queued behind the one it waited for: no reader waits for more than the build under way and one
+            // more, never a chain of them.
+            let newer = self
+                .vis
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|(_, v)| v.clone())
+                .filter(|v| {
+                    v.built_at >= read_done && v.fresh_until.is_none_or(|t| now_micros() < t)
+                });
+            if let Some(v) = newer {
+                if vis_oracle() {
+                    // It was built from a ledger holding at least every row of this scope the reader's did.
+                    let (rows, of) = (ledger.rows.clone(), ns.clone());
+                    let mine =
+                        tokio::task::spawn_blocking(move || ledger_print(&rows, &of)).await?;
+                    if v.ledger_print.0 < mine.0 {
+                        metrics::VIS_ORACLE_DIVERGENCE.inc();
+                        eprintln!(
+                            "visibility oracle: a reader of {ns} that waited was handed a state older than the tables it read"
+                        );
+                        anyhow::bail!(
+                            "visibility oracle: a reader of {ns} that waited was handed a state older than the tables it read"
+                        );
+                    }
+                }
+                return Ok((v, Arc::default()));
+            }
+            // A read that may lag takes the state just built when all that changed in the tables it read since that
+            // state's were read adds memory ([`Vis::only_added`]), as it would have been served before the build:
+            // no removal came after it.
+            let just_built = self.vis.lock().unwrap().get(&key).cloned();
+            if may_lag
+                && pinned.is_none()
+                && branch == MAIN
+                && vis_refresh_every().is_some()
+                && let Some((built_from, last)) = just_built
+                && last.built_at.elapsed() < VIS_LAG_LIMIT
+                && self
+                    .written
+                    .lock()
+                    .unwrap()
+                    .get(&ns)
+                    .is_none_or(|w| *w < last.built_at)
+                && last.fresh_until.is_none_or(|t| now_micros() < t)
+            {
+                let (of, on, now) = (last.clone(), ns.clone(), stamp.clone());
+                let found =
+                    tokio::task::spawn_blocking(move || of.only_added(&on, &built_from, &now))
+                        .await?;
+                if let Ok(added) = found {
+                    drop((building, held));
+                    let added = Arc::new(added);
+                    metrics::VIS_READS.with_label_values(&["lagged"]).inc();
+                    if vis_oracle() {
+                        self.lag_checked(scope, branch, &key, &stamp, &last, &added)
+                            .await?;
+                    }
+                    return Ok((last, added));
+                }
+            }
+            // A background build reads no table under the gate (a loop's read may wait its turn, `loads::turn`,
+            // and every reader queued here with it): it builds what it read.
+            if VIS_BACKGROUND.try_with(|_| ()).is_err() {
+                let tables;
+                (read_at, tables, _) = self.vis_tables(&ns).await?;
+                (
+                    ledger,
+                    episodes,
+                    quotes,
+                    schemas,
+                    closures,
+                    retractions,
+                    retention,
+                    decisions,
+                ) = tables;
+                stamp = stamp_of(
+                    (&ledger, &episodes, &quotes),
+                    [&schemas, &closures, &retractions, &retention, &decisions],
+                );
+            }
+        }
+        if let Some(v) = cached(&stamp) {
             return Ok((v, Arc::default()));
         }
+        // The build runs as a task of its own holding the gate until its state is cached: a reader that gives up
+        // mid-build (a client's timeout) neither leaves it running beside the next reader's build nor throws away
+        // what it built.
+        let (store, branch) = (self.clone(), branch.to_string());
+        let pinned = pinned.map(|(p, h)| (p.to_string(), h.to_vec()));
+        let tables = (
+            ledger,
+            episodes,
+            quotes,
+            schemas,
+            closures,
+            retractions,
+            retention,
+            decisions,
+        );
+        let key = key.clone();
+        let build = async move {
+            let _building = (held, building);
+            let pinned = pinned.as_ref().map(|(p, h)| (p.as_str(), h.as_slice()));
+            store
+                .view_built(&branch, pinned, key, tables, stamp, read_at)
+                .await
+        };
+        match VIS_BACKGROUND.try_with(|_| ()).is_ok() {
+            true => tokio::spawn(VIS_BACKGROUND.scope((), build)).await?,
+            false => tokio::spawn(build).await?,
+        }
+    }
+
+    /// [`vis_oracle`]: a fresh build of the tables `stamp` names holds all that a lagged read of them was served
+    /// (`last` and what was `added` since), or the read fails. Called holding no build gate: it builds.
+    async fn lag_checked(
+        &self,
+        scope: &Scope,
+        branch: &str,
+        key: &(String, String),
+        stamp: &VisStamp,
+        last: &Arc<Vis>,
+        added: &Arc<Added>,
+    ) -> Result<()> {
+        let ns = &key.0;
+        // A fresh build of the same tables: what the lagged read held, it must hold too.
+        let fresh = Box::pin(self.visibility_of(scope, branch, None, false)).await?;
+        let same_tables = self.vis.lock().unwrap().get(key).is_some_and(|(s, v)| {
+            Arc::ptr_eq(v, &fresh) && s.iter().zip(stamp).all(|(a, b)| Arc::ptr_eq(a, b))
+        });
+        let view = View {
+            vis: last.clone(),
+            added: added.clone(),
+        };
+        if same_tables && let Some(why) = view.lost_in(&fresh) {
+            metrics::VIS_ORACLE_DIVERGENCE.inc();
+            eprintln!(
+                "visibility oracle: a lagged read of {ns} held what a fresh build took away: {why}"
+            );
+            anyhow::bail!(
+                "visibility oracle: a lagged read of {ns} held what a fresh build took away: {why}"
+            );
+        }
+        Ok(())
+    }
+
+    /// [`Store::view_read`]'s build of `key`'s state from `tables` (read at `read_at`; `stamp` names them), made
+    /// under the key's gate.
+    async fn view_built(
+        &self,
+        branch: &str,
+        pinned: Option<(&str, &[String])>,
+        key: (String, String),
+        tables: VisTables,
+        stamp: VisStamp,
+        read_at: Instant,
+    ) -> Result<(Arc<Vis>, Arc<Added>)> {
+        let ns = key.0.clone();
+        let (ledger, episodes, quotes, schemas, closures, retractions, retention, decisions) =
+            tables;
         // The state this one follows, to tell whether memory lost anything since (`Vis::removals`). A
         // pinned read's state follows no other.
         let prev = match pinned {
@@ -7587,12 +8676,13 @@ impl Store {
         // Main's next state made from the last one, when all that changed since adds memory ([`Vis::extended`]):
         // what was appended is read, not every table again. Another branch's last state is served as it is when a
         // build of these tables gives the same one ([`Vis::branch_unchanged`]): an open proposal's branch is read
-        // for every listing of proposals, and main moves under it all the time.
+        // for every listing of proposals, and main moves under it all the time. Only main's made state is built in
+        // full every [`VIS_FULL_EVERY`]: a branch's kept state is the one a build gives, however long ago that was.
         let extended = match kept {
             Some((built_from, p))
                 if pinned.is_none()
                     && p.fresh_until.is_none_or(|t| now_micros() < t)
-                    && p.full_at.elapsed() < VIS_FULL_EVERY =>
+                    && (branch != MAIN || p.full_at.elapsed() < VIS_FULL_EVERY) =>
             {
                 let (ns, stamp, on) = (ns.clone(), stamp.clone(), branch.clone());
                 tokio::task::spawn_blocking(move || match on == MAIN {
@@ -7863,6 +8953,7 @@ impl Store {
                 ledger_print: print,
                 built_at: read_at,
                 full_at: read_at,
+                build: next_build(),
             };
             vis.removals = match &prev {
                 Some(p) => match vis.lost_since(p) {
@@ -7948,6 +9039,7 @@ impl Store {
         // Main's memory lost something: what was kept past new writes from before goes.
         if key.1 == MAIN && prev_removals != Some(vis.removals) {
             query::drop_lasting(&scope_ns, vis.removals);
+            lost(&scope_ns, false);
         }
         let mut cached = self.vis.lock().unwrap();
         // Pages pin their first page's heads ([`Session::resume`]): keep a few such states per scope, not one
@@ -8097,6 +9189,14 @@ impl Store {
                 (table, tasks)
             }
         })
+    }
+
+    /// The facts table of `scope` as this server reads it now: its snapshot's sequence number, and its facts
+    /// generation (the same while the table only gains files, a new one once a file it held is gone: an erasure,
+    /// a forget or a compaction, by any process). An answer read from the table is the same at the same two.
+    pub async fn facts_mark(&self, scope: &Scope) -> Result<(i64, u64)> {
+        let (seq, files) = self.fact_files_at(scope).await?;
+        Ok((seq, query::facts_generation(&scope.namespace(), seq, files)))
     }
 
     /// The facts table's data files for `scope` by file key, with the sequence number of the snapshot
@@ -8389,6 +9489,57 @@ impl Store {
         Ok(out)
     }
 
+    /// Who last changed each of `ids` in `scope` on main: the actor of the commit of its newest committed row (the
+    /// writer of its current ACL, an ACL change being a new row). An id with no committed row is left out.
+    pub async fn episode_changers(
+        &self,
+        scope: &Scope,
+        ids: &HashSet<String>,
+    ) -> Result<HashMap<String, String>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ns = scope.namespace();
+        let (snap, vis, eps) = tokio::try_join!(
+            self.ledger_now(),
+            self.visibility(scope, MAIN),
+            self.rows(&ns, EPISODES)
+        )?;
+        let mut commits: HashMap<String, (String, i64)> = HashMap::new();
+        for b in snap.rows.iter() {
+            let (commit, actor, sc) = (
+                strings(b, "commit_id"),
+                strings(b, "actor"),
+                strings(b, "scope"),
+            );
+            let at = timestamps(b, "recorded_at");
+            for i in 0..b.num_rows() {
+                if sc[i] == ns {
+                    commits.insert(commit[i].clone(), (actor[i].clone(), at[i].unwrap_or(0)));
+                }
+            }
+        }
+        let mut newest: HashMap<String, (i64, String)> = HashMap::new();
+        for b in eps.rows.iter() {
+            let (commit, id) = (strings(b, "commit_id"), strings(b, "episode_id"));
+            for i in 0..b.num_rows() {
+                if !ids.contains(&id[i]) || !vis.committed.contains(&commit[i]) {
+                    continue;
+                }
+                let Some((actor, at)) = commits.get(&commit[i]) else {
+                    continue;
+                };
+                match newest.get(&id[i]) {
+                    Some((seen, _)) if seen >= at => {}
+                    _ => {
+                        newest.insert(id[i].clone(), (*at, actor.clone()));
+                    }
+                }
+            }
+        }
+        Ok(newest.into_iter().map(|(id, (_, a))| (id, a)).collect())
+    }
+
     /// Episodes whose committed rows come from more than one source, each with its rows (source, ACL,
     /// recorded at), oldest first. Before remembered notes hashed their author into the id, the same text
     /// remembered by someone else (or already in memory from elsewhere) became a new row of the same
@@ -8444,6 +9595,7 @@ impl Store {
         episode_id: &str,
         is_author: impl Fn(&str) -> bool,
     ) -> Result<bool> {
+        let _losing = Losing::of(scope.namespace());
         let ns = scope.namespace();
         self.invalidate(SYSTEM_NS, LEDGER);
         self.invalidate(&ns, EPISODES);
@@ -8574,6 +9726,7 @@ impl Store {
     /// must approve first, `governance::private_episodes`) takes readers away, now: each one's current readers
     /// the new ACL drops lose it at once (under [`FORGOTTEN`] when none stay), and only the widening waits.
     pub async fn revoke_held(&self, scope: &Scope, actor: &str, held: &[Episode]) -> Result<()> {
+        let _losing = Losing::of(scope.namespace());
         let current = self.current_episodes(scope).await?;
         let norm = |acl: &[String]| -> BTreeSet<String> {
             acl.iter()
@@ -8634,6 +9787,21 @@ impl Store {
         targets: &[AclTarget],
         acl: &[String],
     ) -> Result<usize> {
+        let _losing = Losing::of(scope.namespace());
+        // What this store wrote lately and this change may take away is no longer held as written here
+        // ([`SentHere`]): the episodes it names, or, naming a source, all of the scope's.
+        {
+            let ns = scope.namespace();
+            let mut sent = self.sent_here.lock().unwrap();
+            for t in targets {
+                match t {
+                    AclTarget::Episode(id) => {
+                        sent.rows.remove(&(ns.clone(), id.clone()));
+                    }
+                    _ => sent.clear(&ns),
+                }
+            }
+        }
         anyhow::ensure!(!acl.is_empty(), "an episode needs at least one ACL entry");
         let ns = scope.namespace();
         let want: BTreeSet<String> = acl.iter().map(|a| auth::norm_entry(a)).collect();
@@ -8817,6 +9985,11 @@ impl Store {
         targets: &[AclTarget],
         mark: Mark,
     ) -> Result<Vec<String>> {
+        // A delete or a release takes memory away; a newer version replacing its record (a re-sent document)
+        // doesn't count, as a build of the state doesn't count it ([`Vis::lost_since`]).
+        let _losing = (!matches!(mark, Mark::Supersede)).then(|| Losing::of(scope.namespace()));
+        // What this store wrote lately may be taken away: none of it is held as written here ([`SentHere`]).
+        self.sent_here.lock().unwrap().clear(&scope.namespace());
         // Only a delete holds back the exact id or source it names; the others write the episodes they took.
         let superseded = mark != Mark::Delete;
         let mut ids: Vec<String> = self
@@ -8938,6 +10111,7 @@ impl Store {
         fact_id: Option<&str>,
         actor_prefix: Option<&str>,
     ) -> Result<usize> {
+        let _losing = Losing::of(scope.namespace());
         anyhow::ensure!(
             fact_id.is_some() != actor_prefix.is_some(),
             "retract one fact or one extractor"
@@ -9149,6 +10323,9 @@ impl Store {
         actor: &str,
         policy: &retention::Retention,
     ) -> Result<String> {
+        let _losing = Losing::of(scope.namespace());
+        // What this store wrote lately may be taken away: none of it is held as written here ([`SentHere`]).
+        self.sent_here.lock().unwrap().clear(&scope.namespace());
         policy.check()?;
         self.ensure_scope(scope).await?;
         let ns = scope.namespace();
@@ -9851,6 +11028,41 @@ pub fn newest_retention(
         None => retention::Retention::default(),
         Some((_, body)) => serde_json::from_str(&body)?,
     })
+}
+
+/// When the first of `rows` (episodes rows written again, of episodes a state holds) ages out under `policy` after
+/// `now`. Refused when one is past its age already: any row of an episode past its age expires it ([`expired`]), so
+/// a build hides that episode.
+fn retimed(
+    rows: &[(&RecordBatch, usize)],
+    policy: &retention::Retention,
+    now: i64,
+) -> std::result::Result<Option<i64>, &'static str> {
+    let mut next: Option<i64> = None;
+    if policy.rules.is_empty() {
+        return Ok(next);
+    }
+    for &(b, i) in rows {
+        let source = b
+            .column_by_name("source")
+            .expect("source")
+            .as_string::<i32>()
+            .value(i);
+        let Some(age) = policy.max_age_us(source) else {
+            continue;
+        };
+        let at = b
+            .column_by_name("occurred_at")
+            .map(|a| a.as_primitive::<TimestampMicrosecondType>())
+            .filter(|a| !a.is_null(i))
+            .map(|a| a.value(i));
+        let end = at.unwrap_or_default().saturating_add(age);
+        if end <= now {
+            return Err("an episode written again past its retention");
+        }
+        next = Some(next.map_or(end, |n| n.min(end)));
+    }
+    Ok(next)
 }
 
 /// The episodes past `policy` at `now`, and when the next one still kept ages out. Any row of an episode
@@ -10983,15 +12195,14 @@ async fn load_plan_once(catalog: &dyn Catalog, ns: &str) -> Result<(Table, Vec<F
     let tasks = match table.metadata().current_snapshot() {
         None => vec![],
         Some(_) => {
-            table
-                .scan()
-                .select_all()
-                .with_concurrency_limit(LOAD_CONCURRENCY)
-                .build()?
-                .plan_files()
-                .await?
-                .try_collect()
-                .await?
+            planned(
+                table
+                    .scan()
+                    .select_all()
+                    .with_concurrency_limit(LOAD_CONCURRENCY)
+                    .build()?,
+            )
+            .await?
         }
     };
     // A plan that takes long says where: the table's metadata, or listing its files from the manifests.
@@ -11283,15 +12494,27 @@ const LOAD_CONCURRENCY: usize = 64;
 
 /// Every scan task of the table's current snapshot.
 async fn plan_all(table: &Table) -> Result<Vec<FileScanTask>> {
-    Ok(table
-        .scan()
-        .select_all()
-        .with_concurrency_limit(LOAD_CONCURRENCY)
-        .build()?
-        .plan_files()
-        .await?
-        .try_collect()
-        .await?)
+    planned(
+        table
+            .scan()
+            .select_all()
+            .with_concurrency_limit(LOAD_CONCURRENCY)
+            .build()?,
+    )
+    .await
+}
+
+/// Every scan task `scan` plans, or an error, never part of them. The planner reads the manifests in tasks it
+/// spawns, and once the runtime is shutting down those are cancelled without a word: the plan's stream just ends, a
+/// few files or none into the table, and the caller would take a table missing files for the whole table. So a plan
+/// is answered only while the runtime still runs a task spawned after it (shutting down is for good, so one that
+/// runs says none of the planner's was cancelled).
+async fn planned(scan: iceberg::scan::TableScan) -> Result<Vec<FileScanTask>> {
+    let tasks = scan.plan_files().await?.try_collect().await?;
+    tokio::spawn(async {})
+        .await
+        .context("the runtime is shutting down: a plan made now may be missing files")?;
+    Ok(tasks)
 }
 
 /// The manifest list of `snapshot`; none for an encrypted one.
@@ -11405,11 +12628,17 @@ async fn read_appended(
         if full_keys != keys || misread.is_some() {
             eprintln!(
                 "AMPUP_MEMORY_CHECK_PLAN: the incremental plan of {} differs from the full plan: {} files only in it, \
-                 {} only in the full plan, new file read differently: {:?}",
+                 {} only in the full plan, new file read differently: {:?} (the full plan holds {} files, the snapshot \
+                 says {:?})",
                 meta.location(),
                 keys.difference(&full_keys).count(),
                 full_keys.difference(&keys).count(),
-                misread.map(|t| &t.data_file_path)
+                misread.map(|t| &t.data_file_path),
+                full.len(),
+                current
+                    .summary()
+                    .additional_properties
+                    .get("total-data-files")
             );
             std::process::abort();
         }
@@ -11689,7 +12918,7 @@ pub async fn scan_rows(
     if let Some(f) = filter {
         scan = scan.with_filter(f);
     }
-    let tasks: Vec<FileScanTask> = scan.build()?.plan_files().await?.try_collect().await?;
+    let tasks = planned(scan.build()?).await?;
     let reads = tasks.into_iter().map(|t| read_task(table, t));
     Ok(futures::future::try_join_all(reads)
         .await?
@@ -11814,14 +13043,7 @@ async fn live_rows(table: &Table) -> Result<Option<u64>> {
     {
         return Ok(Some(n));
     }
-    let tasks: Vec<FileScanTask> = table
-        .scan()
-        .select_all()
-        .build()?
-        .plan_files()
-        .await?
-        .try_collect()
-        .await?;
+    let tasks = planned(table.scan().select_all().build()?).await?;
     if tasks.iter().any(|t| !t.deletes.is_empty()) {
         return Ok(None);
     }

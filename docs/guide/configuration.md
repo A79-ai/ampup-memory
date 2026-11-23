@@ -26,6 +26,7 @@ over the server's variables where both exist; a team's setting wins over its org
 | `AMPUP_MEMORY_RATE_LIMIT`, `AMPUP_MEMORY_INGEST_RATE_LIMIT` | Per-caller token buckets, e.g. `60/min:120`; `off` for none. A batch costs a token per item. |
 | `AMPUP_MEMORY_MAX_CONNECTIONS` (4096), `AMPUP_MEMORY_MAX_IN_FLIGHT` (1024) | Open connections and requests being answered at once, per port; past either a request is answered 503 with `Retry-After: 1`. `off` lifts a cap. |
 | `AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER` (64) | One caller's requests under way at once; past it 429. `off` lifts it. |
+| `AMPUP_MEMORY_MAX_SEARCHES` (the CPUs the server may use, at least 2) | Searches (`search_memory`, `/search`) answered at once; the rest wait their turn in the order they came. One caller holds at most all but one of them, so another caller's search always finds a turn soon. `off` lifts it. |
 | `AMPUP_MEMORY_HEADER_TIMEOUT_SECS` (660) | How long a connection may take to send a request's headers, idle keep-alive ones too. Keep it above the load balancer's idle timeout. |
 | `AMPUP_MEMORY_SERVE_WORKSPACES=1` | Serve every workspace side by side (as `serve --workspaces`). |
 | `AMPUP_MEMORY_LOG_FILE` | Write the process's output to this file instead, appended, moved aside past 20 MB with three older ones kept. `service install` and `serve --local --background` set it. |
@@ -85,6 +86,7 @@ Requests carry `X-Title: ampup-memory`, so their spend shows apart on a shared k
 | `AMPUP_MEMORY_EMBED_MODEL`, `AMPUP_MEMORY_EMBED_DIMS`, `AMPUP_MEMORY_EMBED_URL`, `AMPUP_MEMORY_EMBED_KEY` (or `_KEY_FILE`) | The embedding model and API. |
 | `AMPUP_MEMORY_MODEL_DIR` | Where local embedding models are kept (`~/.cache/memstore/models`). `ampup-memory embed warmup` fetches the model there ahead of time. |
 | `HF_ENDPOINT`, `HF_HOME`, `HF_HUB_OFFLINE=1` | Where the local model is fetched from (a mirror), kept instead (over the above), or never fetched. Without it, search ranks by keyword alone. |
+| `AMPUP_MEMORY_EMBED_QUERY_TIMEOUT_MS` | How long one try at embedding a search's query through an API may take (default `1000`), two tries at most. A search whose query isn't embedded in time ranks by keyword alone; when the API didn't answer, was rate limited or failed on its side, so do the next 10 s of searches, without trying. |
 | `AMPUP_MEMORY_EMBED_CACHE` | Where computed vectors are cached, or `off`. |
 | `AMPUP_MEMORY_CHUNK_BYTES` (1500), `AMPUP_MEMORY_CHUNK_OVERLAP` (150) | Passage chunking. |
 | `AMPUP_MEMORY_VIEW_FACTS` (200000) | Values and entities typed queries keep in memory; 0 keeps none. |
@@ -116,6 +118,7 @@ Requests carry `X-Title: ampup-memory`, so their spend shows apart on a shared k
 | `AMPUP_MEMORY_ADVICE_ROUTE_SHORTLIST` (60) | Lines above which routing shortlists first; 0 never. |
 | `AMPUP_MEMORY_ADVICE_CURATION=on`, `AMPUP_MEMORY_ADVICE_RETIRE_MIN` (8), `AMPUP_MEMORY_ADVICE_RETIRE_MARGIN` (0.2), `AMPUP_MEMORY_ADVICE_RETIRE_JUDGED` | Curation. |
 | `AMPUP_MEMORY_ADVICE_ASK_WAIT_MS` | How long an agent's `get_advice` waits before "still being looked up". |
+| `AMPUP_MEMORY_HOOK_ADVICE_WAIT_MS` (2000), `AMPUP_MEMORY_EVENT_ROUTE_WAIT_MS` (800), `AMPUP_MEMORY_FINAL_ROUTE_WAIT_MS` (6000) | How long a hook's `get_advice` waits in all, and for the router at a tool event (before a final answer); what comes later goes with the session's next hook call. |
 | `AMPUP_MEMORY_PUBLIC_CAPABILITIES=off` | No public skill or MCP server suggestions. |
 | `AMPUP_MEMORY_SESSION_IDLE_SECS` (1800), `AMPUP_MEMORY_SESSION_SWEEP_SECS` (60) | Ending idle sessions; judging ended ones. |
 | `AMPUP_MEMORY_RUNS_PER_DAY` (100), `AMPUP_MEMORY_LOG_PER_DAY` (1000), `AMPUP_MEMORY_SESSIONS_PER_DAY` (1000) | Per-person daily caps. |

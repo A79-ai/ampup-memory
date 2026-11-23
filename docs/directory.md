@@ -21,22 +21,23 @@ Code is cited as `file:function`, because line numbers go stale.
 
 Each change is planned into events by `directory::plan`, and the events are folded by
 `Directory::apply_events`. An event is written at version 1 unless an older engine would get it wrong:
-then at the version that gave it its meaning (`SOURCES_VERSION`, `PURGE_VERSION`, `USERS_VERSION`). This
-engine reads up to `EVENT_VERSION = 4`; a row from before versions counts as 1. The fold stops at the first
+then at the version that gave it its meaning (`SOURCES_VERSION`, `PURGE_VERSION`, `USERS_VERSION`,
+`TENANTS_VERSION`). This engine reads up to `EVENT_VERSION = 7`; a row from before versions counts as 1. The fold stops at the first
 change it can't read: a newer version, or an op not in `directory::OPS` at any version (`readable`,
 `Folded::apply`). The `role` and `team` columns are set on `key.create` too, but the fold reads only
 `detail` for keys.
 
 | op | Fields used | Fold effect | Written by (`Change` / function) |
 |---|---|---|---|
-| `org.create` | org | Adds the org if absent, with `created_at = at` (its incarnation). Removes the name from `purged`. Not folded while the name is `purging`, whoever wrote it. | `CreateOrg` |
+| `org.create` | org, detail = `{created_by, tenant}` when a platform makes it (version 7) | Adds the org if absent, with `created_at = at` (its incarnation). Removes the name from `purged`. Not folded while the name is `purging`, whoever wrote it. A platform's records `(platform, tenant) → org` in `tenants` and applies the platform's template. | `CreateOrg`; `tenants::plan_tenant` (a tenant's first request, `PUT /tenants/{id}`) |
 | `org.delete` (version 2) | org | Removes the org. Adds the name to `purging`. Its verified-import keys go into `retired_keys`. | `DeleteOrg` |
-| `org.purged` | org | Moves the name from `purging` to `purged`. | `directory::apply`, after `offboard::purge_org` |
+| `org.purged` | org | Moves the name from `purging` to `purged`, and removes any tenant mapped to it. | `directory::apply`, after `offboard::purge_org` |
 | `team.create` | org, team | Adds an empty team. | `CreateTeam`, `Sync` (for teams it names) |
 | `team.delete` | org, team | Removes the team and its keys. Verified imports among them are retired. | `DeleteTeam` |
 | `member.add` | org, user, role | Sets the role (`admin` or `member`; anything else counts as `member`). Clears `removed`. | `CreateOrg` (first admin), `AddMember`, `AddToTeam`, `Invite`, `Sync` |
-| `member.remove` | org, user | Removes the membership and every team membership. Adds the user to `removed`, so a domain or a group won't bring them back. The planner writes a `key.revoke` with it for every key imported in the user's name there (`directory::import_revokes`). | `RemoveMember`, `Sync`, `offboard::forget_user` |
-| `member.forget` | org, user, detail = `Forgotten` counts | None. It is a tombstone, used by `describe` and the audit. | `offboard::forget_user` |
+| `member.remove` | org, user | Removes the membership and every team membership. Adds the user to `removed`, so a domain or a group won't bring them back. Clears the member's attributes. The planner writes a `key.revoke` with it for every key imported in the user's name there (`directory::import_revokes`). | `RemoveMember`, `Sync`, `offboard::forget_user` |
+| `member.attrs` (version 7) | org, user, detail = `{email?, name?}` | Sets the fields given on the member's attributes. Skipped if they aren't a member. | `tenants::enroll` (a platform's request naming the user, when an attribute header differs) |
+| `member.forget` | org, user, detail = `Forgotten` counts | Adds the user to the org's `forgotten`: a tombstone, used by `describe` and the audit, and by a tenant's member naming (a user forgotten there is another member if named again). | `offboard::forget_user` |
 | `member.request` | org, user | Adds the user to `pending` (with `at`), unless they are a member. Grants nothing: `access` never reads `pending`. `member.add` and `member.remove` clear it. | `RequestJoin` (the person themselves, through `/admin` op `request_join`: `ampup-memory join`) |
 | `member.decline` | org, user | Removes the user from `pending`. | `Decline` |
 | `team.add` | org, team, user | Adds the user to the team, but only if they are a member and the team exists. | `AddToTeam`, `Invite`, `Sync` |
@@ -49,11 +50,43 @@ change it can't read: a newer version, or an op not in `directory::OPS` at any v
 | `key.create` | org, detail = `KeyDetail {name, sha256, team, role, expires_at, sources?, created_by, imported_from?, verified?, imported_user?}` (version 2 when it has `sources`) | Inserts the key by name, replacing any key with that name. A verified import (`imported_from` and `verified`) removes its sha256 from `retired_keys`. An import keeps the user it acted as (`imported_user`, or on older rows the user `imported_from` names). A detail that doesn't parse (an unknown role, say) is skipped. | `CreateKey`, `ImportKeys` |
 | `key.revoke` | org, detail = key name | Removes the key. A verified import goes into `retired_keys`. | `RevokeKey` |
 | `key.sources` (version 2) | org, detail = `KeySources {name, sources}` | Sets the key's source prefixes (empty: any source). A key not there is skipped. | `SetKeySources` |
+| `platform.template` (version 7) | detail = `{platform, template: {settings, limits, schema?}}`, no org | Sets the platform's template, and each of its tenants' settings and limits again: what the tenant's org sets itself wins over the template (`Org::inherit`). | `tenants::plan_template` (`set_tenant_template`) |
 | anything else | | Stops the fold, as a change of a newer version does | |
 
 The fold also keeps state that belongs to no single org: `retired_keys`, `purging`, `purged`, and each
-org's `removed` and `created_at`. Snapshots keep all of it (`SnapOrg`, `SnapKey`,
-`Directory::snapshot_json`). `SNAPSHOT_FORMAT` is 10 (an imported key's user is kept since 9; since 10 an `org.create` while the name is purging isn't folded, and an unknown op stops the fold).
+org's `removed`, `forgotten` and `created_at`. Snapshots keep all of it (`SnapOrg`, `SnapKey`,
+`Directory::snapshot_json`). `SNAPSHOT_FORMAT` is 15 (an imported key's user is kept since 9; since 10 an `org.create` while the name is purging isn't folded, and an unknown op stops the fold; since 15 it keeps the platforms' `templates`, the `tenants` mapping, each org's `tenant`, its members' `attrs` and its `forgotten`, and each org's own settings and limits apart from what it inherits).
+
+### Tenants
+
+A **platform key** (a keys-file row with `"platform": "<name>"`) serves many tenants. Every request names one
+(`x-memstore-tenant`, and optionally `x-memstore-user`); the first request naming a tenant makes its org,
+`<slug>_<base32(sha256(platform \0 tenant))[:16]>`, through the directory compare-and-set (two replicas racing
+make one), and the first naming a user enrolls them as a member, `u<hash>@<org>.members.invalid`. The
+platform is its name (`created_by = platform:<name>`): a rotated key with the same name reaches the same tenants.
+Resolution goes through `tenants`, never the name: a tenant renamed later keeps its org. Code:
+`people/tenants.rs` (planning), `server/tenants.rs` (headers, routes, ACL translation).
+
+- **A tenant deleted and named again** gets an org of a name never held before: the first of `<base>`,
+  `<base>_2`, `<base>_3`, … that is no org and isn't `purging` or `purged` (`tenants::org_name`). Nothing a cache
+  keyed by org name holds (on this server or another) can be served to it. The request that wins the CAS making
+  it purges what is left under the previous name (a write a server made before it saw the delete), after the
+  commit; a request that lost makes nothing and purges nothing.
+- **Member names have generations.** A user's member name hashes their platform id (generation 0) or the id and
+  a generation (`user \0 g`). `forget` writes `member.forget`, which adds the name to the org's `forgotten`; the
+  user named again is enrolled under the next generation's name, so no ACL entry, closure or row written for the
+  forgotten name reads as them. A user an admin removed (`member.remove` without `member.forget`) isn't enrolled
+  again by being named: the request is refused, 403 `member_removed`.
+- **Forget from a platform** deletes what the member wrote, as any forget does, and also every episode the
+  platform ingested whose ACL entries all name that member (`offboard::forget_in_with`, `sole_reader`). An
+  episode shared with someone else stays; the forgotten name in its ACL reads as no one (above). The member's
+  `member.attrs` events stay in the append-only directory log (readable by the operator and the catalog owner
+  only), but the fold drops their attributes on `member.remove`, so no `show` serves them.
+- **Templates.** A platform sets its own template's settings and schema; `limits` (they spend the deployment's
+  budget), the models, `train_log` and `advice_traces` are the operator's, and a platform's `clear` resets only
+  what it may set. Values are checked as `SetSettings` checks them (`directory::check_values`). A template schema
+  (a built-in, by name) is given, `if_unset`, to any of the platform's tenants that has none, on that tenant's
+  next request on each server: one look per org and schema name per server process.
 
 ### Invariants and where each is enforced
 
@@ -126,6 +159,10 @@ Callers are the ones in the review's threat model. In the table, ✓ means allow
   only, and `plan` (`directory_key_may`) holds it to its own org, to members who aren't admins, and to the
   key still being in the directory.
 - **File key** is a non-admin key from `AMPUP_MEMORY_API_KEYS` that no directory key holds. It is bound to no org, so it reads its server's own scope and nothing of any org: every org column below is ✗ for it.
+- **Platform** is a platform key acting in its own tenants only (`Org::platform` is its name; `access` gives it
+  nothing else, `platform_may` holds its changes to its own tenants, `offboard::may_manage` its forgets). It
+  reaches no `/admin` op but `show` of the tenant it names and its own template; its requests run as the
+  tenant's member it names (or the tenant's service identity) and may select no org, team or scope.
 - **Operator** is the admin file key, or the catalog owner using `--direct`. For a directory change,
   `superuser` is true only for these two.
 - **Auth0 op** is a person signed in through the platform's Auth0 tenant (`AMPUP_MEMORY_AUTH0_ISSUER`) for
@@ -134,27 +171,29 @@ Callers are the ones in the review's threat model. In the table, ✓ means allow
 - **Catalog write** is anyone with write access to `memory_system`. It bypasses every check, because it
   appends rows itself.
 
-| Change (events) | Anon | Member | Admin | Org IdP | Keys | Dir key | File key | Operator | Auth0 op | Catalog write | Check lives in |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `CreateOrg`, `DeleteOrg` (`org.create`, `org.delete`, `org.purged`) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | `CreateOrg` only | ✓ | `plan` (`owner_only`) |
-| `SetAuth0Org`, `CreateOrg` with `auth0_org` (`org.auth0`) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | `plan` (`owner_only`, `Change::operators`, `auth0_free`); `directory_change` (not the operators' Organization) |
-| `CreateTeam`, `DeleteTeam`, `AddMember` (role `member`), `RemoveMember`, `AddToTeam`, `RemoveFromTeam` | ✗ | ✗ | own | own | ✗ | own, never an admin (not adding, demoting or removing one); `DeleteTeam` only of a team with no keys, team settings, group mappings or domains | ✗ | ✓ | `AddMember`, `RemoveMember` only (any org) | ✓ | `plan` (`is_admin`, `directory_key_may`); `directory_change` (refuses other keys) |
-| `AddMember` (role `admin`), `Invite`, `Sync`, `SetProfile` | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✓ | `AddMember`, `Invite` only (any org) | ✓ | `plan` (`is_admin`, `directory_key_may`); `directory_change` (refuses keys) |
-| `RequestJoin` (`member.request`) | ✗ | n/a (a member already: refused) | n/a | ✓ for themselves, with a verified email | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ | `plan` (`asks`: a person with a verified email, for themselves only; never in a workspace); `directory_change` (refuses keys) |
-| `Decline` (`member.decline`) | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✓ | ✓ (any org) | ✓ | `plan` (`is_admin`, `Change::operators`) |
-| Approval link (`server/join.rs`: `Invite` as the admin it was mailed to) | ✗ | ✗ | own, holding the link mailed to them (sealed under `AMPUP_MEMORY_SECRET_KEY`, 7 days, one request) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | `join::approve` (the token opens, the request still waits, then `plan` as that admin: one removed since approves nothing) |
-| `SetProvider`, `RemoveProvider` (`auth.provider`) | ✗ | ✗ | own | own (it can replace itself) | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ | `plan`; `directory_change` (`check_issuer`, not the server's client) |
-| `AddDomain` | ✗ | ✗ | own, for their own verified email domain, through the server's IdP only | ✗ | ✗ | ✗ | ✗ | ✓ (any domain) | ✗ | ✓ | `plan` (`proven`) |
-| `RemoveDomain`, `MapGroup`, `UnmapGroup` | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ | `plan` |
-| `CreateKey`, `RevokeKey` (`key.create`, `key.revoke`) | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✓ | `ingest` keys only (any org) | ✓ (any hash) | `plan`; `directory_change` |
-| `SetKeySources` (`key.sources`): an ingest key's source prefixes | ✗ | ✗ | own | own | ✗ (not even on itself) | ✗ | ✗ | ✓ | `ingest` keys (any org) | ✓ | `plan` (`key_sources`); `directory_change` (refuses keys) |
-| `ImportKeys` (`key.create` with `imported_user`) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ (the rows are the server's own keys file's, by id, or the owner's with `--direct`); the server holding the writer lease, for its own keys file's rows, as `server:keys-file` (§1) | ✗ | ✓ | `plan` (the import gate); `directory_change` (the fill by id); `file_keys::fate` |
-| `forget_user` (`member.remove`, `member.forget`) | ✗ | ✗ | own, as a person, not themselves | own | ✗ | ✗ | ✗ | ✓ (every org) | ✗ | ✓ | `offboard.rs:may_manage`, `forget_user`: checked again inside the `member.remove` CAS, against the directory read fresh before each scope's memory is deleted, and inside the `member.forget` CAS. A caller who loses the right partway is refused there: the person is out of the org, no scope is half-forgotten, and someone who may can run it again to finish. |
-| `set_schema` (a ledger commit, not a directory event) | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ | `directory_change` |
-| Read `show` | ✗ | own: themselves only | own | own (as whoever it signs in) | ✗ | own | ✗ | all | all | — | `directory_change` |
-| Read the org's audit; `export_org` | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✓ | ✗ | — | `directory_change`; `offboard.rs:may_manage` |
-| Read the operator's audit; `snapshot`; `check_directory` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | admin file key only for the operator's audit | ✗ | — | `directory_change` |
-| `/ingest`, `/acl`, `/closure`, `/team`, `/metrics` (public port) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | admin file key | ✗ | — | `server/mod.rs:require_admin` |
+| Change (events) | Anon | Member | Admin | Org IdP | Keys | Dir key | File key | Platform | Operator | Auth0 op | Catalog write | Check lives in |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `CreateOrg`, `DeleteOrg` (`org.create`, `org.delete`, `org.purged`) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | its own tenants: `org.create` on a tenant's first use, `DeleteOrg` by `DELETE /tenants/{id}` | ✓ | `CreateOrg` only | ✓ | `plan` (`owner_only`) |
+| `SetAuth0Org`, `CreateOrg` with `auth0_org` (`org.auth0`) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | `plan` (`owner_only`, `Change::operators`, `auth0_free`); `directory_change` (not the operators' Organization) |
+| `CreateTeam`, `DeleteTeam`, `AddMember` (role `member`), `RemoveMember`, `AddToTeam`, `RemoveFromTeam` | ✗ | ✗ | own | own | ✗ | own, never an admin (not adding, demoting or removing one); `DeleteTeam` only of a team with no keys, team settings, group mappings or domains | ✗ | `AddMember` (role `member`) of a user it names in its own tenant, on first use, never one an admin removed; `RemoveMember` only through `forget` | ✓ | `AddMember`, `RemoveMember` only (any org) | ✓ | `plan` (`is_admin`, `directory_key_may`); `directory_change` (refuses other keys) |
+| `AddMember` (role `admin`), `Invite`, `Sync`, `SetProfile` | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | `SetProfile` of a tenant it makes, once, as it is made (its name as the description) | ✓ | `AddMember`, `Invite` only (any org) | ✓ | `plan` (`is_admin`, `directory_key_may`); `directory_change` (refuses keys) |
+| `RequestJoin` (`member.request`) | ✗ | n/a (a member already: refused) | n/a | ✓ for themselves, with a verified email | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ | `plan` (`asks`: a person with a verified email, for themselves only; never in a workspace); `directory_change` (refuses keys) |
+| `Decline` (`member.decline`) | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (any org) | ✓ | `plan` (`is_admin`, `Change::operators`) |
+| Approval link (`server/join.rs`: `Invite` as the admin it was mailed to) | ✗ | ✗ | own, holding the link mailed to them (sealed under `AMPUP_MEMORY_SECRET_KEY`, 7 days, one request) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | `join::approve` (the token opens, the request still waits, then `plan` as that admin: one removed since approves nothing) |
+| `SetProvider`, `RemoveProvider` (`auth.provider`) | ✗ | ✗ | own | own (it can replace itself) | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ | `plan`; `directory_change` (`check_issuer`, not the server's client) |
+| `AddDomain` | ✗ | ✗ | own, for their own verified email domain, through the server's IdP only | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ (any domain) | ✗ | ✓ | `plan` (`proven`) |
+| `RemoveDomain`, `MapGroup`, `UnmapGroup` | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ | `plan` |
+| `CreateKey`, `RevokeKey` (`key.create`, `key.revoke`) | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✗ | ✓ | `ingest` keys only (any org) | ✓ (any hash) | `plan`; `directory_change` |
+| `SetKeySources` (`key.sources`): an ingest key's source prefixes | ✗ | ✗ | own | own | ✗ (not even on itself) | ✗ | ✗ | ✗ | ✓ | `ingest` keys (any org) | ✓ | `plan` (`key_sources`); `directory_change` (refuses keys) |
+| `ImportKeys` (`key.create` with `imported_user`) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ (the rows are the server's own keys file's, by id, or the owner's with `--direct`); the server holding the writer lease, for its own keys file's rows, as `server:keys-file` (§1) | ✗ | ✓ | `plan` (the import gate); `directory_change` (the fill by id); `file_keys::fate` |
+| `forget_user` (`member.remove`, `member.forget`) | ✗ | ✗ | own, as a person, not themselves | own | ✗ | ✗ | ✗ | its own tenants (`POST /tenants/{id}/users/{user}/forget`), also deleting the episodes it ingested that only that member reads | ✓ (every org) | ✗ | ✓ | `offboard.rs:may_manage`, `forget_user`: checked again inside the `member.remove` CAS, against the directory read fresh before each scope's memory is deleted, and inside the `member.forget` CAS. A caller who loses the right partway is refused there: the person is out of the org, no scope is half-forgotten, and someone who may can run it again to finish. |
+| `set_schema` (a ledger commit, not a directory event) | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | the template's built-in schema on a tenant of its own that has none (`if_unset`): as it is made, or on its next request on each server | ✓ | ✗ | ✓ | `directory_change` |
+| Read `show` | ✗ | own: themselves only | own | own (as whoever it signs in) | ✗ | own | ✗ | the tenant it names | all | all | — | `directory_change` |
+| Read the org's audit; `export_org` | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | — | `directory_change`; `offboard.rs:may_manage` |
+| Read the operator's audit; `snapshot`; `check_directory` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | admin file key only for the operator's audit | ✗ | — | `directory_change` |
+| `/ingest`, `/acl`, `/closure`, `/team`, `/metrics` (public port) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | `/ingest` into the tenant it names, ACLs translated | admin file key | ✗ | — | `server/mod.rs:require_admin` |
+| `set_tenant_template` (`platform.template`) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | its own, never `limits`, `reads`, `require_mfa`, `require_sso`, models, `train_log` or `advice_traces`; its `clear` keeps the operator's part | ✓ (any platform, models too; never the three sign-in and read settings) | ✗ | ✓ | `tenants::plan_template`; `directory_change` |
+| `member.attrs` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | a member of its own tenant, from the user's headers | ✗ | ✗ | ✓ | `tenants::enroll` |
 
 ## 3. Trust boundaries and assumptions
 
@@ -239,6 +278,7 @@ There is no key rotation: to rotate, change the key everywhere, then run `auth s
 | `AMPUP_MEMORY_API_KEYS` is the same on every replica | Each server serves its own file's keys, and an import through it takes its rows from that file. A key one file lacks works only where a file has it; a bearer a directory key holds is that key everywhere | Nothing; each server reads its file again when it changes |
 | A non-admin file key is for a server that serves its own scope (a single self-hosted server, an `AMPUP_MEMORY_TEAM_CSV` team): there it reads that scope, never an org's. A server with `AMPUP_MEMORY_DIRECTORY=required` takes none: it imports those it can (§1), and `ampup-memory identity check` and the server's `ALERT` lines (and `memstore_file_keys{id, user, state}`) name the rest, with what to do (`ampup-memory apikey import --org <org> [--team <team>] --from <file> --only <id>`, or a new key from `ampup-memory apikey create`). Admin keys stay in the file. | One key system for orgs: a bearer is one caller everywhere, revocable in the directory with no restart | `file_keys::pass`; `identity check` |
 | Upgrade every server before importing keys (by the server or `apikey import`) once the fleet runs the release that bound file keys to no org (`SNAPSHOT_FORMAT` 11). An older server reads a new import (no `verified` mark) as a directory key that isn't the file key's own, and refuses the bearer where its keys file holds it: it fails closed. A request selecting an org with a non-admin file key, or an org change made with one, is refused from this release on, on every server: move each such key into the directory first. | No key reads more on a mixed fleet; a key may be refused on an old server until it is upgraded | `identity check` (`warn file key`) |
+| **Upgrade every server before adding a platform row to the keys file.** A server from before tenants doesn't know `platform`. A row without `user` doesn't parse there: the keys file is refused (on a reload its previous keys stay), so the platform reaches nothing. A row **with** a `user` parses as a plain non-admin file key in that user's name that ignores the tenant headers: bound to no org, it reads and writes that server's own served scope. Only an older server that runs with `AMPUP_MEMORY_DIRECTORY=required` (`MEMSTORE_DIRECTORY=required`, as releases from before the rename call it) refuses such a key, and even it imports one whose user is a member of exactly one org, as that member's key there. So write platform rows without `user`. The tenant events are at `TENANTS_VERSION` (7), so an older server stops its fold at the first one (fails closed) instead of folding a tenant's org without its platform. **Before rolling back** to a release from before tenants, take the platform rows out of the keys file, or the older server refuses the whole file (giving a row a `user` instead makes it a file key over the served scope, as above, unless the directory is required); and never roll back once a tenant exists, since the older fold stops at the tenant events. | A mixed fleet must never serve a platform key as anything but a platform, or as a key over a served scope | `parse_keys`, `Folded::apply` |
 | Never roll back past the release that added the event version gate | Binaries before the version gate fold any row. Binaries before `retired_keys` and `purging` don't know them. | — |
 | New columns are added in place, and old rows read them as null (`org_created_at`, `version`) | Mixed fleets keep writing | `audit::collect` falls back to time for rows with no incarnation |
 

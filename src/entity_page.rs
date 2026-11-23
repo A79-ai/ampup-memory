@@ -131,16 +131,19 @@ pub async fn run(
             Some((
                 id.as_str(),
                 json!({"source": source, "occurred_at": at, "type": vis.episode_type(id),
-                       "title": titled.get(id).and_then(|t| t.named.as_deref()),
+                       "title": titled.get(id).and_then(|t| t.shown()),
                        "origin": vis.episode_origin(id).map(|o| o.name()), "readers": readers}),
             ))
         })
         .collect();
 
-    // Conflicts the caller may see: both facts open and readable to them, on this entity.
+    // Conflicts the caller may see: both facts open and readable to them, on this entity, of an attribute that holds
+    // one answer ([`crate::conflicts::one_value`]), as the review list and reads take them: two of a deal's
+    // requirements, recorded in conflict before reconcile checked, are both true, never in dispute.
+    let schema = session.schema();
     let open: HashSet<&str> = facts
         .iter()
-        .filter(|f| f.valid_to.is_none())
+        .filter(|f| f.valid_to.is_none() && crate::conflicts::one_value(schema.as_deref(), f))
         .map(|f| f.fact_id.as_str())
         .collect();
     let out_facts: Vec<Value> = facts
@@ -162,7 +165,7 @@ pub async fn run(
             if let Some(r) = &f.value_ref {
                 v["value_ref"] = json!(r);
             }
-            if f.valid_to.is_none() {
+            if open.contains(f.fact_id.as_str()) {
                 let against: Vec<&String> = vis
                     .conflicts_of(&f.fact_id)
                     .iter()

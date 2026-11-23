@@ -98,14 +98,31 @@ interface Lesson {
   evidence?: { ratified?: boolean };
 }
 
+/** The lessons of one whose (the team's, `owner` null, or a person's own), with their trails' totals. */
+interface Group {
+  owner: string | null;
+  lessons: number;
+  runs: number;
+  sessions: number;
+  helped: number;
+}
+
 interface Lessons {
   /** `everyone`: the reader reads every person's lessons and trails (an org admin). */
   reader: { user: string; everyone: boolean };
   /** The people with lessons of their own. */
   people: string[];
+  /** How many lessons the view shows, over every page. */
   count: number;
   lessons: Lesson[];
+  /** Every lesson the reader reads, by whose (an engine that pages lessons says it). */
+  groups?: Group[];
+  /** Where the next page starts; null on the last (an engine that pages lessons says it). */
+  next?: string | null;
 }
+
+/** Lessons a page asks for at a time. */
+const PAGE = 30;
 
 /**
  * A lesson as a link names it: a team lesson by its key, a person's own by its key and its owner (two people's
@@ -619,11 +636,15 @@ export function Learned({
   onAdvice: (key: string) => void;
 }) {
   const [n, setN] = useState(0);
+  const [show, setShow] = useOption("show");
   const [got, setGot] = useState<{ key: string; data?: Lessons; error?: unknown } | null>(null);
-  const key = JSON.stringify([sel.org, sel.team, sel.branch, n]);
+  const [more, setMore] = useState<{ key: string; busy: boolean; error?: unknown } | null>(null);
+  // A page of the view (`show`) at a time: memstore keeps every lesson the reader reads and answers each page from
+  // them, with how many of each whose there are for the tiles and tabs.
+  const key = JSON.stringify([sel.org, sel.team, sel.branch, show, n]);
   useEffect(() => {
     let live = true;
-    call<Lessons>(sel, "lessons").then(
+    call<Lessons>(sel, "lessons", { page: PAGE, ...(show ? { show } : {}) }).then(
       (data) => live && setGot({ key, data }),
       (error: unknown) => live && setGot({ key, error }),
     );
@@ -634,34 +655,78 @@ export function Learned({
   const cur = got?.key === key ? got : null;
   const v = cur?.data;
   const me = v?.reader.user ?? "";
-  const [show, setShow] = useOption("show");
+  const paged = !!v?.groups;
+  const next = v?.next ?? null;
+  const loadMore = () => {
+    if (!v || !next || (more?.key === key && more.busy)) return;
+    setMore({ key, busy: true });
+    call<Lessons>(sel, "lessons", { page: PAGE, after: next, ...(show ? { show } : {}) }).then(
+      (page) => {
+        setGot((g) =>
+          g?.key === key && g.data
+            ? { key, data: { ...g.data, lessons: [...g.data.lessons, ...page.lessons], next: page.next } }
+            : g,
+        );
+        setMore({ key, busy: false });
+      },
+      (error: unknown) => setMore({ key, busy: false, error }),
+    );
+  };
 
   const all = useMemo(() => v?.lessons ?? [], [v]);
-  const whose = (l: Lesson, s: string) =>
-    !s ||
-    (s === "team"
-      ? l.space === "team"
-      : l.space === "mine" && same(l.owner, s === "mine" ? me : s));
-  const shown = useMemo(() => all.filter((l) => whose(l, show)), [all, show, me]);
+  const whose = (owner: string | null, s: string) =>
+    !s || (s === "team" ? owner === null : owner !== null && same(owner, s === "mine" ? me : s));
+  // An engine that pages answers the view asked for; an older one, every lesson, filtered here.
+  const shown = useMemo(
+    () => (paged ? all : all.filter((l) => whose(l.owner, show))),
+    [all, paged, show, me],
+  );
+  const groups: Group[] = useMemo(
+    () =>
+      v?.groups ??
+      Object.values(
+        all.reduce<Record<string, Group>>((by, l) => {
+          const g = (by[l.owner ?? ""] ??= {
+            owner: l.owner,
+            lessons: 0,
+            runs: 0,
+            sessions: 0,
+            helped: 0,
+          });
+          g.lessons += 1;
+          g.runs += l.learned_from.runs;
+          g.sessions += l.served_in.sessions;
+          g.helped += l.served_in.helped;
+          return by;
+        }, {}),
+      ),
+    [v, all],
+  );
+  const inView = (s: string) => groups.filter((g) => whose(g.owner, s));
 
-  // Scrolled to the lesson the link names, once it is on the page.
+  // The lesson the link names: pages are read until it is on the page, then scrolled to.
+  const found = !!lesson && shown.some((l) => lessonId(l) === lesson);
   useEffect(() => {
-    if (lesson && v)
+    if (lesson && v && !found && next) loadMore();
+  }, [lesson, v, found, next]);
+  useEffect(() => {
+    if (lesson && v && found)
       document.getElementById(`lesson-${lesson}`)?.scrollIntoView({ block: "start" });
-  }, [lesson, v]);
+  }, [lesson, v, found]);
 
   const tooOld =
     cur?.error instanceof ApiError &&
     (cur.error.status === 404 || /unknown op/i.test(errorText(cur.error)))
       ? "This deployment's engine predates lessons: they show once the engine is updated."
       : null;
-  const totals = shown.reduce(
-    (t, l) => ({
-      runs: t.runs + l.learned_from.runs,
-      sessions: t.sessions + l.served_in.sessions,
-      helped: t.helped + l.served_in.helped,
+  const totals = inView(show).reduce(
+    (t, g) => ({
+      lessons: t.lessons + g.lessons,
+      runs: t.runs + g.runs,
+      sessions: t.sessions + g.sessions,
+      helped: t.helped + g.helped,
     }),
-    { runs: 0, sessions: 0, helped: 0 },
+    { lessons: 0, runs: 0, sessions: 0, helped: 0 },
   );
   const people = (v?.people ?? []).filter((p) => !same(p, me));
   const tabs: { id: string; label: string }[] = [
@@ -670,7 +735,8 @@ export function Learned({
     { id: "mine", label: "Yours" },
     ...(v?.reader.everyone ? people.map((p) => ({ id: p, label: p })) : []),
   ];
-  const picked = lesson && !shown.some((l) => lessonId(l) === lesson) ? lesson : null;
+  const picked = lesson && !found && !next ? lesson : null;
+  const anyLessons = groups.some((g) => g.lessons > 0);
 
   return (
     <div className="studio ap lr">
@@ -699,19 +765,19 @@ export function Learned({
           <dl className="ap-tiles">
             <div>
               <dt>Lessons</dt>
-              <dd>{shown.length}</dd>
+              <dd>{totals.lessons.toLocaleString()}</dd>
             </div>
             <div>
               <dt>Runs learned from</dt>
-              <dd>{totals.runs}</dd>
+              <dd>{totals.runs.toLocaleString()}</dd>
             </div>
             <div>
               <dt>Sessions served</dt>
-              <dd>{totals.sessions}</dd>
+              <dd>{totals.sessions.toLocaleString()}</dd>
             </div>
             <div>
               <dt>Helped</dt>
-              <dd>{totals.helped}</dd>
+              <dd>{totals.helped.toLocaleString()}</dd>
             </div>
           </dl>
           <nav className="ap-chips lr-chips" aria-label="Whose lessons">
@@ -722,7 +788,10 @@ export function Learned({
                 aria-pressed={show === t.id}
                 onClick={() => setShow(t.id || null)}
               >
-                {t.label} <span className="ap-num">{all.filter((l) => whose(l, t.id)).length}</span>
+                {t.label}{" "}
+                <span className="ap-num">
+                  {inView(t.id).reduce((k, g) => k + g.lessons, 0)}
+                </span>
               </button>
             ))}
           </nav>
@@ -748,9 +817,27 @@ export function Learned({
                 />
               ))
             ) : (
-              <Empty filtered={!!show && all.length > 0} />
+              <Empty filtered={!!show && anyLessons} />
             )}
           </div>
+          {next && (
+            <p className="ap-pad">
+              {more?.key === key && !!more.error && (
+                <span className="ap-error" role="alert">
+                  {errorText(more.error)}{" "}
+                </span>
+              )}
+              <button
+                className="ap-btn2"
+                disabled={more?.key === key && more.busy}
+                onClick={loadMore}
+              >
+                {more?.key === key && more.busy
+                  ? "Reading more…"
+                  : `Show more (${(v?.count ?? 0) - shown.length} left)`}
+              </button>
+            </p>
+          )}
         </>
       )}
     </div>

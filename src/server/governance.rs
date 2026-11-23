@@ -14,7 +14,14 @@ pub(super) async fn handle(
     let field = |k: &str| req[k].as_str().unwrap_or_default();
     let org = field("org");
     crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
-    let dir = Directory::load(store).await?;
+    // A read is decided by the directory requests are signed in by (`Directory::behind`); a change, by the
+    // directory at most the max staleness old.
+    let dir = match field("op") {
+        "entity_owners" | "list_proposals" | "entity_graph" | "get_proposal" | "list_conflicts" => {
+            Directory::behind(store).await?
+        }
+        _ => Directory::load(store).await?,
+    };
     let scope = dir.resolve(
         who.user(),
         via,
@@ -48,13 +55,21 @@ pub(super) async fn handle(
         "entity_owners" => serde_json::to_value(store.entity_owners_held(&scope).await?),
         "list_proposals" => {
             let limit = req["limit"].as_u64().unwrap_or(200).clamp(1, 500) as usize;
-            let listed = store.list_proposals(
-                &scope,
-                &reader,
-                req["entity"].as_str().filter(|e| !e.is_empty()),
-                limit,
-            );
-            serde_json::to_value(json!({"proposals": store.held(listed).await?}))
+            let entity = req["entity"].as_str().filter(|e| !e.is_empty());
+            // `built: true` (Studio's Home): listed only once every proposal's branch has its state built, so the
+            // list waits for no build; until then `proposals` is null, and the branches are built in the background.
+            // Governance read as this server holds it, as the list itself is: Home asks again while they build.
+            if req["built"] == true && !store.held(store.proposal_branches_built(&scope)).await? {
+                return Ok(json!({"org": org, "scope": scope.to_string(),
+                    "result": {"proposals": null, "building": true}}));
+            }
+            let all = proposals_kept(store, &scope, &reader).await?;
+            let listed: Vec<&crate::governance::ProposalSummary> = all
+                .iter()
+                .filter(|p| entity.is_none_or(|e| p.entities.iter().any(|x| x == e)))
+                .take(limit)
+                .collect();
+            serde_json::to_value(json!({"proposals": listed}))
         }
         "entity_graph" => {
             // At most `limit` entities (default 300, the most a page draws), keeping `entity` among them.
@@ -105,10 +120,52 @@ pub(super) async fn handle(
         field("op"),
         "entity_owners" | "list_proposals" | "entity_graph" | "get_proposal" | "list_conflicts"
     ) {
-        let ns = format!("{}\n", scope.namespace());
-        GRAPHS.lock().unwrap().retain(|k, _| !k.starts_with(&ns));
+        // And on the next read of the review lists, for whoever changed it first of all.
+        crate::kept_answers::changed(&scope.namespace());
     }
     Ok(json!({"org": org, "scope": scope.to_string(), "result": result}))
+}
+
+/// Each reader's proposals, by memory state.
+static PROPOSALS: std::sync::LazyLock<
+    crate::kept_answers::Kept<Vec<crate::governance::ProposalSummary>>,
+> = std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(500));
+
+/// Every proposal `reader` may see, newest activity first ([`Store::list_proposals`]), kept by memory state: each
+/// list reads the governance tables and builds the visibility of every proposal's branch. Kept by main's state and
+/// every other branch's heads, and only main may have moved on for a kept list to answer while the next is made: a
+/// branch's change (a draft changed, evidence forgotten there) is listed on the read that follows it.
+async fn proposals_kept(
+    store: &Store,
+    scope: &Scope,
+    reader: &Principal,
+) -> Result<std::sync::Arc<Vec<crate::governance::ProposalSummary>>> {
+    let mark = crate::kept_answers::Mark::read(store, scope).await?;
+    let vis = store.lagging_visibility(scope, crate::MAIN).await?;
+    let mut at = crate::kept_answers::At::of(mark, &vis);
+    at.pinned = store
+        .branch_heads_held(scope)
+        .await?
+        .into_iter()
+        .filter(|(b, _)| b != crate::MAIN)
+        .map(|(b, heads)| format!("{b} {}", heads.join(",")))
+        .collect();
+    PROPOSALS
+        .get(
+            &scope.namespace(),
+            &crate::kept_answers::reader_key(reader),
+            at,
+            true,
+            || {
+                let (store, scope, reader) = (store.clone(), scope.clone(), reader.clone());
+                async move {
+                    store
+                        .held(store.list_proposals(&scope, &reader, None, usize::MAX))
+                        .await
+                }
+            },
+        )
+        .await
 }
 
 /// The entity graph of `scope` as `reader` sees it ([`Store::entity_graph`]), each node named where its id says
@@ -135,25 +192,16 @@ async fn graph(
     crate::names::attach(store, &session, reader, graph, &eps).await
 }
 
-/// Readers whose graphs are kept, at most.
-const MAX_GRAPHS: usize = 500;
+/// Each reader's last graph, by scope, reader (user and every group they read as), `limit` and `entity`: never
+/// shared between readers.
+static GRAPHS: std::sync::LazyLock<crate::kept_answers::Kept<Value>> =
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(500));
 
-struct KeptGraph {
-    /// Main's heads it was built at.
-    heads: Vec<String>,
-    at: std::time::Instant,
-    graph: Value,
-    refreshing: bool,
-}
-
-/// Each reader's last graph, by scope, reader (user and tokens), `limit` and `entity`: never shared between readers.
-static GRAPHS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, KeptGraph>>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// [`graph`], kept: building it reads and decodes every fact the reader may read, seconds in a large org. At the
-/// same heads of main it is the same graph. Once main moved on, the kept one answers at once while the new one is
-/// built in the background for the next read; only a reader's first graph (or one after a restart) is built on
-/// the request.
+/// [`graph`], kept by memory state ([`crate::kept_answers`]): building it reads and decodes every fact the reader
+/// may read, seconds in a large org. At the same state it is the same graph. Once main moved on, the kept one
+/// answers at once while the new one is built in the background for the next read, but never once memory lost
+/// something since it was built; only a reader's first graph (or one after a restart or a loss) is built on the
+/// request.
 async fn graph_kept(
     store: &Store,
     scope: &Scope,
@@ -161,76 +209,25 @@ async fn graph_kept(
     max: usize,
     keep: Option<&str>,
 ) -> Result<Value> {
-    let heads = store
-        .lagging_visibility(scope, crate::MAIN)
-        .await?
-        .heads()
-        .to_vec();
+    let mark = crate::kept_answers::Mark::read(store, scope).await?;
+    let vis = store.lagging_visibility(scope, crate::MAIN).await?;
     let key = format!(
-        "{}\n{}\n{}\n{max}\n{}",
-        scope.namespace(),
-        reader.user(),
-        reader.tokens().join(","),
+        "{}\n{max}\n{}",
+        crate::kept_answers::reader_key(reader),
         keep.unwrap_or_default()
     );
-    {
-        let mut kept = GRAPHS.lock().unwrap();
-        if let Some(g) = kept.get_mut(&key) {
-            if g.heads != heads && !g.refreshing {
-                g.refreshing = true;
-                let (store, scope, reader, key, heads) = (
-                    store.clone(),
-                    scope.clone(),
-                    reader.clone(),
-                    key.clone(),
-                    heads.clone(),
-                );
+    let graph = GRAPHS
+        .get(
+            &scope.namespace(),
+            &key,
+            crate::kept_answers::At::of(mark, &vis),
+            true,
+            || {
+                let (store, scope, reader) = (store.clone(), scope.clone(), reader.clone());
                 let keep = keep.map(String::from);
-                tokio::spawn(async move {
-                    let built = graph(&store, &scope, &reader, max, keep.as_deref()).await;
-                    let mut kept = GRAPHS.lock().unwrap();
-                    match built {
-                        Ok(graph) => keep_graph(&mut kept, key, heads, graph),
-                        Err(e) => {
-                            eprintln!("entity graph of {scope}: {e:#}");
-                            if let Some(g) = kept.get_mut(&key) {
-                                g.refreshing = false;
-                            }
-                        }
-                    }
-                });
-            }
-            return Ok(g.graph.clone());
-        }
-    }
-    let built = graph(store, scope, reader, max, keep).await?;
-    keep_graph(&mut GRAPHS.lock().unwrap(), key, heads, built.clone());
-    Ok(built)
-}
-
-fn keep_graph(
-    kept: &mut HashMap<String, KeptGraph>,
-    key: String,
-    heads: Vec<String>,
-    graph: Value,
-) {
-    if kept.len() >= MAX_GRAPHS && !kept.contains_key(&key) {
-        // The least recently built goes.
-        if let Some(oldest) = kept
-            .iter()
-            .min_by_key(|(_, g)| g.at)
-            .map(|(k, _)| k.clone())
-        {
-            kept.remove(&oldest);
-        }
-    }
-    kept.insert(
-        key,
-        KeptGraph {
-            heads,
-            at: std::time::Instant::now(),
-            graph,
-            refreshing: false,
-        },
-    );
+                async move { graph(&store, &scope, &reader, max, keep.as_deref()).await }
+            },
+        )
+        .await?;
+    Ok((*graph).clone())
 }

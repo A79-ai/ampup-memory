@@ -11,7 +11,7 @@ import type { Branch, Focus, Me, Selection } from "./types";
 import { Icon } from "./ui";
 import { ReviewSection } from "./review";
 import { GraphSection } from "./graph";
-import { Home } from "./home";
+import { Home, type HomeSummary } from "./home";
 import { AddToMemoryDialog } from "./addToMemory";
 import { Advice, AdviceServing, Branches, NotAnswered, Owners, People } from "../studio/Admin";
 import { AdvicePage } from "../studio/AdvicePage";
@@ -403,7 +403,7 @@ export interface MemoryStudioProps {
    * transport's `admin` capability allows (the local caller, once their server lets them).
    */
   admin?: boolean;
-  /** Light, dark, or the system's (`system`). Light unless given. */
+  /** Light, dark, or the system's (`system`). The system's unless given. */
   theme?: "light" | "dark" | "system";
   /**
    * Where the host connects a source and an agent to the memory (a console's Sources and setup pages), for Home's
@@ -454,7 +454,7 @@ export function MemoryStudio({
   goals,
   handover,
   admin: isAdmin,
-  theme = "light",
+  theme = "system",
   connect,
   navigation = "sidebar",
   onNavigation,
@@ -515,23 +515,45 @@ export function MemoryStudio({
   } | null>(null);
   const memoryKey = JSON.stringify([sel.org, sel.team]);
   const selKey = JSON.stringify([sel.org, sel.team, sel.branch]);
-  const [schema, retrySchema] = useOrgSchema(sel, canBrowse);
+  // On Home (main read), its one read names the branches and counts the schema's types: neither is read here
+  // while it is out, nor after it answered them. undefined: not answered yet; null: a server with no such read.
+  const [homeSaid, setHomeSaid] = useState<{ key: string; h: HomeSummary | null } | null>(null);
+  const onHome = section === "home" && (sel.branch ?? "main") === "main";
+  const said = homeSaid?.key === selKey ? homeSaid.h : undefined;
+  const homeNames = onHome && (said === undefined || (said !== null && said.branches !== null));
+  const [schema, retrySchema] = useOrgSchema(sel, canBrowse && !(onHome && said !== null));
+  // The memory whose branches were named: not read again for it.
+  const named = useRef<string | null>(null);
+  const onSummary = useCallback(
+    (h: HomeSummary | null) => {
+      setHomeSaid({ key: selKey, h });
+      if (h?.branches && (sel.branch ?? "main") === "main") {
+        named.current = memoryKey;
+        setBranches({ key: memoryKey, list: h.branches });
+      }
+    },
+    [selKey, memoryKey],
+  );
 
   useEffect(() => {
-    if (!canBrowse) return;
+    if (!canBrowse || homeNames || named.current === memoryKey) return;
     let live = true;
     browse<{ branches: Branch[] | null }>(
       { op: "branches" },
       { org: sel.org, team: sel.team },
     ).then(
-      (r) => live && setBranches({ key: memoryKey, list: r.branches }),
+      (r) => {
+        if (!live) return;
+        named.current = memoryKey;
+        setBranches({ key: memoryKey, list: r.branches });
+      },
       // Unreachable is not "can't name them": pick nothing until it answers.
       () => live && setBranches({ key: memoryKey, list: undefined }),
     );
     return () => {
       live = false;
     };
-  }, [memoryKey, canBrowse]);
+  }, [memoryKey, canBrowse, homeNames]);
 
   useEffect(() => {
     if (!canBrowse) return;
@@ -555,6 +577,9 @@ export function MemoryStudio({
 
   // Below 900px the tree is a drawer, closed on every move.
   const [drawer, setDrawer] = useState(false);
+  // Whether the tree is on screen: always when wide, unless the host draws the sections (then the "Folders" button
+  // shows it); narrow, only while its drawer is open. Hidden, it reads nothing.
+  const wide = useMedia("(min-width: 901px)");
   const searchRef = useRef<HTMLInputElement>(null);
   const go = useCallback((f: Focus) => {
     setDrawer(false);
@@ -605,8 +630,8 @@ export function MemoryStudio({
   const branch = sel.branch ?? "main";
   // Skills usually live on a goal's branch: say where, when there are none on the one read.
   const elsewhere =
-    readable && !readable.some((b) => b.name === branch && b.skills > 0)
-      ? readable.filter((b) => b.name !== branch && b.skills > 0)
+    readable && !readable.some((b) => b.name === branch && (b.skills ?? 0) > 0)
+      ? readable.filter((b) => b.name !== branch && (b.skills ?? 0) > 0)
       : [];
   const pickBranch = (b: string) => choose({ team: sel.team, branch: b || undefined });
 
@@ -664,7 +689,7 @@ export function MemoryStudio({
   );
 
   // For a host that draws the sections: tell it what they are whenever that changes.
-  const typeCount = schema?.types?.size;
+  const typeCount = schema?.types?.size ?? (onHome && said ? said.schema?.types : undefined);
   const navigationKey = JSON.stringify([
     visible.map((g) => [g.group, g.items.map((i) => i.id)]),
     section,
@@ -708,8 +733,8 @@ export function MemoryStudio({
             >
               <Icon name={i.icon} size={16} />
               <span>{i.label}</span>
-              {i.id === "schema" && schema?.types && (
-                <span className="studio-count">{schema.types.size}</span>
+              {i.id === "schema" && typeCount !== undefined && (
+                <span className="studio-count">{typeCount}</span>
               )}
             </button>
           ))}
@@ -937,7 +962,14 @@ export function MemoryStudio({
           <aside className="side" aria-label="Memory">
             <div className="side-scroll">
               <div className="side-section">Memory</div>
-              <Tree key={selKey} sel={sel} focus={focus} onFocus={go} reveal={reveal} />
+              <Tree
+                key={selKey}
+                sel={sel}
+                focus={focus}
+                onFocus={go}
+                reveal={reveal}
+                shown={drawer || (wide && !hostNav)}
+              />
             </div>
           </aside>
           <div className="scrim" onClick={() => setDrawer(false)} />
@@ -990,6 +1022,7 @@ export function MemoryStudio({
                   return `${toHash(f)}${o.size ? `?${o}` : ""}`;
                 }}
                 connect={connect}
+                onSummary={onSummary}
                 // The "Add to memory" control, where the transport can learn. The dream's summary is Home's own
                 // read (an admin's).
                 addToMemory={transport.capabilities.learn ? <AddToMemoryDialog sel={sel} /> : undefined}
@@ -1188,5 +1221,18 @@ function BranchInput({ branch, onPick }: { branch: string; onPick: (b: string) =
         onBlur={() => v.trim() !== branch && onPick(v.trim())}
       />
     </form>
+  );
+}
+
+/** Whether a media query matches, kept up to date as the window changes. */
+function useMedia(query: string): boolean {
+  return useSyncExternalStore(
+    (on) => {
+      if (typeof matchMedia !== "function") return () => {};
+      const m = matchMedia(query);
+      m.addEventListener("change", on);
+      return () => m.removeEventListener("change", on);
+    },
+    () => typeof matchMedia !== "function" || matchMedia(query).matches,
   );
 }

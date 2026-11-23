@@ -722,13 +722,20 @@ type OrgCount = (u64, u64, std::time::Instant);
 static ORG_COUNT: std::sync::LazyLock<Mutex<HashMap<String, OrgCount>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// The episodes `org` holds, over all its scopes, from their snapshots' summaries.
+/// How many of an org's scopes [`org_episodes`] reads from the catalog at once.
+const COUNT_CONCURRENCY: usize = 8;
+
+/// The episodes `org` holds, over all its scopes, from their snapshots' summaries: each scope's table loaded now
+/// (exact, nothing cached), the scopes side by side rather than one after the other, so asking costs one catalog
+/// round trip after the namespaces are listed, however many teams the org has (`/admin show`'s usage, which a
+/// control plane asks for on every view of an org's plan).
 pub async fn org_episodes(store: &Store, org: &str) -> Result<u64> {
-    let mut n = 0;
-    for ns in store.org_namespaces(org).await? {
-        n += store.total_rows(&ns, EPISODES).await?;
-    }
-    Ok(n)
+    use futures::{StreamExt, TryStreamExt};
+    futures::stream::iter(store.org_namespaces(org).await?)
+        .map(|ns| async move { store.total_rows(&ns, EPISODES).await })
+        .buffer_unordered(COUNT_CONCURRENCY)
+        .try_fold(0, |n, rows| async move { Ok(n + rows) })
+        .await
 }
 
 /// Refuse an index update of a workspace scope whose workspace's indexes are at their byte cap already.
@@ -776,10 +783,14 @@ impl Store {
     /// zeros when it has none.
     pub async fn snapshot_totals(&self, ns: &str, name: &str) -> Result<(u64, u64)> {
         let ident = TableIdent::new(NamespaceIdent::new(ns.into()), name.into());
-        if !self.has_table(&ident).await? {
-            return Ok((0, 0));
-        }
-        let table = self.catalog().load_table(&ident).await?;
+        // Loaded first: a table that exists (an org's episodes, the usual case) costs this one catalog read, not two
+        // existence checks before it. Only a load that fails asks whether the table is there at all, so a missing
+        // table or namespace reads as zeros on every catalog, whichever error it answers a missing one with.
+        let table = match self.catalog().load_table(&ident).await {
+            Ok(t) => t,
+            Err(_) if !self.has_table(&ident).await? => return Ok((0, 0)),
+            Err(e) => return Err(e.into()),
+        };
         let total = |key: &str| {
             table
                 .metadata()

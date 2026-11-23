@@ -4,14 +4,15 @@ import { browse, call } from "./api";
 import { when } from "./format";
 import { appliedSaid, DreamSaid, dreamState } from "./review";
 import { needsMe, review, type DreamList } from "./review-api";
-import type { Child, Focus, Listing, Selection } from "./types";
+import type { Branch, Child, Focus, Listing, Selection } from "./types";
 import { EmptyState, Icon } from "./ui";
 import type { Resolved } from "../transport";
 
 // Studio's Home (`#/home`): the memory being read (the org's, or the team picked) as its builders see it. What
 // changed this week, what was answered from it, and what waits on the reader, each number a link into the
-// section that holds it. Every number comes from a read another section already makes; one with no cheap read is
-// left out, and one the reader may not make (an admin's, a review's) is too.
+// section that holds it. Every number is one another section's read would give; one with no cheap read is left out,
+// and one the reader may not make (an admin's, a review's) is too. They come in one read (`home`), counts and short
+// lists only; from a server before it, a read each.
 
 const WEEK_DAYS = 7;
 const WEEK_US = WEEK_DAYS * 86_400_000_000;
@@ -40,6 +41,46 @@ export interface HomeProps {
    * says how instead.
    */
   connect?: { sources?: string; agents?: string };
+  /**
+   * What the one read (`home`) answered so far, for the page around Home: the branches and how many types the
+   * schema declares, so it reads neither while Home is open. null: no such read (a server before it, or it failed).
+   */
+  onSummary?: (h: HomeSummary | null) => void;
+}
+
+/**
+ * `/browse {op: "home"}`: Home's numbers. A part is null where the reader may not read it (or it failed), and
+ * absent while it is still worked out: `pending` names those, for an ask again with `parts`.
+ */
+export interface HomeSummary {
+  /** The week's start (µs): the hour it is now, seven days back. */
+  since: number;
+  pending?: string[];
+  /** The root folders' counts. */
+  counts?: Record<string, number | null> | null;
+  /** The newest source folders, the newest first (with `week`). */
+  sources?: Child[] | null;
+  /** The week's facts: how many, how many of the newest were read, and of those the entities and sources. */
+  week?: { count: number; sample: number; entities: number; by_source: [string, number][] } | null;
+  lessons?: number | null;
+  /** The team's notes served this week (with `week`). */
+  advice?: { times: number; notes: number; waiting: number } | null;
+  activity?: { people: number; sessions: number; served?: number; of?: number } | null;
+  proposals?: { mine: number; pending: number } | null;
+  conflicts?: number | null;
+  dream?: DreamList | null;
+  branches?: Branch[] | null;
+  schema?: { types: number };
+}
+
+/** How many times Home asks again for the parts still worked out (an ask that failed included), before it leaves
+ * them out. */
+const ASK_AGAIN = 5;
+
+/** `h` with what is still pending left out: null, as a part that failed. */
+function settled(h: HomeSummary): HomeSummary {
+  const gone = (h.pending ?? []).flatMap((p) => (p === "week" ? ["week", "sources", "advice"] : [p]));
+  return { ...h, ...Object.fromEntries(gone.map((p) => [p, null])), pending: [] };
 }
 
 type Got<T> = { key: string; data?: T; failed?: boolean };
@@ -59,6 +100,46 @@ function useGot<T>(key: string, on: boolean, load: () => Promise<T>): { data?: T
     );
     return () => {
       live = false;
+    };
+  }, [key, on]);
+  const mine = got?.key === key ? got : null;
+  return { data: mine?.data, done: !on || mine !== null };
+}
+
+/** How often, and how many times, Home asks again for the root's counts while the server is still counting them. */
+const RECOUNT_MS = 2000;
+const RECOUNT_TIMES = 30;
+
+/**
+ * The Explorer's root, with each folder's count: asked again while some folder has no count yet (the server counts
+ * a large memory in the background and answers the folders without counts meanwhile).
+ */
+function useRoot(
+  key: string,
+  on: boolean,
+  sel: HomeProps["sel"],
+): { data?: Listing; done: boolean } {
+  const [got, setGot] = useState<Got<Listing> | null>(null);
+  useEffect(() => {
+    if (!on) return;
+    let live = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ask = (left: number) => {
+      browse<Listing>({ op: "ls", path: [] }, sel).then(
+        (data) => {
+          if (!live) return;
+          setGot({ key, data });
+          if (left > 0 && data.children.some((c) => c.count == null)) {
+            timer = setTimeout(() => ask(left - 1), RECOUNT_MS);
+          }
+        },
+        () => live && setGot((g) => (g?.key === key && g.data ? g : { key, failed: true })),
+      );
+    };
+    ask(RECOUNT_TIMES);
+    return () => {
+      live = false;
+      clearTimeout(timer);
     };
   }, [key, on]);
   const mine = got?.key === key ? got : null;
@@ -93,36 +174,97 @@ export function Home({
   href,
   addToMemory,
   connect,
+  onSummary,
 }: HomeProps) {
   const key = JSON.stringify([sel.org, sel.team, sel.branch]);
+
+  // Every number in one read, shown as it answers: the parts not worked out in time are asked for again. null: a
+  // server with no such read (or the read failed), and Home makes a read each, as before it.
+  const [said, setSaid] = useState<{ key: string; h: HomeSummary | null } | null>(null);
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      // The proposals wait for their branches' states to be built, which a first ask doesn't wait for: asked for
+      // beside it, so that the wait starts with the page rather than once the first ask has answered.
+      const beside = browse<HomeSummary>({ op: "home", parts: ["proposals"] }, sel).catch(() => null);
+      let h: HomeSummary;
+      try {
+        h = await browse<HomeSummary>({ op: "home" }, sel);
+      } catch {
+        if (live) setSaid({ key, h: null });
+        return;
+      }
+      if (live && h.pending?.includes("proposals")) {
+        if (h.pending.length > 1) setSaid({ key, h });
+        const p = await beside;
+        if (p && !p.pending?.includes("proposals")) {
+          h = { ...h, proposals: p.proposals, pending: h.pending.filter((x) => x !== "proposals") };
+        }
+      }
+      for (let again = 0; live; again++) {
+        if (!h.pending?.length || again === ASK_AGAIN) {
+          setSaid({ key, h: settled(h) });
+          return;
+        }
+        setSaid({ key, h });
+        try {
+          h = { ...h, ...(await browse<HomeSummary>({ op: "home", parts: h.pending }, sel)) };
+        } catch {
+          // Asked again on the next turn: what it waited for goes on being worked out, and is kept for it.
+        }
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [key]);
+  // undefined until it answers; null: a read each.
+  const one = said?.key === key ? said.h : undefined;
+  const each = one === null;
+  useEffect(() => {
+    if (one !== undefined) onSummary?.(one);
+  }, [one]);
+  // A part has answered (or isn't the reader's): from the one read, once it isn't pending; else once its own read has.
+  const done = (part: string, got: { done: boolean }) =>
+    each ? got.done : one !== undefined && !one.pending?.includes(part);
+
   // The week, fixed for the page: a re-render doesn't move it.
   const since = useMemo(() => Date.now() * 1000 - WEEK_US, [key]);
 
   // What the memory holds: the Explorer's root, with each folder's count.
-  const rootGot = useGot(key, true, () => browse<Listing>({ op: "ls", path: [] }, sel));
-  const root = rootGot.data;
+  // Only when the one read is refused (an older server): the root's counts, asked again until counted.
+  const rootGot = useRoot(key, each, sel);
+  const counts: Record<string, number | null | undefined> | undefined = one
+    ? (one.counts ?? undefined)
+    : rootGot.data && Object.fromEntries(rootGot.data.children.map((c) => [c.name, c.count]));
   // Each source and when it last brought something.
-  const sources = useRead(key, true, () =>
+  const sources = useRead(key, each, () =>
     browse<Listing>({ op: "ls", path: ["sources"], limit: 200 }, sel),
   );
   // The facts that took effect this week: how many, on how many entities, and from where.
-  const factsGot = useGot(key, true, () =>
+  const factsGot = useGot(key, each, () =>
     browse<FactsPage>(
       { op: "facts", valid_from: { gte: since }, limit: FACT_SAMPLE, order: "newest" },
       sel,
     ),
   );
   const facts = factsGot.data;
-  const lessonsGot = useGot(key, can.lessons, () =>
+  const lessonsGot = useGot(key, each && can.lessons, () =>
     call<{ count: number }>(sel, "lessons", { since, count: true }),
   );
-  const lessons = lessonsGot.data;
-  const adviceGot = useGot(key, true, () =>
+  const lessons = !can.lessons
+    ? undefined
+    : one
+      ? one.lessons == null
+        ? undefined
+        : { count: one.lessons }
+      : lessonsGot.data;
+  const adviceGot = useGot(key, each, () =>
     browse<AdviceUsage>({ op: "advice_usage", days: WEEK_DAYS }, sel),
   );
   const advice = adviceGot.data;
   // The admins' read of who asked what (the team read, never the branch, as People reads it).
-  const activityGot = useGot(key, admin, () =>
+  const activityGot = useGot(key, each && admin, () =>
     call<Activity>({ org: sel.org, team: sel.team }, "admin", {
       op: "activity",
       sinceDays: WEEK_DAYS,
@@ -130,23 +272,39 @@ export function Home({
     }),
   );
   const activity = activityGot.data;
-  const proposalsGot = useGot(key, can.review, () => review.proposals(sel));
+  const proposalsGot = useGot(key, each && can.review, () => review.proposals(sel));
   const proposals = proposalsGot.data;
   // Only the count: one conflict and the total.
-  const conflictsGot = useGot(key, can.review, () =>
+  const conflictsGot = useGot(key, each && can.review, () =>
     review.conflicts(sel, { mine: true, limit: 1 }),
   );
-  const conflicts = conflictsGot.data;
+  const conflicts = !can.review
+    ? undefined
+    : one
+      ? one.conflicts == null
+        ? undefined
+        : { total: one.conflicts }
+      : conflictsGot.data;
   // The dream's (an org admin's): its last pass, what waits, and what it applied this week, from one decision's read.
-  const dreamGot = useGot(key, admin && can.review, () =>
+  const dreamGot = useGot(key, each && admin && can.review, () =>
     review.dream(sel, { status: "applied", since, limit: 1 }),
   );
-  const dream = dreamGot.data;
+  const dream = !(admin && can.review) ? undefined : one ? (one.dream ?? undefined) : dreamGot.data;
 
-  const count = (name: string) => root?.children.find((c) => c.name === name)?.count ?? 0;
-  const empty = root !== undefined && count("sources") === 0 && count("entities") === 0;
+  const count = (name: string) => counts?.[name] ?? 0;
+  // Empty only once counted: a folder the server is still counting has no count, and never reads as 0.
+  const empty = counts?.sources === 0 && counts?.entities === 0;
 
   const weekFacts = useMemo(() => {
+    if (one)
+      return one.week
+        ? {
+            count: one.week.count,
+            sampled: one.week.sample < one.week.count,
+            entities: one.week.entities,
+            bySource: one.week.by_source,
+          }
+        : null;
     if (!facts) return null;
     const entities = new Set(facts.facts.map((f) => f.entity));
     const bySource = new Map<string, number>();
@@ -160,9 +318,10 @@ export function Home({
       entities: entities.size,
       bySource: [...bySource].sort((a, b) => b[1] - a[1]),
     };
-  }, [facts]);
+  }, [one, facts]);
 
   const served = useMemo(() => {
+    if (one) return one.advice ?? null;
     if (!advice) return null;
     const used = advice.advice.filter((a) => a.used > 0);
     return {
@@ -170,9 +329,10 @@ export function Home({
       notes: used.length,
       waiting: advice.advice.filter((a) => a.used > 0 && !a.ratified && !a.held).length,
     };
-  }, [advice]);
+  }, [one, advice]);
 
   const asked = useMemo(() => {
+    if (one) return admin ? (one.activity ?? null) : null;
     if (!activity) return null;
     const people = activity.people.filter((p) => p.sessions + p.runs + p.answers > 0);
     return {
@@ -181,11 +341,12 @@ export function Home({
       served: activity.serving?.sessions_served,
       of: activity.serving?.sessions,
     };
-  }, [activity]);
+  }, [one, admin, activity]);
 
-  const mine = proposals ? needsMe(proposals, me).length : undefined;
-  const pending = proposals?.filter((p) => p.status === "pending_review").length;
-  const recent = (sources?.children ?? [])
+  const waits = one && can.review ? (one.proposals ?? null) : null;
+  const mine = waits ? waits.mine : proposals ? needsMe(proposals, me).length : undefined;
+  const pending = waits ? waits.pending : proposals?.filter((p) => p.status === "pending_review").length;
+  const recent = ((one ? one.sources : sources?.children) ?? [])
     .map((c) => ({ c, at: c.latest ?? c.occurred_at ?? 0 }))
     .sort((a, b) => b.at - a.at);
 
@@ -227,7 +388,12 @@ export function Home({
         <>
           <NeedsYou
             // Settled once every read behind a row has answered (or failed, or isn't the reader's to make).
-            settled={proposalsGot.done && conflictsGot.done && dreamGot.done && adviceGot.done}
+            settled={
+              done("proposals", proposalsGot) &&
+              done("conflicts", conflictsGot) &&
+              done("dream", dreamGot) &&
+              done("week", adviceGot)
+            }
             needs={[
               mine !== undefined && {
                 key: "proposals",
@@ -257,6 +423,7 @@ export function Home({
                   n: served.waiting,
                   one: "team note served this week waits for ratifying",
                   many: "team notes served this week wait for ratifying",
+                  where: "on Advice, not counted in Review",
                 },
               !admin &&
                 pending !== undefined &&
@@ -302,8 +469,8 @@ export function Home({
                 />
               )}
               {/* Each tile's place holds while its read is out, so the page doesn't jump as they land. */}
-              {!factsGot.done && <TileSkeleton count={2} />}
-              {!lessonsGot.done && <TileSkeleton />}
+              {!done("week", factsGot) && <TileSkeleton count={2} />}
+              {!done("lessons", lessonsGot) && <TileSkeleton />}
             </div>
             {weekFacts && weekFacts.bySource.length > 0 && (
               <p className="hm-by">
@@ -335,11 +502,12 @@ export function Home({
                 />
               )}
               {asked?.served !== undefined && asked.of !== undefined && (
+                // Advice's details count the same (Serving's "Sessions served a note"), at 7 days.
                 <Tile
                   href={href({ kind: "serving" }, { days: String(WEEK_DAYS) })}
                   n={asked.served}
-                  label="sessions given advice"
-                  note={`of ${asked.of.toLocaleString()}`}
+                  label={asked.served === 1 ? "session served a note" : "sessions served a note"}
+                  note={`of ${asked.of.toLocaleString()} sessions`}
                 />
               )}
               {served && (
@@ -350,16 +518,18 @@ export function Home({
                   note={`${served.notes} ${served.notes === 1 ? "note" : "notes"}`}
                 />
               )}
-              {root && count("sessions") > 0 && (
+              {counts && count("sessions") > 0 && (
+                // Not the activity count above: the reader's own records in `sessions/`, kept since the memory began.
                 <Tile
                   href={href({ kind: "folder", path: ["sessions"] })}
                   n={count("sessions")}
-                  label="of your sessions kept"
-                  note="all time"
+                  label="of your session records kept"
+                  note="yours, all time"
+                  title="Your own records in the sessions/ folder, since the memory began: an ended session's record and a coding session's hook notes each count, so one coding session can count twice"
                 />
               )}
-              {!activityGot.done && <TileSkeleton count={2} />}
-              {!adviceGot.done && <TileSkeleton />}
+              {!done("activity", activityGot) && <TileSkeleton count={2} />}
+              {!done("week", adviceGot) && <TileSkeleton />}
             </div>
             {admin && (
               <p className="hm-by">
@@ -377,12 +547,12 @@ export function Home({
                 <Icon name="database" size={14} /> In memory
               </h2>
               {/* The counts read every fact the reader may: the sources below don't wait for them. */}
-              {!rootGot.done && (
+              {!done("counts", rootGot) && (
                 <div className="hm-tiles hm-tiles-sm">
                   <TileSkeleton count={4} />
                 </div>
               )}
-              {root && (
+              {counts && (
                 <div className="hm-tiles hm-tiles-sm">
                   {(
                     [
@@ -393,7 +563,9 @@ export function Home({
                       ["skills", "skills"],
                     ] as const
                   ).map(([name, label]) =>
-                    name === "sources" || name === "entities" || count(name) > 0 ? (
+                    (name === "sources" || name === "entities") && counts[name] == null ? (
+                      <TileSkeleton key={name} />
+                    ) : name === "sources" || name === "entities" || count(name) > 0 ? (
                       <Tile
                         key={name}
                         href={href({ kind: "folder", path: [name] })}
@@ -452,6 +624,8 @@ interface NeedRow {
   many: string;
   /** Not the reader's to act on: shown, never as a call to act. */
   quiet?: boolean;
+  /** Where it waits, when that isn't Review (whose "Needs you" counts the rest). */
+  where?: string;
 }
 
 /**
@@ -490,11 +664,12 @@ function NeedsYou({ needs, settled }: { needs: (NeedRow | false | null | undefin
   );
 }
 
-function Need({ row: { href, n, one, many, quiet } }: { row: NeedRow }) {
+function Need({ row: { href, n, one, many, quiet, where } }: { row: NeedRow }) {
   return (
     <li className={`hm-need ${quiet ? "" : "hm-need-on"}`}>
       <a href={href}>
         <span className="hm-fig">{n.toLocaleString()}</span> {n === 1 ? one : many}
+        {where && <span className="muted"> · {where}</span>}
         <Icon name="chevron" size={12} />
       </a>
     </li>

@@ -215,10 +215,11 @@ static QUERY_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<f32
 const QUERY_CACHE_MAX: usize = 1024;
 
 /// Search texts being embedded now: a search's facts and its source text are searched at once, and both
-/// embed the query, which is computed once.
+/// embed the query, which is computed once. A failure is shared too: those waiting with it don't each try again
+/// in turn, each waiting out the embedder's timeout.
 #[allow(clippy::type_complexity)]
 static EMBEDDING: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Vec<f32>>>>>,
+    std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Result<Vec<f32>, (String, bool)>>>>>,
 > = std::sync::LazyLock::new(Default::default);
 
 /// The unit-length embedding of one text (a search's), from the cache of recent ones when it is there.
@@ -233,20 +234,39 @@ pub async fn embed_text(text: &str) -> Result<Vec<f32>> {
         .or_default()
         .clone();
     let v = cell
-        .get_or_try_init(|| async {
-            let v = embed(vec![text.to_string()]).await?.remove(0);
+        .get_or_init(|| async {
+            let v = embed(vec![text.to_string()])
+                .await
+                .map_err(|e| (format!("{e:#}"), e.is::<embed::Unavailable>()))?
+                .remove(0);
             let mut cache = QUERY_CACHE.lock().unwrap();
             if cache.len() >= QUERY_CACHE_MAX {
                 cache.clear();
             }
             cache.insert(text.to_string(), v.clone());
-            anyhow::Ok(v)
+            Ok(v)
         })
         .await
-        .cloned();
+        .clone()
+        .map_err(|(e, unavailable)| match unavailable {
+            true => embed::Unavailable(e).into(),
+            false => anyhow::Error::msg(e),
+        });
     // Done (or failed, and the next search tries again): it is in the cache now.
     EMBEDDING.lock().unwrap().remove(text);
     v
+}
+
+/// How long one try at embedding a search's query through an API may take: `AMPUP_MEMORY_EMBED_QUERY_TIMEOUT_MS`
+/// (default 1,000), two tries at most ([`embed::quick`]). It is also how long a search waits, twice over, for the
+/// unindexed tail's vectors ([`embed_tail_for_search`]).
+fn query_embed_try() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("AMPUP_MEMORY_EMBED_QUERY_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1_000),
+    )
 }
 
 /// When a search last ranked by keyword alone for want of vectors, to say so once a [`embed::LOAD_REST`].
@@ -262,14 +282,113 @@ pub fn keyword_only(e: &anyhow::Error) {
     }
 }
 
-/// [`embed_text`], or None where the embedder fails ([`keyword_only`]).
+/// [`embed_text`] for a search, given about two seconds through an API ([`query_embed_try`]), or None where the
+/// embedder fails or doesn't answer in that time ([`keyword_only`]): the search ranks by keyword alone rather than
+/// wait on it (an API's request had no deadline, and five tries over 15 s of backoff).
+///
+/// Once an API has failed to embed a query in time ([`embed::Unavailable`]: no answer, rate limited, its own
+/// failure), the next [`QUERY_EMBED_REST`] of searches don't try again (one search makes several, one after
+/// another, and each would wait out the embedder again): they use a cached query's vector, or rank by keyword
+/// alone. A query the API refuses fails alone.
 pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
-    embed_text(text).await.map_err(|e| keyword_only(&e)).ok()
+    // `AMPUP_MEMORY_EMBED_DELAY_MS`: a wait before each query's embedding, so a measurement with the local embedder
+    // waits about as long as a remote one does (0.3-1 s), and what a search reads meanwhile overlaps it as it would.
+    static DELAY: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("AMPUP_MEMORY_EMBED_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    if *DELAY > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(*DELAY)).await;
+    }
+    if QUERY_EMBED_FAILED
+        .lock()
+        .unwrap()
+        .is_some_and(|t| t.elapsed() < QUERY_EMBED_REST)
+    {
+        return QUERY_CACHE.lock().unwrap().get(text).cloned();
+    }
+    let per_try = query_embed_try();
+    let unavailable = || *QUERY_EMBED_FAILED.lock().unwrap() = Some(std::time::Instant::now());
+    let quick = embed::quick(per_try, embed_text(text));
+    let r = match embed::provider() {
+        embed::Provider::Local { .. } => quick.await,
+        // The same text being embedded already, for something that isn't a search (without the deadlines
+        // [`embed::quick`] sets): no longer than this search's own tries.
+        _ => {
+            match tokio::time::timeout(per_try * embed::QUICK_ATTEMPTS + JOINED_SLACK, quick).await
+            {
+                Ok(r) => r,
+                Err(_) => Err(embed::Unavailable(format!(
+                    "embeddings: no reply in {} ms",
+                    (per_try * embed::QUICK_ATTEMPTS + JOINED_SLACK).as_millis()
+                ))
+                .into()),
+            }
+        }
+    };
+    r.map_err(|e| {
+        if e.is::<embed::Unavailable>() {
+            unavailable();
+        }
+        keyword_only(&e)
+    })
+    .ok()
 }
+
+/// How many fact searches ranked without a vector they would have had given longer (their query's, or the unindexed
+/// tail's): a search's answer that may lack one is not kept to be answered again ([`unembedded`]).
+static UNEMBEDDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`UNEMBEDDED`]'s count: read before and after a search, an answer is whole when it didn't move.
+pub fn unembedded() -> u64 {
+    UNEMBEDDED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn ranked_unembedded() {
+    UNEMBEDDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// How much longer than its own tries a search waits for an embedding of its text that something else started.
+const JOINED_SLACK: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// When a search's query last failed to embed ([`embed_query`]).
+static QUERY_EMBED_FAILED: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// How long after a query fails to embed searches rank by keyword alone without trying ([`embed_query`]).
+const QUERY_EMBED_REST: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// [`embed_tail`], or None where the embedder fails ([`keyword_only`]): the tail is matched by its words.
 pub async fn embed_tail_or_none(texts: &[String]) -> Option<Vec<Vec<f32>>> {
     embed_tail(texts).await.map_err(|e| keyword_only(&e)).ok()
+}
+
+/// [`embed_tail_or_none`] for a search, which waits for it as long as for its query's two tries: the embedding runs
+/// on its own task, so one that takes longer is matched by its words now and still fills the tail cache for the
+/// next search.
+pub async fn embed_tail_for_search(texts: &[String]) -> Option<Vec<Vec<f32>>> {
+    let wait = query_embed_try() * 2;
+    let texts = texts.to_vec();
+    let n = texts.len();
+    let job = crate::log_org::spawn(async move { embed_tail_or_none(&texts).await });
+    match tokio::time::timeout(wait, job).await {
+        Ok(v) => v.ok().flatten(),
+        Err(_) => {
+            static SAID: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            let mut at = SAID.lock().unwrap();
+            if at.is_none_or(|t| t.elapsed() >= embed::LOAD_REST) {
+                *at = Some(std::time::Instant::now());
+                eprintln!(
+                    "search: {n} unindexed texts weren't embedded in {} ms: matched by their words this time (their \
+                     embedding goes on, for the next search)",
+                    wait.as_millis()
+                );
+            }
+            None
+        }
+    }
 }
 
 /// Unit-length embeddings of `texts`, from the process's provider (`crate::search::embed`).
@@ -1295,11 +1414,13 @@ pub fn memory_report() -> String {
     let (flat_parts, flat_bytes) = rows::flat_held();
     format!(
         "lance caches {} MB, open indexes {} fact + {passage_open} passage, index rows {} fact + {} keyed + \
-         {passage_rows} passage, flat vectors {flat_parts} parts {} MB, query vectors {}",
+         {passage_rows} passage, held whole {} fact rows {} MB, flat vectors {flat_parts} parts {} MB, query vectors {}",
         session().size_bytes() >> 20,
         OPEN.lock().unwrap().len(),
-        FACT_ROWS.len(),
+        FACT_VECS.len(),
         KEYED_ROWS.len(),
+        KEYED_ROWS.resident().0,
+        KEYED_ROWS.resident().1 >> 20,
         flat_bytes >> 20,
         TAIL_CACHE.lock().unwrap().len(),
     )
@@ -2670,13 +2791,71 @@ impl PreparedCandidates {
 #[cfg(test)]
 mod candidate_tests;
 
-/// Fact rows read from index parts (see [`rows`]) for a search's keyword lists, whose hits are scored by vector
-/// from their embedding: about 4 KB each with the embedding (on a production deployment), so at
-/// most a few hundred MB. `AMPUP_MEMORY_INDEX_FACT_ROWS` overrides.
+/// The embeddings of index rows (see [`rows`]) a search's keyword lists named: a keyword hit is scored by vector from
+/// its stored embedding. The rest of such a row comes from [`KEYED_ROWS`], so only this one column is read from
+/// storage for it (a take reads each column apart: on a production deployment a take of every column cost about what
+/// one without the embedding did). 6 KB each at 1536 dimensions, so at most a few hundred MB.
+/// `AMPUP_MEMORY_INDEX_FACT_ROWS` overrides.
 const FACT_ROWS_MAX: usize = 100_000;
 
-static FACT_ROWS: std::sync::LazyLock<rows::RowCache<FactRow>> =
+static FACT_VECS: std::sync::LazyLock<rows::RowCache<Vec<f32>>> =
     std::sync::LazyLock::new(|| rows::RowCache::new(index_knob("FACT_ROWS", FACT_ROWS_MAX)));
+
+fn decode_vecs(b: &RecordBatch) -> Result<Vec<Vec<f32>>> {
+    let vs = b
+        .column_by_name("vec")
+        .map(|c| c.as_fixed_size_list().clone())
+        .ok_or_else(|| anyhow::anyhow!("no vec in an index take"))?;
+    Ok((0..b.num_rows())
+        .map(|i| {
+            vs.value(i)
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .values()
+                .to_vec()
+        })
+        .collect())
+}
+
+/// The bytes a decoded fact row takes in memory, about (its strings and lists, and the row itself).
+fn row_bytes(r: &FactRow) -> usize {
+    let f = &r.fact;
+    let opt = |s: &Option<String>| s.as_ref().map_or(0, |s| s.capacity());
+    std::mem::size_of::<FactRow>()
+        + r.file.capacity()
+        + r.commit.capacity()
+        + f.fact_id.capacity()
+        + f.entity.capacity()
+        + f.predicate.capacity()
+        + f.value.capacity()
+        + f.source_episodes.iter().map(|s| s.capacity() + 24).sum::<usize>()
+        + f.tags.iter().map(|s| s.capacity() + 24).sum::<usize>()
+        + opt(&f.quote)
+        + opt(&f.entity_type)
+        + opt(&f.value_type)
+        + opt(&f.value_ref)
+        + opt(&f.unit)
+        + opt(&f.cite)
+        + opt(&f.time_basis)
+        + r.vec.as_ref().map_or(0, |v| v.capacity() * 4)
+        // The map entry and its Arc.
+        + 48
+}
+
+/// The most bytes of index rows held whole in memory ([`KEYED_ROWS`], `rows::RowCache::hold`):
+/// `AMPUP_MEMORY_INDEX_RESIDENT_BYTES`, by default 1 GiB, or a tenth of the container's memory if that is less;
+/// 0 holds none. Rows without their embedding, about 1 KB each: a production deployment's 530k facts take about
+/// half a GB.
+fn resident_budget() -> usize {
+    static BUDGET: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        index_knob("RESIDENT_BYTES", crate::metrics::sized(1 << 30, 0.1))
+    });
+    *BUDGET
+}
+
+/// Hold `ds`'s rows (without their embedding) in memory, in the background: see [`KEYED_ROWS`].
+fn hold_rows(ds: &Dataset) {
+    KEYED_ROWS.hold_later(ds, FACT_COLUMNS, decode_rows, row_bytes, resident_budget());
+}
 
 fn decode_rows(b: &RecordBatch) -> Result<Vec<FactRow>> {
     let file = crate::strings(b, "data_file");
@@ -2701,9 +2880,18 @@ fn decode_rows(b: &RecordBatch) -> Result<Vec<FactRow>> {
 }
 
 /// Fact rows read by an entity's, a key's or some facts' ids ([`keyed`] scans, [`key_lookup`]), and a search's
-/// candidates that only a vector list named ([`ranked`]), without the embedding: a search's groups read every fact of their entities, thousands for a big deal, and the embedding,
-/// which only ranking uses, is most of a row (a few KB of about 4). About 1 KB each, so at most a few hundred MB.
-/// `AMPUP_MEMORY_INDEX_KEYED_ROWS` overrides.
+/// candidates (the rows a ranked list names, [`ranked`]), without the embedding: a search's groups read every fact of
+/// their entities, thousands for a big deal, and the embedding, which only ranking uses, is most of a row (a few KB
+/// of about 4). About 1 KB each, so at most a few hundred MB. `AMPUP_MEMORY_INDEX_KEYED_ROWS` overrides.
+///
+/// Each index part a read reaches is also held whole ([`hold_rows`], within [`resident_budget`]): its fragments read
+/// once, in order, in the background, and then every row of the part is answered from memory. A search's rows are a
+/// few hundred scattered over the whole index, so a cache of the rows read before missed nearly all of them: on a
+/// production deployment (530k facts) a search took 500-600 rows from storage in 0.5-3 s, more on a busy server.
+/// These are raw index rows, as they are in storage, before any reader's visibility: every read still filters them by
+/// the current files and the reader exactly as before (`current`, [`crate::Vis::allows`]). A fragment that leaves the
+/// part (compacted, rewritten) is dropped from memory, and rows deleted from a held fragment are dropped from it, at the
+/// next hold; deleting an index clears it all ([`forget_cached`]).
 const KEYED_ROWS_MAX: usize = 200_000;
 
 static KEYED_ROWS: std::sync::LazyLock<rows::RowCache<FactRow>> =
@@ -2714,11 +2902,12 @@ async fn keyed_rows(ds: &Dataset, ids: Vec<u64>) -> Result<HashMap<u64, Arc<Fact
     Ok(keyed_rows_counted(ds, ids).await?.0)
 }
 
-/// [`keyed_rows`], with how many rows it took from the part's files (the rest came from the row cache).
+/// [`keyed_rows`], with how many rows it took from the part's files (the rest came from memory).
 async fn keyed_rows_counted(
     ds: &Dataset,
     ids: Vec<u64>,
 ) -> Result<(HashMap<u64, Arc<FactRow>>, usize)> {
+    hold_rows(ds);
     if ids.is_empty() {
         return Ok((HashMap::new(), 0));
     }
@@ -2728,24 +2917,39 @@ async fn keyed_rows_counted(
     Ok((ids.into_iter().zip(rows).collect(), taken))
 }
 
-/// The rows `ids` of index part `ds`, by id: from the row cache, the missing ones in one read.
+/// The rows `ids` of index part `ds` with their embeddings, by id: the row from [`KEYED_ROWS`], the embedding from
+/// [`FACT_VECS`], each read from storage only when missing there.
 async fn fact_rows(ds: &Dataset, ids: Vec<u64>) -> Result<HashMap<u64, Arc<FactRow>>> {
     Ok(fact_rows_counted(ds, ids).await?.0)
 }
 
-/// [`fact_rows`], with how many rows it took from the part's files (the rest came from the row cache).
+/// [`fact_rows`], with how many rows and how many embeddings it took from the part's files.
 async fn fact_rows_counted(
     ds: &Dataset,
     ids: Vec<u64>,
-) -> Result<(HashMap<u64, Arc<FactRow>>, usize)> {
+) -> Result<(HashMap<u64, Arc<FactRow>>, (usize, usize))> {
     if ids.is_empty() {
-        return Ok((HashMap::new(), 0));
+        return Ok((HashMap::new(), (0, 0)));
     }
-    let columns: Vec<&str> = FACT_COLUMNS.iter().copied().chain(["vec"]).collect();
-    let (rows, taken) = FACT_ROWS
-        .get_counted(ds, &ids, &columns, decode_rows)
-        .await?;
-    Ok((ids.into_iter().zip(rows).collect(), taken))
+    let ((keyed, rows_taken), (vecs, vecs_taken)) = tokio::try_join!(
+        keyed_rows_counted(ds, ids.clone()),
+        FACT_VECS.get_counted(ds, &ids, &["vec"], decode_vecs)
+    )?;
+    let out = ids
+        .into_iter()
+        .zip(vecs)
+        .map(|(id, v)| {
+            let r = &keyed[&id];
+            let row = FactRow {
+                file: r.file.clone(),
+                commit: r.commit.clone(),
+                fact: r.fact.clone(),
+                vec: Some(v.as_ref().clone()),
+            };
+            (id, Arc::new(row))
+        })
+        .collect();
+    Ok((out, (rows_taken, vecs_taken)))
 }
 
 /// Whether a scan with `filter` reads few rows, which its scalar indexes find: an entity's, a key's, or
@@ -2924,6 +3128,20 @@ pub async fn newest_versions(
         }
     }
     Ok(out)
+}
+
+/// Facts of entities of type `ty` by either name for it: the type the schema gave the entity, or the type its id
+/// starts with (`ty:…`). Where a schema types an entity apart from its id (an undeclared type in open mode, say),
+/// a reader asking by the id's type still finds it. The id's prefix is a range (`ty:` up to `ty;`, `;` following
+/// `:`), so SQL and the in-memory check agree and the entity index serves it.
+pub fn of_named_type(ty: &str) -> Filter {
+    Filter::Or(vec![
+        Filter::Eq(Col::EntityType, Lit::Str(ty.to_string())),
+        Filter::And(vec![
+            Filter::Cmp(Col::Entity, Op::Ge, Lit::Str(format!("{ty}:"))),
+            Filter::Cmp(Col::Entity, Op::Lt, Lit::Str(format!("{ty};"))),
+        ]),
+    ])
 }
 
 /// Facts of entities of type `ty`, and of any written before their scope had a schema (no type).
@@ -3378,7 +3596,13 @@ pub async fn warm(store: &Store, scope: &Scope) -> Result<()> {
             rows::ids(scan).await?;
         }
     }
-    passages::warm(store, scope, query, q.as_ref()).await
+    passages::warm(store, scope, query, q.as_ref()).await?;
+    // The parts' rows, held in memory in the background once the index files the first searches need are in, so
+    // reading them doesn't hold those up.
+    for ds in [&index.open, &index.closed].into_iter().flatten() {
+        hold_rows(ds);
+    }
+    Ok(())
 }
 
 /// Index rows fetched per search part start at this multiple of `k`, and grow by 4x while too
@@ -3688,16 +3912,215 @@ async fn ranked(
         }
     };
 
-    // Embedding and storage reads are independent. Record each completion separately so a slow search
-    // still says which one it waited for, even when they finish out of order.
+    // The query's embedding is all a vector list waits for. Everything a keyword list needs (the index, its files,
+    // the unindexed tail's vectors, the terms to search), the keyword lists themselves and their rows are read
+    // while it is computed: on a production deployment the embedding took 0.3-1 s of a search, and the keyword
+    // lists with their rows another 0.1-1 s after it. Each completion is recorded on its own, so a slow search
+    // still says which it waited for.
     // `tail` is every current file the index doesn't hold, read directly below. Index rows are
     // trusted only for files that are still current with the same deletes.
-    let (q_vec, found) = tokio::join!(
+    // Borrowed by the reads below that run at once; logged when the search ends.
+    let slow = &slow;
+    let user_sql = filter.map(Filter::to_sql);
+    // Open rows are searched without a prefilter. Closed rows (the small part) are prefiltered
+    // to those still valid at `valid_at`; at the end of time (`i64::MAX`, "current") none can
+    // be, so that part is skipped.
+    let parts_of = |index: &OpenIndex| -> Vec<(Dataset, Option<String>)> {
+        [
+            index.open.as_ref().map(|d| (d.clone(), user_sql.clone())),
+            index
+                .closed
+                .as_ref()
+                .filter(|_| valid_at != Some(i64::MAX))
+                .map(|d| {
+                    let time = valid_at.map(|t| {
+                        format!("(valid_from IS NULL OR valid_from <= {t}) AND valid_to > {t}")
+                    });
+                    let both = match (time, &user_sql) {
+                        (Some(t), Some(u)) => Some(format!("({t}) AND ({u})")),
+                        (t, u) => t.or(u.clone()),
+                    };
+                    (d.clone(), both)
+                }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+    let fetch = pool;
+    // Whether candidates only vector lists found are scored by keyword too (below), from the whole any-terms lists.
+    let rescore = !rank.classic;
+    // Every ranked list of every part, in the order its rows are taken: per part each keyword ranking and the
+    // vector one; with a time named, also the best keyword and nearest matches stated in it, so the facts of
+    // that time are candidates however many others match better. A vector list is listed only with a query
+    // vector (below).
+    let lists_of = |parts: &[(Dataset, Option<String>)], keyword: usize| {
+        let mut out: Vec<(usize, Option<usize>, Option<String>)> = vec![];
+        for (part, (_, filter)) in parts.iter().enumerate() {
+            out.extend(
+                (0..keyword)
+                    .map(Some)
+                    .chain([None])
+                    .map(|s| (part, s, filter.clone())),
+            );
+            if let Some(w) = &window {
+                let only = format!("valid_from >= {} AND valid_from < {}", w.from, w.to);
+                let only = match filter {
+                    Some(f) => format!("({f}) AND ({only})"),
+                    None => only,
+                };
+                let first = (keyword > 0).then_some(Some(0));
+                out.extend(
+                    first
+                        .into_iter()
+                        .chain([None])
+                        .map(|s| (part, s, Some(only.clone()))),
+                );
+            }
+        }
+        out
+    };
+    let fts = |q: &lance_index::scalar::inverted::query::FtsQuery| {
+        FullTextSearchQuery::new_query(q.clone())
+    };
+    // One list's row ids, by keyword ranking `signal` or (None) by the query vector `q`; a keyword list's every
+    // match, best first, when `whole` (it is cut to `fetch` where it is taken).
+    let list = async |ds: &Dataset,
+                      part: usize,
+                      signal: Option<usize>,
+                      filter: Option<String>,
+                      keyword: &[(lance_index::scalar::inverted::query::FtsQuery, f32)],
+                      q: Option<&Float32Array>,
+                      whole: bool|
+           -> Result<Vec<(u64, Option<f32>)>> {
+        let t = std::time::Instant::now();
+        // Over-fetch: visibility filtering happens after ranking. The keyword limit must be on
+        // the query, which makes the index return the BM25 top-k; a scanner limit would
+        // truncate an unranked match stream instead.
+        let mut scan = ds.scan();
+        if let Some(f) = &filter {
+            scan.filter(f)?.prefilter(true);
+        }
+        let flat = match (signal, q) {
+            (None, Some(q)) => {
+                probe(scan.nearest("vec", q, fetch)?);
+                // A part with no vector index is searched by its embeddings held in memory.
+                rows::nearest_flat(ds, "vec", q, fetch, filter.as_deref()).await?
+            }
+            (Some(s), _) => {
+                let limit = (!whole).then_some(fetch as i64);
+                scan.full_text_search(fts(&keyword[s].0).limit(limit))?;
+                None
+            }
+            (None, None) => anyhow::bail!("a vector list without a query vector"),
+        };
+        let how = match (signal, flat.is_some()) {
+            (Some(s), _) => format!("keyword {s}"),
+            (None, true) => "flat".to_string(),
+            (None, false) => "vector".to_string(),
+        };
+        let ids = match flat {
+            Some(ids) => ids,
+            None => rows::ids(scan).await?,
+        };
+        if let Ok(mut l) = slow.lists.lock() {
+            l.push(format!(
+                "part {part} {how} {} ms {} rows",
+                t.elapsed().as_millis(),
+                ids.len()
+            ));
+        }
+        Ok(ids)
+    };
+    // What the vector side needs from the keyword side: the parts and how many keyword rankings there are, once the
+    // index is open; then the ids the keyword lists named in each part, whose rows are read there (with their
+    // embedding). A side that fails drops its sender, and the other stops waiting on it.
+    let (setup_tx, setup_rx) =
+        tokio::sync::oneshot::channel::<(Vec<(Dataset, Option<String>)>, usize)>();
+    // Per part, the ids the keyword lists named, and the whole any-terms list (its rows are scored by keyword below).
+    type Whole = Option<Arc<Vec<(u64, Option<f32>)>>>;
+    let (named_tx, named_rx) = tokio::sync::oneshot::channel::<Vec<(HashSet<u64>, Whole)>>();
+    let (vector_side, found) = tokio::join!(
         async {
             // None without an embedder (the local model not fetched, and offline): keyword lists alone.
             let v = embed_query(query).await;
+            if v.is_none() {
+                ranked_unembedded();
+            }
             slow.mark("embed");
-            Ok::<_, anyhow::Error>(v.map(Float32Array::from))
+            let q_vec = v.map(Float32Array::from);
+            let (Some(q), Ok((parts, keywords))) = (q_vec.as_ref(), setup_rx.await) else {
+                return Ok::<_, anyhow::Error>((q_vec, vec![], vec![]));
+            };
+            // The vector lists as soon as both the vector and the index are in, beside the keyword lists.
+            let wanted = lists_of(&parts, keywords);
+            let by_vector: Vec<Vec<(u64, Option<f32>)>> =
+                futures::future::try_join_all(wanted.iter().filter(|l| l.1.is_none()).map(
+                    |(part, signal, filter)| {
+                        list(
+                            &parts[*part].0,
+                            *part,
+                            *signal,
+                            filter.clone(),
+                            &[],
+                            Some(q),
+                            false,
+                        )
+                    },
+                ))
+                .await?;
+            slow.mark("vector lists");
+            // The rows only vector lists name, read without the embedding, a tenth of the bytes, from the cache
+            // that keeps rows that way ([`KEYED_ROWS`]): on a production deployment most of a search's time was its
+            // rows read from storage, 1 to 5 s, the embeddings most of their bytes.
+            let Ok(named) = named_rx.await else {
+                return Ok((q_vec, by_vector, vec![]));
+            };
+            let vector_rows = futures::future::try_join_all(parts.iter().enumerate().map(
+                |(part, (ds, _))| {
+                    let ids: Vec<u64> = wanted
+                        .iter()
+                        .filter(|l| l.1.is_none())
+                        .zip(&by_vector)
+                        .filter(|(l, _)| l.0 == part)
+                        .flat_map(|(_, ids)| ids.iter().map(|(id, _)| *id))
+                        .filter(|id| !named[part].0.contains(id))
+                        .collect::<HashSet<u64>>()
+                        .into_iter()
+                        .collect();
+                    // Those the any-terms list holds too are scored by keyword below, by vector from their embedding
+                    // as every keyword hit is, so they are read with it.
+                    let listed: HashSet<u64> = ids.iter().copied().collect();
+                    let in_whole: HashSet<u64> = named[part]
+                        .1
+                        .iter()
+                        .flat_map(|all| all.iter().map(|(id, _)| *id))
+                        .filter(|id| listed.contains(id))
+                        .collect();
+                    let (scored, ids): (Vec<u64>, Vec<u64>) =
+                        ids.into_iter().partition(|id| in_whole.contains(id));
+                    async move {
+                        let t = std::time::Instant::now();
+                        let (asked, embedded) = (ids.len(), scored.len());
+                        let ((mut rows, taken), (with, (taken_with, vecs_with))) = tokio::try_join!(
+                            keyed_rows_counted(ds, ids),
+                            fact_rows_counted(ds, scored)
+                        )?;
+                        rows.extend(with);
+                        if let Ok(mut l) = slow.lists.lock() {
+                            l.push(format!(
+                                "part {part} vector rows {} ms {taken} of {asked} taken from storage without the embedding, \
+                                 {taken_with} of {embedded} with it, {vecs_with} embeddings",
+                                t.elapsed().as_millis(),
+                            ));
+                        }
+                        anyhow::Ok(rows)
+                    }
+                },
+            ))
+            .await?;
+            slow.mark("vector rows");
+            Ok((q_vec, by_vector, vector_rows))
         },
         async {
             let index = index_for(store, scope, pin).await?;
@@ -3719,54 +4142,131 @@ async fn ranked(
                         .iter()
                         .map(|(_, f)| fact_text(&f.entity, &f.predicate, &f.value))
                         .collect();
-                    embed_tail_or_none(&texts).await
+                    let v = embed_tail_for_search(&texts).await;
+                    if v.is_none() {
+                        ranked_unembedded();
+                    }
+                    v
                 }
             };
             slow.mark("tail embedded");
-            Ok::<_, anyhow::Error>((index, current, tail_facts, tail_vecs))
+            let cols: Vec<&str> = FTS_FIELDS.iter().map(|f| f.0).collect();
+            let keep = fewest(
+                index.open.as_ref(),
+                &cols,
+                &ordered,
+                max_terms(),
+                term_rows_budget(),
+            )
+            .await;
+            if let Some(k) = &keep {
+                slow.searched
+                    .store(k.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+            let keyword = keyword_queries(&ordered, rank.classic, keep.as_ref())?;
+            // The keyword lists, all at once, then their rows: only a keyword list's rows need their embedding (a
+            // keyword hit is scored by vector from it, `for_list`), so they are read with it, each part's in one
+            // read (see `fact_rows`).
+            let parts = parts_of(&index);
+            let wanted = lists_of(&parts, keyword.len());
+            let _ = setup_tx.send((parts.clone(), keyword.len()));
+            // Each part's any-terms list under the part's own filter is read whole: its scores are every
+            // keyword score the rescoring below needs (BM25's statistics are the index's, whatever a list's filter),
+            // so no second keyword query is run for the candidates only vector lists found. Scoring every match is
+            // the list's cost either way (Lance's combined-fields search scores every row holding a term); keeping
+            // them all adds a sort.
+            let whole = |part: usize, signal: Option<usize>, filter: &Option<String>| {
+                rescore && signal == Some(0) && *filter == parts[part].1
+            };
+            let mut by_keyword: Vec<Vec<(u64, Option<f32>)>> =
+                futures::future::try_join_all(wanted.iter().filter(|l| l.1.is_some()).map(
+                    |(part, signal, filter)| {
+                        list(
+                            &parts[*part].0,
+                            *part,
+                            *signal,
+                            filter.clone(),
+                            &keyword,
+                            None,
+                            whole(*part, *signal, filter),
+                        )
+                    },
+                ))
+                .await?;
+            // Each part's whole any-terms list, and that list cut to `fetch` as the query's limit would have cut it
+            // (both are best first, ties by row id).
+            let mut matched: Vec<Whole> = vec![None; parts.len()];
+            for ((part, signal, filter), ids) in wanted
+                .iter()
+                .filter(|l| l.1.is_some())
+                .zip(by_keyword.iter_mut())
+            {
+                if whole(*part, *signal, filter) && matched[*part].is_none() {
+                    matched[*part] = Some(Arc::new(ids.clone()));
+                    ids.truncate(fetch);
+                }
+            }
+            slow.mark("keyword lists");
+            let _ = named_tx.send(
+                (0..parts.len())
+                    .map(|part| {
+                        let named = wanted
+                            .iter()
+                            .filter(|l| l.1.is_some())
+                            .zip(&by_keyword)
+                            .filter(|(l, _)| l.0 == part)
+                            .flat_map(|(_, ids)| ids.iter().map(|(id, _)| *id))
+                            .collect();
+                        (named, matched[part].clone())
+                    })
+                    .collect(),
+            );
+            let keyword_rows = futures::future::try_join_all(parts.iter().enumerate().map(
+                |(part, (ds, _))| {
+                    let ids: Vec<u64> = wanted
+                        .iter()
+                        .filter(|l| l.1.is_some())
+                        .zip(&by_keyword)
+                        .filter(|(l, _)| l.0 == part)
+                        .flat_map(|(_, ids)| ids.iter().map(|(id, _)| *id))
+                        .collect();
+                    async move {
+                        let t = std::time::Instant::now();
+                        let asked = ids.len();
+                        let (rows, (taken, vecs)) = fact_rows_counted(ds, ids).await?;
+                        if let Ok(mut l) = slow.lists.lock() {
+                            l.push(format!(
+                                "part {part} keyword rows {} ms {taken} of {asked} taken from storage, {vecs} embeddings",
+                                t.elapsed().as_millis(),
+                            ));
+                        }
+                        anyhow::Ok(rows)
+                    }
+                },
+            ))
+            .await?;
+            slow.mark("keyword rows");
+            Ok::<_, anyhow::Error>((
+                index,
+                current,
+                tail_facts,
+                tail_vecs,
+                keyword,
+                by_keyword,
+                keyword_rows,
+                matched,
+            ))
         }
     );
-    let q_vec = q_vec?;
-    let (index, current, tail_facts, tail_vecs) = found?;
-    let current = index.trusted(current);
-    let cols: Vec<&str> = FTS_FIELDS.iter().map(|f| f.0).collect();
-    let keep = fewest(
-        index.open.as_ref(),
-        &cols,
-        &ordered,
-        max_terms(),
-        term_rows_budget(),
-    )
-    .await;
-    if let Some(k) = &keep {
-        slow.searched
-            .store(k.len(), std::sync::atomic::Ordering::Relaxed);
+    let (index, current, tail_facts, tail_vecs, keyword, by_keyword, mut fetched, matched) = found?;
+    let (q_vec, by_vector, vector_rows) = vector_side?;
+    for (part, rows) in vector_rows.into_iter().enumerate() {
+        fetched[part].extend(rows);
     }
-    let keyword = keyword_queries(&ordered, rank.classic, keep.as_ref())?;
-    // Open rows are searched without a prefilter. Closed rows (the small part) are prefiltered
-    // to those still valid at `valid_at`; at the end of time (`i64::MAX`, "current") none can
-    // be, so that part is skipped.
-    let user_sql = filter.map(Filter::to_sql);
-    let parts: Vec<(&Dataset, Option<String>)> = [
-        index.open.as_ref().map(|d| (d, user_sql.clone())),
-        index
-            .closed
-            .as_ref()
-            .filter(|_| valid_at != Some(i64::MAX))
-            .map(|d| {
-                let time = valid_at.map(|t| {
-                    format!("(valid_from IS NULL OR valid_from <= {t}) AND valid_to > {t}")
-                });
-                let both = match (time, &user_sql) {
-                    (Some(t), Some(u)) => Some(format!("({t}) AND ({u})")),
-                    (t, u) => t.or(u.clone()),
-                };
-                (d, both)
-            }),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    slow.mark("rows");
+    let current = index.trusted(current);
+    let parts = parts_of(&index);
+    let wanted = lists_of(&parts, keyword.len());
     // Supersession: under now/as_of, a hit on a one-valued attribute is dropped when the reader
     // can see a newer version of it (see `newest_versions`). Decided per reader at read time,
     // never in the index, so a version one principal can't see never hides one they can.
@@ -3839,131 +4339,20 @@ async fn ranked(
             );
         }
     };
-    let fts = |q: &lance_index::scalar::inverted::query::FtsQuery| {
-        FullTextSearchQuery::new_query(q.clone())
-    };
-    let fetch = pool;
     // Whether some ranked list was cut at `fetch` rows (more candidates exist past it).
     let mut saturated = false;
-    // Every ranked list of every part is one query of the part's indexes for row ids, and all run at once. The
-    // rows come from the row cache after (see `fact_rows`), each part's missing ones in one read, and are
-    // taken list by list in this order.
-    let mut queries = vec![];
-    for (part, (ds, filter)) in parts.iter().enumerate() {
-        // Over-fetch: visibility filtering happens after ranking. The keyword limit must be on
-        // the query, which makes the index return the BM25 top-k; a scanner limit would
-        // truncate an unranked match stream instead.
-        // Each keyword ranking and the vector one; with a time named, also the best keyword and nearest
-        // matches stated in it, so the facts of that time are candidates however many others match better.
-        let vector = q_vec.as_ref().map(|_| None);
-        let mut lists: Vec<(Option<usize>, Option<String>)> = (0..keyword.len())
-            .map(Some)
-            .chain(vector)
-            .map(|s| (s, filter.clone()))
-            .collect();
-        if let Some(w) = &window {
-            let only = format!("valid_from >= {} AND valid_from < {}", w.from, w.to);
-            let only = match filter {
-                Some(f) => format!("({f}) AND ({only})"),
-                None => only,
-            };
-            let first = (!keyword.is_empty()).then_some(Some(0));
-            lists.extend(
-                first
-                    .into_iter()
-                    .chain(vector)
-                    .map(|s| (s, Some(only.clone()))),
-            );
-        }
-        for (signal, filter) in lists {
-            let mut scan = ds.scan();
-            if let Some(f) = &filter {
-                scan.filter(f)?.prefilter(true);
-            }
-            // A vector list is listed only with a query vector.
-            let q_vec = q_vec.as_ref();
-            match (signal, q_vec) {
-                (None, Some(q)) => {
-                    probe(scan.nearest("vec", q, fetch)?);
-                }
-                (None, None) => continue,
-                (Some(s), _) => {
-                    scan.full_text_search(fts(&keyword[s].0).limit(Some(fetch as i64)))?;
-                }
-            }
-            let log = &slow.lists;
-            queries.push(async move {
-                let t = std::time::Instant::now();
-                // A part with no vector index is searched by its embeddings held in memory.
-                let flat = match (signal, q_vec) {
-                    (None, Some(q)) => {
-                        rows::nearest_flat(ds, "vec", q, fetch, filter.as_deref()).await?
-                    }
-                    _ => None,
-                };
-                let how = match (signal, flat.is_some()) {
-                    (Some(s), _) => format!("keyword {s}"),
-                    (None, true) => "flat".to_string(),
-                    (None, false) => "vector".to_string(),
-                };
-                let ids = match flat {
-                    Some(ids) => ids,
-                    None => rows::ids(scan).await?,
-                };
-                if let Ok(mut l) = log.lock() {
-                    l.push(format!(
-                        "part {part} {how} {} ms {} rows",
-                        t.elapsed().as_millis(),
-                        ids.len()
-                    ));
-                }
-                anyhow::Ok((part, signal, ids))
-            });
-        }
-    }
-    let lists = futures::future::try_join_all(queries).await?;
-    slow.mark("lists");
-    // Only a keyword list's rows need their embedding (a keyword hit is scored by vector from it, `for_list`); a
-    // vector list's distance comes with its ids. So the rows only vector lists name are read without it, a
-    // tenth of the bytes, from the cache that keeps rows that way ([`KEYED_ROWS`]): on a production deployment
-    // most of a search's time was its rows read from storage, 1 to 5 s, the embeddings most of their bytes.
-    let fetched = futures::future::try_join_all(parts.iter().enumerate().map(|(part, (ds, _))| {
-        let mut keyword_ids: Vec<u64> = vec![];
-        let mut vector_ids: Vec<u64> = vec![];
-        for l in lists.iter().filter(|l| l.0 == part) {
-            let to = match l.1 {
-                Some(_) => &mut keyword_ids,
-                None => &mut vector_ids,
-            };
-            to.extend(l.2.iter().map(|(id, _)| *id));
-        }
-        let with_vec: HashSet<u64> = keyword_ids.iter().copied().collect();
-        vector_ids.retain(|id| !with_vec.contains(id));
-        let log = &slow.lists;
-        async move {
-            let t = std::time::Instant::now();
-            let asked = (keyword_ids.len(), vector_ids.len());
-            let (with, without) = tokio::try_join!(
-                fact_rows_counted(ds, keyword_ids),
-                keyed_rows_counted(ds, vector_ids)
-            )?;
-            if let Ok(mut l) = log.lock() {
-                l.push(format!(
-                    "part {part} rows {} ms {} of {} taken from storage, {} of {} without the embedding",
-                    t.elapsed().as_millis(),
-                    with.1 + without.1,
-                    asked.0 + asked.1,
-                    without.1,
-                    asked.1
-                ));
-            }
-            let mut rows = with.0;
-            rows.extend(without.0);
-            anyhow::Ok(rows)
-        }
-    }))
-    .await?;
-    slow.mark("rows");
+    // Every list in its place, its rows taken in that order.
+    let (mut by_keyword, mut by_vector) = (by_keyword.into_iter(), by_vector.into_iter());
+    let lists: Vec<_> = wanted
+        .iter()
+        .filter_map(|(part, signal, _)| {
+            let ids = match signal {
+                Some(_) => by_keyword.next(),
+                None => by_vector.next(),
+            }?;
+            Some((*part, *signal, ids))
+        })
+        .collect();
     for (part, signal, ids) in &lists {
         saturated |= ids.len() >= fetch;
         let rows = &fetched[*part];
@@ -3972,8 +4361,9 @@ async fn ranked(
         take(&listed, *signal);
     }
     // Candidates the any-terms keyword ranking didn't reach (the vector list found them) that share a word
-    // with the query: their keyword score too, from the index (a keyword search over just them), so both
-    // signals rank every candidate.
+    // with the query: their keyword score too, so both signals rank every candidate. Their scores are in the part's
+    // whole any-terms list (`matched`), by the rows the lists read them from; a part without one (a classic ranking,
+    // no keyword list) asks the index (a keyword search over just them).
     let unscored: Vec<Lit> = hits
         .lock()
         .unwrap()
@@ -3982,23 +4372,43 @@ async fn ranked(
         .map(|h| Lit::Str(h.fact.fact_id.clone()))
         .collect();
     if !unscored.is_empty() && !keyword.is_empty() && !rank.classic {
+        let wanted_ids: HashSet<&str> = unscored
+            .iter()
+            .filter_map(|l| match l {
+                Lit::Str(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
         let only = Filter::In(Col::FactId, unscored.clone()).to_sql();
-        let scored = futures::future::try_join_all(parts.iter().map(|(ds, _)| {
-            let (only, n, any_terms) = (&only, unscored.len(), &keyword[0].0);
-            async move {
-                let mut scan = ds.scan();
-                scan.filter(only)?.prefilter(true);
-                scan.full_text_search(fts(any_terms).limit(Some(n as i64)))?;
-                let ids = rows::ids(scan).await?;
-                let rows = fact_rows(ds, ids.iter().map(|(id, _)| *id).collect()).await?;
-                anyhow::Ok(
-                    ids.iter()
-                        .map(|(id, x)| (rows[id].clone(), *x))
-                        .collect::<Vec<_>>(),
-                )
-            }
-        }))
-        .await?;
+        let scored =
+            futures::future::try_join_all(parts.iter().enumerate().map(|(part, (ds, _))| {
+                let (only, n, any_terms) = (&only, unscored.len(), &keyword[0].0);
+                let (matched, fetched, wanted_ids) = (&matched[part], &fetched[part], &wanted_ids);
+                async move {
+                    // The rows the lists read already, with their embedding (read with the vector lists' rows), with
+                    // their scores.
+                    if let Some(all) = matched {
+                        return anyhow::Ok(
+                            all.iter()
+                                .filter_map(|(id, x)| Some((fetched.get(id)?, *x)))
+                                .filter(|(r, _)| wanted_ids.contains(r.fact.fact_id.as_str()))
+                                .map(|(r, x)| (r.clone(), x))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    let mut scan = ds.scan();
+                    scan.filter(only)?.prefilter(true);
+                    scan.full_text_search(fts(any_terms).limit(Some(n as i64)))?;
+                    let ids = rows::ids(scan).await?;
+                    let rows = fact_rows(ds, ids.iter().map(|(id, _)| *id).collect()).await?;
+                    anyhow::Ok(
+                        ids.iter()
+                            .map(|(id, x)| (rows[id].clone(), *x))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            }))
+            .await?;
         for rows in &scored {
             take(rows, Some(0));
         }
@@ -4580,7 +4990,7 @@ pub async fn remove_dir(dir: &str) -> Result<()> {
 /// with it (they reopen in the new session), so only one bounded session is ever in use.
 fn forget_cached() {
     drop_open(|_| true);
-    FACT_ROWS.clear();
+    FACT_VECS.clear();
     KEYED_ROWS.clear();
     rows::clear_flat();
     passages::forget_open("");

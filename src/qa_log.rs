@@ -355,6 +355,198 @@ pub async fn check_all(
         .map(|_| ())
 }
 
+/// The window the day's most entries is counted over (µs).
+const DAY_MICROS: i64 = 86_400_000_000;
+
+/// How old a count may be before a refusal from it also counts again, in the background: an admin clearing empty
+/// sessions on another server takes rows off a count, and another server may have counted since. A refusal from an
+/// older count is still answered at once (rows are only ever added, so a count only grows until one leaves the day's
+/// window), and the next is answered from the new count. Sessions started ([`Cap::Sessions`]) are counted only in a
+/// session's start, so their count is not answered past this; their cap is never the lower one by default, each
+/// session being an entry of the log too.
+const CAPPED_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How old a count of the day's entries may be and still refuse a session's start before it reads anything, when no
+/// count since could be made (the log can't be read): a caller backs off an hour at most ([`capped`]'s refusal says
+/// until when), so each of their tries in that time finds a newer count.
+const CAPPED_KEPT: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+/// How long before a capped caller's next entry fits the day's entries are counted again, so the try they make
+/// then (told to wait until it) is answered from a count that holds what they added meanwhile.
+const RECOUNT_LEAD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A most a day a session's start is refused at: the log's entries ([`max_per_day`]), or the sessions started
+/// (`AMPUP_MEMORY_SESSIONS_PER_DAY`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Cap {
+    Entries,
+    Sessions,
+}
+
+/// Per scope (namespace), user and cap reached: until when (µs) one more fits, the most, and when that was counted.
+type Capped = HashMap<(String, String, Cap), (i64, usize, std::time::Instant)>;
+
+/// Who in which scope is at which most a day ([`Capped`]): set by [`entries_cap`], [`count_entries`] and by a
+/// session's start, read by [`capped`] before a session's start reads anything.
+static CAPPED: std::sync::LazyLock<std::sync::Mutex<Capped>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Notes whether one more entry or session (`cap`) from `user` would pass the day's most (`max`), given when each of
+/// theirs in the window was recorded (`times`, oldest first): then until the oldest one that must leave the window has.
+pub(crate) fn note_capped(scope: &Scope, user: &str, cap: Cap, times: &[i64], max: usize) {
+    let key = (scope.namespace(), user.to_string(), cap);
+    let mut capped = CAPPED.lock().unwrap();
+    match times.get(times.len().saturating_sub(max)) {
+        Some(t) if times.len() >= max => {
+            capped.insert(key, (t + DAY_MICROS, max, std::time::Instant::now()));
+        }
+        _ => {
+            capped.remove(&key);
+        }
+    }
+    // Entries past their time go with each note, so the map holds only who is capped now.
+    let now = now_micros();
+    capped.retain(|_, (until, _, _)| *until > now);
+}
+
+/// Forgets every count in `scope`: rows were taken off them here (an admin cleared empty sessions), so a caller
+/// counted at a most a day may be under it now. Their next session's start counts again.
+pub(crate) fn forget_counts(scope: &Scope) {
+    let ns = scope.namespace();
+    CAPPED.lock().unwrap().retain(|(n, _, _), _| *n != ns);
+}
+
+/// When `user` is at a most a day in `scope` as last counted here: the refusal and the seconds until one more fits
+/// (the later of the two caps when both are reached). Reads nothing: for refusing a capped caller's next session
+/// before the request does any other work. A count of the entries is answered for up to [`CAPPED_KEPT`], of the
+/// sessions for [`CAPPED_RECHECK`]; [`recount_later`] keeps the first fresh.
+pub(crate) fn capped(scope: &Scope, user: &str) -> Option<(String, u64)> {
+    let now = now_micros();
+    let (cap, max, left) = {
+        let all = CAPPED.lock().unwrap();
+        [Cap::Entries, Cap::Sessions]
+            .into_iter()
+            .filter_map(|cap| {
+                let (until, max, at) = *all.get(&(scope.namespace(), user.to_string(), cap))?;
+                let kept = match cap {
+                    Cap::Entries => CAPPED_KEPT,
+                    Cap::Sessions => CAPPED_RECHECK,
+                };
+                (until > now && at.elapsed() < kept).then_some((cap, max, until - now))
+            })
+            .max_by_key(|(_, _, left)| *left)?
+    };
+    let secs = (left as u64).div_ceil(1_000_000);
+    let what = match cap {
+        Cap::Entries => "logged",
+        Cap::Sessions => "started",
+    };
+    let things = match cap {
+        Cap::Entries => "entries",
+        Cap::Sessions => "sessions",
+    };
+    Some((
+        format!(
+            "daily cap reached, retry after {secs} s: {user} has {what} {max} or more {things} in {scope} today, \
+             the most a day"
+        ),
+        secs,
+    ))
+}
+
+/// Per scope (namespace) and user, the count of their entries being made: one at a time, and a caller that finds one
+/// running takes its outcome rather than counting again.
+type Counting = HashMap<(String, String), Arc<tokio::sync::Mutex<Option<std::time::Instant>>>>;
+
+static COUNTING: std::sync::LazyLock<std::sync::Mutex<Counting>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Counts `user`'s entries in `scope` today and notes whether one more would pass the most a day ([`note_capped`]),
+/// unless a count began after `asked` (one already running when this was asked is waited for and taken instead).
+pub(crate) async fn count_entries(
+    store: &Store,
+    scope: &Scope,
+    user: &str,
+    asked: std::time::Instant,
+) -> Result<()> {
+    let gate = COUNTING
+        .lock()
+        .unwrap()
+        .entry((scope.namespace(), user.to_string()))
+        .or_default()
+        .clone();
+    let mut last = gate.lock().await;
+    if last.is_some_and(|began| began >= asked) {
+        return Ok(());
+    }
+    let began = std::time::Instant::now();
+    let times = store
+        .qa_row_times_since(scope, user, now_micros() - DAY_MICROS)
+        .await?;
+    note_capped(scope, user, Cap::Entries, &times, max_per_day());
+    *last = Some(began);
+    Ok(())
+}
+
+/// When the counts of capped callers' entries are due, per scope (namespace) and user: one sleeping count each.
+type Recounts = HashMap<(String, String), Vec<std::time::Instant>>;
+
+static RECOUNTS: std::sync::LazyLock<std::sync::Mutex<Recounts>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// After a refusal of `user`'s session at the day's most entries: their entries are counted again in the background,
+/// now if their count is past [`CAPPED_RECHECK`], and just before the next one fits if that is within
+/// [`CAPPED_KEPT`], so the refusal of their next try never has to count before answering.
+pub(crate) fn recount_later(store: &Store, scope: &Scope, user: &str) {
+    let key = (scope.namespace(), user.to_string());
+    let Some((until, _, at)) = CAPPED
+        .lock()
+        .unwrap()
+        .get(&(key.0.clone(), key.1.clone(), Cap::Entries))
+        .copied()
+    else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let left = std::time::Duration::from_micros((until - now_micros()).max(0) as u64);
+    let mut due = vec![];
+    if at.elapsed() >= CAPPED_RECHECK {
+        due.push(now);
+    }
+    if left <= CAPPED_KEPT {
+        due.push(now + left.saturating_sub(RECOUNT_LEAD));
+    }
+    for when in due {
+        {
+            let mut recounts = RECOUNTS.lock().unwrap();
+            let set = recounts.entry(key.clone()).or_default();
+            if set
+                .iter()
+                .any(|w| w.max(&when).duration_since(*w.min(&when)) < RECOUNT_LEAD)
+            {
+                continue;
+            }
+            set.push(when);
+        }
+        let (store, scope, id) = (store.clone(), scope.clone(), key.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep_until(when.into()).await;
+            {
+                let mut recounts = RECOUNTS.lock().unwrap();
+                if let Some(set) = recounts.get_mut(&id) {
+                    set.retain(|w| *w != when);
+                    if set.is_empty() {
+                        recounts.remove(&id);
+                    }
+                }
+            }
+            if let Err(e) = count_entries(&store, &scope, &id.1, when).await {
+                eprintln!("counting {}'s entries in {scope} again failed: {e:#}", id.1);
+            }
+        });
+    }
+}
+
 /// Refused once `who` has added a day's most rows to the scope's log (answers, runs, sessions and their steps).
 pub(crate) async fn daily_cap(store: &Store, scope: &Scope, who: &Principal) -> Result<()> {
     entries_cap(store, scope, who, 1).await
@@ -367,10 +559,12 @@ pub(crate) async fn entries_cap(
     who: &Principal,
     adding: usize,
 ) -> Result<()> {
-    let today = store
-        .qa_rows_since(scope, who.user(), now_micros() - 86_400_000_000)
+    let times = store
+        .qa_row_times_since(scope, who.user(), now_micros() - DAY_MICROS)
         .await?;
+    let today = times.len();
     let max = max_per_day();
+    note_capped(scope, who.user(), Cap::Entries, &times, max);
     if today + adding > max {
         let who = who.user();
         return Err(Refused(if adding == 1 {
@@ -958,17 +1152,20 @@ fn newest(view: &View, chunks: &[Arc<Vec<Row>>], goal: Option<&str>) -> Vec<Logg
 pub(crate) trait StoreQaLog {
     async fn write_qa_rows(&self, scope: &Scope, actor: &str, rows: &[Logged]) -> Result<()>;
     async fn write_qa(&self, scope: &Scope, actor: &str, l: &Logged) -> Result<()>;
-    async fn qa_rows_since(&self, scope: &Scope, asker: &str, since: i64) -> Result<usize>;
+    async fn qa_rows_since(&self, scope: &Scope, asker: &str, since: i64) -> Result<usize> {
+        Ok(self.qa_row_times_since(scope, asker, since).await?.len())
+    }
+    async fn qa_row_times_since(&self, scope: &Scope, asker: &str, since: i64) -> Result<Vec<i64>>;
 }
 
 impl StoreQaLog for Store {
-    /// Rows `asker` added to the log since `since` (µs), ratings included; not the one row ending a session
-    /// `empty` (an admin's `clear_empty_sessions` writes one per session it clears, in the asker's name). Its
-    /// start was a row of its own, which counts, as does any other row of it.
-    async fn qa_rows_since(&self, scope: &Scope, asker: &str, since: i64) -> Result<usize> {
+    /// When each row `asker` added to the log since `since` (µs) was recorded, oldest first, ratings included; not
+    /// the one row ending a session `empty` (an admin's `clear_empty_sessions` writes one per session it clears, in
+    /// the asker's name). Its start was a row of its own, which counts, as does any other row of it.
+    async fn qa_row_times_since(&self, scope: &Scope, asker: &str, since: i64) -> Result<Vec<i64>> {
         let rows = self.side_rows(&scope.namespace(), QA_LOG).await?;
         let mut ended_empty = std::collections::HashSet::new();
-        let mut n = 0;
+        let mut n = vec![];
         for b in rows.iter() {
             let ended_by = optional_strings(b, "ended_by");
             for (((a, t), e), id) in strings(b, "asker")
@@ -983,9 +1180,10 @@ impl StoreQaLog for Store {
                 if e.as_deref() == Some("empty") && ended_empty.insert(id) {
                     continue;
                 }
-                n += 1;
+                n.extend(t);
             }
         }
+        n.sort_unstable();
         Ok(n)
     }
 
@@ -1101,6 +1299,20 @@ impl StoreQaLog for Store {
         // The session log is read at every session's step: the rows just written are cached here, not read back
         // from the catalog by the next step.
         self.wrote(&ns, QA_LOG, after, before).await;
+        // A session ended `empty` (an admin's clear) leaves its asker's day count: counts kept here are counted again.
+        if rows.iter().any(|l| {
+            l.session
+                .as_ref()
+                .is_some_and(|s| s.ended_by.as_deref() == Some("empty"))
+        }) {
+            forget_counts(scope);
+        }
+        // Rows one person writes for another's entries (an admin clearing empty sessions, naming their tasks or
+        // marking them automated, a reviewer's grade) change what the activity and advice pages show of them: what
+        // was kept of those pages is worked out again on their next read here.
+        if rows.iter().any(|l| l.asker != actor) {
+            crate::kept_answers::changed(&ns);
+        }
         self.append_ledger(
             &id,
             scope,

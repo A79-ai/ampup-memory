@@ -181,17 +181,59 @@ async fn read(
     ids: Vec<String>,
     sources: &mut HashMap<String, Source>,
 ) -> Result<()> {
+    let more = read_more(reads, store, who, ids, sources).await?;
+    sources.extend(more);
+    Ok(())
+}
+
+/// The episodes of `ids` that `sources` doesn't hold yet, as the caller may read them.
+async fn read_more(
+    reads: &Reads,
+    store: &Store,
+    who: &Principal,
+    ids: Vec<String>,
+    sources: &HashMap<String, Source>,
+) -> Result<HashMap<String, Source>> {
     let todo: Vec<String> = ids
         .into_iter()
         .filter(|id| !sources.contains_key(id))
         .collect();
     if todo.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
-    for (id, (_, ep)) in reads.episodes(store, who, &todo).await? {
-        sources.insert(id, Source::of(&ep));
+    Ok(reads
+        .episodes(store, who, &todo)
+        .await?
+        .into_iter()
+        .map(|(id, (_, ep))| (id, Source::of(&ep)))
+        .collect())
+}
+
+/// The display-name facts of the entities `ids` the caller may read, as of `record_at`.
+async fn name_facts(
+    reads: &Reads,
+    store: &Store,
+    who: &Principal,
+    ids: Vec<search::Lit>,
+    record_at: Option<i64>,
+) -> Result<Vec<crate::Fact>> {
+    if ids.is_empty() {
+        return Ok(vec![]);
     }
-    Ok(())
+    reads
+        .read_where(
+            store,
+            who,
+            &search::Filter::And(vec![
+                search::Filter::In(search::Col::Entity, ids),
+                search::Filter::Eq(
+                    search::Col::Predicate,
+                    search::Lit::Str(crate::query::schema::NAME.into()),
+                ),
+            ]),
+            record_at,
+        )
+        .await
 }
 
 /// One result: an entity and the facts found about it and its items, best first.
@@ -481,10 +523,89 @@ pub(super) async fn search(
             .cloned()
             .collect()
     };
-    let read_facts = reads
-        .read_in(store, who, search::Col::Entity, &ids, record_at)
-        .await?;
-    crate::phases::mark("entities read");
+    // Source text that matches where no fact does: the first page shows the best of it.
+    let cited: HashSet<&str> = cards
+        .iter()
+        .flat_map(|c| c.hits.iter())
+        .flat_map(|h| h.fact.source_episodes.iter().map(String::as_str))
+        .chain(gone.iter().map(String::as_str))
+        .collect();
+    let mut passages: Vec<search::passages::PassageHit> = vec![];
+    if let Some(found) = found {
+        let mut seen = HashSet::new();
+        // A scope with no source text indexed answers with facts alone.
+        passages = found
+            .unwrap_or_else(|e| {
+                eprintln!("search_memory: passages: {e:#}");
+                vec![]
+            })
+            .into_iter()
+            .filter(|p| !cited.contains(p.passage.episode_id.as_str()))
+            .filter(|p| {
+                ask.kinds.is_empty()
+                    || reads
+                        .episode_type(&p.passage.episode_id)
+                        .is_some_and(|k| ask.kinds.contains(&k))
+            })
+            .filter(|p| words.content.is_empty() || words.in_text(&p.passage.text))
+            .filter(|p| seen.insert(p.passage.episode_id.clone()))
+            .take(PASSAGES)
+            .collect();
+    }
+
+    // Name the shown results by their episodes.
+    let mut wanted: Vec<String> = window
+        .iter()
+        .flat_map(|c| c.episodes().into_iter().take(EPISODES_PER_RESULT))
+        .collect();
+    wanted.extend(passages.iter().map(|p| p.passage.episode_id.clone()));
+    // The names of the results and of the ids their found facts give, wanted unless their episodes name them (below):
+    // read beside the results' other facts and their episodes rather than after them, as those read nothing
+    // these need. The ids only the other facts give are named after, as before.
+    let early: Vec<String> = {
+        let mut seen = HashSet::new();
+        window
+            .iter()
+            .flat_map(|c| {
+                std::iter::once(c.entity.as_str()).chain(
+                    c.hits
+                        .iter()
+                        .map(|h| h.fact.value.as_str())
+                        .filter(|v| is_id(v)),
+                )
+            })
+            .filter(|id| seen.insert(*id))
+            .take(NAMES)
+            .map(str::to_string)
+            .collect()
+    };
+    // Each marks its own end, so a slow search's line says which of them it waited for.
+    let (read_facts, more, early_names) = tokio::join!(
+        async {
+            let r = reads
+                .read_in(store, who, search::Col::Entity, &ids, record_at)
+                .await;
+            crate::phases::mark("entities read");
+            r
+        },
+        async {
+            let r = read_more(&reads, store, who, wanted, &sources).await;
+            crate::phases::mark("sources read");
+            r
+        },
+        async {
+            let lits = early
+                .iter()
+                .map(|id| search::Lit::Str(id.clone()))
+                .collect();
+            let r = name_facts(&reads, store, who, lits, record_at).await;
+            crate::phases::mark("early names read");
+            r
+        },
+    );
+    let read_facts = read_facts?;
+    sources.extend(more?);
+    let early_names = early_names?;
     // One-valued where a scope read says so (the caller's own alone, unless it reads others).
     let one = |f: &crate::Fact| {
         reads.sessions().any(|r| {
@@ -539,44 +660,6 @@ pub(super) async fn search(
         })
         .collect();
 
-    // Source text that matches where no fact does: the first page shows the best of it.
-    let cited: HashSet<&str> = cards
-        .iter()
-        .flat_map(|c| c.hits.iter())
-        .flat_map(|h| h.fact.source_episodes.iter().map(String::as_str))
-        .chain(gone.iter().map(String::as_str))
-        .collect();
-    let mut passages: Vec<search::passages::PassageHit> = vec![];
-    if let Some(found) = found {
-        let mut seen = HashSet::new();
-        // A scope with no source text indexed answers with facts alone.
-        passages = found
-            .unwrap_or_else(|e| {
-                eprintln!("search_memory: passages: {e:#}");
-                vec![]
-            })
-            .into_iter()
-            .filter(|p| !cited.contains(p.passage.episode_id.as_str()))
-            .filter(|p| {
-                ask.kinds.is_empty()
-                    || reads
-                        .episode_type(&p.passage.episode_id)
-                        .is_some_and(|k| ask.kinds.contains(&k))
-            })
-            .filter(|p| words.content.is_empty() || words.in_text(&p.passage.text))
-            .filter(|p| seen.insert(p.passage.episode_id.clone()))
-            .take(PASSAGES)
-            .collect();
-    }
-
-    // Name the shown results by their episodes.
-    let mut wanted: Vec<String> = window
-        .iter()
-        .flat_map(|c| c.episodes().into_iter().take(EPISODES_PER_RESULT))
-        .collect();
-    wanted.extend(passages.iter().map(|p| p.passage.episode_id.clone()));
-    read(&reads, store, who, wanted, &mut sources).await?;
-    crate::phases::mark("sources read");
     // What to call an id: a person by the name their episodes give, anything by its display name.
     let mut names: HashMap<String, String> = HashMap::new();
     for s in sources.values() {
@@ -607,20 +690,25 @@ pub(super) async fn search(
             .collect()
     };
     if !unnamed.is_empty() {
-        let mut found = reads
-            .read_where(
-                store,
-                who,
-                &search::Filter::And(vec![
-                    search::Filter::In(search::Col::Entity, unnamed),
-                    search::Filter::Eq(
-                        search::Col::Predicate,
-                        search::Lit::Str(crate::query::schema::NAME.into()),
-                    ),
-                ]),
-                record_at,
-            )
-            .await?;
+        // Those read beside the results' facts are taken from that read; the rest are read now.
+        let asked: HashSet<&str> = early.iter().map(String::as_str).collect();
+        let unnamed_ids: HashSet<&str> = unnamed
+            .iter()
+            .filter_map(|l| match l {
+                search::Lit::Str(id) => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let late: Vec<search::Lit> = unnamed
+            .iter()
+            .filter(|l| !matches!(l, search::Lit::Str(id) if asked.contains(id.as_str())))
+            .cloned()
+            .collect();
+        let mut found: Vec<crate::Fact> = early_names
+            .into_iter()
+            .filter(|f| unnamed_ids.contains(f.entity.as_str()))
+            .collect();
+        found.extend(name_facts(&reads, store, who, late, record_at).await?);
         found.sort_by_key(|f| std::cmp::Reverse(f.valid_from));
         for f in found {
             if !f.value.trim().is_empty() {

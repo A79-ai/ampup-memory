@@ -21,7 +21,8 @@ const ANSWER_PREVIEW: usize = 2_000;
 const TRANSCRIPT_MAX: usize = 200_000;
 
 /// What `entries` (the log, newest first) says of each person active since `since` (µs), and, for `user`, their
-/// newest `limit` entries; for no `user`, everyone's.
+/// newest `limit` entries; for no `user`, everyone's. `gaps` counts the entries in the window not answered well, by
+/// why ([`gap`]), all of them, not only the `limit` listed.
 pub fn view(entries: &[Logged], user: Option<&str>, since: i64, limit: usize) -> Value {
     #[derive(Default)]
     struct Person {
@@ -81,7 +82,25 @@ pub fn view(entries: &[Logged], user: Option<&str>, since: i64, limit: usize) ->
     mine.sort_by_key(|l| std::cmp::Reverse(l.updated_at.max(l.asked_at)));
     let shown: Vec<Value> = mine.iter().take(limit).map(|l| entry(l)).collect();
     let serving = serving(mine.iter().map(|l| **l), since);
-    json!({"people": summary, "entries": shown, "more": mine.len() > limit, "serving": serving})
+    let mut gaps = json!({"unhelpful": 0, "went_wrong": 0, "no_facts": 0});
+    for g in mine.iter().filter_map(|l| gap(l)) {
+        gaps[g] = json!(gaps[g].as_u64().unwrap_or(0) + 1);
+    }
+    json!({"people": summary, "entries": shown, "more": mine.len() > limit, "serving": serving, "gaps": gaps})
+}
+
+/// Why an entry wasn't answered well, if it wasn't: its asker rated it unhelpful, a session or run went wrong (its
+/// reward is below zero), or a logged answer used no fact or episode from the memory (unless its asker rated it
+/// helpful). Counted over the whole window in `view`'s `gaps`, however few entries `limit` lets it list, so a page
+/// of gaps shows how many there are in all.
+fn gap(l: &Logged) -> Option<&'static str> {
+    match l.rating.as_deref() {
+        Some("not_helpful") => Some("unhelpful"),
+        _ if l.reward.is_some_and(|r| r < 0.0) => Some("went_wrong"),
+        Some("helpful") => None,
+        _ => (kind_of(l) == "answer" && l.cited.is_empty() && l.episodes.is_empty())
+            .then_some("no_facts"),
+    }
 }
 
 /// Lookups and sessions counted together: how many, how many gave advice, and what the rest came to.

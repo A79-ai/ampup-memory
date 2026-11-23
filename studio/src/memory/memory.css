@@ -1559,6 +1559,18 @@
     color: var(--muted);
     font-weight: 400;
   }
+  .schema-from {
+    font-size: var(--t-xs);
+    color: var(--muted);
+  }
+  .schema-held {
+    margin: var(--s2) 10px var(--s1);
+    padding-top: var(--s2);
+    border-top: 1px solid var(--line);
+    font-size: var(--t-xs);
+    font-weight: 600;
+    color: var(--muted);
+  }
   .schema-type-head {
     display: flex;
     flex-wrap: wrap;
@@ -1656,6 +1668,24 @@
     display: flex;
     flex-wrap: wrap;
     gap: var(--s3) var(--s5);
+  }
+  /* The thing's name over its headline value and fields, all in one row from the left: an unknown amount takes
+     no more room than a known one, and leaves no gap before the fields. */
+  .layout-hero-stack {
+    flex-direction: column;
+    justify-content: flex-start;
+    gap: var(--s3);
+  }
+  .layout-hero-stack .layout-row {
+    align-items: flex-end;
+    gap: var(--s3) var(--s6);
+  }
+  .facts-weak .fact {
+    opacity: 0.6;
+  }
+  .fact-kind {
+    color: var(--muted);
+    font-size: var(--t-sm);
   }
   .layout-big {
     font-size: var(--t-2xl);

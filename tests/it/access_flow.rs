@@ -853,7 +853,8 @@ async fn a_deprovisioned_user_is_refused_at_once_and_stays_refused_after_a_resta
         .await
         .0
     };
-    // Within the directory's staleness bound (AMPUP_MEMORY_MAX_STALENESS_MS, 1s), never later.
+    // Within the directory's lag (AMPUP_MEMORY_DIRECTORY_LAG_MS, 5s) at most: while requests come, about the
+    // staleness bound (AMPUP_MEMORY_MAX_STALENESS_MS, 1s) and one directory read.
     let settles = async |e: &Env, token: &str, want: u16| {
         let t = Instant::now();
         while status_on(e, token).await != want {

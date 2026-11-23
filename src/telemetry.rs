@@ -717,6 +717,47 @@ pub async fn holdings(store: &crate::Store) -> anyhow::Result<(Inventory, crate:
     Ok((inv, by_org))
 }
 
+/// The facts and bytes (of the episode and fact data files) each org `keep` takes holds, over its scopes, from each
+/// table's snapshot summary alone: what [`holdings`] counts per org, without the rest of the inventory. A cell
+/// other than the sender's measures its own orgs with it. Scopes that don't read are left out and said, as
+/// [`holdings`] leaves them; an error only when none read.
+pub async fn stored(
+    store: &crate::Store,
+    keep: impl Fn(&crate::Scope) -> bool,
+) -> anyhow::Result<crate::usage::Gauges> {
+    let mut by_org = crate::usage::Gauges::new();
+    let mut failed = Failed::default();
+    for scope in store.scopes().await?.into_iter().filter(|s| keep(s)) {
+        let (_, facts, bytes) = match scope_totals(store, &scope).await {
+            Ok(t) => t,
+            Err(e) => {
+                failed.left_out("stored count", &scope, e);
+                continue;
+            }
+        };
+        failed.read += 1;
+        let g = by_org
+            .entry(crate::usage::org_or_system(scope.org_name()))
+            .or_default();
+        g.0 += facts;
+        g.1 += bytes;
+    }
+    failed.check()?;
+    Ok(by_org)
+}
+
+/// A scope's episodes and facts, and the bytes of its episode and fact data files, from the tables' snapshot
+/// summaries (no data read).
+async fn scope_totals(
+    store: &crate::Store,
+    scope: &crate::Scope,
+) -> anyhow::Result<(u64, u64, u64)> {
+    let ns = scope.namespace();
+    let (episodes, episode_bytes) = store.snapshot_totals(&ns, crate::EPISODES).await?;
+    let (facts, fact_bytes) = store.snapshot_totals(&ns, crate::FACTS).await?;
+    Ok((episodes, facts, episode_bytes + fact_bytes))
+}
+
 /// The scopes a count over every scope read, and the first that didn't.
 #[derive(Default)]
 struct Failed {
@@ -774,8 +815,7 @@ async fn scope_holdings(
         Scope::User(_) => inv.scopes.users += 1,
     }
     let ns = scope.namespace();
-    let (episodes, episode_bytes) = store.snapshot_totals(&ns, crate::EPISODES).await?;
-    let (facts, fact_bytes) = store.snapshot_totals(&ns, crate::FACTS).await?;
+    let (episodes, facts, bytes) = scope_totals(store, scope).await?;
     inv.episodes += episodes;
     inv.facts += facts;
     let ident = iceberg::TableIdent::new(
@@ -811,7 +851,7 @@ async fn scope_holdings(
             inv.schemas.metrics += s.metrics.len() as u64;
         }
     }
-    Ok(episode_bytes + fact_bytes)
+    Ok(bytes)
 }
 
 /// How the advice served in agents' sessions worked out (`crate::sessions`), over every scope, as it stands:

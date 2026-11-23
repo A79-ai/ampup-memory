@@ -246,6 +246,8 @@ async fn a_notes_lessons_are_traced_item_by_item_across_its_versions() {
         std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE_URL", &url);
         std::env::set_var("AMPUP_MEMORY_ADVICE_ROUTE_KEY", "stand-in");
         std::env::set_var("AMPUP_MEMORY_ADVICE_EVIDENCE", "0");
+        // Each rewrite replaces the note at once, so its versions follow one another (trials would hold it back).
+        std::env::set_var("AMPUP_MEMORY_ADVICE_TRIALS", "off");
         // Judged as soon as it ends, not once what the person did next could be seen.
         std::env::set_var("AMPUP_MEMORY_SESSION_JUDGE_WAIT_SECS", "0");
     }

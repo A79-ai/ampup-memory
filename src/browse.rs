@@ -27,7 +27,8 @@
 //! `{"op": "sources", "prefixes"?, "top"?}` says what each source taught the memory (`crate::learned_from`);
 //! `{"op": "entity", "path": [...]}` reads one entity as its page shows it (`crate::entity_page`);
 //! `{"op": "episode", "id": "..."}` reads one episode with the facts that cite it; `{"op": "branches"}` names
-//! the scope's branches, each with how many compiled skills the caller may read there; `{"op": "schema"}` reads
+//! the scope's branches, each with how many compiled skills the caller may read there (null while a branch's state
+//! is still being built); `{"op": "schema"}` reads
 //! the scope's schema on the branch read, with every version committed there; `{"op": "lessons", …}` what it
 //! learned, lesson by lesson, with each one's trail (`crate::lessons`, also `POST /lessons`).
 
@@ -119,8 +120,7 @@ pub async fn run(
                         .ok_or_else(|| bad("days is a whole number of days, 1 to 3650"))?,
                 ),
             };
-            let since = days.map_or(0, |d| crate::now_micros() - d as i64 * 86_400_000_000);
-            crate::advice::usage(store, session.scope(), who, reader.every_session, since).await
+            usage_kept(store, session.scope(), reader, days).await
         }
         // What it learned, lesson by lesson, with where each came from and where it was served (`/lessons`).
         "lessons" => crate::lessons::run(store, session, reader, req).await,
@@ -140,6 +140,16 @@ pub async fn run(
                 .clamp(1, MAX_LIMIT);
             let after = req["after"].as_str();
             let narrow = Narrow::of(req, reader)?;
+            // The entities and their types, and the sessions, unnarrowed: kept ([`entities_kept`]).
+            if narrow.is_empty()
+                && match path.first().map(String::as_str) {
+                    Some("entities") => path.len() <= 2,
+                    Some("sessions") => true,
+                    _ => false,
+                }
+            {
+                return entities_kept(store, session, reader, &path, limit, after).await;
+            }
             ls(store, session, reader, &path, limit, after, &narrow).await
         }
         // What each source taught the memory: its episodes, the facts drawn from them and the entities they are
@@ -164,7 +174,8 @@ pub async fn run(
             )?;
             crate::names::attach(store, session, who, page, &eps).await
         }
-        "branches" => branches(store, session.scope(), who).await,
+        // `build: false`: the branches not built are left so, not built in the background for the next listing.
+        "branches" => branches(store, session.scope(), who, req["build"] != false).await,
         // The schema the memory is typed with on the branch read, and every version committed there (oldest
         // first): it holds no memory, only the types and what its `extract` section names.
         "schema" => {
@@ -173,26 +184,45 @@ pub async fn run(
             Ok(json!({"schema": session.schema().as_deref(), "history": history}))
         }
         op => Err(bad(format!(
-            "unknown op {op:?}: ls, entity, episode, branches, schema, sources, facts, advice, advice_usage or lessons"
+            "unknown op {op:?}: ls, entity, episode, branches, schema, sources, facts, advice, advice_usage, lessons or home"
         ))),
     }
 }
 
 /// The scope's branches, main first, each with the compiled skills the caller may read on it: a memory build
 /// often compiles on a branch of its own, so a reader on main learns where to look.
-async fn branches(store: &Store, scope: &Scope, who: &Principal) -> Result<Value> {
+async fn branches(store: &Store, scope: &Scope, who: &Principal, build: bool) -> Result<Value> {
     // Listed only: the ledger as this server holds it, and each branch's skills read at once.
     let mut names: Vec<String> = store.branch_heads_held(scope).await?.into_keys().collect();
     names.sort_by_key(|b| (b.as_str() != crate::MAIN, b.clone()));
     if names.is_empty() {
         names.push(crate::MAIN.to_string());
     }
-    let pinned = futures::future::try_join_all(names.iter().map(|b| store.pin(scope, b))).await?;
-    let out: Vec<Value> = names
-        .into_iter()
-        .zip(pinned)
-        .map(|(b, session)| json!({"name": b, "skills": skill_keys(&session, who).len()}))
-        .collect();
+    // Main as a request's reads pin it; another branch only as a state already built ([`Store::pin_if_built`]): a
+    // listing waits for no branch's build. A branch without one has its skills unknown (null) and is built in the
+    // background, one branch at a time, for the next listing.
+    let pinned = futures::future::try_join_all(names.iter().map(|b| async move {
+        match b == crate::MAIN {
+            true => store.pin_lagging(scope, b).await.map(Some),
+            false => store.pin_if_built(scope, b).await,
+        }
+    }))
+    .await?;
+    let mut unbuilt = vec![];
+    let mut out: Vec<Value> = Vec::with_capacity(names.len());
+    for (b, session) in names.into_iter().zip(pinned) {
+        let skills = match session {
+            Some(s) => json!(skill_keys(&s, who).len()),
+            None => {
+                unbuilt.push(b.clone());
+                Value::Null
+            }
+        };
+        out.push(json!({"name": b, "skills": skills}));
+    }
+    if build {
+        store.build_later(scope, unbuilt);
+    }
     Ok(json!({"branches": out}))
 }
 
@@ -266,6 +296,136 @@ impl Narrow {
             facts.retain(|f| theirs.contains(f.fact_id.as_str()));
         }
         Ok(facts)
+    }
+}
+
+/// Each reader's advice page (`advice_usage`), by memory state and answer log.
+static USAGE: std::sync::LazyLock<crate::kept_answers::Kept<Value>> =
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(500));
+
+/// `advice_usage` over the last `days` (none: all), kept by memory state and the scope's answer log
+/// ([`crate::kept_answers`]): it reads every note the reader may read and every session logged. Kept by the reader
+/// (who, every group they read as, and whether they read everyone's sessions) and the days asked for, and, for a
+/// window of days, the span of time it was asked in ([`crate::kept_answers::span`]): the window ends when the answer
+/// was worked out, never more than [`crate::kept_answers::STALE`] before now.
+async fn usage_kept(
+    store: &Store,
+    scope: &crate::Scope,
+    reader: Reader<'_>,
+    days: Option<u64>,
+) -> Result<Value> {
+    let mark = crate::kept_answers::Mark::read(store, scope).await?;
+    let now = store.lagging_visibility(scope, crate::MAIN).await?;
+    let log = crate::kept_answers::Log::read(store, scope).await?;
+    let at = crate::kept_answers::At::with_log(mark, &now, log);
+    let key = format!(
+        "{}\n{}\n{}",
+        crate::kept_answers::reader_key(reader.who),
+        reader.every_session,
+        days.map_or_else(
+            || "all".to_string(),
+            |d| format!("{d} in {}", crate::kept_answers::span())
+        )
+    );
+    let (store2, scope2, who, every) = (
+        store.clone(),
+        scope.clone(),
+        reader.who.clone(),
+        reader.every_session,
+    );
+    let usage = USAGE
+        .get(&scope.namespace(), &key, at, true, || async move {
+            let since = days.map_or(0, |d| crate::now_micros() - d as i64 * 86_400_000_000);
+            crate::advice::usage(&store2, &scope2, &who, every, since).await
+        })
+        .await?;
+    Ok((*usage).clone())
+}
+
+/// Each reader's listing of the entity types, of one type's entities, or of their sessions, by memory state (none: no
+/// such type or folder).
+static ENTITIES: std::sync::LazyLock<crate::kept_answers::Kept<Option<Value>>> =
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(500));
+
+/// `ls` of `entities` or `entities/<type>`, or of `sessions` (and its folders), unnarrowed, kept by memory state
+/// ([`crate::kept_answers`]) for main as it is now: listing them reads every fact, or every episode, the reader may
+/// read. Kept by the reader (who, and every group they read
+/// as) and what they listed (the path, the page); a read of a branch or of a past state lists them itself.
+async fn entities_kept(
+    store: &Store,
+    session: &Session,
+    reader: Reader<'_>,
+    path: &[String],
+    limit: usize,
+    after: Option<&str>,
+) -> Result<Value> {
+    let at = match session.on_main_now() {
+        true => {
+            let mark = crate::kept_answers::Mark::read(store, session.scope()).await?;
+            let now = store
+                .lagging_visibility(session.scope(), crate::MAIN)
+                .await?;
+            std::ptr::eq(session.vis(), &*now).then(|| crate::kept_answers::At::of(mark, &now))
+        }
+        false => None,
+    };
+    let Some(at) = at else {
+        return ls(
+            store,
+            session,
+            reader,
+            path,
+            limit,
+            after,
+            &Narrow::default(),
+        )
+        .await;
+    };
+    let key = format!(
+        "{}\n{}\n{limit}\n{}",
+        crate::kept_answers::reader_key(reader.who),
+        path.join("\u{1f}"),
+        after.unwrap_or_default()
+    );
+    let (store2, session2, who, every) = (
+        store.clone(),
+        session.clone(),
+        reader.who.clone(),
+        reader.every_session,
+    );
+    let (path, after) = (path.to_vec(), after.map(String::from));
+    let listed = ENTITIES
+        .get(
+            &session.scope().namespace(),
+            &key,
+            at,
+            true,
+            || async move {
+                let reader = Reader {
+                    who: &who,
+                    every_session: every,
+                };
+                let narrow = Narrow::default();
+                match ls(
+                    &store2,
+                    &session2,
+                    reader,
+                    &path,
+                    limit,
+                    after.as_deref(),
+                    &narrow,
+                )
+                .await
+                {
+                    Err(e) if e.is::<NotFound>() => Ok(None),
+                    got => got.map(Some),
+                }
+            },
+        )
+        .await?;
+    match &*listed {
+        Some(v) => Ok(v.clone()),
+        None => Err(NotFound.into()),
     }
 }
 
@@ -535,14 +695,14 @@ async fn episode(store: &Store, session: &Session, who: &Principal, id: &str) ->
         .collect();
     let titled =
         crate::arrivals::titled(store, session, who, &[(e.id.clone(), e.source.clone())]).await?;
-    let title = titled.get(&e.id).and_then(|t| t.named.clone());
+    let title = titled.get(&e.id).and_then(|t| t.shown());
     let v = json!({"episode_id": e.id, "source": e.source, "path": path, "occurred_at": e.occurred_at,
                    "title": title, "about": e.about, "body": text, "truncated": truncated, "facts": cites});
     crate::names::attach(store, session, who, v, &eps).await
 }
 
 /// A source's page of children with each episode on it titled by what its type says it is (a call by its
-/// recorder's title), when it says ([`crate::arrivals::titled`]).
+/// recorder's title), else by its first line ([`crate::arrivals::Titled::shown`]).
 async fn sources_titled(
     store: &Store,
     session: &Session,
@@ -569,7 +729,7 @@ async fn sources_titled(
         let Some(t) = c["episode_id"].as_str().and_then(|id| titled.get(id)) else {
             continue;
         };
-        if let Some(name) = &t.named {
+        if let Some(name) = t.shown() {
             c["title"] = json!(name);
         }
     }
@@ -947,28 +1107,58 @@ async fn notes(store: &Store, session: &Session, who: &Principal, eps: &[Ep]) ->
 }
 
 /// The caller's own sessions among `eps`, each with the folders it is filed under (below `sessions/`): `ended/<day>`
-/// a session's record, `<harness>/<repo>` what a coding session's hooks kept as it went.
+/// a session's record, `<harness>/<repo>` what a coding session's hooks kept as it went. One entry per session, its
+/// latest save: a session's conversation is kept again at every step (each a new version of one document), and its
+/// record and transcript come beside it, so listing every episode showed one session dozens of times.
 fn filed<'a>(eps: &'a [Ep], who: &Principal) -> Vec<(Vec<String>, &'a Ep)> {
     let me = who.user();
-    eps.iter()
-        .filter_map(|e| {
-            let (author, rest) = crate::profile::author_of(&e.source)?;
-            if !author.eq_ignore_ascii_case(me) {
-                return None;
-            }
-            let at: Vec<String> = if crate::session_record_source(&e.source).is_some()
-                || rest.starts_with("session:")
-            {
-                vec!["ended".into(), day(e.occurred_at)]
+    let mut latest: BTreeMap<(bool, &str, &str), &Ep> = BTreeMap::new();
+    for e in eps {
+        let Some((author, rest)) = crate::profile::author_of(&e.source) else {
+            continue;
+        };
+        if !author.eq_ignore_ascii_case(me) {
+            continue;
+        }
+        // (ended, the folder's key, the session): an ended session's records by its id; a hook's note by its source.
+        let key =
+            if crate::session_record_source(&e.source).is_some() || rest.starts_with("session:") {
+                (true, "", session_of(rest))
             } else if crate::keep::hook_session_note(&e.source) {
+                (false, rest, "")
+            } else {
+                continue;
+            };
+        let held = latest.entry(key).or_insert(e);
+        if (e.occurred_at, e.recorded_at, &e.id) > (held.occurred_at, held.recorded_at, &held.id) {
+            *held = e;
+        }
+    }
+    latest
+        .into_iter()
+        .map(|((ended, rest, _), e)| {
+            let at: Vec<String> = if ended {
+                vec!["ended".into(), day(e.occurred_at)]
+            } else {
                 let parts: Vec<&str> = rest.split(':').collect();
                 vec![parts[0].into(), parts[1].into()]
-            } else {
-                return None;
             };
-            Some((at, e))
+            (at, e)
         })
         .collect()
+}
+
+/// The session a record of it is of, from its source past its author: `memstore:session:<id>` (and its
+/// `…:conversation`), `memstore:transcript:<harness>:<repo>:<id>`, or the older `session:<id>`.
+fn session_of(rest: &str) -> &str {
+    if let Some(r) = rest.strip_prefix(crate::TRANSCRIPT_SOURCE) {
+        return r.rsplit_once(':').map_or(r, |(_, id)| id);
+    }
+    let r = rest
+        .strip_prefix(crate::SESSION_SOURCE)
+        .or_else(|| rest.strip_prefix("session:"))
+        .unwrap_or(rest);
+    r.split(':').next().unwrap_or(r)
 }
 
 /// A note's or a session's title: its first line that says something, at most 90 characters.

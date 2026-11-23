@@ -623,6 +623,18 @@ pub(crate) struct Turn {
     monitor: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// What this process's waiters for each task lease last read of its holder, by the lease's directory: the
+/// heartbeat and when it was first read so. A waiter's own observation would start again with every attempt, and
+/// one that waits less than [`TTL`] (the index refresh waits 30 s) would never see a holder that stopped without
+/// letting go (a server killed mid-task) as lapsed: the task would wait for it forever. Kept from one attempt to
+/// the next, the heartbeat still has to be unchanged for [`TTL`] on this process's clock.
+#[allow(clippy::type_complexity)]
+static TASK_SEEN: std::sync::LazyLock<Mutex<HashMap<String, (u64, Vec<u8>, Instant)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Most task leases [`TASK_SEEN`] remembers; past it, it starts again.
+const TASK_SEEN_MAX: usize = 10_000;
+
 impl Turn {
     pub(crate) async fn acquire(
         store: &Store,
@@ -631,7 +643,24 @@ impl Turn {
     ) -> Result<Self> {
         use sha2::Digest;
         let hash = crate::auth::hex(&sha2::Sha256::digest(key.as_bytes()));
-        let lease = Lease::named(format!("_task-{hash}"));
+        let directory = format!("_task-{hash}");
+        let lease = Lease::named(directory.clone());
+        *lease.seen.lock().unwrap() = TASK_SEEN.lock().unwrap().get(&directory).cloned();
+        // Waiting ends: what this attempt read of the holder is kept for the next (none once it holds the lease).
+        let keep = |lease: &Lease| {
+            let mut kept = TASK_SEEN.lock().unwrap();
+            match lease.seen.lock().unwrap().clone() {
+                Some(s) if !lease.holds() => {
+                    if kept.len() >= TASK_SEEN_MAX {
+                        kept.clear();
+                    }
+                    kept.insert(directory.clone(), s);
+                }
+                _ => {
+                    kept.remove(&directory);
+                }
+            }
+        };
         let source = store.clone();
         let heartbeat = tokio::spawn(lease.clone().run(move || source.clone()));
         let mut turn = Self {
@@ -643,13 +672,17 @@ impl Turn {
             if let Some(why) = turn.lease.unplaceable() {
                 anyhow::bail!("task lease is unavailable: {why}");
             }
-            store.check_fence()?;
-            anyhow::ensure!(
-                chrono::Utc::now() < deadline,
-                "timed out waiting for task lease"
-            );
+            if let Err(e) = store.check_fence() {
+                keep(&turn.lease);
+                return Err(e);
+            }
+            if chrono::Utc::now() >= deadline {
+                keep(&turn.lease);
+                anyhow::bail!("timed out waiting for task lease");
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        keep(&turn.lease);
         // A lost task lease is never reacquired by this operation; a new attempt gets a new Turn.
         let lease = turn.lease.clone();
         turn.monitor = Some(tokio::spawn(async move {

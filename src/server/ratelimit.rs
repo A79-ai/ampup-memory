@@ -20,6 +20,10 @@
 //!   always answered.
 //! - `AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER` (default 64): requests one caller (the same key or person as the rate)
 //!   has under way at once. Past it a request is answered 429 with `Retry-After`, before its body is read.
+//! - `AMPUP_MEMORY_MAX_SEARCHES` (default: the CPUs this server may use, at least 2): searches (`search_memory`,
+//!   `/search`) answered at once, and all but one of them at most one caller's. The rest wait their turn, in the
+//!   order they came, rather than all scan at once and each take many times as long: a caller's burst of twenty
+//!   searches no longer holds up everyone else's.
 //! - `AMPUP_MEMORY_HEADER_TIMEOUT_SECS` (default 660): how long a connection may take to send a request's headers,
 //!   idle ones included. Longer than load balancers keep idle connections to a backend (600 s), so the balancer
 //!   always closes first; a server reached directly can take less.
@@ -108,6 +112,7 @@ pub struct Limiter {
     caps: Caps,
     /// Requests each caller has under way, by the same id as its bucket.
     under_way: Arc<Mutex<HashMap<String, usize>>>,
+    searches: Searches,
 }
 
 /// How much a server takes on at once: see the module's notes. None: no cap.
@@ -117,6 +122,7 @@ pub struct Caps {
     pub in_flight: Option<usize>,
     pub per_caller: Option<usize>,
     pub header_timeout: Option<Duration>,
+    pub searches: Option<usize>,
 }
 
 impl Default for Caps {
@@ -126,6 +132,11 @@ impl Default for Caps {
             in_flight: Some(1024),
             per_caller: Some(64),
             header_timeout: Some(Duration::from_secs(660)),
+            searches: Some(
+                std::thread::available_parallelism()
+                    .map_or(2, |n| n.get())
+                    .max(2),
+            ),
         }
     }
 }
@@ -153,7 +164,103 @@ impl Caps {
             per_caller: cap("AMPUP_MEMORY_MAX_IN_FLIGHT_PER_CALLER", d.per_caller)?,
             header_timeout: cap("AMPUP_MEMORY_HEADER_TIMEOUT_SECS", secs)?
                 .map(|s| Duration::from_secs(s as u64)),
+            searches: cap("AMPUP_MEMORY_MAX_SEARCHES", d.searches)?,
         })
+    }
+}
+
+/// Searches answered at once on this server (`AMPUP_MEMORY_MAX_SEARCHES`), and each caller's share of them. A search
+/// scans vector and keyword indexes on every core it can get: twenty at once on a few cores each take many times
+/// as long as one, and the scans thrash each other's caches. Past the cap a search waits, in the order they came;
+/// a caller's own searches wait in its lane (all but one of the turns) before they join that queue, so a caller
+/// never has more than that many searches running or queued for a turn: another caller's search waits behind
+/// at most that many of each other caller's, and with one caller bursting it starts at once. A search takes its
+/// turn once and holds it to its end: none waits for a turn while holding one.
+struct Searches {
+    all: Option<Arc<tokio::sync::Semaphore>>,
+    cap: usize,
+    per_caller: usize,
+    lanes: Arc<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>>,
+}
+
+impl Searches {
+    fn new(cap: Option<usize>) -> Self {
+        Searches {
+            all: cap.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
+            cap: cap.unwrap_or_default(),
+            per_caller: cap.map_or(0, |n| n.saturating_sub(1).max(1)),
+            lanes: Default::default(),
+        }
+    }
+
+    async fn enter(&self, who: &str) -> SearchTurn {
+        let Some(all) = &self.all else {
+            return SearchTurn::default();
+        };
+        let t = Instant::now();
+        let lane = {
+            let mut lanes = self.lanes.lock().unwrap();
+            // Lanes left behind by searches dropped while they waited (their caller went away).
+            if lanes.len() >= PRUNE_AT {
+                lanes.retain(|_, l| {
+                    Arc::strong_count(l) > 1 || l.available_permits() < self.per_caller
+                });
+            }
+            lanes
+                .entry(who.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.per_caller)))
+                .clone()
+        };
+        // Neither is ever closed.
+        let mine = lane.acquire_owned().await.ok();
+        let any = all.clone().acquire_owned().await.ok();
+        let waited = t.elapsed();
+        if waited >= SEARCH_WAIT_SAID {
+            eprintln!(
+                "search: waited {} ms for a turn ({} at once on this server, {} a caller)",
+                waited.as_millis(),
+                self.cap,
+                self.per_caller
+            );
+        }
+        SearchTurn {
+            any,
+            mine,
+            lane: Some((who.to_string(), self.lanes.clone(), self.per_caller)),
+        }
+    }
+}
+
+/// A wait for a search's turn this long is logged.
+const SEARCH_WAIT_SAID: Duration = Duration::from_secs(1);
+
+/// A search's turn ([`Searches`]): held until dropped.
+#[derive(Default)]
+pub struct SearchTurn {
+    any: Option<tokio::sync::OwnedSemaphorePermit>,
+    mine: Option<tokio::sync::OwnedSemaphorePermit>,
+    #[allow(clippy::type_complexity)]
+    lane: Option<(
+        String,
+        Arc<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>>,
+        usize,
+    )>,
+}
+
+impl Drop for SearchTurn {
+    fn drop(&mut self) {
+        self.any.take();
+        self.mine.take();
+        // The caller's lane goes once nothing waits in it or holds a turn from it.
+        if let Some((who, lanes, per_caller)) = self.lane.take() {
+            let mut lanes = lanes.lock().unwrap();
+            if lanes
+                .get(&who)
+                .is_some_and(|l| Arc::strong_count(l) == 1 && l.available_permits() == per_caller)
+            {
+                lanes.remove(&who);
+            }
+        }
     }
 }
 
@@ -183,7 +290,13 @@ impl Limiter {
             buckets: Mutex::new((HashMap::new(), PRUNE_AT)),
             caps: Caps::default(),
             under_way: Default::default(),
+            searches: Searches::new(Caps::default().searches),
         }
+    }
+
+    /// A turn to search for `who` (the id its bucket has, or who they are), once one is free: see [`Searches`].
+    pub async fn search(&self, who: &str) -> SearchTurn {
+        self.searches.enter(who).await
     }
 
     pub fn caps(&self) -> Caps {
@@ -228,6 +341,7 @@ impl Limiter {
         let caps = Caps::from_env()?;
         Ok(Limiter {
             caps,
+            searches: Searches::new(caps.searches),
             ..Limiter::new(default, ingest)
         })
     }

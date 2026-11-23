@@ -284,11 +284,11 @@ pub async fn keep(
     });
     let text = serde_json::to_vec(&body)?;
     let acl: Vec<&str> = acl.iter().map(String::as_str).collect();
-    // Every part of the session under one source; one sent again (a retry) is the same episode, kept once.
+    // Every part of the session under one source; one sent again (a retry) is the same episode, kept once: where main
+    // holds it already but for its time it isn't written again, which would only make the next read build the
+    // scope's state in full.
     let ep = Episode::sourced(&source, &text, &acl).without_text_index();
-    store
-        .commit_record(scope, who.user(), std::slice::from_ref(&ep))
-        .await?;
+    crate::sessions::commit_unless_held(store, scope, who.user(), &ep).await?;
     Ok(json!({"kept": true, "episode_id": ep.episode_id, "calls": total_calls}))
 }
 

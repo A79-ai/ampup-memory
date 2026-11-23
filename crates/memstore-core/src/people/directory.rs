@@ -82,6 +82,11 @@ const MAX_COMPILE_BATCH: usize = 100;
 /// The most rewarded runs `advice_personal_runs` may name: the server's own bar for a person's first map
 /// (`AMPUP_MEMORY_ADVICE_MIN_NEW`) is 10 by default, and the setting only ever lowers bars.
 const MAX_PERSONAL_RUNS: usize = 10;
+/// The `advice_personal_runs` an org starts with: a person's own note at 2 of their rewarded sessions of a kind of
+/// task, written again after 2 new ones, instead of the server's bars (2 wrong or 4 right, then 5 new). One person
+/// using memory alone gets their own advice within days, where a team note never comes (it needs two people). 2, not
+/// 1: no note rests on a single run.
+pub const NEW_ORG_PERSONAL_RUNS: usize = 2;
 
 /// What a scope's `advice_personal_runs` says ([`Settings::advice_personal_runs`]): a number of rewarded runs (`0`
 /// unsets it), or `"off"`, which turns it off there whatever its org or the server says.
@@ -141,10 +146,10 @@ pub const INSTRUCTIONS: &[&str] = &["", "default", "purpose"];
 /// version: an older reader that meets it stops folding there (it serves the directory as of the change
 /// before, signs no one in, refuses directory writes, and raises `memstore_directory_blocked`). Only a
 /// change that needs it is written at it ([`SOURCES_VERSION`], [`PURGE_VERSION`], [`USERS_VERSION`],
-/// [`PERSONAL_VERSION`], [`SIGNIN_VERSION`]); every
+/// [`PERSONAL_VERSION`], [`SIGNIN_VERSION`], [`TENANTS_VERSION`]); every
 /// other change stays at 1, so an older reader folds on until a change it would get wrong. An op this
 /// engine doesn't know stops the fold too, whatever its version ([`OPS`]).
-pub const EVENT_VERSION: i64 = 6;
+pub const EVENT_VERSION: i64 = 7;
 
 /// The version of a change whose op is newer than this engine ([`OPS_VERSION`] and up). From this engine on,
 /// every engine stops folding at an op it doesn't know, at any version; an engine before it reads at most
@@ -186,6 +191,8 @@ pub const OPS: &[&str] = &[
     "user.enable",
     "closure.set",
     "team.csv",
+    "member.attrs",
+    "platform.template",
 ];
 
 /// The key an org's limits (`set_limits`) are written under, in an org-wide `org.settings` change. They ride on
@@ -242,6 +249,11 @@ pub const PERSONAL_VERSION: i64 = 5;
 /// The version of an `org.settings` change that sets which sign-ins an org takes (`require_mfa`, `require_sso`):
 /// an engine before it would fold the change as settings that set nothing, and let a sign-in that names no org in.
 pub const SIGNIN_VERSION: i64 = 6;
+
+/// The version of an `org.create` that records the platform tenant it was made for (its detail's `tenant`), and of
+/// the tenants' own ops (`member.attrs`, `platform.template`): an engine before it would fold the org without its
+/// tenant, so a platform's request naming that tenant would make it a second org.
+pub const TENANTS_VERSION: i64 = 7;
 
 /// The longest a personal key may live, in seconds: it is a person's bearer, so it always expires.
 pub const PERSONAL_KEY_MAX_SECS: i64 = 365 * 24 * 3600;
@@ -376,6 +388,8 @@ impl Event {
                 "set {user}'s closure edit: {}",
                 self.detail.as_deref().unwrap_or("{}")
             ),
+            "member.attrs" => format!("set what the platform says of {user} in {org}"),
+            "platform.template" => "set a platform's template for its tenants".into(),
             "team.csv" if self.detail.is_none() => "clear the pushed team csv".into(),
             "team.csv" => "replace the team csv".into(),
             "domain.remove" => format!(
@@ -531,7 +545,7 @@ pub struct Org {
     pub team_settings: BTreeMap<String, Settings>,
     /// People an admin removed: a domain or a group doesn't bring them back (an invite does).
     #[serde(skip)]
-    removed: BTreeSet<String>,
+    pub(crate) removed: BTreeSet<String>,
     /// People who asked to join (`request_join`, what `memstore join` sends when the directory doesn't hold
     /// them) and wait for an admin, each with when they asked (µs). An invite or `add_member` lets them in;
     /// `decline` turns them away. Nothing until then: a request grants no access.
@@ -559,14 +573,46 @@ pub struct Org {
     /// which that key may go on setting up (`provisioner_may`). None for any other.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
-    /// What it is held to (`set_limits`, [`crate::limits`]): none by default.
+    /// What it is held to (`set_limits`, [`crate::limits`]): none by default. For a platform's tenant, its own limits
+    /// over its platform's template's ([`Org::own_limits`], [`crate::people::tenants::Template`]).
     #[serde(skip_serializing_if = "crate::limits::OrgLimits::is_empty")]
     pub limits: crate::limits::OrgLimits,
+    /// The settings its admins (or the operator) set themselves: [`Org::settings`] is these over its platform's
+    /// template, for a platform's tenant, and these alone for any other org.
+    #[serde(skip)]
+    pub own_settings: Settings,
+    /// The limits set on it itself ([`Org::limits`] is these over its platform's template).
+    #[serde(skip)]
+    pub own_limits: crate::limits::OrgLimits,
+    /// The platform tenant it was made for (`x-memstore-tenant`), with `created_by` naming the platform.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// What a platform says of its members (`member.attrs`): their email and display name, attributes only, never
+    /// who they are.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub attrs: BTreeMap<String, MemberAttrs>,
+    /// The users forgotten here (`member.forget`): a platform's user named again after a forget is enrolled under a
+    /// new member name ([`crate::people::tenants::current_member`]).
+    #[serde(skip)]
+    pub forgotten: BTreeSet<String>,
     /// Which org of this name it is: the time (µs) the directory's log stamped on its `org.create` (0: the
     /// default org, or one created before the log). A name taken again after a delete is another org, with
     /// another incarnation; audit rows carry the one they were recorded for ([`crate::audit`]).
     #[serde(skip)]
     pub created_at: i64,
+}
+
+/// The domain of a platform's member addresses ([`crate::people::tenants::member_name`]): reserved, so no identity
+/// provider issues it.
+pub const MEMBERS_DOMAIN: &str = ".members.invalid";
+
+/// What a platform says of one of its tenant's members (`member.attrs`): attributes, never their identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberAttrs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// A member's sign-in whose email the platform's Auth0 tenant hasn't verified, waiting for an admin.
@@ -613,6 +659,30 @@ impl Org {
     /// Whether an admin removed `user` (a [`user_id`]) and no invite brought them back.
     pub fn removed(&self, user: &str) -> bool {
         self.removed.contains(user)
+    }
+
+    /// The platform it was made for, if it is a platform's tenant (`created_by` is `platform:<name>`).
+    pub fn platform(&self) -> Option<&str> {
+        self.created_by
+            .as_deref()?
+            .strip_prefix(crate::people::tenants::PLATFORM_MARK)
+    }
+
+    /// Its settings and limits as they hold: its own over its platform's template, if it is a tenant.
+    fn inherit(&mut self, templates: &BTreeMap<String, crate::people::tenants::Template>) {
+        let t = self.platform().and_then(|p| templates.get(p));
+        let mut settings = t.map(|t| t.settings.clone()).unwrap_or_default();
+        settings.merge(self.own_settings.clone());
+        self.settings = settings;
+        let mut limits = self.own_limits.clone();
+        if let Some(t) = t {
+            limits.monthly_model_tokens = limits
+                .monthly_model_tokens
+                .or(t.limits.monthly_model_tokens);
+            limits.max_episodes = limits.max_episodes.or(t.limits.max_episodes);
+            limits.expires_at = limits.expires_at.or(t.limits.expires_at);
+        }
+        self.limits = limits;
     }
 }
 
@@ -771,6 +841,9 @@ pub struct FileKey {
     /// A provisioner key's row (`"provisioner": true`): never imported.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub provisioner: bool,
+    /// A platform key's row (`"platform": "<name>"`): never imported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
 }
 
 /// A keys file's rows: a JSON list of `{id, sha256, user, groups, admin}` (the keys file and
@@ -936,6 +1009,11 @@ pub struct SignIn {
     /// keys-file row's id. It creates orgs, finishes setting up those it created (a built-in schema too, while one
     /// has none), and sets orgs' limits, and nothing else ([`provisioner_may`]).
     pub provisioner: Option<String>,
+    /// Signed in with a platform key (the keys file's `"platform": "<name>"`), or acting through one: the platform's
+    /// name. It reaches only the orgs made for its tenants ([`crate::people::tenants`]), the one each request names.
+    pub platform: Option<String>,
+    /// The tenant a platform key's request named (`x-memstore-tenant`): its rate-limit bucket's.
+    pub tenant: Option<String>,
 }
 
 impl SignIn {
@@ -1313,7 +1391,7 @@ impl Settings {
         self.extract_model.is_some() || self.compile_model.is_some() || self.aip_model.is_some()
     }
     /// What `other` sets, over this.
-    fn merge(&mut self, other: Settings) {
+    pub(crate) fn merge(&mut self, other: Settings) {
         if other.compile.is_some() {
             self.compile = other.compile;
         }
@@ -1520,6 +1598,12 @@ struct SnapOrg {
     settings: Settings,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     team_settings: BTreeMap<String, Settings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    attrs: BTreeMap<String, MemberAttrs>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    forgotten: BTreeSet<String>,
 }
 
 /// A service key as a snapshot keeps it: with its hash, never when it was last used (not the log's).
@@ -1610,7 +1694,7 @@ fn chain(prev: &str, e: &Event) -> String {
 
 /// What a snapshot's state means changes when the fold does: a snapshot of another format is never
 /// loaded (the log is replayed instead). Bump it with any change to what [`Directory::apply_events`] does.
-pub const SNAPSHOT_FORMAT: i64 = 14;
+pub const SNAPSHOT_FORMAT: i64 = 15;
 
 /// A folded snapshot of the directory log (`memory_system.directory_snapshot`): the state after the log's
 /// first `events` changes, the last of them at `at`.
@@ -1785,6 +1869,13 @@ pub struct Directory {
     /// ([`crate::auth::acl::team_of`]).
     #[serde(skip)]
     pub team_csv: Option<String>,
+    /// Each platform's template for its tenants (`platform.template`).
+    #[serde(skip)]
+    pub templates: BTreeMap<String, crate::people::tenants::Template>,
+    /// Each platform tenant's org, by (platform, tenant id): from its `org.create` until its memory is purged
+    /// (`org.purged`), so a delete that stopped halfway still finds the org to finish.
+    #[serde(skip)]
+    pub tenants: BTreeMap<(String, String), String>,
 }
 
 /// User ids are compared as the IdP's emails are: case-insensitively, folding ASCII letters only (as
@@ -1821,6 +1912,8 @@ impl Directory {
             disabled: BTreeMap::new(),
             closure_edits: BTreeMap::new(),
             team_csv: None,
+            templates: BTreeMap::new(),
+            tenants: BTreeMap::new(),
         }
     }
 
@@ -1829,6 +1922,8 @@ impl Directory {
         let orgs = &mut self.orgs;
         let purging = &mut self.purging;
         let purged = &mut self.purged;
+        let templates = &mut self.templates;
+        let tenants = &mut self.tenants;
         for e in events {
             let user = e.user.as_deref().map(user_id);
             let team = e.team.as_deref();
@@ -1859,6 +1954,23 @@ impl Directory {
                     self.team_csv = e.detail.clone();
                     continue;
                 }
+                ("platform.template", _) => {
+                    // Deployment-wide: the platform it is for is in the detail, and its tenants follow it at once.
+                    if let Some((platform, t)) = e
+                        .detail
+                        .as_deref()
+                        .and_then(crate::people::tenants::Template::of_event)
+                    {
+                        templates.insert(platform.clone(), t);
+                        for o in orgs
+                            .values_mut()
+                            .filter(|o| o.platform() == Some(&platform))
+                        {
+                            o.inherit(templates);
+                        }
+                    }
+                    continue;
+                }
                 _ => {}
             }
             if e.op == "org.create" {
@@ -1868,22 +1980,37 @@ impl Directory {
                     continue;
                 }
                 // Who made it, where the change says (a provisioner key's org).
-                let created_by = e
+                let detail = e
                     .detail
                     .as_deref()
                     .and_then(|d| serde_json::from_str::<Value>(d).ok())
-                    .and_then(|v| v["created_by"].as_str().map(String::from));
-                orgs.entry(e.org.clone()).or_insert_with(|| Org {
-                    created_at: e.at,
-                    created_by,
-                    ..Default::default()
-                });
+                    .unwrap_or_default();
+                let created_by = detail["created_by"].as_str().map(String::from);
+                // A platform's tenant: mapped to the org from now on, until its memory is purged.
+                let tenant = detail["tenant"].as_str().map(String::from);
+                if !orgs.contains_key(&e.org) {
+                    let mut org = Org {
+                        created_at: e.at,
+                        created_by,
+                        tenant: tenant.clone(),
+                        ..Default::default()
+                    };
+                    if let (Some(p), Some(t)) = (org.platform().map(String::from), tenant) {
+                        tenants.insert((p, t), e.org.clone());
+                    }
+                    org.inherit(templates);
+                    orgs.insert(e.org.clone(), org);
+                }
                 purged.remove(&e.org);
                 continue;
             }
             if e.op == "org.purged" {
                 purging.remove(&e.org);
                 purged.insert(e.org.clone());
+                // Its tenant is free again: the next request naming it makes a new, empty org.
+                if !orgs.contains_key(&e.org) {
+                    tenants.retain(|_, o| *o != e.org);
+                }
                 continue;
             }
             if e.op == "org.delete" {
@@ -1951,6 +2078,7 @@ impl Directory {
                     org.signin_requests.remove(&u);
                     org.signin_approved.remove(&u);
                     org.signin_declined.remove(&u);
+                    org.attrs.remove(&u);
                     org.removed.insert(u.clone());
                     for m in org.teams.values_mut() {
                         m.remove(&u);
@@ -1964,6 +2092,25 @@ impl Directory {
                 ("team.remove", Some(t), Some(u)) => {
                     if let Some(m) = org.teams.get_mut(t) {
                         m.remove(&u);
+                    }
+                }
+                ("member.forget", _, Some(u)) => {
+                    org.forgotten.insert(u);
+                }
+                ("member.attrs", _, Some(u)) if org.members.contains_key(&u) => {
+                    // What it names changes; what it leaves out stays.
+                    if let Some(set) = e
+                        .detail
+                        .as_deref()
+                        .and_then(|d| serde_json::from_str::<MemberAttrs>(d).ok())
+                    {
+                        let a = org.attrs.entry(u).or_default();
+                        if set.email.is_some() {
+                            a.email = set.email;
+                        }
+                        if set.name.is_some() {
+                            a.name = set.name;
+                        }
                     }
                 }
                 ("workspace.set", _, _) => {
@@ -1983,7 +2130,7 @@ impl Directory {
                     if t.is_none()
                         && let Some(l) = limits_in(e.detail.as_deref())
                     {
-                        org.limits = l.unwrap_or_default();
+                        org.own_limits = l.unwrap_or_default();
                     }
                     if let Some(set) = e
                         .detail
@@ -1992,9 +2139,10 @@ impl Directory {
                     {
                         match t {
                             Some(t) => org.team_settings.entry(t.into()).or_default().merge(set),
-                            None => org.settings.merge(set),
+                            None => org.own_settings.merge(set),
                         }
                     }
+                    org.inherit(templates);
                 }
                 ("auth.provider", _, _) => {
                     org.provider = e
@@ -2083,6 +2231,11 @@ impl Directory {
         Ok(store.directory().await?.dir.clone())
     }
 
+    /// The directory a request is signed in and given its scope by ([`crate::Store::directory_behind`]).
+    pub async fn behind(store: &Store) -> Result<Self> {
+        Ok(store.directory_behind().await?.dir.clone())
+    }
+
     /// The directory read from the catalog now, never a fold from before this call.
     pub async fn fresh(store: &Store) -> Result<Self> {
         Ok(store
@@ -2135,17 +2288,22 @@ impl Directory {
                     signin_declined: o.signin_declined.clone(),
                     created_at: o.created_at,
                     created_by: o.created_by.clone(),
-                    limits: o.limits.clone(),
+                    limits: o.own_limits.clone(),
                     workspace: o.workspace.clone(),
-                    settings: o.settings.clone(),
+                    settings: o.own_settings.clone(),
                     team_settings: o.team_settings.clone(),
+                    tenant: o.tenant.clone(),
+                    attrs: o.attrs.clone(),
+                    forgotten: o.forgotten.clone(),
                 };
                 (name, org)
             })
             .collect();
+        let tenants: Vec<[&String; 3]> = self.tenants.iter().map(|((p, t), o)| [p, t, o]).collect();
         json!({"orgs": orgs, "purging": self.purging,
                "purged": self.purged, "disabled": self.disabled,
-               "closure_edits": self.closure_edits, "team_csv": self.team_csv})
+               "closure_edits": self.closure_edits, "team_csv": self.team_csv,
+               "templates": self.templates, "tenants": tenants})
         .to_string()
     }
 
@@ -2164,8 +2322,13 @@ impl Directory {
             closure_edits: BTreeMap<String, ClosureEdit>,
             #[serde(default)]
             team_csv: Option<String>,
+            #[serde(default)]
+            templates: BTreeMap<String, crate::people::tenants::Template>,
+            #[serde(default)]
+            tenants: Vec<[String; 3]>,
         }
         let snap: Snap = serde_json::from_str(text)?;
+        let templates = snap.templates;
         let orgs = snap
             .orgs
             .into_iter()
@@ -2190,7 +2353,7 @@ impl Directory {
                         (n, key)
                     })
                     .collect();
-                let org = Org {
+                let mut org = Org {
                     members: o.members,
                     teams: o.teams,
                     profile: o.profile,
@@ -2207,11 +2370,17 @@ impl Directory {
                     signin_declined: o.signin_declined,
                     created_at: o.created_at,
                     created_by: o.created_by,
-                    limits: o.limits,
+                    limits: Default::default(),
                     workspace: o.workspace,
-                    settings: o.settings,
+                    settings: Default::default(),
                     team_settings: o.team_settings,
+                    own_settings: o.settings,
+                    own_limits: o.limits,
+                    tenant: o.tenant,
+                    attrs: o.attrs,
+                    forgotten: o.forgotten,
                 };
+                org.inherit(&templates);
                 (name, org)
             })
             .collect();
@@ -2222,6 +2391,12 @@ impl Directory {
             disabled: snap.disabled,
             closure_edits: snap.closure_edits,
             team_csv: snap.team_csv,
+            templates,
+            tenants: snap
+                .tenants
+                .into_iter()
+                .map(|[p, t, o]| ((p, t), o))
+                .collect(),
         })
     }
 
@@ -2243,6 +2418,35 @@ impl Directory {
     /// domains and (through its own provider) groups give them. Orgs their provider doesn't vouch for, and
     /// orgs that require their own provider when they signed in through another, give them nothing.
     pub fn access(&self, user: &str, via: &SignIn) -> BTreeMap<String, Access> {
+        // A platform's caller (a tenant's own service identity, or a member the platform vouches for) counts in the
+        // one tenant its request named, and only in an org made for that platform: never the default org, an org
+        // the operator made, or another platform's tenant. A member there is a member, never more.
+        if let Some(p) = &via.platform {
+            let user = user_id(user);
+            let mut out = BTreeMap::new();
+            for name in via.orgs.iter().flatten() {
+                let Some(org) = self
+                    .orgs
+                    .get(name)
+                    .filter(|o| o.platform() == Some(p.as_str()))
+                else {
+                    continue;
+                };
+                if via.person && !org.members.contains_key(&user) {
+                    continue;
+                }
+                let access = Access {
+                    role: Role::Member,
+                    teams: BTreeSet::new(),
+                };
+                out.insert(name.clone(), access);
+            }
+            return out;
+        }
+        // A platform's member address is the platform's to vouch for: signed in any other way, it is no one.
+        if user_id(user).ends_with(MEMBERS_DOMAIN) {
+            return BTreeMap::new();
+        }
         if let Some(org) = &via.local_admin {
             let admin = Access {
                 role: Role::Admin,
@@ -2730,10 +2934,11 @@ impl Directory {
         self.setting(scope, |s| s.advice_automated, true)
     }
 
-    /// Whether `scope` runs evals (`Settings::advice_eval`): its team's setting, else its org's; off where neither
-    /// sets it, and in a scope the directory doesn't hold.
+    /// Whether `scope` runs evals (`Settings::advice_eval`): its team's setting, else its org's, else the server's
+    /// `AMPUP_MEMORY_ADVICE_EVAL` (off unless set, [`evals_from_env`]), which a scope the directory doesn't hold (a
+    /// `serve --local` store's own) also gets.
     pub fn runs_evals(&self, scope: &crate::Scope) -> bool {
-        self.setting(scope, |s| s.advice_eval, false)
+        self.setting(scope, |s| s.advice_eval, evals_from_env())
     }
 
     /// Whether `scope` folds each person's notes into a profile and hands it at a session's start
@@ -3472,6 +3677,82 @@ macro_rules! invalid {
     ($($t:tt)*) => { return Err(Invalid(format!($($t)*)).into()) };
 }
 
+/// A setting's values in range, as `set_settings` and a platform's tenant template take them: source lists,
+/// batch and run counts, and the named choices.
+pub(crate) fn check_values(settings: &Settings) -> Result<()> {
+    if let Some(sources) = &settings.compile_sources {
+        if sources.len() > 50 {
+            invalid!("compile_sources names at most 50 source prefixes");
+        }
+        for p in sources {
+            if p.trim().is_empty() || p.trim() != p || p.len() > 200 {
+                invalid!(
+                    "invalid compile source {p:?}: a source prefix (kb:, github:acme/) or * for every source"
+                );
+            }
+        }
+    }
+    if let Some(sources) = &settings.compile_kind_sources {
+        if sources.len() > 50 {
+            invalid!("compile_kind_sources names at most 50 source prefixes");
+        }
+        for p in sources {
+            if p.trim().is_empty() || p.trim() != p || p.len() > 200 || p == "*" {
+                invalid!(
+                    "invalid compile_kind_sources entry {p:?}: a source prefix (sentry:) that compile_kind is about; [] unsets it"
+                );
+            }
+        }
+    }
+    if let Some(users) = &settings.advice_learn_exclude {
+        if users.len() > 50 {
+            invalid!("advice_learn_exclude names at most 50 accounts");
+        }
+        for u in users {
+            if u.trim().is_empty() || u.trim() != u || u.len() > 254 {
+                invalid!(
+                    "invalid account {u:?} in advice_learn_exclude: a user id as its sign-in gives it (dev@example.com)"
+                );
+            }
+        }
+    }
+    if settings
+        .compile_batch
+        .is_some_and(|n| n > MAX_COMPILE_BATCH)
+    {
+        invalid!("compile_batch is at most {MAX_COMPILE_BATCH} sources a round (0 unsets it)");
+    }
+    if let Some(PersonalRuns::Runs(n)) = settings.advice_personal_runs
+        && n > MAX_PERSONAL_RUNS
+    {
+        invalid!(
+            "advice_personal_runs is at most {MAX_PERSONAL_RUNS} rewarded runs (0 unsets it, \"off\" turns it off): it only lowers the bars a person's own advice waits for"
+        );
+    }
+    if let Some(k) = &settings.advice_skills
+        && !ADVICE_SKILLS.contains(&k.as_str())
+    {
+        invalid!(
+            "invalid advice_skills {k:?}: \"fallback\" (compiled skills only where no kind of task learned from runs fits), \"together\" (both on one list), \"off\" (never a compiled skill), or \"\" to unset it"
+        );
+    }
+    if let Some(k) = &settings.instructions
+        && !INSTRUCTIONS.contains(&k.as_str())
+    {
+        invalid!(
+            "invalid instructions {k:?}: \"default\" (the session's call order), \"purpose\" (what memory is for, no fixed procedure), or \"\" to unset it"
+        );
+    }
+    if let Some(k) = &settings.compile_kind
+        && !COMPILE_KINDS.contains(&k.as_str())
+    {
+        invalid!(
+            "invalid compile_kind {k:?}: \"errors\" (the sources are error reports), or \"\" to unset it"
+        );
+    }
+    Ok(())
+}
+
 /// A key's source prefixes as given, checked: an ingest key's only (they bound `/ingest` and `/retract`,
 /// which no other key reaches), each non-empty and outside the server's own families, sorted, once each.
 fn key_sources(role: KeyRole, sources: &[String]) -> Result<Vec<String>> {
@@ -3757,10 +4038,15 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
     if let Some(key) = &actor.via.provisioner {
         provisioner_may(dir, key, change)?;
     }
+    // A platform key deletes its own tenants' orgs, and makes no other change through here.
+    if let Some(p) = &actor.via.platform {
+        crate::people::tenants::platform_may(dir, p, change)?;
+    }
     // An operator makes the changes that are theirs as an admin key would, and no other.
     let superuser = actor.superuser
         || (actor.via.operator && change.operators(dir))
-        || actor.via.provisioner.is_some();
+        || actor.via.provisioner.is_some()
+        || actor.via.platform.is_some();
     // Creating and deleting orgs is the catalog owner's; the rest is the org's admins'.
     // A file key is the operator's to import, never an org admin's: the rows are the keys file's own, as the
     // server holding it reads them (`directory_change` takes them from its file by id), or the catalog owner's.
@@ -3876,6 +4162,13 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         if let Some(a) = admin {
             out.push(ev("member.add").user(&user_id(a)).role(Role::Admin));
         }
+        // A new org's people get their own advice soon ([`NEW_ORG_PERSONAL_RUNS`]): set as its own setting, so its
+        // admins see it and may change it, and orgs made before keep theirs.
+        let starts = Settings {
+            advice_personal_runs: Some(PersonalRuns::Runs(NEW_ORG_PERSONAL_RUNS)),
+            ..Default::default()
+        };
+        out.push(ev("org.settings").detail(&serde_json::to_string(&starts)?));
         return Ok(out);
     }
     if let Change::DeleteOrg { confirm, .. } = change {
@@ -4178,78 +4471,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                     "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"compile_kind_sources\": [\"<source prefix>\"], \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"digest\": true|false, \"require_mfa\": true|false, \"require_sso\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"advice_eval\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
-            if let Some(sources) = &settings.compile_sources {
-                if sources.len() > 50 {
-                    invalid!("compile_sources names at most 50 source prefixes");
-                }
-                for p in sources {
-                    if p.trim().is_empty() || p.trim() != p || p.len() > 200 {
-                        invalid!(
-                            "invalid compile source {p:?}: a source prefix (kb:, github:acme/) or * for every source"
-                        );
-                    }
-                }
-            }
-            if let Some(sources) = &settings.compile_kind_sources {
-                if sources.len() > 50 {
-                    invalid!("compile_kind_sources names at most 50 source prefixes");
-                }
-                for p in sources {
-                    if p.trim().is_empty() || p.trim() != p || p.len() > 200 || p == "*" {
-                        invalid!(
-                            "invalid compile_kind_sources entry {p:?}: a source prefix (sentry:) that compile_kind is about; [] unsets it"
-                        );
-                    }
-                }
-            }
-            if let Some(users) = &settings.advice_learn_exclude {
-                if users.len() > 50 {
-                    invalid!("advice_learn_exclude names at most 50 accounts");
-                }
-                for u in users {
-                    if u.trim().is_empty() || u.trim() != u || u.len() > 254 {
-                        invalid!(
-                            "invalid account {u:?} in advice_learn_exclude: a user id as its sign-in gives it (dev@example.com)"
-                        );
-                    }
-                }
-            }
-            if settings
-                .compile_batch
-                .is_some_and(|n| n > MAX_COMPILE_BATCH)
-            {
-                invalid!(
-                    "compile_batch is at most {MAX_COMPILE_BATCH} sources a round (0 unsets it)"
-                );
-            }
-            if let Some(PersonalRuns::Runs(n)) = settings.advice_personal_runs
-                && n > MAX_PERSONAL_RUNS
-            {
-                invalid!(
-                    "advice_personal_runs is at most {MAX_PERSONAL_RUNS} rewarded runs (0 unsets it, \"off\" turns it off): it only lowers the bars a person's own advice waits for"
-                );
-            }
-            if let Some(k) = &settings.advice_skills
-                && !ADVICE_SKILLS.contains(&k.as_str())
-            {
-                invalid!(
-                    "invalid advice_skills {k:?}: \"fallback\" (compiled skills only where no kind of task learned from runs fits), \"together\" (both on one list), \"off\" (never a compiled skill), or \"\" to unset it"
-                );
-            }
-            if let Some(k) = &settings.instructions
-                && !INSTRUCTIONS.contains(&k.as_str())
-            {
-                invalid!(
-                    "invalid instructions {k:?}: \"default\" (the session's call order), \"purpose\" (what memory is for, no fixed procedure), or \"\" to unset it"
-                );
-            }
-            if let Some(k) = &settings.compile_kind
-                && !COMPILE_KINDS.contains(&k.as_str())
-            {
-                invalid!(
-                    "invalid compile_kind {k:?}: \"errors\" (the sources are error reports), or \"\" to unset it"
-                );
-            }
+            check_values(settings)?;
             // A model spends the platform's model budget: the operator's to choose, never an org admin's.
             if settings.sets_models() && !superuser {
                 refuse!(
@@ -4376,7 +4598,8 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             expires_at,
             ..
         } => {
-            let mut l = org.limits.clone();
+            // Its own limits: a platform's template stays the template's, not copied into the org.
+            let mut l = org.own_limits.clone();
             if let Some(n) = monthly_model_tokens {
                 l.monthly_model_tokens = *n;
             }
@@ -4392,7 +4615,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                     },
                 };
             }
-            match l == org.limits {
+            match l == org.own_limits {
                 true => vec![],
                 // As an org-wide settings change ([`limits_in`]), written at version 1.
                 false => vec![ev("org.settings").detail(&json!({LIMITS_KEY: l}).to_string())],
@@ -4661,6 +4884,11 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                         "file key {id} is a provisioner key: it stays in the keys file (leave it out with --only)"
                     );
                 }
+                if k.platform.is_some() {
+                    refuse!(
+                        "file key {id} is a platform key: it stays in the keys file (leave it out with --only)"
+                    );
+                }
                 // A directory key can't administer anything: an admin key would lose what it holds.
                 if k.admin {
                     refuse!(
@@ -4901,6 +5129,17 @@ pub fn parse_members(text: &str) -> Result<Vec<SyncMember>> {
         out.push(SyncMember { user, role, teams });
     }
     Ok(out)
+}
+
+/// Whether the server's `AMPUP_MEMORY_ADVICE_EVAL` (`1`, `true`, `on` or `yes`) runs evals where no team or org setting
+/// says (`Settings::advice_eval`): its operator grades the `train` sessions, so one graded run teaches a note.
+pub fn evals_from_env() -> bool {
+    std::env::var("AMPUP_MEMORY_ADVICE_EVAL").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
 }
 
 /// Whether the server's `AMPUP_MEMORY_PROFILE` (`1`, `true`, `on` or `yes`) turns profiles on where no team or org

@@ -197,6 +197,11 @@ impl Space {
         format!("{}map", self.prefix)
     }
 
+    /// The document key of situation `key`'s candidate note, on trial against its note ([`Trial`]).
+    fn trial_note(&self, key: &str) -> String {
+        format!("{}{key}{TRIAL_SUFFIX}", self.prefix)
+    }
+
     fn index(&self) -> String {
         format!("{}index", self.prefix)
     }
@@ -736,6 +741,64 @@ struct Map {
     /// Learning keeps them while no runs back their situation, and writes them anew from runs once some do.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     seeded: BTreeMap<String, String>,
+    /// Notes whose rewrite is on trial ([`trials`]): a note's key → its candidate. The note stays as it was, served to
+    /// the sessions the candidate isn't, until the runs served each settle which one is kept.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    trials: BTreeMap<String, Trial>,
+}
+
+/// What a document key's end marks as a note's candidate rather than the note ([`Space::trial_note`]).
+const TRIAL_SUFFIX: &str = "~trial";
+
+/// A rewrite of a note on trial against the note it would replace ([`trials`]). A rewrite that fixes the runs it
+/// was written from can break what the note got right (on an incident eval, one took its training runs from 54 to
+/// 46 right: it mended one look-alike and lost another), so it is served to some sessions and kept only if their
+/// rewarded runs go better than the note's own over the same time.
+#[derive(Clone, Serialize, Deserialize)]
+struct Trial {
+    /// What the candidate was written from ([`Map::notes`]), and its [`Written`]: the note's once it is kept.
+    hash: String,
+    written: Written,
+    /// When the trial began (µs): only runs since then compare the two.
+    since: i64,
+}
+
+/// Whether a note's rewrite is tried against it before it replaces it (`AMPUP_MEMORY_ADVICE_TRIALS`, on unless set to
+/// `0`, `false`, `off` or `no`): a rewrite of a note that exists is kept as a candidate, served to about half the
+/// sessions routed to it, and replaces the note only once the rewarded runs served it beat those served the note.
+pub fn trials() -> bool {
+    std::env::var("AMPUP_MEMORY_ADVICE_TRIALS").map_or(true, |v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// How long a trial may wait for enough rewarded runs before its rewrite is dropped and the note may be written
+/// again (`AMPUP_MEMORY_ADVICE_TRIAL_DAYS`, default 14; 0 or less waits forever). Where few runs are rewarded, a trial
+/// would otherwise hold its note unchanged, and serve an untried rewrite to half its sessions, indefinitely.
+fn trial_days() -> f64 {
+    std::env::var("AMPUP_MEMORY_ADVICE_TRIAL_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(14.0)
+}
+
+/// Rewarded runs each version of a note on trial needs before the two are compared
+/// (`AMPUP_MEMORY_ADVICE_TRIAL_RUNS`, default 10).
+fn trial_runs() -> usize {
+    std::env::var("AMPUP_MEMORY_ADVICE_TRIAL_RUNS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(10)
+        .max(2)
+}
+
+/// Whether a session asking `question` is served the candidate of a note on trial since `since`: about half the
+/// questions, the same question always the same side for the trial's length.
+fn trial_side(question: &str, since: i64) -> bool {
+    Sha256::digest(format!("{since}\n{}", question.trim()).as_bytes())[0] & 1 == 1
 }
 
 /// What a note was last written from.
@@ -1022,6 +1085,9 @@ struct Run {
     /// Whether it is an eval's training session ([`crate::sessions::TRAIN`]): only a situation whose runs all are
     /// takes an eval's bars ([`evals`]).
     train: bool,
+    /// The version of each note its session was served (note key → the note document's episode id): which of a
+    /// note's two versions on trial it had ([`Trial`]).
+    versions: BTreeMap<String, String>,
 }
 
 /// A rewarded run's reward and the advice it was served, for what later came of a note
@@ -1124,6 +1190,18 @@ pub struct Learned {
     /// What curating did, where the scope curates advice ([`crate::advice_curate`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub curation: Option<curate::Curated>,
+    /// Rewrites kept as candidates on trial against their notes ([`Trial`]).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub trials_begun: usize,
+    /// Trials still waiting for enough rewarded runs of each version.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub trials_running: usize,
+    /// Candidates whose runs went better than their notes', which replaced them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub trials_kept: usize,
+    /// Candidates whose runs went no better, dropped: their notes stay.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub trials_dropped: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -1426,6 +1504,11 @@ async fn runs_and_overrides(
             let pr = pr_outcome(&l);
             let given = given(&l);
             let train = crate::sessions::split(&l) == Some(crate::sessions::TRAIN);
+            let versions = l
+                .session
+                .as_ref()
+                .map(|s| s.served_versions.clone())
+                .unwrap_or_default();
             // A person who read the whole trace graded it (`crate::qa_log::review`): it teaches as a whole too.
             let reviewed = crate::qa_log::reviewed(&l);
             // A session graded request by request teaches by each request the person's next move graded, in
@@ -1528,6 +1611,7 @@ async fn runs_and_overrides(
                 at: l.asked_at,
                 given,
                 train,
+                versions,
             }]
         })
         .collect();
@@ -1675,6 +1759,11 @@ fn task_runs(l: &crate::qa_log::Logged, body: &str, graded: &[(usize, usize, boo
                 // The person's own next message graded it.
                 given: true,
                 train: crate::sessions::split(l) == Some(crate::sessions::TRAIN),
+                versions: l
+                    .session
+                    .as_ref()
+                    .map(|s| s.served_versions.clone())
+                    .unwrap_or_default(),
             })
         })
         .collect()
@@ -1750,6 +1839,8 @@ pub async fn hold(
         }
     }
     write_admin_map(store, scope, &mut map, "advice:hold").await?;
+    // What the advice page kept shows each note held or ratified as it was: worked out again on its next read here.
+    crate::kept_answers::changed(&scope.namespace());
     Ok(map.held)
 }
 
@@ -1776,6 +1867,8 @@ pub async fn ratify(
         }
     }
     write_admin_map(store, scope, &mut map, "advice:ratify").await?;
+    // What the advice page kept shows each note held or ratified as it was: worked out again on its next read here.
+    crate::kept_answers::changed(&scope.namespace());
     Ok(map.ratified.into_keys().collect())
 }
 
@@ -3617,6 +3710,16 @@ fn redundant_items(
 /// told the budget ([`BUDGET_RULE`]), and a note past it keeps its highest-value items ([`curb`]).
 const NOTE_BUDGET: usize = 1_500;
 
+/// The characters of a note an agent is served: `AMPUP_MEMORY_ADVICE_BUDGET`, else [`NOTE_BUDGET`]. A task whose
+/// right and wrong runs part on several checks (telling one cause from its look-alikes) needs room for each.
+fn note_budget() -> usize {
+    std::env::var("AMPUP_MEMORY_ADVICE_BUDGET")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|n: &usize| *n >= 500)
+        .unwrap_or(NOTE_BUDGET)
+}
+
 /// What the writer and the editor are told of [`NOTE_BUDGET`]; `{budget}` is filled in.
 const BUDGET_RULE: &str = "Keep the note short: an agent is served all of it but Freshness and Evidence, at most \
 {budget} characters, and items past that are dropped, the least valuable first. Write When in one or two sentences, \
@@ -3624,7 +3727,7 @@ and keep the items that change most what an agent does: a failure people hit, a 
 ";
 
 fn budget_rule() -> String {
-    BUDGET_RULE.replace("{budget}", &NOTE_BUDGET.to_string())
+    BUDGET_RULE.replace("{budget}", &note_budget().to_string())
 }
 
 /// Sessions the judge must have found an item redundant in (the agent did what it says, and would have without the
@@ -3737,7 +3840,8 @@ fn curb(
         }
     }
     let mut text = without(&drop);
-    while to_budget && size(&text) > NOTE_BUDGET {
+    let budget = note_budget();
+    while to_budget && size(&text) > budget {
         let last_step = steps_left(&drop) <= 1;
         let Some(i) = items
             .iter()
@@ -4356,6 +4460,8 @@ async fn learn_space(
         Some(_) => personal_runs(store, scope).await,
         None => None,
     };
+    // Candidates whose trial they won ([`Trial`]): each replaces its note once the pass writes its documents.
+    let mut kept_trials: Vec<(String, String)> = vec![];
     for ((c, s), rs) in &groups {
         let trained = eval && rs.iter().all(|r| r.train);
         let min_people = if trained { 1 } else { min_people };
@@ -4443,6 +4549,85 @@ async fn learn_space(
         let h = note_hash(rs, &[NOTE_FORMAT, &procedures]);
         // A note an admin asked to be written again whole (`learn_advice {rewrite: [...]}`) is, whatever changed.
         let rewriting = pass.rewrite.contains(&k);
+        // A note whose rewrite is on trial: once each version has enough rewarded runs since the trial began, the
+        // rewrite replaces the note if its runs went better, and is dropped if not; until then the note isn't written
+        // again (unless an admin asks for it whole, which ends the trial).
+        if let Some(t) = map.trials.get(&k).cloned() {
+            let candidate = session
+                .document(store, &who, &space.trial_note(&k), None)
+                .await?;
+            let served = format!("{}{k}", space.tag());
+            // (runs, right ones) served the rewrite, and served the note.
+            let (mut tried, mut stayed) = ((0usize, 0usize), (0usize, 0usize));
+            if let Some((id, _, _)) = &candidate {
+                for r in rs.iter().filter(|r| r.at >= t.since && !judged(r)) {
+                    match r.versions.get(&served) {
+                        Some(v) if v == id => {
+                            tried.0 += 1;
+                            tried.1 += usize::from(r.right);
+                        }
+                        Some(_) => {
+                            stayed.0 += 1;
+                            stayed.1 += usize::from(r.right);
+                        }
+                        None => {}
+                    }
+                }
+            }
+            let min = trial_runs();
+            match candidate {
+                None => {
+                    map.trials.remove(&k);
+                }
+                Some(_) if tried.0 < min || stayed.0 < min => {
+                    let days = trial_days();
+                    let age = (crate::now_micros() - t.since) as f64 / 86_400_000_000.0;
+                    if days > 0.0 && age >= days {
+                        // Too few rewarded runs to judge it in time: the note stays, and may be written again.
+                        eprintln!(
+                            "advice {served}: its rewrite on trial had {} rewarded runs and the note {} in {age:.1} days, \
+                             under {min} each: the note stays and the rewrite is dropped",
+                            tried.0, stayed.0
+                        );
+                        map.trials.remove(&k);
+                        done.trials_dropped += 1;
+                    } else if !rewriting {
+                        done.trials_running += 1;
+                        continue;
+                    } else {
+                        map.trials.remove(&k);
+                    }
+                }
+                Some((_, _, b)) => {
+                    // Right more often: right ones over runs, compared without division.
+                    let better = tried.1 * stayed.0 > stayed.1 * tried.0;
+                    eprintln!(
+                        "advice {served}: its rewrite on trial was right in {} of {} runs, the note in {} of {}: {}",
+                        tried.1,
+                        tried.0,
+                        stayed.1,
+                        stayed.0,
+                        if better {
+                            "the rewrite replaces the note"
+                        } else {
+                            "the note stays and the rewrite is dropped"
+                        }
+                    );
+                    map.trials.remove(&k);
+                    if better {
+                        map.notes.insert(k.clone(), t.hash.clone());
+                        map.written.insert(k.clone(), t.written.clone());
+                        kept_trials.push((k.clone(), String::from_utf8_lossy(&b).into_owned()));
+                        done.trials_kept += 1;
+                    } else {
+                        done.trials_dropped += 1;
+                    }
+                    if !rewriting {
+                        continue;
+                    }
+                }
+            }
+        }
         if map.notes.get(&k) == Some(&h) && !rewriting {
             continue;
         }
@@ -4583,6 +4768,7 @@ async fn learn_space(
     map.notes.retain(|k, _| keep(k));
     map.written.retain(|k, _| keep(k));
     map.withheld.retain(|k, _| keep(k));
+    map.trials.retain(|k, _| keep(k));
     map.needs_backing = needs_backing;
     let notes = &map.notes;
     map.ratified.retain(|k, from| notes.get(k) == Some(from));
@@ -4648,6 +4834,12 @@ async fn learn_space(
     let mut docs = vec![];
     // The notes written whole or edited here, their items' ids stamped as they were.
     let mut stamped = BTreeSet::new();
+    for (k, text) in kept_trials {
+        docs.push(
+            Episode::sourced(&space.source, text.as_bytes(), &entries).version_of(&space.note(&k)),
+        );
+        stamped.insert(k);
+    }
     for (k, h, w, n, tokens) in written {
         match n {
             // An edit that changed nothing: the note stands as it is, and waits for new runs again.
@@ -4709,6 +4901,32 @@ async fn learn_space(
                 map.notes.remove(&k);
                 map.written.insert(k, w);
                 done.unbacked += 1;
+            }
+            // A rewrite of a note there is goes on trial against it ([`trials`]): kept as a candidate, served to
+            // part of the sessions, while the note stays as it was.
+            Ok(Some((text, _, _)))
+                if trials() && map.notes.contains_key(&k) && !pass.rewrite.contains(&k) =>
+            {
+                let text = stamp_ids(&text, &k);
+                let (text, _) = curb(&text, &format!("{}{k}", space.tag()), &tally, today, true);
+                docs.push(
+                    Episode::sourced(&space.source, text.as_bytes(), &entries)
+                        .version_of(&space.trial_note(&k)),
+                );
+                eprintln!(
+                    "advice {}{k}: written again from {} runs; the rewrite goes on trial against the note, which stays",
+                    space.tag(),
+                    w.runs
+                );
+                map.trials.insert(
+                    k,
+                    Trial {
+                        hash: h,
+                        written: w,
+                        since: crate::now_micros(),
+                    },
+                );
+                done.trials_begun += 1;
             }
             Ok(Some((text, edits, backed_step))) => {
                 let whole = edits.is_none();
@@ -4839,7 +5057,13 @@ async fn learn_space(
         Episode::sourced(&space.source, &serde_json::to_vec_pretty(&map)?, &entries)
             .version_of(&space.map()),
     );
-    store.commit(scope, "advice:learn", &docs, &[]).await?;
+    // A version the pass wrote as it was (an index or map nothing changed) is the document's newest version again with
+    // a new time: written, it would change only that time, and the next read would build the scope's state in full.
+    let held = store.held_but_time(scope, &docs).await?;
+    docs.retain(|d| !held.contains(&d.episode_id));
+    if !docs.is_empty() {
+        store.commit(scope, "advice:learn", &docs, &[]).await?;
+    }
     Ok(done)
 }
 
@@ -5730,16 +5954,27 @@ async fn route(
             key, note, skills, ..
         } => {
             let note = if *note {
-                session
-                    .document(store, who, &space.note(key), None)
-                    .await?
-                    .map(|(id, _, b)| {
-                        version = Some(id);
-                        served_text(
-                            &String::from_utf8_lossy(&b),
-                            chrono::Utc::now().date_naive(),
-                        )
-                    })
+                // A note whose rewrite is on trial: about half the questions are served the rewrite ([`Trial`]).
+                let trial = map
+                    .as_ref()
+                    .and_then(|m| m.trials.get(key))
+                    .is_some_and(|t| trial_side(question, t.since));
+                let mut found = None;
+                if trial {
+                    found = session
+                        .document(store, who, &space.trial_note(key), None)
+                        .await?;
+                }
+                if found.is_none() {
+                    found = session.document(store, who, &space.note(key), None).await?;
+                }
+                found.map(|(id, _, b)| {
+                    version = Some(id);
+                    served_text(
+                        &String::from_utf8_lossy(&b),
+                        chrono::Utc::now().date_naive(),
+                    )
+                })
             } else {
                 None
             };

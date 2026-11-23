@@ -315,10 +315,11 @@ export function GraphSection({
             {" "}
             <b>
               Showing the {data.nodes.length.toLocaleString()} with the most facts, of{" "}
-              {total.toLocaleString()}
-            </b>{" "}
-            (owned entities and ones with changes waiting always shown). Open any other from
-            Explorer or Search.
+              {total.toLocaleString()} nodes
+            </b>
+            , including notes and linked records (owned entities and ones with changes waiting
+            always shown). Explorer counts entities with any fact, ended ones included, and no
+            notes, so its total differs. Open any other from Explorer or Search.
           </>
         )}
       </p>

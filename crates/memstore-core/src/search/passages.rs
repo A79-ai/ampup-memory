@@ -1218,21 +1218,74 @@ pub async fn search(
             n if n > search::TAIL_EMBED_MAX => None,
             _ => {
                 let texts: Vec<String> = tail.iter().map(|p| p.text.clone()).collect();
-                search::embed_tail_or_none(&texts).await
+                search::embed_tail_for_search(&texts).await
             }
         }
     };
-    // None without an embedder (the local model not fetched, and offline): the keyword list alone.
-    let (q_vec, tail_embedded) = tokio::join!(search::embed_query(text), tail_embedded);
-    let q_vec = q_vec.map(Float32Array::from);
-    mark!("embed");
+    let mut fetch = k * search::FETCH_MULTIPLE;
+    let ds = index.passages.as_ref().filter(|_| !nothing);
+    // The first round's lists and their rows (into the row cache, where the round takes them from), each read as
+    // soon as it can be: the keyword one while the query is embedded, the vector one when the embedding is in.
+    // On a production deployment the embedding took 0.3-1 s of a search.
+    let first_list = async |q: Option<&Float32Array>| {
+        let Some(ds) = ds.filter(|_| q.is_some() || !fts.is_empty()) else {
+            return anyhow::Ok(None);
+        };
+        let q_t = std::time::Instant::now();
+        let ids = match q {
+            Some(q) => match search::rows::nearest_flat(ds, "vec", q, fetch, sql.as_deref()).await?
+            {
+                Some(ids) => ids,
+                None => {
+                    let mut scan = ds.scan();
+                    if let Some(f) = &sql {
+                        scan.filter(f)?.prefilter(true);
+                    }
+                    search::probe(scan.nearest("vec", q, fetch)?);
+                    search::rows::ids(scan).await?
+                }
+            },
+            None => {
+                let mut scan = ds.scan();
+                if let Some(f) = &sql {
+                    scan.filter(f)?.prefilter(true);
+                }
+                scan.full_text_search(
+                    FullTextSearchQuery::new(fts.clone()).limit(Some(fetch as i64)),
+                )?;
+                search::rows::ids(scan).await?
+            }
+        };
+        let ms = q_t.elapsed().as_millis();
+        let wanted: Vec<u64> = ids.iter().map(|(id, _)| *id).collect();
+        ROWS.get(ds, &wanted, COLUMNS, |b| Ok(decode(b))).await?;
+        anyhow::Ok(Some((ids, ms)))
+    };
+    let embedded_at = std::sync::Mutex::new(None);
+    let first_vector = async {
+        // None without an embedder (the local model not fetched, and offline): the keyword list alone.
+        let q_vec = search::embed_query(text).await.map(Float32Array::from);
+        *embedded_at.lock().unwrap() = Some(t0.elapsed().as_secs_f64() * 1000.0);
+        let first = match q_vec.as_ref() {
+            Some(q) => first_list(Some(q)).await?,
+            None => None,
+        };
+        anyhow::Ok((q_vec, first))
+    };
+    let (first_vector, tail_embedded, first_keyword) =
+        tokio::join!(first_vector, tail_embedded, first_list(None));
+    let (q_vec, first_vector) = first_vector?;
+    let (mut first_keyword, mut first_vector) = (first_keyword?, first_vector);
+    if let Some(at) = embedded_at.into_inner().unwrap() {
+        took.push(("embed", at));
+    }
+    mark!("first lists");
     // (bm25, distance) per (episode, chunk), and the passage.
     let mut hits: HashMap<(String, i32), Ranked> = HashMap::new();
-    let mut fetch = k * search::FETCH_MULTIPLE;
     // Per round, for the slow search's line: how many it asked for, each query's own time and row count,
     // the rows' fetch, and how many of those rows the caller may see.
     let mut rounds: Vec<String> = vec![];
-    if let Some(ds) = index.passages.as_ref().filter(|_| !nothing) {
+    if let Some(ds) = ds {
         loop {
             let round_t = std::time::Instant::now();
             let mut saturated = false;
@@ -1255,7 +1308,16 @@ pub async fn search(
                 }
                 // Row ids only: the rows come from the row cache (see `search::rows`).
                 let (q_vec, sql) = (q_vec.as_ref(), &sql);
+                // The first round's lists were read already, beside the query's embedding.
+                let read = if by_vector {
+                    first_vector.take()
+                } else {
+                    first_keyword.take()
+                };
                 queries.push(async move {
+                    if let Some((ids, ms)) = read {
+                        return anyhow::Ok((by_vector, ids, ms));
+                    }
                     let q_t = std::time::Instant::now();
                     // Without a vector index, the embeddings held in memory are searched.
                     let flat = match q_vec.filter(|_| by_vector) {

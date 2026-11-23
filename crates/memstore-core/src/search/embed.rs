@@ -220,6 +220,18 @@ impl Provider {
             } => format!("openrouter {model} ({dims} dims) at {base_url}"),
         }
     }
+
+    /// The cosine similarity below which a text's nearest stored text is no more than what an unrelated text
+    /// reaches with this model: each model spreads unrelated texts over its own range. Measured over a sales
+    /// memory with nonsense queries (best hit) against paraphrased ones: the default local model put nonsense at
+    /// 0.47-0.56 and paraphrases' best hits at 0.56-0.67; OpenAI's text-embedding-3-small put nonsense at
+    /// 0.32-0.39 and paraphrases at 0.42-0.74. Other models take 0.5 until measured.
+    pub fn unrelated_similarity(&self) -> f32 {
+        match self {
+            Provider::Local { code, .. } if code == DEFAULT_LOCAL_MODEL => 0.6,
+            _ => 0.5,
+        }
+    }
 }
 
 /// The fastembed model named `code`: its listed model code (`Xenova/bge-small-en-v1.5`), that
@@ -553,9 +565,40 @@ fn budget_batches(inputs: Vec<String>, max_items: usize, max_chars: usize) -> Ve
     batches
 }
 
+tokio::task_local! {
+    /// Set while a search waits on its own embedding ([`quick`]): how long one try may take.
+    static QUICK: std::time::Duration;
+}
+
+/// Tries an API embedding gets inside [`quick`]: one, and one quick retry.
+pub const QUICK_ATTEMPTS: u32 = 2;
+
+/// Why an embedding inside [`quick`] failed when the API didn't answer in time, was rate limited, failed on its
+/// side or couldn't be reached: the next request may well fail the same way. A refusal of the request itself
+/// (a 4xx other than 429) isn't one.
+#[derive(Debug)]
+pub struct Unavailable(pub String);
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unavailable {}
+
+/// `f`, with each embedding request it makes to an API given `per_try` for a try and [`QUICK_ATTEMPTS`] tries, at
+/// once and with no wait for a rate limit's `Retry-After`: what a search's query takes, whose caller waits on it
+/// and which ranks by keyword alone without it. An index build's requests (thousands of inputs, megabytes of
+/// reply) keep their own patience. The local model isn't affected.
+pub async fn quick<F: std::future::Future>(per_try: std::time::Duration, f: F) -> F::Output {
+    QUICK.scope(per_try, f).await
+}
+
 /// One POST of `body` to `url`, retried with backoff on rate limits, server errors and
 /// transport failures. Returns the JSON reply of a success; any other status is an error.
-/// OpenRouter's attribution headers go only to OpenRouter.
+/// OpenRouter's attribution headers go only to OpenRouter. Inside [`quick`], each try has a deadline and
+/// there are fewer of them.
 async fn post_json(
     url: &str,
     bearer: &str,
@@ -563,9 +606,10 @@ async fn post_json(
     label: &str,
     openrouter: bool,
 ) -> Result<serde_json::Value> {
+    let quick = QUICK.try_with(|d| *d).ok();
     let mut last = None;
-    for attempt in 0..API_ATTEMPTS {
-        if attempt > 0 {
+    for attempt in 0..quick.map_or(API_ATTEMPTS, |_| QUICK_ATTEMPTS) {
+        if attempt > 0 && quick.is_none() {
             tokio::time::sleep(std::time::Duration::from_millis(500 << attempt)).await;
         }
         let mut req = HTTP.post(url).bearer_auth(bearer).json(body);
@@ -574,24 +618,34 @@ async fn post_json(
                 .header("HTTP-Referer", OPENROUTER_REFERER)
                 .header("X-Title", OPENROUTER_TITLE);
         }
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                last = Some(anyhow::Error::from(e).context(format!("{label}: request")));
-                continue;
-            }
+        let tried = async {
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| anyhow::Error::from(e).context(format!("{label}: request")))?;
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+            // A reply holds a vector per input, megabytes of JSON for a full request: a body cut off or
+            // unreadable on the way is a transport failure, retried like one, not an empty answer.
+            let body = resp.bytes().await.map_err(|e| {
+                anyhow::Error::from(e).context(format!("{label}: reading the reply"))
+            })?;
+            anyhow::Ok((status, retry_after, body))
         };
-        let status = resp.status();
-        let retry_after = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
-        // A reply holds a vector per input, megabytes of JSON for a full request: a body cut off or
-        // unreadable on the way is a transport failure, retried like one, not an empty answer.
-        let body = match resp.bytes().await {
-            Ok(b) => b,
+        let tried = match quick {
+            Some(d) => match tokio::time::timeout(d, tried).await {
+                Ok(t) => t,
+                Err(_) => Err(anyhow::anyhow!("{label}: no reply in {} ms", d.as_millis())),
+            },
+            None => tried.await,
+        };
+        let (status, retry_after, body) = match tried {
+            Ok(t) => t,
             Err(e) => {
-                last = Some(anyhow::Error::from(e).context(format!("{label}: reading the reply")));
+                last = Some(e);
                 continue;
             }
         };
@@ -611,12 +665,16 @@ async fn post_json(
         let out = parsed.unwrap_or_default();
         let msg = format!("{label}: HTTP {status} {}", out["error"]["message"]);
         anyhow::ensure!(status.as_u16() == 429 || status.is_server_error(), msg);
-        if let Some(s) = retry_after {
+        if let Some(s) = retry_after.filter(|_| quick.is_none()) {
             tokio::time::sleep(std::time::Duration::from_secs(s.min(60))).await;
         }
         last = Some(anyhow::anyhow!(msg));
     }
-    Err(last.unwrap_or_else(|| anyhow::anyhow!("{label}: gave up")))
+    let e = last.unwrap_or_else(|| anyhow::anyhow!("{label}: gave up"));
+    Err(match quick {
+        Some(_) => Unavailable(format!("{e:#}")).into(),
+        None => e,
+    })
 }
 
 fn floats(v: &serde_json::Value) -> Vec<f32> {

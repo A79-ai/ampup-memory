@@ -47,12 +47,45 @@ learned from it.
 `AMPUP_MEMORY_CONTEXT`, then the current one, and renews an expiring sign-in with the saved refresh token, writing
 it back where the CLI reads it.
 
+## Serving many tenants (platforms)
+
+A platform (an app that serves many customers of its own) uses one platform key for all of them. Each request names
+the tenant, by the platform's own id for that customer, and, optionally, the user acting in it. Memory creates a
+tenant the first time a request names it and enrolls a user the same way; each tenant's memory, and what it learns,
+stays inside it.
+
+```ts
+const platform = new AmpUpMemory("https://memory.example.com", "msk_..."); // the platform key, on your server only
+
+// Per request: a copy for that tenant and user.
+const mem = platform.forTenant("acme", { name: "Acme Corp" }).forUser("u_42", { email: "pat@example.com", name: "Pat Lee" });
+const run = await mem.session({ task: "Draft the renewal email", harness: "renewal-writer" });
+await mem.ingest([{ source: "crm:note:9", body: "...", occurred_at: micros(new Date()), acl: ["user:u_42"] }]);
+
+await platform.tenants.ensure("acme", { name: "Acme Corp" }); // {tenant, org, created}
+await platform.tenants.list({ limit: 100 }); // the platform's tenants and their usage
+await platform.tenants.forgetUser("acme", "u_42"); // a user leaves
+await platform.tenants.delete("acme"); // purge the tenant; {purging: true} until it is done
+```
+
+Or pass `tenant`, `tenantName`, `user`, `userEmail` and `userName` to the constructor. Tenant and user ids are the
+platform's own: 1 to 128 printable ASCII characters, case-sensitive. Email and name are stored on the user and kept
+up to date, never their identity. Names and emails can be any text: the client sends them percent-encoded (UTF-8). A
+tenant's name only labels it when it is created. Without a user, a request is the tenant's own: it can ingest and
+read what the whole tenant shares, but sessions, advice, `remember` and `forget` need a user. ACLs on what the
+platform writes name its users as `user:<user id>` and the whole tenant as `group:all`.
+
+Name each of your agents' sessions with its own `harness`, never one ending in `:sdk`: advice isn't learned from
+those.
+
 ## Methods
 
 | Method | Route | Returns |
 |---|---|---|
-| `new AmpUpMemory(server, token, {org, team, timeoutMs})` | | `token` may be `null` for a local server |
+| `new AmpUpMemory(server, token, {org, team, tenant, tenantName, user, userEmail, userName, timeoutMs})` | | `token` may be `null` for a local server |
 | `AmpUpMemory.fromProfile(context?)` | | a client for a CLI context |
+| `forTenant(tenant, {name})` | | a copy for another tenant, as the tenant itself |
+| `forUser(user, {email, name})` | | a copy for another user of the same tenant |
 | `me()` | `GET /me` | who you are: user, groups, scope, memberships |
 | `ingest(episodes)` | `POST /ingest` | every episode id; sent in batches of 500; needs an ingest or admin key |
 | `remember(source, body, {acl, document})` | `POST /remember` | `{episode_id, scope, readers}`, or `{queued, message}` |
@@ -65,6 +98,11 @@ it back where the CLI reads it.
 | `session.end({outcome, reward, transcript, reason})` | `POST /sessions/end` | `{ended, served, session_id}` |
 | `advice(question)` | `POST /advice` | advice outside any session |
 | `reward(runId, reward, reason?)` | `POST /runs/reward` | the id; rewards an ended session (written within a minute of its end) or a run |
+| `tenants.ensure(tenant, {name})` | `PUT /tenants/{tenant}` | `{tenant, org, created}` |
+| `tenants.get(tenant)` | `GET /tenants/{tenant}` | `{tenant, org, created_at, limits, usage}`; 404 if unknown |
+| `tenants.list({after, limit})` | `GET /tenants` | a page of the platform's tenants with usage (up to 500) |
+| `tenants.delete(tenant)` | `DELETE /tenants/{tenant}` | purges the tenant; `{purging: true}` while it runs |
+| `tenants.forgetUser(tenant, user)` | `POST /tenants/{tenant}/users/{user}/forget` | forgets the user and what they wrote |
 | `micros(date)` | | `occurred_at` in microseconds since the epoch |
 
 Every failure throws `AmpUpMemoryError` with `status`, `message` and, on a 429, `retryAfter`. An error the server

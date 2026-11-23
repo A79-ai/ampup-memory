@@ -1467,12 +1467,17 @@ async fn run_inner(
     let ids: HashSet<&str> = v.facts.iter().map(|(_, f)| f.entity.as_str()).collect();
     // When the pass began: what is dated after it ends nothing.
     let now = now_micros();
-    // The facts recorded in conflict with another: the people's to settle.
+    // The facts recorded in conflict with another: the people's to settle. Only of an attribute that holds one
+    // answer ([`crate::conflicts::one_value`]): a record of two values of one that holds several (two of a deal's
+    // requirements, recorded before reconcile checked) is no dispute, and stops nothing being ended or merged.
     let disputed: HashMap<&str, &Fact> = v
         .facts
         .iter()
         .map(|(_, f)| f)
-        .filter(|f| !v.vis.conflicts_of(&f.fact_id).is_empty())
+        .filter(|f| {
+            !v.vis.conflicts_of(&f.fact_id).is_empty()
+                && crate::conflicts::one_value(schema.as_deref(), f)
+        })
         .map(|f| (f.fact_id.as_str(), f))
         .collect();
 
@@ -1967,9 +1972,13 @@ impl Audience<'_> {
     /// conflict are the people's to settle, so neither ends the other, and another fact ends one of them only as a
     /// newer source that settles it: begun after each fact `old` is in conflict with, and restating none of them (a
     /// later restatement of one side is that side again, not a settlement).
+    /// Only records between disputed facts count (`disputed`): one on an attribute that holds several stops nothing.
     fn settles(&self, old: &Fact, by: &Fact) -> bool {
+        if !self.disputed.contains_key(old.fact_id.as_str()) {
+            return true;
+        }
         self.v.vis.conflicts_of(&old.fact_id).iter().all(|o| {
-            *o != by.fact_id
+            (*o != by.fact_id || !self.disputed.contains_key(by.fact_id.as_str()))
                 && self.disputed.get(o.as_str()).is_none_or(|o| {
                     by.valid_from > o.valid_from
                         && squash(&o.value) != squash(&by.value)
@@ -1980,7 +1989,9 @@ impl Audience<'_> {
 
     /// Whether two facts were recorded in conflict ([`crate::conflicts`]): never linked as saying the same thing.
     fn disputes(&self, a: &Fact, b: &Fact) -> bool {
-        self.v.vis.conflicts_of(&a.fact_id).contains(&b.fact_id)
+        self.disputed.contains_key(a.fact_id.as_str())
+            && self.disputed.contains_key(b.fact_id.as_str())
+            && self.v.vis.conflicts_of(&a.fact_id).contains(&b.fact_id)
     }
 }
 

@@ -3,12 +3,12 @@ import { optionsOf, setOptions, subscribe } from "./hashOptions";
 import { transport } from "../transport";
 import { ApiError, browse, call, keptBrowse, keptSearch, search } from "./api";
 import { ago, day, entityName, humanize, named, short, sourceKind, sourceTitle, when } from "./format";
-import { EntityLink, Layout } from "./layouts";
+import { EntityLink, entityRef, FactText, Layout } from "./layouts";
 import { Markdown } from "./markdown";
-import type { OrgType } from "./schema";
+import { offSchemaOrigin, type OrgType } from "./schema";
 import { shapeOf } from "./shape";
 import { mcp } from "./tools";
-import { label } from "./tree";
+import { isSessionDays, label, ordered } from "./tree";
 import type {
   Aip,
   Child,
@@ -126,6 +126,7 @@ export function Inspector({
           sel={sel}
           onFocus={onFocus}
           admin={admin}
+          schema={schema}
         />
       );
     case "entity":
@@ -173,7 +174,7 @@ export function Inspector({
           query={focus.query}
           sel={sel}
           onFocus={onFocus}
-          types={schema ? [...schema.keys()].sort() : []}
+          schema={schema}
           admin={admin}
         />
       );
@@ -357,16 +358,43 @@ const open = (c: Child): Focus =>
       ? { kind: "skill", path: c.path }
       : { kind: c.kind, path: c.path };
 
+/** A UTC day folder's name (`2026-11-22`) as a date, read in UTC so it stays the day it names. */
+const utcDay = (name: string) => {
+  const d = new Date(`${name}T00:00:00Z`);
+  return Number.isNaN(d.getTime())
+    ? name
+    : d.toLocaleDateString(undefined, { timeZone: "UTC", year: "numeric", month: "short", day: "numeric" });
+};
+
+/** What `path`'s parent listing says the folder holds (its `count`), from what was read on this page: the
+ * tree's read, the Explorer's, or the Explorer's narrowed one. */
+function keptCount(path: string[], sel: Selection, narrow: Record<string, string>): number | undefined {
+  const parent = path.slice(0, -1);
+  const at = JSON.stringify(path);
+  for (const req of [
+    { op: "ls", path: parent },
+    { op: "ls", path: parent, limit: 500 },
+    { op: "ls", path: parent, limit: 500, ...narrow },
+  ]) {
+    const c = keptBrowse<Listing>(req, sel)?.children.find((c) => JSON.stringify(c.path) === at);
+    if (c?.count != null) return c.count;
+  }
+  return undefined;
+}
+
 function FolderView({
   path,
   sel,
   onFocus: focus,
   admin = false,
+  schema,
 }: {
   path: string[];
   sel: Selection;
   onFocus: (f: Focus) => void;
   admin?: boolean;
+  /** The org's schema: an entity type it doesn't declare is marked so. */
+  schema?: Map<string, OrgType>;
 }) {
   // The entities and their types narrow to what was learned from a source or a person (`?from=`, `?by=`).
   const learned = path[0] === "entities" && path.length <= 2;
@@ -381,6 +409,32 @@ function FolderView({
   );
   const root = path.length === 1 ? ROOTS[path[0] ?? ""] : undefined;
   const name = path.at(-1) ?? "";
+  // A folder with more than one page of children says how much it holds as its parent listing counts it
+  // (episodes under a source, entities of a type, skills), read from what this page already has, else read once.
+  const more = s.status === "ok" && s.data.next != null;
+  const parentNarrow = learned && path.length === 2 ? narrowReq(narrow) : {};
+  const [held, setHeld] = useState<number | undefined>(undefined);
+  useEffect(() => {
+    if (!more || path.length === 0) return;
+    const kept = keptCount(path, sel, parentNarrow);
+    if (kept != null) return setHeld(kept);
+    let live = true;
+    const at = JSON.stringify(path);
+    browse<Listing>({ op: "ls", path: path.slice(0, -1), ...parentNarrow }, sel).then(
+      (l) => live && setHeld(l.children.find((c) => JSON.stringify(c.path) === at)?.count),
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [more, path, sel, narrow.from, narrow.by]);
+  const unit = ROOTS[path[0] ?? ""]?.unit ?? "items";
+  const days = isSessionDays(path);
+  const oneDay = path.length === 3 && isSessionDays(path.slice(0, 2));
+  // Off-schema: an entity type the memory holds that its schema doesn't declare (a goal's types, an episode type's
+  // items), marked where the types are listed.
+  const offSchema = (type: string) =>
+    path.length === 1 && path[0] === "entities" && !!schema?.size && !schema.has(type);
   return (
     <section>
       <div className="head">
@@ -391,15 +445,30 @@ function FolderView({
           <div className="eyebrow">
             {root ? "Folder" : path.slice(0, -1).map(humanize).join(" / ")}
           </div>
-          <h1 className="title">{root ? root.title : humanize(name || "∅")}</h1>
+          <h1 className="title">
+            {root
+              ? root.title
+              : s.status === "ok" && s.data.title
+                ? s.data.title
+                : oneDay
+                  ? utcDay(name)
+                  : humanize(name || "∅")}
+          </h1>
           <div className="subtitle">
-            {s.status === "ok" && (
-              <span>
-                {s.data.children.length}
-                {s.data.next ? "+" : ""} {s.data.children.length === 1 ? "item" : "items"}
-              </span>
-            )}
+            {s.status === "ok" &&
+              (more && held != null ? (
+                <span>
+                  {held.toLocaleString()} {held === 1 ? unit.replace(/s$/, "") : unit}
+                </span>
+              ) : (
+                <span>
+                  {s.data.children.length.toLocaleString()}
+                  {more ? "+" : ""} {s.data.children.length === 1 ? "item" : "items"}
+                </span>
+              ))}
             {root && <span>{root.note}</span>}
+            {days && <span>One folder per day in UTC, newest first</span>}
+            {oneDay && <span>A day in UTC</span>}
           </div>
         </div>
       </div>
@@ -431,27 +500,37 @@ function FolderView({
               </EmptyState>
             ) : l.children.every((c) => c.kind === "folder") ? (
               <div className="grid">
-                {l.children.map((c) => (
+                {ordered(path, l.children, l.next).map((c) => (
                   <button
                     key={JSON.stringify(c.path)}
                     className="tile"
                     onClick={() => onFocus(open(c))}
                   >
                     <div className="tile-top">
-                      <span className="tile-name">{humanize(c.name || "∅")}</span>
+                      <span className="tile-name">
+                        {days ? utcDay(c.name) : humanize(c.name || "∅")}
+                      </span>
                       <Icon name="chevron" className="muted" />
                     </div>
                     {c.count != null && <div className="tile-stat">{c.count.toLocaleString()}</div>}
                     <div className="tile-note">
                       <span className="mono">{c.name}</span>
                       {c.latest ? ` · updated ${ago(c.latest)}` : ""}
+                      {offSchema(c.name) && (
+                        <>
+                          {" "}
+                          <span className="badge" title={offSchemaOrigin(c.name).long}>
+                            {offSchemaOrigin(c.name).short}
+                          </span>
+                        </>
+                      )}
                     </div>
                   </button>
                 ))}
               </div>
             ) : (
               <div className="list">
-                {l.children.map((c) => (
+                {ordered(path, l.children, l.next).map((c) => (
                   <Row
                     key={JSON.stringify(c.path) + (c.episode_id ?? "")}
                     c={c}
@@ -486,7 +565,7 @@ function Row({ c, onFocus }: { c: Child; onFocus: (f: Focus) => void }) {
     sub = (
       <>
         <span className="mono">{c.entity ?? c.name}</span>
-        {c.count != null && ` · ${c.count} ${c.count === 1 ? "fact" : "facts"}`}
+        {c.count != null && ` · ${c.count.toLocaleString()} ${c.count === 1 ? "fact" : "facts"}`}
       </>
     );
   } else if (c.kind === "episode") {
@@ -511,7 +590,7 @@ function Row({ c, onFocus }: { c: Child; onFocus: (f: Focus) => void }) {
     title = c.kind === "skill_index" ? "Routing index" : humanize(c.name);
     sub =
       c.kind === "skill_index"
-        ? `${c.count ?? 0} skills`
+        ? `${(c.count ?? 0).toLocaleString()} skills`
         : (c.when ?? <span className="mono">{c.name}</span>);
   }
   if (c.title) {
@@ -534,7 +613,7 @@ function Row({ c, onFocus }: { c: Child; onFocus: (f: Focus) => void }) {
           {ago(t2)}
         </div>
       ) : c.count != null && c.kind === "folder" ? (
-        <div className="list-meta">{c.count}</div>
+        <div className="list-meta">{c.count.toLocaleString()}</div>
       ) : null}
       <Icon name="chevron" />
     </button>
@@ -652,7 +731,7 @@ function EntityPane({
                     <span className="badge badge-error">{conflicts.length} in dispute</span>
                   )}
                   <span>
-                    from {sources} {sources === 1 ? "episode" : "episodes"}
+                    from {sources.toLocaleString()} {sources === 1 ? "episode" : "episodes"}
                   </span>
                   {latest > 0 && <span title={when(latest)}>updated {ago(latest)}</span>}
                 </div>
@@ -1282,47 +1361,92 @@ type Hit = Fact & { facts?: Fact[] };
  * A search narrowed by its facets: memstore's `search_memory` (as an agent calls it) with the dates, the
  * episode types and the entity type, as JSON. Unnarrowed, the page's own `/search` answers (and is kept).
  */
-async function facetSearch(query: string, f: Facets, sel: Selection): Promise<{ facts: Fact[] }> {
+async function facetSearch(
+  query: string,
+  f: Facets,
+  sel: Selection,
+  offSchema = false,
+): Promise<{ facts: Fact[] }> {
+  // `type` filters on the type the schema gave each fact as it was written, so a type the schema doesn't declare
+  // matches nothing there (its facts were written untyped): those are asked for unfiltered, and kept here by
+  // their entity id's type.
+  const byId = offSchema && f.type ? f.type : "";
   const r = await mcp<{ content?: { text?: string }[]; isError?: boolean }>(sel, "tools/call", {
     name: "search_memory",
     arguments: {
       query,
-      k: 30,
+      k: byId ? 200 : 30,
       format: "json",
       ...(f.from ? { start_date: f.from } : {}),
       ...(f.to ? { end_date: f.to } : {}),
       ...(f.kinds.length ? { episode_type: f.kinds } : {}),
-      ...(f.type ? { type: f.type } : {}),
+      ...(f.type && !byId ? { type: f.type } : {}),
       ...(f.newest ? { order: "newest" } : {}),
     },
   });
   const text = (r.content ?? []).map((c) => c.text ?? "").join("\n");
   if (r.isError) throw new Error(text || "search_memory failed");
-  const hits = JSON.parse(text || "[]") as Hit[];
+  // A list of hits, or (from a server that also answers passages) `{hits, passages}`.
+  const answered = JSON.parse(text || "[]") as Hit[] | { hits?: Hit[] };
+  const hits = Array.isArray(answered) ? answered : (answered.hits ?? []);
   const seen = new Set<string>();
   const facts: Fact[] = [];
   for (const h of hits)
     for (const x of [h, ...(h.facts ?? [])])
-      if (!seen.has(x.fact_id)) {
+      if (!seen.has(x.fact_id) && (!byId || x.entity.startsWith(`${byId}:`))) {
         seen.add(x.fact_id);
         facts.push(x);
       }
-  return { facts };
+  return { facts: byId ? facts.slice(0, 30) : facts };
 }
+
+/** The entity types the memory holds, as the Explorer lists them (`entities`): what was read on this page, else
+ * read once. */
+function useStoredTypes(sel: Selection): string[] {
+  const req = { op: "ls", path: ["entities"] };
+  const names = (l?: Listing) => (l?.children ?? []).map((c) => c.name);
+  const kept = () =>
+    keptBrowse<Listing>(req, sel) ?? keptBrowse<Listing>({ ...req, limit: 500 }, sel);
+  const [types, setTypes] = useState<string[]>(() => names(kept()));
+  useEffect(() => {
+    if (kept()) return;
+    let live = true;
+    browse<Listing>(req, sel).then(
+      (l) => live && setTypes(names(l)),
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [sel.org, sel.team, sel.branch]);
+  return types;
+}
+
+/** The query's words a fact would hold if it matched them: three letters or more, in lower case. */
+const wordsOf = (q: string) =>
+  [...new Set(q.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? [])];
 
 function SearchPane({
   query,
   sel,
   onFocus,
-  types,
+  schema,
   admin,
 }: {
   query: string;
   sel: Selection;
   onFocus: (f: Focus) => void;
-  types: string[];
+  /** The org's schema: its types, beside those the memory holds that it doesn't declare. */
+  schema?: Map<string, OrgType>;
   admin: boolean;
 }) {
+  // A search narrows to any type the memory holds: the schema's, and those it holds that the schema doesn't
+  // declare (marked so), which `search_memory` filters by as it does any other.
+  const stored = useStoredTypes(sel);
+  const declared = schema ? [...schema.keys()] : [];
+  const types = [...new Set([...declared, ...stored])].sort();
+  const entityTypes = useMemo(() => new Set(types), [types.join(",")]);
+  const offSchema = (t: string) => declared.length > 0 && !declared.includes(t);
   // The narrowing is kept in the link (`?from=…&to=…&kinds=…&type=…&newest=1&person=…`).
   const hash = useSyncExternalStore(subscribe, () => location.hash);
   const facets = useMemo<Facets>(() => {
@@ -1353,9 +1477,9 @@ function SearchPane({
       facets.person
         ? personSearch(query, facets, sel)
         : on
-          ? facetSearch(query, facets, sel)
+          ? facetSearch(query, facets, sel, offSchema(facets.type))
           : search<{ facts: Fact[] }>(query, sel),
-    [query, sel, JSON.stringify(facets)],
+    [query, sel, JSON.stringify(facets), offSchema(facets.type)],
     on ? undefined : () => keptSearch<{ facts: Fact[] }>(query, sel),
   );
   const set = (p: Partial<Facets>) => setFacets({ ...facets, ...p });
@@ -1369,9 +1493,11 @@ function SearchPane({
           <div className="eyebrow">Search</div>
           <h1 className="title">“{query}”</h1>
           <div className="subtitle">
-            {s.status === "ok"
-              ? `${s.data.facts.length} best-matching facts, current and past${on ? ", narrowed" : ""}`
-              : "Searching facts…"}
+            {s.status === "ok" ? (
+              <SearchSummary query={query} facts={s.data.facts} narrowed={on} />
+            ) : (
+              "Searching facts…"
+            )}
           </div>
         </div>
       </div>
@@ -1407,7 +1533,7 @@ function SearchPane({
               <option value="">any type</option>
               {types.map((t) => (
                 <option key={t} value={t}>
-                  {t}
+                  {offSchema(t) ? `${t} (${offSchemaOrigin(t).short})` : t}
                 </option>
               ))}
             </select>
@@ -1471,7 +1597,13 @@ function SearchPane({
       <Loading s={s} retry={retry}>
         {(r) =>
           r.facts.length ? (
-            <Facts facts={r.facts} onFocus={onFocus} showEntity />
+            <Facts
+              facts={r.facts}
+              onFocus={onFocus}
+              showEntity
+              entityTypes={entityTypes}
+              weak={r.facts.every((f) => f.weak)}
+            />
           ) : (
             <EmptyState icon="search" title="No matching facts">
               {facets.person
@@ -1486,6 +1618,46 @@ function SearchPane({
         }
       </Loading>
     </section>
+  );
+}
+
+/**
+ * How many facts a search answered. The search always answers its nearest facts (their scores rank them against
+ * each other, never against a bar), so a query nothing matches still gets some: when no fact holds any of the
+ * query's words, it says so, and that these are only the nearest in meaning.
+ */
+function SearchSummary({
+  query,
+  facts,
+  narrowed,
+}: {
+  query: string;
+  facts: Fact[];
+  narrowed: boolean;
+}) {
+  if (!facts.length) return <>No facts</>;
+  // The memory marks a hit `weak` when it is not a close match (a server before that marks none).
+  if (facts.every((f) => f.weak))
+    return (
+      <>
+        <b>Nothing matched closely.</b> The {facts.length.toLocaleString()} nearest{" "}
+        {facts.length === 1 ? "fact is" : "facts are"} below.
+      </>
+    );
+  const words = wordsOf(query);
+  const holds = (f: Fact) => {
+    const text = `${f.entity} ${f.predicate} ${f.value} ${f.quote ?? ""}`.toLowerCase();
+    return words.some((w) => text.includes(w));
+  };
+  const n = facts.length.toLocaleString();
+  const what = `${facts.length === 1 ? "fact" : "facts"}, current and past${narrowed ? ", narrowed" : ""}`;
+  return (
+    <>
+      The {n} closest {what}
+      {words.length > 0 && !facts.some(holds) && (
+        <>. None holds “{query}”: these are only the nearest in meaning.</>
+      )}
+    </>
   );
 }
 
@@ -1520,16 +1692,22 @@ function Facts({
   onFocus,
   showEntity,
   hideEvidence,
+  entityTypes,
+  weak = false,
 }: {
   facts: Fact[];
   onFocus: (f: Focus) => void;
   showEntity?: boolean;
   hideEvidence?: string;
+  /** The entity types the memory holds: a value that is one's id (`account:acme`) opens it. */
+  entityTypes?: ReadonlySet<string>;
+  /** None is a close match: drawn quieter. */
+  weak?: boolean;
 }) {
   const showAll = showEntity || facts.some((f) => f.entity !== facts[0]?.entity);
   const top = Math.max(0, ...facts.map((f) => f.score ?? 0));
   return (
-    <div className="card facts">
+    <div className={`card facts ${weak ? "facts-weak" : ""}`}>
       {facts.map((f) => {
         const ended = f.valid_to != null;
         const evidence = f.source_episodes.filter((e) => e !== hideEvidence);
@@ -1545,10 +1723,10 @@ function Facts({
                 </div>
               )}
               <div className="fact-value">
-                {named(f.value) ? (
-                  <EntityLink entity={f.value} onFocus={onFocus} />
+                {named(f.value) || (entityTypes && entityRef(f.value, entityTypes)) ? (
+                  <EntityLink entity={f.value.trim()} onFocus={onFocus} />
                 ) : (
-                  f.value
+                  <FactText value={f.value} />
                 )}
               </div>
               {f.quote && <div className="quote">“{f.quote}”</div>}

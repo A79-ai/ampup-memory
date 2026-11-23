@@ -45,11 +45,43 @@ impl<T> Default for Gen<T> {
 /// Decoded rows of index parts, by fragment and row id: at most `max` rows, the least recently read dropped first.
 /// Two generations: rows are added to the newer, a row read from the older moves to the newer, and once the newer
 /// holds half of `max` it becomes the older and the older is dropped. A row read in the last `max / 2` reads stays.
+///
+/// Besides those, whole fragments can be held ([`RowCache::hold`]): every row of a part's fragments, read once in
+/// order, kept until the fragment leaves the part. Those rows are answered from memory before the generations.
 pub struct RowCache<T> {
     max: usize,
     held: Mutex<(Gen<T>, Gen<T>)>,
     /// Bumped (under `held`) by [`RowCache::clear`]: a take that began before keeps its rows out of the cache.
     cleared: AtomicU64,
+    /// Whole fragments held in memory ([`RowCache::hold`]).
+    resident: Mutex<Resident<T>>,
+}
+
+/// The fragments a [`RowCache`] holds whole: each one's rows, and what they take in memory.
+struct Resident<T> {
+    by: HashMap<Frag, Whole<T>>,
+    bytes: usize,
+    /// Per part (uri): the newest version a hold read it at, and whether it is done (every fragment that fit is
+    /// held, and its deletions applied) or under way.
+    parts: HashMap<String, (u64, bool)>,
+}
+
+impl<T> Default for Resident<T> {
+    fn default() -> Self {
+        Resident {
+            by: HashMap::new(),
+            bytes: 0,
+            parts: HashMap::new(),
+        }
+    }
+}
+
+/// One fragment held whole: its rows by row id (less those deleted since), their bytes, and the deletion file
+/// (id, version) last applied to it.
+struct Whole<T> {
+    rows: HashMap<u64, Arc<T>>,
+    bytes: usize,
+    deletion: Option<(u64, u64)>,
 }
 
 /// What a fragment's rows are: its data files and overlays (paths are never reused), so equal for every version
@@ -93,6 +125,7 @@ impl<T> RowCache<T> {
             max,
             held: Mutex::new(Default::default()),
             cleared: Default::default(),
+            resident: Mutex::new(Default::default()),
         }
     }
 
@@ -128,6 +161,9 @@ impl<T> RowCache<T> {
         let mut missing: Vec<u64> = vec![];
         let cleared;
         {
+            // Whole fragments first: a row deleted since its fragment was read is no longer there, and is looked
+            // for below (a reader of an older version may still ask for it).
+            let resident = self.resident.lock().unwrap();
             let mut held = self.held.lock().unwrap();
             cleared = self.cleared.load(Ordering::SeqCst);
             let mut seen = std::collections::HashSet::new();
@@ -140,7 +176,9 @@ impl<T> RowCache<T> {
                     missing.push(id);
                     continue;
                 };
-                if let Some(r) = held.0.by.get(frag).and_then(|p| p.get(&id)) {
+                if let Some(r) = resident.by.get(frag).and_then(|w| w.rows.get(&id)) {
+                    have.insert(id, r.clone());
+                } else if let Some(r) = held.0.by.get(frag).and_then(|p| p.get(&id)) {
                     have.insert(id, r.clone());
                 } else if let Some(r) = held.1.by.get_mut(frag).and_then(|p| p.remove(&id)) {
                     held.1.rows -= 1;
@@ -205,10 +243,239 @@ impl<T> RowCache<T> {
     /// Forget every row (an index is deleted: memory that was forgotten must not stay here), and keep out the
     /// rows of takes under way.
     pub fn clear(&self) {
+        let mut resident = self.resident.lock().unwrap();
         let mut held = self.held.lock().unwrap();
         self.cleared.fetch_add(1, Ordering::SeqCst);
         *held = Default::default();
+        *resident = Default::default();
     }
+
+    /// Rows and bytes held whole ([`RowCache::hold`]), for the memory log.
+    pub fn resident(&self) -> (usize, usize) {
+        let r = self.resident.lock().unwrap();
+        (r.by.values().map(|w| w.rows.len()).sum(), r.bytes)
+    }
+}
+
+impl<T: Send + Sync + 'static> RowCache<T> {
+    /// Hold `ds`'s fragments whole in the background ([`RowCache::hold`]), unless this version or a newer one of
+    /// the part already was, or a hold of it is under way.
+    pub fn hold_later(
+        &'static self,
+        ds: &Dataset,
+        columns: &'static [&'static str],
+        decode: fn(&RecordBatch) -> Result<Vec<T>>,
+        size: fn(&T) -> usize,
+        budget: usize,
+    ) {
+        if budget == 0 || ds.manifest().uses_stable_row_ids() {
+            return;
+        }
+        let (uri, version) = (ds.uri().to_string(), ds.version().version);
+        {
+            let mut r = self.resident.lock().unwrap();
+            match r.parts.get(&uri) {
+                Some(&(v, done)) if v > version || (v == version && done) => return,
+                Some(&(v, false)) if v == version => return,
+                _ => {}
+            }
+            r.parts.insert(uri.clone(), (version, false));
+        }
+        let ds = ds.clone();
+        tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            match self.hold(&ds, columns, decode, size, budget).await {
+                Ok(h) => {
+                    if h.read > 0 || h.dropped > 0 || h.pruned > 0 {
+                        let (rows, bytes) = self.resident();
+                        eprintln!(
+                            "memstore: index rows of {uri} held in memory at version {version} in {} ms: {} files read \
+                             ({} rows), {} dropped, {} rows deleted since dropped, {} files left out for the budget \
+                             of {} MB; {rows} rows ({} MB) held in all",
+                            t0.elapsed().as_millis(),
+                            h.read,
+                            h.rows,
+                            h.dropped,
+                            h.pruned,
+                            h.over,
+                            budget >> 20,
+                            bytes >> 20,
+                        );
+                    }
+                }
+                Err(e) => eprintln!(
+                    "memstore: index rows of {uri} not held in memory (read on demand): {e:#}"
+                ),
+            }
+            let mut r = self.resident.lock().unwrap();
+            if let Some(p) = r.parts.get_mut(&uri)
+                && p.0 == version
+            {
+                p.1 = true;
+            }
+        });
+    }
+
+    /// Hold every row of `ds`'s fragments in memory, `columns` decoded by `decode`, within `budget` bytes in all
+    /// (`size` per row): fragments already held stay, those no longer in the part are dropped, rows deleted
+    /// since a fragment was read are dropped from it, and the others are read whole, one fragment at a time,
+    /// while they fit. A fragment's files never change, so its rows are the same in every version holding it.
+    /// A version older than the newest held changes nothing.
+    async fn hold(
+        &self,
+        ds: &Dataset,
+        columns: &[&str],
+        decode: fn(&RecordBatch) -> Result<Vec<T>>,
+        size: fn(&T) -> usize,
+        budget: usize,
+    ) -> Result<Held> {
+        let mut out = Held::default();
+        let uri = ds.uri().to_string();
+        let frags: Vec<lance::table::format::Fragment> = ds.manifest().fragments.to_vec();
+        let all: Vec<u64> = frags.iter().map(|f| f.id << 32).collect();
+        let keys = frag_keys(ds, &all);
+        let deletion = |f: &lance::table::format::Fragment| {
+            f.deletion_file.as_ref().map(|d| (d.id, d.read_version))
+        };
+        let cleared = self.cleared.load(Ordering::SeqCst);
+        // Fragments no longer in the part, then rows deleted since their fragment was read.
+        let mut stale = vec![];
+        {
+            let mut r = self.resident.lock().unwrap();
+            let current: std::collections::HashSet<&Frag> = keys.values().collect();
+            let gone: Vec<Frag> =
+                r.by.keys()
+                    .filter(|k| k.0 == uri && !current.contains(k))
+                    .cloned()
+                    .collect();
+            for k in gone {
+                if let Some(w) = r.by.remove(&k) {
+                    r.bytes -= w.bytes;
+                    out.dropped += 1;
+                }
+            }
+            for f in &frags {
+                if let Some(w) = keys.get(&f.id).and_then(|k| r.by.get(k))
+                    && w.deletion != deletion(f)
+                {
+                    stale.push(f.id);
+                }
+            }
+        }
+        for id in stale {
+            let Some(fragment) = ds.get_fragment(id as usize) else {
+                continue;
+            };
+            let deleted = fragment.get_deletion_vector().await?;
+            let mut r = self.resident.lock().unwrap();
+            if self.cleared.load(Ordering::SeqCst) != cleared {
+                return Ok(out);
+            }
+            let r = &mut *r;
+            let Some(w) = keys.get(&id).and_then(|k| r.by.get_mut(k)) else {
+                continue;
+            };
+            if let Some(dv) = &deleted {
+                let before = w.bytes;
+                let mut bytes = 0;
+                w.rows.retain(|row, v| {
+                    let keep = !dv.contains(*row as u32);
+                    if keep {
+                        bytes += size(v);
+                    } else {
+                        out.pruned += 1;
+                    }
+                    keep
+                });
+                w.bytes = bytes;
+                r.bytes = r.bytes - before + bytes;
+            }
+            w.deletion = deletion(fragment.metadata());
+        }
+        // Fragments not held yet, read whole while they fit (a fragment's size is guessed from the rows held, at 1 KB
+        // a row before any is).
+        for f in &frags {
+            let Some(key) = keys.get(&f.id) else {
+                continue;
+            };
+            let (per_row, room) = {
+                let r = self.resident.lock().unwrap();
+                if r.by.contains_key(key) {
+                    continue;
+                }
+                let n: usize = r.by.values().map(|w| w.rows.len()).sum();
+                let per_row = r.bytes.checked_div(n).unwrap_or(1024);
+                (per_row, budget.saturating_sub(r.bytes))
+            };
+            let rows = f.physical_rows.unwrap_or(0);
+            if rows * per_row > room {
+                out.over += 1;
+                continue;
+            }
+            let mut scan = ds.scan();
+            // A batch or two ahead, not Lance's default: this runs beside searches, whose reads come first.
+            scan.with_fragments(vec![f.clone()])
+                .project(columns)?
+                .batch_readahead(2)
+                .with_row_id();
+            let mut stream = scan.try_into_stream().await?;
+            let mut whole = Whole {
+                rows: HashMap::new(),
+                bytes: 0,
+                deletion: deletion(f),
+            };
+            while let Some(b) = stream.try_next().await? {
+                let ids = b
+                    .column_by_name("_rowid")
+                    .and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<arrow_array::UInt64Array>()
+                            .cloned()
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("a fragment scan returned no row ids"))?;
+                let decoded = decode(&b)?;
+                anyhow::ensure!(
+                    decoded.len() == ids.len(),
+                    "decoded {} rows of {}",
+                    decoded.len(),
+                    ids.len()
+                );
+                for (i, v) in decoded.into_iter().enumerate() {
+                    whole.bytes += size(&v);
+                    whole.rows.insert(ids.value(i), Arc::new(v));
+                }
+            }
+            let mut r = self.resident.lock().unwrap();
+            // Cleared meanwhile (an index was deleted), or the newest version moved past this one: stop here.
+            if self.cleared.load(Ordering::SeqCst) != cleared
+                || r.parts
+                    .get(&uri)
+                    .is_some_and(|p| p.0 != ds.version().version)
+            {
+                return Ok(out);
+            }
+            if r.bytes + whole.bytes > budget {
+                out.over += 1;
+                continue;
+            }
+            out.read += 1;
+            out.rows += whole.rows.len();
+            r.bytes += whole.bytes;
+            r.by.insert(key.clone(), whole);
+        }
+        Ok(out)
+    }
+}
+
+/// What a [`RowCache::hold`] did: fragments read (and their rows), dropped, rows dropped as deleted, and fragments
+/// left out for the budget.
+#[derive(Default)]
+struct Held {
+    read: usize,
+    rows: usize,
+    dropped: usize,
+    pruned: usize,
+    over: usize,
 }
 
 /// The row ids a scan returns, with its `_score` (a full-text search) or `_distance` (a vector search) when it

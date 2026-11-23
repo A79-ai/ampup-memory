@@ -982,11 +982,31 @@ async fn preferences_are_kept_from_what_people_type() {
     .await;
     assert_ne!(status, 200, "a writer key opens carol's note: {read}");
 
+    // Her search finds the note's fact, asked twice (the second answered from what was kept: the same ask of the
+    // same memory); asked again right after she forgets the note, it doesn't.
+    let fact_id = pinned["fact_id"].as_str().unwrap().to_string();
+    let ask = json!({"query": "Pin exact dependency versions", "format": "json", "k": 10});
+    for _ in 0..2 {
+        let (said, failed) = rig.tool(&carol, None, "search_memory", ask.clone()).await;
+        assert!(!failed, "{said}");
+        assert!(
+            said.contains(&fact_id),
+            "carol's search misses her note's fact: {said}"
+        );
+    }
+
     // A note carol forgets is gone from her notes, its fact with it.
     let (said, failed) = rig
         .tool(&carol, None, "forget_memory", json!({"episode_id": note}))
         .await;
     assert!(!failed, "{said}");
+    let (said, failed) = rig.tool(&carol, None, "search_memory", ask).await;
+    assert!(!failed, "{said}");
+    assert!(
+        !said.contains(&fact_id)
+            && !said.contains("Pin exact dependency versions, never caret ranges."),
+        "carol's search right after she forgot her note finds it: {said}"
+    );
     let mine = rig.browse(&carol, json!(["notes"])).await;
     assert!(
         !names(&mine).contains(&pinned["name"].as_str().unwrap().to_string()),
@@ -994,6 +1014,52 @@ async fn preferences_are_kept_from_what_people_type() {
     );
     let (status, read) = rig.read(&carol, &note).await;
     assert_eq!(status, 404, "carol opens her forgotten note: {read}");
+
+    // Her sessions listed (each folder twice, the second from what was kept): a session she forgets is gone from
+    // every listing she reads right after.
+    async fn listed(rig: &Rig, bearer: &str) -> (Vec<Value>, Vec<String>) {
+        let (mut paths, mut ids, mut at) = (vec![], vec![], vec![json!(["sessions"])]);
+        while let Some(path) = at.pop() {
+            for _ in 0..2 {
+                let (status, body) = post(
+                    &format!("{}/browse", rig.s),
+                    bearer,
+                    &[("x-memstore-org", "acme")],
+                    &json!({"op": "ls", "path": path}),
+                )
+                .await;
+                assert!(status == 200 || status == 404, "{path}: {body}");
+                if status == 404 {
+                    continue;
+                }
+                for c in body["children"].as_array().into_iter().flatten() {
+                    if let Some(id) = c["episode_id"].as_str() {
+                        ids.push(id.to_string());
+                    } else if c["kind"] == "folder" && !paths.contains(&c["path"]) {
+                        paths.push(c["path"].clone());
+                        at.push(c["path"].clone());
+                    }
+                }
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        (paths, ids)
+    }
+    let (_, sessions) = listed(&rig, &carol).await;
+    let gone = sessions
+        .first()
+        .unwrap_or_else(|| panic!("carol lists no session"))
+        .clone();
+    let (said, failed) = rig
+        .tool(&carol, None, "forget_memory", json!({"episode_id": gone}))
+        .await;
+    assert!(!failed, "{said}");
+    let (_, after) = listed(&rig, &carol).await;
+    assert!(
+        !after.contains(&gone),
+        "carol lists her forgotten session {gone} right after: {after:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1125,8 +1191,92 @@ async fn advice_learns_from_each_graded_request_and_hands_its_preferences() {
             .any(|l| l["owner"] == "carol@acme.com"),
         "dave reads carol's lesson: {his}"
     );
-    let (status, his) = lessons(dave, json!({"person": "carol@acme.com"})).await;
+    let (status, his) = lessons(dave.clone(), json!({"person": "carol@acme.com"})).await;
     assert_eq!(status, 400, "dave asks for carol's lessons: {his}");
+    // A page of them is answered from what was kept for each reader: dave's pages never hold what alice's did, nor
+    // may he ask for a page of carol's.
+    let (status, his) = lessons(dave.clone(), json!({"page": 1})).await;
+    assert_eq!(status, 200, "{his}");
+    assert!(
+        !his.to_string().contains("carol@acme.com"),
+        "a page of dave's holds carol's: {his}"
+    );
+    let (status, his) = lessons(dave, json!({"page": 1, "show": "carol@acme.com"})).await;
+    assert_eq!(
+        status, 400,
+        "dave asks for a page of carol's lessons: {his}"
+    );
+    let (status, page) = lessons(
+        rig.token("alice@acme.com"),
+        json!({"page": 1, "show": "carol@acme.com"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert!(from_her_session(&page), "alice's page of carol's: {page}");
+
+    // A team note on the advice page alice reads (twice: the second from what was kept for her), retracted: the next
+    // read of the page never holds it.
+    let note = crate::advice_versions::doc(
+        "advice/team/ship",
+        "# Advice: ship\n\n## When\nxqteamnote ship the CI change\n\n## Steps\n1. [how-to] run the type check first\n",
+    );
+    let note_id = note.episode_id.clone();
+    let map = json!({"categories": {"team": {"description": "d", "situations": {
+            "ship": {"when": "xqteamnote ship the CI change", "skills": []}}}},
+        "assign": {}, "notes": {"team/ship": "h"}, "acl": ["*"], "linked": "",
+        "written": {"team/ship": {"runs": 2, "wrong": 0, "context": "", "format": "kinds-3-budgeted"}}});
+    rig.store
+        .commit(
+            &acme(),
+            "test",
+            &[
+                crate::advice_versions::doc("advice/map", &map.to_string()),
+                note,
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+    let alice = rig.token("alice@acme.com");
+    let usage = async || {
+        let (status, page) = post(
+            &format!("{}/browse", rig.s),
+            &alice,
+            &[("x-memstore-org", "acme")],
+            &json!({"op": "advice_usage", "days": 30}),
+        )
+        .await;
+        assert_eq!(status, 200, "{page}");
+        page.to_string()
+    };
+    until("the team note on alice's advice page", async || {
+        usage().await.contains("xqteamnote").then_some(())
+    })
+    .await;
+    assert!(usage().await.contains("xqteamnote"), "kept for alice");
+    // Retracted by alice, the org's admin.
+    let (status, said) = post(
+        &format!("{}/retract", rig.s),
+        &alice,
+        &[("x-memstore-org", "acme")],
+        &json!({"episode_id": note_id}),
+    )
+    .await;
+    assert_eq!((status, &said["retracted"]), (200, &json!(1)), "{said}");
+    let page = usage().await;
+    assert!(
+        !page.contains("xqteamnote"),
+        "alice's advice page holds the note retracted just before: {page}"
+    );
+    // Carol forgotten: what was kept for alice is never answered again, and her session is gone from it.
+    rig.admin(json!({"op": "forget_user", "user": "carol@acme.com", "org": "acme"}))
+        .await;
+    let (status, admin) = lessons(rig.token("alice@acme.com"), json!({})).await;
+    assert_eq!(status, 200, "{admin}");
+    assert!(
+        !from_her_session(&admin),
+        "alice reads carol's session after carol was forgotten: {admin}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

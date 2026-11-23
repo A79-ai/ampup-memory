@@ -341,6 +341,18 @@ pub struct Titled {
     pub subject: Option<String>,
 }
 
+impl Titled {
+    /// What a list of sources or a page calls it: the title its type reads ([`Titled::named`]), else its first
+    /// line ([`Titled::title`]: a Slack thread kept as text, a note), but not when that line is only the id of what
+    /// it is a record of (a call with no title of its own reads as its `meeting:<id>`).
+    pub fn shown(&self) -> Option<String> {
+        self.named.clone().or_else(|| {
+            (!self.title.is_empty() && self.subject.as_deref() != Some(self.title.as_str()))
+                .then(|| self.title.clone())
+        })
+    }
+}
+
 /// Titles read once per server, by episode id: an episode's id is its text's hash, so its title never changes.
 static TITLES: LazyLock<Mutex<HashMap<String, Titled>>> = LazyLock::new(Default::default);
 /// Titles held at most; past it, they are read again.

@@ -18,6 +18,46 @@ export function EntityLink({ entity, onFocus }: { entity: string; onFocus: (f: F
   );
 }
 
+/** The kinds of fact the generic extraction names (`src/extract/mod.rs` `KINDS`, and `what_happened`), as some
+ * writers put them before a value. */
+const KINDS = new Set([
+  "decision",
+  "issue",
+  "owner",
+  "how_it_works",
+  "how_to_enable",
+  "supports",
+  "shipped_in",
+  "changed_in",
+  "requested_by",
+  "what_happened",
+]);
+
+/**
+ * A fact's value as words: the kind some writers put before it (`(how_it_works) …`) as a quiet label, and markdown
+ * bold (`**…**`) drawn bold, never as its markers. The value as stored stays in the title.
+ */
+export function FactText({ value }: { value: string }) {
+  const m = /^\(([a-z]+(?:_[a-z]+)*)\)\s+(\S[\s\S]*)$/.exec(value);
+  const kind = m && KINDS.has(m[1]!) ? m : null;
+  const text = kind ? kind[2]! : value;
+  const parts = text.split(/\*\*(\S(?:[\s\S]*?\S)?)\*\*/g);
+  if (!kind && parts.length === 1) return <>{value}</>;
+  return (
+    <span title={value}>
+      {kind && <span className="fact-kind">{humanize(kind[1]!)} · </span>}
+      {parts.map((p, i) => (i % 2 ? <b key={i}>{p}</b> : p))}
+    </span>
+  );
+}
+
+/** A value that is an entity's id (`account:acme`), of a type the memory holds: never one that only looks like one
+ * (a URL, a time, words with a colon in them). */
+export function entityRef(value: string, types: ReadonlySet<string>): boolean {
+  const m = /^([a-z][a-z0-9_]*):([^\s/]+)$/.exec(value.trim());
+  return !!m && types.has(m[1]!);
+}
+
 /** Enum values that read as good, middling or bad, so their badge says so. */
 const TONE: Record<string, string> = {
   won: "badge-ok",
@@ -62,7 +102,7 @@ export function Value({
     case "timestamp":
       return <span className="mono">{value}</span>;
     default:
-      return <span>{value}</span>;
+      return <FactText value={value} />;
   }
 }
 
@@ -121,13 +161,15 @@ export function Layout({
       const notes = shape.text.filter((p) => of(p).length);
       body = (
         <>
-          <div className="layout-hero">
-            <div>
-              <div className="field-k">{humanize(shape.money!.key)}</div>
-              <div className="layout-big">{values(shape.money!)}</div>
-              <div className="muted">{name}</div>
-            </div>
+          <div className="layout-hero layout-hero-stack">
+            <div className="layout-name">{name}</div>
             <div className="layout-row">
+              <div className="field-cell" title={`${shape.money!.key}: money`}>
+                <div className="field-k">{humanize(shape.money!.key)}</div>
+                <div className={of(shape.money!).length ? "layout-big" : "field-v"}>
+                  {values(shape.money!)}
+                </div>
+              </div>
               {shape.flags.map(field)}
               {date && field(date)}
             </div>
@@ -136,7 +178,7 @@ export function Layout({
             {grid(without(shape.money, ...shape.flags, date, ...shape.text))}
             {notes.map((p) => (
               <div key={p.key} className="callout">
-                <b>{humanize(p.key)}</b> · {latest(p)}
+                <b>{humanize(p.key)}</b> · <FactText value={latest(p) ?? ""} />
               </div>
             ))}
           </div>
@@ -266,7 +308,9 @@ export function Layout({
               {of(p).length ? (
                 <ul>
                   {(p.card === "many" ? of(p) : of(p).slice(0, 1)).map((f) => (
-                    <li key={f.fact_id}>{f.value}</li>
+                    <li key={f.fact_id}>
+                      <FactText value={f.value} />
+                    </li>
                   ))}
                 </ul>
               ) : (
@@ -316,15 +360,24 @@ function Scorecard({
     return { p, v, at: v ? scoreLevel(p, v) : null };
   });
   const top = scoreLevel(shape.score[0]!, shape.score[0]!.values![0]!)!.top;
-  const assessed = rows.filter((r) => r.v).length;
+  const scored = rows.filter((r) => r.v).length;
   const total = rows.reduce((n, r) => n + (r.at?.level ?? 0), 0);
   const strip = (k: string) => humanize(k.slice(shape.scorePrefix.length).replace(/^_+/, "") || k);
+  // Only what was scored (a fact for the element's own predicate) counts. The evidence that would feed a score
+  // (a pain, a competitor, an advocate) can be on the page without one, so an element with no score says "not
+  // scored", never that nothing is known about it.
   return (
     <div className="scorecard">
       <div className="scorecard-head">
         <b>{shape.scorePrefix ? shape.scorePrefix.toUpperCase() : "Scorecard"}</b>
         <span className="muted">
-          {assessed} of {rows.length} assessed · {Math.round((total / (rows.length * top)) * 100)}%
+          {scored ? (
+            <>
+              {scored} of {rows.length} scored · {Math.round((total / (rows.length * top)) * 100)}%
+            </>
+          ) : (
+            `none of ${rows.length} scored yet`
+          )}
         </span>
       </div>
       <div className="scorecard-rows">
@@ -339,7 +392,7 @@ function Scorecard({
                 />
               ))}
             </span>
-            <span className={v ? "muted" : "unset"}>{v ? v.replace(/_/g, " ") : "not known"}</span>
+            <span className={v ? "muted" : "unset"}>{v ? v.replace(/_/g, " ") : "not scored"}</span>
           </div>
         ))}
       </div>

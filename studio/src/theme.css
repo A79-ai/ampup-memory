@@ -1,7 +1,7 @@
 /* Dark: the same warm system at night. Each part of the pages keeps its palette in tokens (base.css on the root,
    memory.css on `.memory`, studio.css on `.studio`, review.css's graph set), so dark is those tokens again. The
-   root says which: `data-studio-theme="dark"`, or `"system"` to follow the system's setting. Light is the
-   default and needs nothing here. */
+   root says which: `data-studio-theme="dark"`, or `"system"` (the default) to follow the system's setting.
+   Light needs nothing here. */
 
 [data-studio-theme="dark"] {
   --bg: #18181a;

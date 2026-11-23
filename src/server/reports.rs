@@ -56,6 +56,11 @@ pub struct Report {
     /// process's added up.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub org_tokens: crate::limits::Book,
+    /// The facts and bytes its cell's orgs hold, as it last measured them ([`measure_cell`]): written by a process
+    /// of a cell other than the default one, whose orgs the sender can't open, for the sender's gauges
+    /// ([`crate::usage::with_cells`]). None from the default cell, an older process, or before its first measure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored: Option<crate::usage::Measured>,
 }
 
 impl Report {
@@ -165,6 +170,9 @@ pub async fn run(state: Arc<State>, every: Duration) {
             usage: crate::usage::collapsed(&book),
             usage_by_org: Some(book),
             org_tokens: crate::limits::book(),
+            stored: crate::usage::METER
+                .last_measured()
+                .filter(|_| !super::cell::is_default()),
         };
         match write(&store, &report).await {
             Ok(()) => {
@@ -366,6 +374,29 @@ async fn read_org_limits(store: &crate::Store) {
     }
 }
 
+/// On a cell other than the default one, measure what its orgs hold (facts, and bytes of episode and fact files:
+/// [`crate::telemetry::stored`]) every `every`, the first soon after start, as this process's gauges, which its
+/// report carries to the sender ([`Report::stored`]). The sender's own cell is measured by the sender with its
+/// inventory; another cell's orgs it can't open, so without this their storage was never counted. Only the cell's
+/// own orgs: a person's own memory is every cell's, and the sender's count holds it.
+pub async fn measure_cell(state: Arc<State>, every: Duration) {
+    let mut wait = Duration::from_secs(10).min(every);
+    loop {
+        tokio::time::sleep(wait).await;
+        wait = every;
+        let store = state.store.read().unwrap().clone();
+        let mine = |s: &crate::Scope| s.org_name().is_some_and(memstore_core::cell::holds_org);
+        match crate::telemetry::stored(&store, mine).await {
+            Ok(by_org) => crate::usage::METER.gauges(by_org),
+            Err(e) => eprintln!(
+                "reports: cell {}'s stored facts and bytes not measured (kept as last measured): {}",
+                super::cell::me(),
+                super::writer::redacted(&e)
+            ),
+        }
+    }
+}
+
 /// Run `work`, in a process that isn't a server (a dream job's worker), for `org`: its model calls count against
 /// the org's month with every server's, and in the deployment's usage, and are held to the org's limits (and the
 /// control plane's stops) as a server's are ([`crate::limits`]).
@@ -408,6 +439,7 @@ pub async fn standalone<T>(
             usage: crate::usage::collapsed(&book),
             usage_by_org: Some(book),
             org_tokens,
+            stored: None,
         };
         if let Err(e) = write(store, &report).await {
             eprintln!(

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { retryable, transport, type Arm } from "../transport";
-import { ApiError, call } from "./api";
+import { call } from "./api";
 import { RememberThis } from "./addToMemory";
 import { Markdown } from "./markdown";
 import type { Selection } from "./types";
@@ -47,6 +47,9 @@ const BUILTIN: Arm[] = [
   },
   { id: "none", name: "No memory", tools: [], model: "haiku", maxToolCalls: 1, builtin: true },
 ];
+
+/** Whether two arms' names read as the same one. */
+const same = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
 
 /** One tool call an agent made, as `/agent/run` traces it. */
 interface Step {
@@ -177,6 +180,14 @@ export function Agent({ sel }: { sel: Selection }) {
 
   const save = async (arm: Arm) => {
     const { id, name, tools, model, maxToolCalls } = arm;
+    // Two arms of one name read as one in the list and in the answers side by side: a new arm, or a rename, may
+    // not take a name already here. A saved arm keeps the name it has, even one a built-in arm shares.
+    const was = arm.builtin ? undefined : saved.find((b) => b.id === id);
+    if (!was || !same(was.name, name)) {
+      const taken = arms.find((b) => same(b.name, name) && b !== was);
+      if (taken)
+        throw new Error(`An arm named “${taken.name}” is already here: name this one apart.`);
+    }
     const body = { ...(arm.builtin || !id ? {} : { id }), name, tools, model, maxToolCalls };
     const store = armStore();
     const out = store
@@ -236,7 +247,12 @@ export function Agent({ sel }: { sel: Selection }) {
                 />
                 <span className="agent-arm-name">{a.name}</span>
                 <span className="muted agent-arm-meta">
-                  {a.tools.length ? `${a.tools.length} tools` : "no tools"} · {modelName(a.model)}
+                  {/* An org's own arm named like another (a built-in one, say) says it is the org's. */}
+                  {!a.builtin && arms.some((b) => b !== a && same(b.name, a.name)) && "saved · "}
+                  {a.tools.length
+                    ? `${a.tools.length} ${a.tools.length === 1 ? "tool" : "tools"}`
+                    : "no tools"}{" "}
+                  · {modelName(a.model)}
                 </span>
               </label>
               <button
@@ -364,7 +380,7 @@ function ArmEditor({
     setBusy(true);
     setError(undefined);
     f()
-      .catch((e: Error) => setError(e instanceof ApiError ? e.message : String(e)))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setBusy(false));
   };
   return (

@@ -658,6 +658,24 @@ fn fit_chat_wait() -> Duration {
     wait_secs("AMPUP_MEMORY_ADVICE_FIT_WAIT_SECS", 8.0)
 }
 
+/// Room for the chat router's reply to the fit question ([`fits_chat`]): one word is asked for, but a model that
+/// reads the request back first would be cut off before its answer, and an unanswered check serves nothing.
+const FIT_REPLY_TOKENS: u32 = 300;
+
+/// The fit check's answer in `reply` (lowercased): its first word where that is yes, no or when, else the last of
+/// those it says, as a model that reasoned first ends on its answer. None where it says none of them.
+fn verdict(reply: &str) -> Option<&'static str> {
+    let words: Vec<&str> = reply
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let pick = |w: &str| ["yes", "no", "when"].into_iter().find(|v| *v == w);
+    words
+        .first()
+        .and_then(|w| pick(w))
+        .or_else(|| words.iter().rev().find_map(|w| pick(w)))
+}
+
 /// What the chat router is asked of routed advice ([`fits_chat`]): the questions [`fits`] asks the decisions model.
 pub const FIT_PROMPT: &str = "An AI agent was given the request below, and the advice below was found for it. Is \
 the advice for this very task, so that following it is what doing the request takes? Answer no when it is for a \
@@ -699,7 +717,8 @@ pub async fn fits_chat(
     let f = crate::extract::fence(&[question, &stated, &head]);
     let prompt = format!("{FIT_PROMPT}\n{f}\nRequest: {question}{stated}\n\nAdvice:\n{head}\n{f}");
     let wait = fit_chat_wait();
-    let answered = tokio::time::timeout(wait, router.complete_with(&prompt, 50)).await;
+    let answered =
+        tokio::time::timeout(wait, router.complete_with(&prompt, FIT_REPLY_TOKENS)).await;
     let said = match answered {
         // An empty reply says neither yes nor no: unanswered, and said so, not read as advice that doesn't fit.
         Ok(Ok(reply)) if reply.trim().is_empty() => {
@@ -732,14 +751,19 @@ pub async fn fits_chat(
             return Fit::OffTask;
         }
     };
-    let fit = if said.starts_with("yes") {
-        Fit::Fits
-    } else if said.starts_with("when") && when.is_some() {
-        Fit::WhenMismatch
-    } else {
-        Fit::OffTask
+    let fit = match verdict(&said) {
+        Some("yes") => Fit::Fits,
+        Some("when") if when.is_some() => Fit::WhenMismatch,
+        _ => Fit::OffTask,
     };
-    eprintln!("advice: the chat router finds the routed advice {fit:?} for the request");
+    // Never the reply itself: it reads the request back, and a request isn't kept in the server's logs.
+    let first = verdict(said.split_whitespace().next().unwrap_or("")).is_some();
+    eprintln!(
+        "advice: the chat router finds the routed advice {fit:?} for the request ({} answered {}, {} characters)",
+        router.model(),
+        if first { "first" } else { "after reasoning" },
+        said.chars().count()
+    );
     fit
 }
 

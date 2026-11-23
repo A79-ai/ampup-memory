@@ -270,6 +270,7 @@
 .ap-detail {
   padding: 16px 22px;
   min-width: 0;
+  overflow-wrap: anywhere;
   position: sticky;
   top: 16px;
   max-height: calc(100vh - 32px);
@@ -389,6 +390,12 @@
 .ap-diag {
   padding: 14px 20px;
   border-top: 1px solid var(--line);
+}
+/* Its toggle wraps on a narrow screen rather than widening the page. */
+.ap-diag > .ap-btn2 {
+  max-width: 100%;
+  white-space: normal;
+  text-align: left;
 }
 .ap-diag-in {
   margin-top: 12px;

@@ -3727,7 +3727,16 @@ async fn local_store(dir: &std::path::Path) -> Result<Store> {
 /// [`local_store`] on the catalog of `dir` already opened.
 fn on_local(dir: &std::path::Path, catalog: std::sync::Arc<dyn iceberg::Catalog>) -> Store {
     memstore::search::embed_cache::default_to(dir.join("embeddings").display().to_string());
-    Store::new(catalog).with_index_base(dir.join("index").display().to_string())
+    Store::new(catalog).with_index_base(local_index(dir))
+}
+
+/// Where a local store's search index lives: `index` in its directory, or `AMPUP_MEMORY_LOCAL_INDEX_URI` (a path,
+/// `s3://…` or `gs://…`), which puts it on object storage to measure searches the way a deployment reads them.
+fn local_index(dir: &std::path::Path) -> String {
+    std::env::var("AMPUP_MEMORY_LOCAL_INDEX_URI")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| dir.join("index").display().to_string())
 }
 
 /// `memstore serve --local [DIR]`: everything under one directory on this machine. The one caller reads as
@@ -3783,7 +3792,7 @@ async fn serve_local(dir: &str, port: u16, scope: Scope, groups: Vec<String>) ->
         memstore::server::Options {
             catalog: Some(catalog),
             identity: Some("fixed".into()),
-            index_base: Some(dir.join("index").display().to_string()),
+            index_base: Some(local_index(&dir)),
             bind: Some("127.0.0.1".into()),
             loopback_only: true,
             writes_here: true,

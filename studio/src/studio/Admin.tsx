@@ -2,7 +2,7 @@ import "./studio.css";
 import { Fragment, useCallback, useEffect, useState } from "react";
 import { ApiError, errorText, transport, type AreaOwner, type AreaOwnerKind } from "../transport";
 import { call } from "../memory/api";
-import { when } from "../memory/format";
+import { day, when } from "../memory/format";
 import { useChoice, useOption } from "../memory/hashOptions";
 import { EPISODE_TYPES } from "../memory/inspector";
 import { Markdown } from "../memory/markdown";
@@ -73,7 +73,7 @@ function Sheet({
             {facts.map(([k, v]) => (
               <div key={k}>
                 <dt>{k}</dt>
-                <dd className="st-fig">{v}</dd>
+                <dd className="st-fig">{typeof v === "number" ? fig(v) : v}</dd>
               </div>
             ))}
           </dl>
@@ -97,6 +97,45 @@ function Failed({ error, onRetry }: { error: unknown; onRetry: () => void }) {
 }
 
 const ago = (us: number | null | undefined) => (us ? when(us) : "—");
+
+/** A count with its thousands marked: 1,628, not 1628. */
+const fig = (n: number) => n.toLocaleString();
+
+/**
+ * A question as a person reads it. A harness wraps some prompts in a tag of its own at the start
+ * (`<scheduled-task name="triage" file="…">…</scheduled-task>`, `<command-name>/review</command-name>`): a wrapping
+ * tag naming something is said in words ("Scheduled task “triage”: …"), and a harness's tags elsewhere (hyphenated:
+ * `<command-name>`) dropped, what they hold kept. Any other tag is the person's own words (`Promise<string>`).
+ */
+function plainQuestion(q: string): string {
+  let rest = q.trim();
+  const said: string[] = [];
+  for (;;) {
+    // A harness's tag: hyphenated (`scheduled-task`), or naming something (`name="…"`).
+    const m = /^<([a-z]+(?:[-_][a-z]+)+|[a-z]+(?=\s[^>]*\bname="))(\s[^>]*)?>/i.exec(rest);
+    if (!m) break;
+    const [open, tag = "", attrs = ""] = m;
+    const name = /\bname="([^"]*)"/.exec(attrs)?.[1];
+    if (name) {
+      const what = tag.replace(/[-_]+/g, " ");
+      said.push(`${what.charAt(0).toUpperCase()}${what.slice(1)} “${name}”`);
+    }
+    rest = rest.slice(open.length).replace(`</${tag}>`, " ").trim();
+  }
+  rest = rest
+    .replace(/<\/?[a-z]+(?:[-_][a-z]+)+(\s[^>]*)?>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return [said.join(", "), rest].filter(Boolean).join(": ");
+}
+
+/** An entry's question for its row: in words, or, for a session that kept none, its goal or that none was kept. */
+function QuestionText({ e }: { e: Entry }) {
+  const q = e.question ? plainQuestion(e.question) : "";
+  if (q) return <>{q}</>;
+  if (e.goal) return <>{plainQuestion(e.goal)}</>;
+  return <span className="st-quiet">No question was kept</span>;
+}
 
 /* ---------- Owners ---------- */
 
@@ -270,7 +309,7 @@ export function Owners({ sel }: { sel: Selection }) {
                   <td>{KIND_LABEL[o.kind]}</td>
                   <td>{o.owner}</td>
                   <td className="st-quiet">
-                    {o.setBy}, {new Date(o.setAt).toLocaleDateString()}
+                    {o.setBy}, {day(Date.parse(o.setAt) * 1000)}
                   </td>
                   <td className="st-act">
                     <button
@@ -345,7 +384,7 @@ function EntityOwners({ sel }: { sel: Selection }) {
                     </td>
                     <td>{o.user}</td>
                     <td className="st-quiet">
-                      {o.since ? new Date(o.since / 1000).toLocaleDateString() : "—"}
+                      {o.since ? day(o.since) : "—"}
                     </td>
                   </tr>
                 );
@@ -410,9 +449,13 @@ interface Activity {
   more: boolean;
   /** When advice was served and when it wasn't, over the window (absent from older engines). */
   serving?: Serving;
+  /** The entries in the window not answered well, all of them, by why (absent from older engines). */
+  gaps?: { unhelpful: number; went_wrong: number; no_facts: number };
 }
 
 const WINDOWS = [7, 30, 90] as const;
+/** Most entries one activity read lists (the server's cap). */
+const READ_AT_MOST = 500;
 
 /** A session a harness opened before anything was asked, with nothing kept yet: the start hook opens one as the
  * harness starts, and its first prompt names it. Most end empty, out of the activity; until then they'd show as rows
@@ -447,12 +490,11 @@ function threads(entries: Entry[]): Map<string, { k: number; n: number; task: st
 /** An entry's place in its conversation, under its question. */
 function PartOf({ part }: { part?: { k: number; n: number; task: string } }) {
   if (!part) return null;
+  const task = plainQuestion(part.task);
   return (
     <div className="st-small st-quiet">
       Part {part.k} of {part.n} of one conversation
-      {part.k > 1 && part.task
-        ? `: ${part.task.slice(0, 120)}${part.task.length > 120 ? "…" : ""}`
-        : ""}
+      {part.k > 1 && task ? `: ${task.slice(0, 120)}${task.length > 120 ? "…" : ""}` : ""}
     </div>
   );
 }
@@ -529,27 +571,62 @@ export function People({
   const people = data?.people ?? [];
   const total = (k: keyof Person) => people.reduce((n, p) => n + (p[k] as number), 0);
   // A column no one in the window has any of says nothing: it is left out, and named under the table.
+  // Each column says what it counts: the answer log's entries in the window, not the sessions kept in the memory
+  // (the Explorer's `sessions/` folder counts those, all time, and only the reader's own).
   const cols: {
     label: string;
+    about: string;
     has: (p: Person) => number;
     cell: (p: Person) => React.ReactNode;
   }[] = [
-    { label: "Sessions", has: (p) => p.sessions, cell: (p) => p.sessions },
-    { label: "Runs", has: (p) => p.runs, cell: (p) => p.runs },
-    { label: "Answers", has: (p) => p.answers, cell: (p) => p.answers },
+    {
+      label: "Sessions",
+      about:
+        "agent sessions the memory served them; a conversation a harness split in parts counts once per part",
+      has: (p) => p.sessions,
+      cell: (p) => fig(p.sessions),
+    },
+    {
+      label: "Runs",
+      about: "runs a program made as them (a claude -p or SDK run)",
+      has: (p) => p.runs,
+      cell: (p) => fig(p.runs),
+    },
+    {
+      label: "Answers",
+      about: "answers the memory logged for them",
+      has: (p) => p.answers,
+      cell: (p) => fig(p.answers),
+    },
     {
       label: "Helpful / not",
+      about: "those they rated helpful, and not helpful",
       has: (p) => p.helpful + p.not_helpful,
       cell: (p) => (
         <>
-          {p.helpful} /{" "}
-          <span className={p.not_helpful ? "st-out" : undefined}>{p.not_helpful}</span>
+          {fig(p.helpful)} /{" "}
+          <span className={p.not_helpful ? "st-out" : undefined}>{fig(p.not_helpful)}</span>
         </>
       ),
     },
-    { label: "Facts", has: (p) => p.facts, cell: (p) => p.facts },
-    { label: "Episodes", has: (p) => p.episodes, cell: (p) => p.episodes },
-    { label: "Advice", has: (p) => p.advice, cell: (p) => p.advice },
+    {
+      label: "Facts",
+      about: "different facts those cited",
+      has: (p) => p.facts,
+      cell: (p) => fig(p.facts),
+    },
+    {
+      label: "Episodes",
+      about: "different episodes those facts came from",
+      has: (p) => p.episodes,
+      cell: (p) => fig(p.episodes),
+    },
+    {
+      label: "Advice",
+      about: "different team notes their sessions were served",
+      has: (p) => p.advice,
+      cell: (p) => fig(p.advice),
+    },
   ];
   const shownCols = cols.filter((c) => people.some((p) => c.has(p) > 0));
   const hiddenCols = cols.filter((c) => !shownCols.includes(c));
@@ -575,12 +652,12 @@ export function People({
       facts={
         data && !user
           ? [
-              ["Active", people.length] as [string, number],
+              [`Active, ${days} days`, people.length] as [string, number],
               ["Sessions", total("sessions")] as [string, number],
               ["Runs", total("runs")] as [string, number],
               ["Answers", total("answers")] as [string, number],
               ["Rated unhelpful", total("not_helpful")] as [string, number],
-            ].filter(([k, n]) => n > 0 || k === "Active" || k === "Sessions")
+            ].filter(([k, n]) => n > 0 || k.startsWith("Active") || k === "Sessions")
           : undefined
       }
       tools={tools}
@@ -601,12 +678,15 @@ export function People({
           <p className="st-quiet st-pad">No one used the memory in the last {days} days.</p>
         ) : (
           <div className="st-table-wrap st-pad-x">
+            <p className="st-quiet st-small">
+              Each person's activity in the last {days} days, counted from the answer log.
+            </p>
             <table className="st-table">
               <thead>
                 <tr>
                   <th scope="col">Person</th>
                   {shownCols.map((c) => (
-                    <th key={c.label} scope="col" className="st-num">
+                    <th key={c.label} scope="col" className="st-num" title={c.about}>
                       {c.label}
                     </th>
                   ))}
@@ -631,6 +711,13 @@ export function People({
                 ))}
               </tbody>
             </table>
+            <p className="st-quiet st-small">
+              {shownCols.map((c) => (
+                <Fragment key={c.label}>
+                  <b>{c.label}</b>: {c.about}.{" "}
+                </Fragment>
+              ))}
+            </p>
             {hiddenCols.length > 0 && (
               <p className="st-quiet st-small">
                 Not shown, as no one has any in the last {days} days:{" "}
@@ -747,7 +834,7 @@ function Entries({
                         aria-expanded={isOpen}
                         onClick={() => setOpen(isOpen ? null : e.id)}
                       >
-                        {e.question || "(no question)"}
+                        <QuestionText e={e} />
                       </button>
                     )}
                     <PartOf part={parts.get(e.id)} />
@@ -836,18 +923,18 @@ function TallyCells({ t }: { t: Tally }) {
   const miss = t.lookups ? topMiss(t) : null;
   return (
     <>
-      <td className="st-num st-fig">{t.sessions || "—"}</td>
+      <td className="st-num st-fig">{t.sessions ? fig(t.sessions) : "—"}</td>
       <td className="st-num st-fig">
         {t.sessions ? (
           <>
-            {t.sessions_served}{" "}
+            {fig(t.sessions_served)}{" "}
             <span className="st-quiet">({share(t.sessions_served, t.sessions)})</span>
           </>
         ) : (
           "—"
         )}
       </td>
-      <td className="st-num st-fig">{t.lookups}</td>
+      <td className="st-num st-fig">{fig(t.lookups)}</td>
       <td className="st-num st-fig">{share(t.served, t.lookups)}</td>
       <td className="st-small">{miss ?? <span className="st-quiet">—</span>}</td>
     </>
@@ -923,7 +1010,7 @@ function KeyTable({
                 <tr key={r.key}>
                   <td className="mono st-small">{r.key}</td>
                   {sessions && <td className="st-num st-fig">{r.sessions ?? "—"}</td>}
-                  <td className="st-num st-fig">{r.lookups}</td>
+                  <td className="st-num st-fig">{fig(r.lookups)}</td>
                 </tr>
               ))}
             </tbody>
@@ -939,7 +1026,8 @@ function KeyTable({
  * window, in all and by caller, moment, person and harness, with the lines served most and the ones that most often
  * served nothing. */
 export function AdviceServing({ sel, onUser }: { sel: Selection; onUser: (u: string) => void }) {
-  const [days, setDays] = useChoice("days", WINDOWS, 7);
+  // The Advice page's window (`days` in the link, 30 by default), which it sits under.
+  const [days, setDays] = useChoice("days", WINDOWS, 30);
   const { data, error, loading, reload } = useAdmin<Activity>(sel, {
     op: "activity",
     sinceDays: days,
@@ -993,7 +1081,7 @@ export function AdviceServing({ sel, onUser }: { sel: Selection; onUser: (u: str
               ["Advice given", share(s.served, s.lookups)],
               [
                 "Sessions served a note",
-                `${s.sessions_served} of ${s.sessions} (${share(s.sessions_served, s.sessions)})`,
+                `${fig(s.sessions_served)} of ${fig(s.sessions)} (${share(s.sessions_served, s.sessions)})`,
               ],
               ["Held out", s.sessions_withheld],
             ]
@@ -1053,7 +1141,7 @@ export function AdviceServing({ sel, onUser }: { sel: Selection; onUser: (u: str
                             {o.label}
                           </td>
                           <td className="st-quiet st-small">{o.about}</td>
-                          <td className="st-num st-fig">{n}</td>
+                          <td className="st-num st-fig">{fig(n)}</td>
                           <td className="st-num st-fig st-nowrap">
                             <Bar n={n} of={s.lookups} /> {share(n, s.lookups)}
                           </td>
@@ -1111,7 +1199,7 @@ export function AdviceServing({ sel, onUser }: { sel: Selection; onUser: (u: str
                     {moments.map(([m, t]) => (
                       <tr key={m}>
                         <td>{MOMENTS[m] ?? m}</td>
-                        <td className="st-num st-fig">{t.lookups}</td>
+                        <td className="st-num st-fig">{fig(t.lookups)}</td>
                         <td className="st-num st-fig">{share(t.served, t.lookups)}</td>
                         <td className="st-small">{topMiss(t) ?? "—"}</td>
                       </tr>
@@ -1225,16 +1313,32 @@ export function NotAnswered({
   const { data, error, loading, reload } = useAdmin<Activity>(sel, {
     op: "activity",
     sinceDays: days,
-    limit: 500,
+    limit: READ_AT_MOST,
   });
   const [open, setOpen] = useOption("open");
-  const fetched = data?.entries.length ?? 0;
+  // The window's totals: `people` counts every entry in it, however few the read lists.
+  const people = data?.people ?? [];
+  const sessions = people.reduce((n, p) => n + p.sessions + p.runs, 0);
+  const answers = people.reduce((n, p) => n + p.answers, 0);
+  const read = data?.entries.length ?? 0;
   const all = asked(data?.entries ?? []);
   const gaps = all.map((e) => ({ e, why: gapOf(e) })).filter((g) => g.why);
   const parts = threads(all);
-  const unhelpful = gaps.filter((g) => g.why !== "no facts").length;
-  const answers = all.filter((e) => e.kind === "answer").length;
-  const sessions = all.length - answers;
+  // What wasn't answered well in all, where the engine counts it over the window; else among the entries read,
+  // which are all of the window's unless `more`.
+  const counted = data?.gaps;
+  const sampled = !counted && Boolean(data?.more);
+  const unhelpful = counted
+    ? counted.unhelpful + counted.went_wrong
+    : gaps.filter((g) => g.why !== "no facts").length;
+  const noFacts = counted ? counted.no_facts : gaps.length - unhelpful;
+  const inAll = unhelpful + noFacts;
+  const entriesInWindow = sessions + answers;
+  const note = sampled
+    ? `The last two counts and this list come from the newest ${fig(read)} of the ${fig(entriesInWindow)} sessions, runs and answers in the last ${days} days.`
+    : data?.more && gaps.length < inAll
+      ? `Listed: the ${fig(gaps.length)} among the newest ${fig(read)} of the ${fig(entriesInWindow)} sessions, runs and answers in the last ${days} days.`
+      : null;
   const off = error instanceof ApiError && error.status === 403 && /activity/i.test(error.message);
   return (
     <Sheet
@@ -1242,10 +1346,18 @@ export function NotAnswered({
       facts={
         data
           ? [
-              ["Sessions and runs", sessions],
+              [`Sessions and runs, ${days} days`, sessions],
               ["Answers", answers],
-              ["Unhelpful or went wrong", unhelpful],
-              ["Answered with no facts", gaps.length - unhelpful],
+              [
+                sampled
+                  ? `Unhelpful or went wrong, newest ${fig(read)}`
+                  : "Unhelpful or went wrong",
+                unhelpful,
+              ],
+              [
+                sampled ? `Answered with no facts, newest ${fig(read)}` : "Answered with no facts",
+                noFacts,
+              ],
             ]
           : undefined
       }
@@ -1279,124 +1391,120 @@ export function NotAnswered({
         <Failed error={error} onRetry={reload} />
       ) : loading ? (
         <p className="st-quiet st-pad">Reading the answer log…</p>
-      ) : gaps.length === 0 ? (
+      ) : inAll === 0 ? (
         <p className="st-quiet st-pad">
-          {all.length
-            ? [
-                sessions &&
-                  (sessions === 1
-                    ? "The one session or run didn't go wrong and wasn't rated unhelpful."
-                    : `None of the ${sessions} sessions and runs went wrong or was rated unhelpful.`),
-                answers &&
-                  (answers === 1
-                    ? "The one logged answer used the memory."
-                    : `Every one of the ${answers} logged answers used the memory.`),
-              ]
-                .filter(Boolean)
-                .join(" ")
-            : `No questions in the last ${days} days.`}
-          {data?.more && ` Only the newest ${fetched} in the last ${days} days were checked.`}
+          {sampled
+            ? `None of the newest ${fig(read)} of the ${fig(entriesInWindow)} sessions, runs and answers in the last ${days} days went wrong, was rated unhelpful or was answered without facts. The older ones weren't checked.`
+            : entriesInWindow
+              ? [
+                  sessions &&
+                    (sessions === 1
+                      ? "The one session or run didn't go wrong and wasn't rated unhelpful."
+                      : `None of the ${fig(sessions)} sessions and runs went wrong or was rated unhelpful.`),
+                  answers &&
+                    (answers === 1
+                      ? "The one logged answer used the memory."
+                      : `Every one of the ${fig(answers)} logged answers used the memory.`),
+                ]
+                  .filter(Boolean)
+                  .join(" ")
+              : `No questions in the last ${days} days.`}
         </p>
       ) : (
         <div className="st-table-wrap st-pad-x">
-          {data?.more && (
-            <p className="st-quiet st-small">
-              Only the newest {fetched} in the last {days} days were checked.
-            </p>
-          )}
-          <table className="st-table">
-            <thead>
-              <tr>
-                <th scope="col">When</th>
-                <th scope="col">Asked by</th>
-                <th scope="col">Question</th>
-                <th scope="col">Why</th>
-              </tr>
-            </thead>
-            <tbody>
-              {gaps.map(({ e, why }) => {
-                const isOpen = open === e.id;
-                return (
-                  <Fragment key={e.id}>
-                    <tr>
-                      <td className="st-quiet st-nowrap">{ago(e.updated_at || e.asked_at)}</td>
-                      <td>
-                        <button className="st-link" onClick={() => onUser(e.user)}>
-                          {e.user}
-                        </button>
-                      </td>
-                      <td>
-                        {e.withheld ? (
-                          <span
-                            className="st-quiet"
-                            title="Kept to its asker, or resting on episodes you can't read"
-                          >
-                            Withheld
-                          </span>
-                        ) : (
-                          <button
-                            className="st-name-btn st-q"
-                            aria-expanded={isOpen}
-                            onClick={() => setOpen(isOpen ? null : e.id)}
-                          >
-                            {e.question || "(no question)"}
+          {note && <p className="st-quiet st-small">{note}</p>}
+          {gaps.length > 0 && (
+            <table className="st-table">
+              <thead>
+                <tr>
+                  <th scope="col">When</th>
+                  <th scope="col">Asked by</th>
+                  <th scope="col">Question</th>
+                  <th scope="col">Why</th>
+                </tr>
+              </thead>
+              <tbody>
+                {gaps.map(({ e, why }) => {
+                  const isOpen = open === e.id;
+                  return (
+                    <Fragment key={e.id}>
+                      <tr>
+                        <td className="st-quiet st-nowrap">{ago(e.updated_at || e.asked_at)}</td>
+                        <td>
+                          <button className="st-link" onClick={() => onUser(e.user)}>
+                            {e.user}
                           </button>
-                        )}
-                        <PartOf part={parts.get(e.id)} />
-                      </td>
-                      <td className={why === "no facts" ? "st-watch" : "st-out"}>
-                        {why === "unhelpful"
-                          ? "Rated unhelpful"
-                          : why === "went wrong"
-                            ? "Went wrong"
-                            : "No facts used"}
-                      </td>
-                    </tr>
-                    {isOpen && (
-                      <tr className="st-detail">
-                        <td colSpan={4}>
-                          <div className="st-detail-in">
-                            {e.answer ? (
-                              <p className="st-answer">
-                                {e.answer}
-                                {e.answer_cut ? "…" : ""}
-                              </p>
-                            ) : (
-                              <p className="st-quiet">No answer was logged.</p>
-                            )}
-                            {e.reward_reason && <p className="st-quiet">{e.reward_reason}</p>}
-                            {e.transcript && (
-                              <p>
-                                <button className="st-link" onClick={() => onTrace(e.id)}>
-                                  Trace the conversation
-                                </button>
-                              </p>
-                            )}
-                            {e.episodes.length > 0 && (
-                              <p className="st-chips">
-                                <b>Episodes</b>
-                                {e.episodes.map((id) => (
-                                  <button
-                                    key={id}
-                                    className="st-chip mono"
-                                    onClick={() => onEpisode(id)}
-                                  >
-                                    {id.slice(0, 12)}
-                                  </button>
-                                ))}
-                              </p>
-                            )}
-                          </div>
+                        </td>
+                        <td>
+                          {e.withheld ? (
+                            <span
+                              className="st-quiet"
+                              title="Kept to its asker, or resting on episodes you can't read"
+                            >
+                              Withheld
+                            </span>
+                          ) : (
+                            <button
+                              className="st-name-btn st-q"
+                              aria-expanded={isOpen}
+                              onClick={() => setOpen(isOpen ? null : e.id)}
+                            >
+                              <QuestionText e={e} />
+                            </button>
+                          )}
+                          <PartOf part={parts.get(e.id)} />
+                        </td>
+                        <td className={why === "no facts" ? "st-watch" : "st-out"}>
+                          {why === "unhelpful"
+                            ? "Rated unhelpful"
+                            : why === "went wrong"
+                              ? "Went wrong"
+                              : "No facts used"}
                         </td>
                       </tr>
-                    )}
-                  </Fragment>
-                );
-              })}
-            </tbody>
-          </table>
-          {data?.more && (
-            <p className="st-quiet st-pad">Read from the newest 500 entries in this window.</p>
+                      {isOpen && (
+                        <tr className="st-detail">
+                          <td colSpan={4}>
+                            <div className="st-detail-in">
+                              {e.answer ? (
+                                <p className="st-answer">
+                                  {e.answer}
+                                  {e.answer_cut ? "…" : ""}
+                                </p>
+                              ) : (
+                                <p className="st-quiet">No answer was logged.</p>
+                              )}
+                              {e.reward_reason && <p className="st-quiet">{e.reward_reason}</p>}
+                              {e.transcript && (
+                                <p>
+                                  <button className="st-link" onClick={() => onTrace(e.id)}>
+                                    Trace the conversation
+                                  </button>
+                                </p>
+                              )}
+                              {e.episodes.length > 0 && (
+                                <p className="st-chips">
+                                  <b>Episodes</b>
+                                  {e.episodes.map((id) => (
+                                    <button
+                                      key={id}
+                                      className="st-chip mono"
+                                      onClick={() => onEpisode(id)}
+                                    >
+                                      {id.slice(0, 12)}
+                                    </button>
+                                  ))}
+                                </p>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
           )}
         </div>
       )}
@@ -1927,7 +2035,7 @@ function Trail({
 
 interface Branch {
   name: string;
-  skills: number;
+  skills: number | null;
 }
 interface Diff {
   main_changed: number;

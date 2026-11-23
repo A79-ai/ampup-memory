@@ -49,7 +49,12 @@ pub(super) async fn handle(
     use crate::people::directory::{Directory, Invalid, Refused};
     let org = req["org"].as_str().unwrap_or_default();
     crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
-    let dir = Directory::load(store).await?;
+    // The list is decided by the directory requests are signed in by (`Directory::behind`); a review, by the
+    // directory at most the max staleness old.
+    let dir = match req["op"] == "dream_decisions" {
+        true => Directory::behind(store).await?,
+        false => Directory::load(store).await?,
+    };
     if !dir.is_admin(who.user(), via, org) {
         return Err(Refused(format!(
             "{} may not review org {org}'s dream (only its admins may)",
@@ -75,6 +80,10 @@ pub(super) async fn handle(
         "dream_now" => now(state, store, &scope, who).await?,
         _ => unreachable!(),
     };
+    // What a review changed shows on the next list, its maker's first of all.
+    if req["op"] != "dream_decisions" {
+        crate::kept_answers::changed(&scope.namespace());
+    }
     Ok(json!({"org": org, "scope": scope.to_string(), "result": result}))
 }
 
@@ -96,6 +105,7 @@ impl Action {
 }
 
 /// One decision as the page shows it.
+#[derive(Clone)]
 struct Decision {
     /// Its record (a team share: the shared note).
     id: String,
@@ -118,6 +128,43 @@ struct Decision {
     /// What keeps a pass from deciding it again ([`dream::block_of`]).
     block: Option<String>,
     review: Option<Value>,
+}
+
+/// What a list of the dream's decisions reads, as one reader reads it at one memory state.
+struct Listed {
+    /// The decisions the reader may read, newest first.
+    decisions: Vec<Decision>,
+    /// When a pass last ran, as the ledger has it ([`dream::last_run`]).
+    last_run: Option<(i64, Option<i64>)>,
+    /// The model's reason for each of them where one was kept, by decision.
+    reasons: HashMap<String, String>,
+}
+
+/// Each reader's decisions, by memory state ([`crate::kept_answers`]): reading them reads every episode and fact
+/// of the scope. Only what the memory holds: whether a pass runs here now, and the counts that depend on the time,
+/// are worked out on each list.
+static LISTED: LazyLock<crate::kept_answers::Kept<Listed>> =
+    LazyLock::new(|| crate::kept_answers::Kept::new(200));
+
+async fn listed(store: &Store, scope: &Scope, reader: &Principal) -> Result<Listed> {
+    let read = decisions(store, scope, reader, false).await?;
+    let last_run = dream::last_run(store, scope, &read.vis, &read.eps).await?;
+    let decisions: Vec<Decision> = read.decisions.into_iter().filter(|d| d.readable).collect();
+    let ids: HashSet<&str> = decisions.iter().map(|d| d.id.as_str()).collect();
+    // Through the last visibility state, as the decisions were read: a reason goes with what it cites.
+    let reasons: HashMap<String, String> = crate::qa_log::list(store, scope, None)
+        .await?
+        .into_iter()
+        .filter(|l| {
+            l.kind.as_deref() == Some(dream::REASON_KIND) && ids.contains(l.answer_id.as_str())
+        })
+        .filter_map(|l| l.answer.map(|a| (l.answer_id, a)))
+        .collect();
+    Ok(Listed {
+        decisions,
+        last_run,
+        reasons,
+    })
 }
 
 /// Bodies of the dream's records and of the reviews of them, per scope, by episode id. An episode's id is its body's
@@ -538,8 +585,21 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
         ),
     };
     let limit = req["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
-    let read = decisions(store, scope, reader, false).await?;
-    let mut all: Vec<Decision> = read.decisions.into_iter().filter(|d| d.readable).collect();
+    let mark = crate::kept_answers::Mark::read(store, scope).await?;
+    let vis = store.lagging_visibility(scope, MAIN).await?;
+    let kept = LISTED
+        .get(
+            &scope.namespace(),
+            &crate::kept_answers::reader_key(reader),
+            crate::kept_answers::At::of(mark, &vis),
+            true,
+            || {
+                let (store, scope, reader) = (store.clone(), scope.clone(), reader.clone());
+                async move { listed(&store, &scope, &reader).await }
+            },
+        )
+        .await?;
+    let all = &kept.decisions;
     // The newest pass that decided something, for the banner: the decisions that name it. Records from before
     // passes were named name none: theirs are those decided within an hour of the newest of them (the gate keeps
     // passes a day apart), a pass being minutes.
@@ -576,10 +636,7 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
     // When a pass last ran at all, a change or not, and which: its last commit in the ledger, or this process's last
     // pass where that is newer (one that weighed nothing commits nothing; what it did is `dreaming.last`).
     let here = dream::last_pass(scope);
-    let ran = match (
-        dream::last_run(store, scope, &read.vis, &read.eps).await?,
-        &here,
-    ) {
+    let ran = match (kept.last_run, &here) {
         (Some((at, _)), Some((t, _))) if *t > at => Some(json!({"at": t, "pass": null})),
         (Some((at, pass)), _) => Some(json!({"at": at, "pass": pass})),
         (None, Some((t, _))) => Some(json!({"at": t, "pass": null})),
@@ -612,19 +669,15 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
     let page = &shown[start.min(shown.len())..(start + limit).min(shown.len())];
     let next = (start + limit < shown.len()).then(|| page.last().map(|d| d.id.clone()));
     let total = shown.len();
-    let on_page: HashSet<String> = page.iter().map(|d| d.id.clone()).collect();
     let mut texts = share_texts(store, scope, page).await?;
-    for d in all.iter_mut().filter(|d| on_page.contains(&d.id)) {
-        d.text = texts.remove(&d.id);
-    }
-    let page: Vec<&Decision> = all.iter().filter(|d| on_page.contains(&d.id)).collect();
-    // Through the last visibility state, as the decisions were read: a reason goes with what it cites.
-    let reasons: HashMap<String, String> = crate::qa_log::list(store, scope, None)
-        .await?
-        .into_iter()
-        .filter(|l| l.kind.as_deref() == Some(dream::REASON_KIND))
-        .filter_map(|l| l.answer.map(|a| (l.answer_id, a)))
+    let page: Vec<Decision> = page
+        .iter()
+        .map(|d| Decision {
+            text: texts.remove(&d.id),
+            ..(*d).clone()
+        })
         .collect();
+    let reasons = &kept.reasons;
     let key = scope.to_string();
     let available = dream::internal_scheduler().unwrap_or(false)
         && crate::extract::Extractor::dream_from_env()
@@ -782,6 +835,7 @@ async fn now(state: &Arc<State>, store: &Store, scope: &Scope, who: &Principal) 
                     .insert(key.clone(), (crate::now_micros(), writer::redacted(&e)));
             }
         }
+        crate::kept_answers::changed(&scope.namespace());
         RUNNING.lock().unwrap().remove(&key);
     });
     Ok(json!({"started": true, "running": true}))

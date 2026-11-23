@@ -1062,6 +1062,43 @@ impl Store {
         published: &HashSet<String>,
         state: &State,
     ) -> Result<Impact> {
+        if state.owners.is_empty() {
+            return Ok(Impact::default());
+        }
+        // Most commits touch nothing an owner holds, which is told from the commits' own rows; only those it can't
+        // tell are weighed against the scope's whole history. No owner, no change and no evidence either way.
+        if self.touches_nothing_owned(scope, commits, state).await? {
+            if governance_oracle() {
+                let full = self
+                    .governance_impact_full(scope, commits, published, state)
+                    .await;
+                if let Some(why) = match &full {
+                    Ok(i) if i.owners.is_empty() => None,
+                    Ok(i) => Some(format!("it needs {:?}", i.owners)),
+                    Err(e) => Some(format!("it fails: {e:#}")),
+                } {
+                    eprintln!(
+                        "governance oracle: commits {commits:?} in {scope} were found to touch nothing owned, but in full {why}"
+                    );
+                    anyhow::bail!(
+                        "governance oracle: commits in {scope} were found to touch nothing owned, but in full {why}"
+                    );
+                }
+            }
+            return Ok(Impact::default());
+        }
+        self.governance_impact_full(scope, commits, published, state)
+            .await
+    }
+
+    /// [`Store::governance_impact`], weighed against every table of the scope.
+    async fn governance_impact_full(
+        &self,
+        scope: &Scope,
+        commits: &HashSet<String>,
+        published: &HashSet<String>,
+        state: &State,
+    ) -> Result<Impact> {
         let mut out = Impact::default();
         if state.owners.is_empty() {
             return Ok(out);
@@ -2118,6 +2155,25 @@ impl Store {
                 })
             })
             .collect())
+    }
+
+    /// Whether every proposal's branch has its visibility state built already, as [`Store::pin_if_built`] serves
+    /// one: a list of proposals then builds none ([`Store::list_proposals`] reads each branch's state). Those not
+    /// built are built in the background, one after another ([`Store::build_later`]), for a later ask.
+    pub async fn proposal_branches_built(&self, scope: &Scope) -> Result<bool> {
+        let ledger = self.governance_ledger(scope).await?;
+        let state = self.governance_state(scope, &ledger).await?;
+        let branches: BTreeSet<String> =
+            state.proposals.values().map(|p| p.branch.clone()).collect();
+        let mut unbuilt = vec![];
+        for b in branches {
+            if self.pin_if_built(scope, &b).await?.is_none() {
+                unbuilt.push(b);
+            }
+        }
+        let built = unbuilt.is_empty();
+        self.build_later(scope, unbuilt);
+        Ok(built)
     }
 
     /// The proposals this reader may see (all of whose evidence they may read), newest activity first;
@@ -3656,4 +3712,290 @@ pub fn approved_facts(rows: &[RecordBatch], ledger: &Ledger) -> HashMap<String, 
         }
     }
     out
+}
+
+/// Whether a commit whose publication check found nothing owned (by [`Store::touches_nothing_owned`]) is checked
+/// again in full, and fails if the full check finds an owner (`AMPUP_MEMORY_GOVERNANCE_ORACLE`: `1` on, `0` off;
+/// on by default in debug builds, so every test that commits to a scope with owners checks it, and off in release).
+fn governance_oracle() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        match std::env::var("AMPUP_MEMORY_GOVERNANCE_ORACLE").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => cfg!(debug_assertions),
+        }
+    });
+    *ON
+}
+
+/// A hash of an id, to look it up among a batch's ([`BatchIndex`]) before its rows are read.
+fn id_hash(id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut h);
+    h.finish()
+}
+
+/// What the publication check keeps of one table batch: a batch never changes, so this is worked out once, the
+/// first time a check meets it, not on every commit.
+struct BatchIndex {
+    /// The batch's first column, held weakly so its address, the batch's identity ([`batch_id`]), is never reused
+    /// while this is kept, without keeping the batch's data alive once the table lets go of it.
+    _anchor: std::sync::Weak<dyn Array>,
+    /// The commits its rows belong to.
+    commits: HashSet<String>,
+    /// Its rows' fact or episode ids, hashed ([`id_hash`]).
+    ids: HashSet<u64>,
+    /// A facts batch's rows naming an owned entity, with the owned entities it was worked out for: each row's index.
+    named: Option<(Arc<Vec<String>>, Vec<u32>)>,
+}
+
+/// Per scope and table: each batch's [`BatchIndex`], by batch identity.
+type TableIndexes = HashMap<(String, &'static str), HashMap<usize, Arc<BatchIndex>>>;
+static INDEXES: std::sync::LazyLock<std::sync::Mutex<TableIndexes>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The id column a table's [`BatchIndex::ids`] hold.
+fn id_column(table: &str) -> &'static str {
+    match table {
+        FACTS => "fact_id",
+        _ => "episode_id",
+    }
+}
+
+/// Whether row `i` of a facts batch names an owned entity: its subject, value or referenced entity.
+fn row_names_owned(b: &RecordBatch, i: usize, owned: &HashSet<&str>) -> bool {
+    ["entity", "value", "value_ref"]
+        .iter()
+        .any(|c| cell(text_column(b, c), i).is_some_and(|v| owned.contains(v)))
+}
+
+/// The episodes row `i` of a facts batch cites.
+fn row_sources(b: &RecordBatch, i: usize) -> impl Iterator<Item = &str> {
+    cell(text_column(b, "source_episodes"), i)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+}
+
+/// `rows`' batches, each with its index, worked out once ([`BatchIndex`]); a facts batch's rows naming an owned
+/// entity worked out for these owners (`owned`, also as a set).
+fn batch_indexes(
+    ns: &str,
+    table: &'static str,
+    rows: &[RecordBatch],
+    owners: Option<(&Arc<Vec<String>>, &HashSet<&str>)>,
+) -> Vec<(RecordBatch, Arc<BatchIndex>)> {
+    let held: HashMap<usize, Arc<BatchIndex>> = INDEXES
+        .lock()
+        .unwrap()
+        .get(&(ns.to_string(), table))
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::with_capacity(rows.len());
+    let mut kept = HashMap::with_capacity(rows.len());
+    for b in rows {
+        let id = batch_id(b);
+        let known = held.get(&id).filter(|x| {
+            owners.is_none_or(|(owned, _)| {
+                x.named
+                    .as_ref()
+                    .is_some_and(|(o, _)| Arc::ptr_eq(o, owned) || o == owned)
+            })
+        });
+        let x = match known {
+            Some(x) => x.clone(),
+            None => {
+                let commits = text_column(b, "commit_id")
+                    .map(|c| (0..b.num_rows()).map(|i| c.value(i).to_string()).collect())
+                    .unwrap_or_default();
+                let ids = text_column(b, id_column(table))
+                    .map(|c| {
+                        (0..b.num_rows())
+                            .filter(|i| !c.is_null(*i))
+                            .map(|i| id_hash(c.value(i)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let named = owners.map(|(list, owned)| {
+                    let rows = (0..b.num_rows())
+                        .filter(|i| row_names_owned(b, *i, owned))
+                        .map(|i| i as u32)
+                        .collect();
+                    (list.clone(), rows)
+                });
+                Arc::new(BatchIndex {
+                    _anchor: Arc::downgrade(b.column(0)),
+                    commits,
+                    ids,
+                    named,
+                })
+            }
+        };
+        kept.insert(id, x.clone());
+        out.push((b.clone(), x));
+    }
+    // Only the batches the table holds now: those of an older snapshot (compacted away) go.
+    INDEXES
+        .lock()
+        .unwrap()
+        .insert((ns.to_string(), table), kept);
+    out
+}
+
+/// The rows of `indexes`' batches whose `column` is `id`, each with its batch.
+fn rows_with<'a>(
+    indexes: &'a [(RecordBatch, Arc<BatchIndex>)],
+    column: &str,
+    id: &str,
+) -> Vec<(&'a RecordBatch, usize)> {
+    let hash = id_hash(id);
+    let mut out = vec![];
+    for (b, _) in indexes.iter().filter(|(_, x)| x.ids.contains(&hash)) {
+        if let Some(c) = text_column(b, column) {
+            out.extend(
+                (0..b.num_rows())
+                    .filter(|i| !c.is_null(*i) && c.value(*i) == id)
+                    .map(|i| (b, i)),
+            );
+        }
+    }
+    out
+}
+
+/// The rows of `indexes`' batches written by one of `commits`.
+fn rows_of<'a>(
+    indexes: &'a [(RecordBatch, Arc<BatchIndex>)],
+    commits: &HashSet<String>,
+) -> Vec<(&'a RecordBatch, usize)> {
+    let mut out = vec![];
+    for (b, _) in indexes
+        .iter()
+        .filter(|(_, x)| commits.iter().any(|c| x.commits.contains(c)))
+    {
+        if let Some(c) = text_column(b, "commit_id") {
+            out.extend(
+                (0..b.num_rows())
+                    .filter(|i| commits.contains(c.value(*i)))
+                    .map(|i| (b, i)),
+            );
+        }
+    }
+    out
+}
+
+impl Store {
+    /// Whether `commits` provably change nothing an entity owner holds, read from what each table batch was
+    /// indexed to ([`BatchIndex`]) and the commits' own rows: proportional to the commits, not to the scope's
+    /// history. `false` says only that it can't tell: [`Store::governance_impact`] then decides in full. It says
+    /// `true` only where the full check finds no owner, so the verdict is the same either way
+    /// ([`governance_oracle`] checks it):
+    ///
+    /// - nothing in schemas, aggregates or retractions (each may need every owner, or reaches facts by episode);
+    /// - every episode written is new (none of its versions was written before: no other reader to widen it to, no
+    ///   document it was) and is either not a document or one person at most reads it;
+    /// - no fact written, nor any other version of its id, names an owned entity or cites an episode a fact naming
+    ///   one cites (ownership travels with shared evidence);
+    /// - every closure or quote written is on a fact that exists, none of whose versions does either.
+    ///
+    /// The episodes a fact naming an owned entity cites are taken from every version of every fact, not only those
+    /// on main nor only those more than one person reads: more than the full check counts, never less.
+    async fn touches_nothing_owned(
+        &self,
+        scope: &Scope,
+        commits: &HashSet<String>,
+        state: &State,
+    ) -> Result<bool> {
+        let ns = scope.namespace();
+        let (schema_rows, aggregate_rows, retraction_rows) = futures::try_join!(
+            self.governance_rows(scope, SCHEMAS),
+            self.governance_rows(scope, AGGREGATES),
+            self.governance_rows(scope, RETRACTIONS),
+        )?;
+        let (episode_rows, closure_rows, quote_rows, fact_rows) = futures::try_join!(
+            self.governance_rows(scope, EPISODES),
+            self.governance_rows(scope, CLOSURES),
+            self.governance_rows(scope, QUOTES),
+            self.governance_rows(scope, FACTS),
+        )?;
+        let list: Arc<Vec<String>> = Arc::new(state.owners.keys().cloned().collect());
+        let commits = commits.clone();
+        tokio::task::spawn_blocking(move || {
+            let owned: HashSet<&str> = list.iter().map(String::as_str).collect();
+            for (table, rows) in [
+                (SCHEMAS, &schema_rows),
+                (AGGREGATES, &aggregate_rows),
+                (RETRACTIONS, &retraction_rows),
+            ] {
+                if !rows_of(&batch_indexes(&ns, table, rows, None), &commits).is_empty() {
+                    return false;
+                }
+            }
+            // Episodes: each new, and private unless it isn't a document.
+            let episodes = batch_indexes(&ns, EPISODES, &episode_rows, None);
+            let mut written: HashMap<&str, (BTreeSet<String>, bool)> = HashMap::new();
+            for (b, i) in rows_of(&episodes, &commits) {
+                let Some(id) = cell(text_column(b, "episode_id"), i) else {
+                    return false;
+                };
+                let w = written.entry(id).or_default();
+                w.0.extend(
+                    split_list(cell(text_column(b, "acl"), i).unwrap_or_default())
+                        .iter()
+                        .map(|a| auth::norm_entry(a)),
+                );
+                w.1 |= cell(text_column(b, "document"), i).is_some();
+            }
+            for (id, (acl, document)) in &written {
+                let before = rows_with(&episodes, "episode_id", id)
+                    .into_iter()
+                    .any(|(b, i)| {
+                        cell(text_column(b, "commit_id"), i).is_none_or(|c| !commits.contains(c))
+                    });
+                if before || (*document && !at_most_one_reader(acl)) {
+                    return false;
+                }
+            }
+            // Facts: the episodes ownership travels through.
+            let facts = batch_indexes(&ns, FACTS, &fact_rows, Some((&list, &owned)));
+            let mut evidence: HashSet<&str> = HashSet::new();
+            for (b, x) in &facts {
+                if let Some((_, rows)) = &x.named {
+                    for i in rows {
+                        evidence.extend(row_sources(b, *i as usize));
+                    }
+                }
+            }
+            let touches = |b: &RecordBatch, i: usize| {
+                row_names_owned(b, i, &owned) || row_sources(b, i).any(|e| evidence.contains(e))
+            };
+            // A fact id: whether it has a version (`Some`), and whether any does touch what an owner holds.
+            let versions_touch = |fid: &str| -> Option<bool> {
+                let rows = rows_with(&facts, "fact_id", fid);
+                (!rows.is_empty()).then(|| rows.iter().any(|(b, i)| touches(b, *i)))
+            };
+            for (b, i) in rows_of(&facts, &commits) {
+                let Some(fid) = cell(text_column(b, "fact_id"), i) else {
+                    return false;
+                };
+                if touches(b, i) || versions_touch(fid) != Some(false) {
+                    return false;
+                }
+            }
+            for (table, rows) in [(CLOSURES, &closure_rows), (QUOTES, &quote_rows)] {
+                for (b, i) in rows_of(&batch_indexes(&ns, table, rows, None), &commits) {
+                    let Some(fid) = cell(text_column(b, "fact_id"), i) else {
+                        return false;
+                    };
+                    if versions_touch(fid) != Some(false) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .await
+        .map_err(Into::into)
+    }
 }

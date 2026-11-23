@@ -524,6 +524,7 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
     );
     let private_id = private.episode_id.clone();
     let fact = Fact::new(entity, "refund_days", "xprivate-value").from_episodes(&[&private]);
+    let private_fact = fact.fact_id.clone();
     // Its display name too: pages name an entity by it (the graph, the Explorer's list, its page, its links), so
     // whoever can't read the note must never see it there either.
     let name = Fact::new(entity, "_name", "xprivate-value name").from_episodes(&[&private]);
@@ -539,6 +540,22 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
     assert_ne!(status, 200, "{body}");
     assert!(!body.to_string().contains("xprivate-value"), "{body}");
     e.store.merge(&e.scope, "private", "agent").await.unwrap();
+    // Recorded in conflict with a value everyone reads: the conflict is listed to a reader of both facts only.
+    let (_, public) = e.seed("policy:shipping", "fifteen").await;
+    let mut record = Episode::sourced(
+        &format!("{}test", memstore::conflicts::SOURCE),
+        format!("{} {private_fact}", public.fact_id).as_bytes(),
+        &[memstore::conflicts::ACL],
+    );
+    record.document = Some(format!(
+        "{}{}/{private_fact}",
+        memstore::conflicts::PREFIX,
+        public.fact_id
+    ));
+    e.store
+        .commit(&e.scope, "reconcile", &[record], &[])
+        .await
+        .unwrap();
     // Its facts, and everywhere it is named: the type's list, its page, the page of one linking to it, the graph.
     let read = |token: String| {
         let url = e.url.clone();
@@ -562,6 +579,7 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
                     json!({"org":"acme","op":"entity","path":["entities","policy","shipping"]}),
                 ),
                 ("admin", json!({"org":"acme","op":"entity_graph"})),
+                ("admin", json!({"org":"acme","op":"list_conflicts"})),
             ] {
                 let (status, answer) = post(&format!("{url}/{path}"), &token, &body).await;
                 assert_eq!(status, 200, "{body}: {answer}");
@@ -570,6 +588,23 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
             all
         }
     };
+    // A page that keeps nothing (the note's entity) and the graph, which is kept per reader.
+    let get = |token: String, path: &'static str, body: Value| {
+        let url = e.url.clone();
+        async move {
+            let (status, answer) = post(&format!("{url}/{path}"), &token, &body).await;
+            assert_eq!(status, 200, "{body}: {answer}");
+            answer
+        }
+    };
+    let page = |token: String| {
+        get(
+            token,
+            "browse",
+            json!({"org":"acme","op":"entity","path":["entities","policy","refund-window"]}),
+        )
+    };
+    let graph = |token: String| get(token, "admin", json!({"org":"acme","op":"entity_graph"}));
     // The server's reads catch up with a commit made beside it within a few seconds. She reads it, and as its name
     // on each page that names it.
     let named = |all: &str| all.matches(r#""title":"xprivate-value name""#).count();
@@ -581,9 +616,69 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
     }
     assert!(hers.contains(r#""value":"xprivate-value""#), "{hers}");
     assert_eq!(named(&hers), 4, "{hers}");
+    // The review lists are kept per reader and memory state: Bob, reading right after her at the same state, is
+    // never answered what was worked out for her.
+    let start = Instant::now();
+    while !e
+        .ok(&e.carol, json!({"op":"list_conflicts"}))
+        .await
+        .to_string()
+        .contains("xprivate-value")
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "Carol never lists the conflict"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let his = e.ok(&e.bob, json!({"op":"list_conflicts"})).await;
+    assert!(!his.to_string().contains("xprivate-value"), "{his}");
     assert!(!read(e.bob.clone()).await.contains("xprivate-value"));
     let theirs = e.ok(&e.bob, json!({"op":"list_proposals"})).await;
     assert!(!theirs.to_string().contains("xprivate-value"), "{theirs}");
+    // Home's one read is each reader's too: its week counts the note's source for her, never for him, and he owns
+    // no conflict he can't read both sides of. The admins' parts are refused to whoever isn't one, left out.
+    let home = |token: String| {
+        let url = e.url.clone();
+        async move {
+            let parts = [
+                "counts",
+                "week",
+                "lessons",
+                "branches",
+                "activity",
+                "proposals",
+                "conflicts",
+                "dream",
+                "schema",
+            ];
+            let body = json!({"org":"acme","op":"home","parts":parts});
+            let (status, answer) = post(&format!("{url}/browse"), &token, &body).await;
+            assert_eq!(status, 200, "{answer}");
+            serde_json::from_str::<Value>(&answer).unwrap()
+        }
+    };
+    let from_private = |h: &Value| {
+        h["week"]["by_source"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|s| s[0] == "private")
+    };
+    let start = Instant::now();
+    while !from_private(&home(e.carol.clone()).await) {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "Carol's week never counts the note"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let his = home(e.bob.clone()).await;
+    assert!(!from_private(&his), "{his}");
+    assert!(!his.to_string().contains("xprivate"), "{his}");
+    assert_eq!(his["conflicts"], 0, "{his}");
+    assert!(his["activity"].is_null() && his["dream"].is_null(), "{his}");
+    assert!(home(e.alice.clone()).await["dream"].is_object());
     // Adding an entry no one holds lets no one else read it, so it stays immediate, and the note stays Carol's.
     e.store
         .change_acl(
@@ -626,14 +721,19 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
         memstore::governance::OwnerApprovalRequired::caused(&handed),
         "{handed:#}"
     );
+    // The server sees the change once it has read the commit made beside it. From the first page it shows gone
+    // (built after the loss), it is gone from every page: the graph built before the loss is never answered.
     let start = Instant::now();
-    while read(e.carol.clone()).await.contains("xprivate-value") {
+    while page(e.carol.clone()).await.contains("xprivate-value") {
         assert!(
             start.elapsed() < Duration::from_secs(20),
             "Carol still reads it once handed on"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    let theirs = graph(e.carol.clone()).await;
+    assert!(!theirs.contains("xprivate-value"), "{theirs}");
+    assert!(!read(e.carol.clone()).await.contains("xprivate-value"));
     assert!(!read(e.bob.clone()).await.contains("xprivate-value"));
     // Forgetting it stays immediate.
     e.store
@@ -645,14 +745,19 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
         )
         .await
         .unwrap();
+    // The server sees the change once it has read the commit made beside it. From the first page it shows gone
+    // (built after the loss), it is gone from every page: the graph built before the loss is never answered.
     let start = Instant::now();
-    while read(e.carol.clone()).await.contains("xprivate-value") {
+    while page(e.carol.clone()).await.contains("xprivate-value") {
         assert!(
             start.elapsed() < Duration::from_secs(20),
             "still read after it was forgotten"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    let theirs = graph(e.carol.clone()).await;
+    assert!(!theirs.contains("xprivate-value"), "{theirs}");
+    assert!(!read(e.carol.clone()).await.contains("xprivate-value"));
 
     // Team membership is required even when the caller administers its organization.
     admin(
@@ -963,8 +1068,25 @@ async fn an_org_admin_decides_for_owners_and_owners_settle_conflicts() {
         0
     );
 
-    // A member sees the conflict but may not settle it; its owner may, and nobody of another org sees it.
-    let listed = e.ok(&e.carol, json!({"op":"list_conflicts"})).await;
+    // A member sees the conflict but may not settle it; its owner may, and nobody of another org sees it. The three
+    // values are one conflict, of one attribute, with the three pairs recorded among them; by pair, three.
+    let grouped = e.ok(&e.carol, json!({"op":"list_conflicts"})).await;
+    let groups = grouped["conflicts"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{grouped}");
+    assert_eq!(
+        (
+            &grouped["total"],
+            &grouped["total_groups"],
+            &grouped["total_pairs"]
+        ),
+        (&json!(1), &json!(1), &json!(3)),
+        "{grouped}"
+    );
+    assert_eq!(groups[0]["facts"].as_array().unwrap().len(), 3, "{grouped}");
+    assert_eq!(groups[0]["pairs"].as_array().unwrap().len(), 3, "{grouped}");
+    let listed = e
+        .ok(&e.carol, json!({"op":"list_conflicts","by":"pair"}))
+        .await;
     assert_eq!(listed["conflicts"].as_array().unwrap().len(), 3, "{listed}");
     let c = listed["conflicts"]
         .as_array()
