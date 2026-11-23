@@ -7956,13 +7956,19 @@ async fn handle(
             "/sessions/end" => end_session(&state, &store, &scope, &who, &via, &args).await,
             // What became of a PR, for the caller's sessions that opened or pushed to it.
             "/sessions/prs" => crate::sessions::pr_event(&store, &scope, &who, &args).await,
-            _ => start_session(&state, &session, &store, &who, &via, &args, false)
-                .await
-                .map(|(l, served)| {
+            _ => match start_session(&state, &session, &store, &who, &via, &args, false).await {
+                Ok((l, served)) => {
                     let mut v = served_json(&served);
                     v["session_id"] = json!(l.answer_id);
-                    v
-                }),
+                    let recent =
+                        crate::sessions::recent(&store, &scope, who.user(), &l.answer_id).await;
+                    if !recent.is_empty() {
+                        v["your_recent_sessions"] = Value::Array(recent);
+                    }
+                    Ok(v)
+                }
+                Err(e) => Err(e),
+            },
         };
         if path == "/sessions" {
             let text = done.as_ref().map(Value::to_string).map_err(|_| ());
@@ -13240,7 +13246,7 @@ async fn mcp(
                             Ok::<_, anyhow::Error>(notes)
                         }),
                     );
-                    started
+                    let started = started
                         .map(|((l, served), (remembered, later))| {
                             // What the person opened with, in their words: the preferences in it are kept.
                             if args["keep"].as_bool() != Some(false) {
@@ -13255,9 +13261,17 @@ async fn mcp(
                             );
                             let out =
                                 session_started(&l, &served, session.vis().episode_type_counts(who));
-                            crate::keep::with_remembered(out, remembered, later)
+                            (l.answer_id.clone(), crate::keep::with_remembered(out, remembered, later))
                         })
-                        .map_err(runs_error)
+                        .map_err(runs_error);
+                    // What the person did lately, after the start: the log is read (cached) once the session is in it.
+                    match started {
+                        Ok((id, out)) => Ok(crate::sessions::with_recent(
+                            out,
+                            crate::sessions::recent(&store, scope, who.user(), &id).await,
+                        )),
+                        Err(e) => Err(e),
+                    }
                 }
                 "end_session" if !may_write => Err(ToolError(format!(
                     "{} only reads: it is a reader key",

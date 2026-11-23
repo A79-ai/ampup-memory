@@ -9,7 +9,9 @@
 //! **Grading.** What became of a PR reaches its sessions as events (`POST /sessions/prs`, [`crate::sessions::pr_event`]),
 //! sent for the person whose sessions they are (a recorder key names them in `x-memstore-as`, as a CI job does
 //! at a merge): `merged`, `closed` (unmerged), `reverted`, and `regression` (a later PR said "Regression from #N"
-//! of it). [`outcome`] turns them into the session's reward, the surest kind ([`crate::advice`]'s outcome): a PR
+//! of it). A merge the agent ran itself (`gh pr merge`, its result saying it merged: [`merges_in`]) is a `merged`
+//! event too, read from the transcript the session ended with, for the person's sessions that opened or pushed to
+//! that PR: a repository with no CI job that reports merges still teaches. [`outcome`] turns them into the session's reward, the surest kind ([`crate::advice`]'s outcome): a PR
 //! reverted, or one a later PR fixed a regression of, is a failure; one merged is a success, a firm one once it
 //! has stood [`STANDING_DAYS`] days with neither; one closed unmerged says nothing either way.
 
@@ -119,6 +121,77 @@ pub fn links_in(t: &str) -> Vec<Pr> {
         }
     }
     out
+}
+
+/// The PRs transcript `t` shows the agent merging, as `(repo, number)`, each once: a `gh pr merge` whose result
+/// says it merged (gh's "Merged pull request", or a `gh pr view` after it answering `MERGED`), not one it only
+/// queued (`--auto`). The repository is the one the call names (`--repo`, `-R`, a PR's URL) or its result does;
+/// `None` when neither does (the PR of the directory the agent was in), for the caller to match by number.
+pub fn merges_in(t: &str) -> Vec<(Option<String>, u64)> {
+    let lines: Vec<&str> = t.lines().collect();
+    let mut out: Vec<(Option<String>, u64)> = vec![];
+    for (i, line) in lines.iter().enumerate() {
+        let Some(call) = line.trim_start().strip_prefix("tool ") else {
+            continue;
+        };
+        let Some(after) = call.split("gh pr merge").nth(1) else {
+            continue;
+        };
+        let result = lines
+            .get(i + 1)
+            .and_then(|l| l.trim_start().strip_prefix("-> "))
+            .unwrap_or_default();
+        let lower = result.to_ascii_lowercase();
+        let merged = (lower.contains("merged pull request") && !lower.contains("will be"))
+            || result.split_whitespace().any(|w| w == "MERGED");
+        if !merged {
+            continue;
+        }
+        let args: Vec<&str> = after
+            .split(['&', ';', '|', '"', '\\'])
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        let named = args
+            .iter()
+            .position(|a| *a == "--repo" || *a == "-R")
+            .and_then(|p| args.get(p + 1))
+            .map(|r| r.trim_matches(|c| c == '\'' || c == '"').to_string())
+            .filter(|r| r.split('/').count() == 2 && r.split('/').all(name_ok));
+        let url = pr_urls(after).into_iter().chain(pr_urls(result)).next();
+        let number = args
+            .iter()
+            .find_map(|a| a.parse::<u64>().ok())
+            .or(url.as_ref().map(|u| u.1))
+            .or_else(|| said_number(result));
+        let Some(number) = number else {
+            continue;
+        };
+        let repo = named.or(url.map(|u| u.0)).or_else(|| said_repo(result));
+        if !out.iter().any(|(r, n)| *n == number && *r == repo) {
+            out.push((repo, number));
+        }
+    }
+    out
+}
+
+/// The number in gh's "Merged pull request owner/repo#12" or "#12".
+fn said_number(result: &str) -> Option<u64> {
+    let at = result.find('#')?;
+    result[at + 1..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// The repository in gh's "Merged pull request owner/repo#12".
+fn said_repo(result: &str) -> Option<String> {
+    let at = result.find('#')?;
+    let word = result[..at].rsplit(' ').next()?;
+    (word.split('/').count() == 2 && word.split('/').all(name_ok)).then(|| word.to_string())
 }
 
 fn add(out: &mut Vec<Pr>, repo: String, number: Option<u64>, branch: Option<String>, how: &str) {

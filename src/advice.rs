@@ -785,6 +785,10 @@ fn trial_days() -> f64 {
         .unwrap_or(14.0)
 }
 
+/// The most rewarded runs a side a person's own note on trial needs (fewer where `AMPUP_MEMORY_ADVICE_TRIAL_RUNS` or
+/// their `advice_personal_runs` says so, never under 2): one person's sessions of one kind of task come slowly.
+const PERSONAL_TRIAL_RUNS: usize = 3;
+
 /// Rewarded runs each version of a note on trial needs before the two are compared
 /// (`AMPUP_MEMORY_ADVICE_TRIAL_RUNS`, default 10).
 fn trial_runs() -> usize {
@@ -4574,7 +4578,13 @@ async fn learn_space(
                     }
                 }
             }
-            let min = trial_runs();
+            // A person's own note is tried on fewer runs a side ([`PERSONAL_TRIAL_RUNS`], or their scope's
+            // `advice_personal_runs` where that is fewer, never under 2): one person rarely brings 10 a side before
+            // the trial's days run out, so their rewrite would always be dropped.
+            let min = match space.owner {
+                Some(_) => bar(trial_runs().min(PERSONAL_TRIAL_RUNS)).max(2),
+                None => trial_runs(),
+            };
             match candidate {
                 None => {
                     map.trials.remove(&k);

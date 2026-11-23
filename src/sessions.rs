@@ -159,6 +159,80 @@ pub fn judge_wait() -> Duration {
     )
 }
 
+/// The most of a person's own ended sessions [`recent`] hands back at a start.
+const RECENT: usize = 3;
+
+/// What `user` did lately in `scope`: their own last [`RECENT`] ended sessions (a person's, not a program's; none
+/// discarded), newest first, but `except` (the session starting now). Each is its task, how it ended and how long
+/// ago, so an agent picks up where they left off from their second session on, with no advice learned yet, on a host
+/// with no hooks too. Only the caller's own: the log is read by asker, never another person's work.
+pub async fn recent(store: &Store, scope: &Scope, user: &str, except: &str) -> Vec<Value> {
+    let all = match list(store, scope).await {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("start_session: reading {user}'s recent sessions failed: {e:#}");
+            return vec![];
+        }
+    };
+    let now = crate::now_micros();
+    let mut mine: Vec<&Logged> = all
+        .iter()
+        .filter(|l| {
+            l.kind.as_deref() == Some(KIND)
+                && l.asker == user
+                && l.answer_id != except
+                && l.session.as_ref().is_some_and(|s| s.ended_at.is_some())
+                && !l.question.trim().is_empty()
+                && !automated(l)
+                && !discarded(l)
+        })
+        .collect();
+    mine.sort_by_key(|l| std::cmp::Reverse(l.session.as_ref().and_then(|s| s.ended_at)));
+    mine.into_iter()
+        .take(RECENT)
+        .map(|l| {
+            let ended = l
+                .session
+                .as_ref()
+                .and_then(|s| s.ended_at)
+                .unwrap_or(l.asked_at);
+            let mut v = serde_json::json!({
+                "task": head(l.question.trim(), 160),
+                "ended": ago(now - ended),
+            });
+            if let Some(o) = l.answer.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+                v["outcome"] = serde_json::json!(head(o, 200));
+            }
+            v
+        })
+        .collect()
+}
+
+/// `us` microseconds before now, in words.
+fn ago(us: i64) -> String {
+    let m = us.max(0) / 60_000_000;
+    match (m / (60 * 24), m / 60, m) {
+        (d, _, _) if d >= 2 => format!("{d} days ago"),
+        (1, _, _) => "yesterday".into(),
+        (_, h, _) if h >= 2 => format!("{h} hours ago"),
+        (_, 1, _) => "an hour ago".into(),
+        (_, _, m) if m >= 2 => format!("{m} minutes ago"),
+        _ => "just now".into(),
+    }
+}
+
+/// `out` (a start's answer) with the person's [`recent`] sessions, where there are some.
+pub fn with_recent(out: String, recent: Vec<Value>) -> String {
+    if recent.is_empty() {
+        return out;
+    }
+    let Ok(Value::Object(mut o)) = serde_json::from_str::<Value>(&out) else {
+        return out;
+    };
+    o.insert("your_recent_sessions".into(), Value::Array(recent));
+    Value::Object(o).to_string()
+}
+
 /// The first `n` characters of `s`.
 fn head(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
@@ -3207,8 +3281,108 @@ pub async fn end(
                 .unwrap_or_default()
         ));
     }
+    // The PRs its agent merged: merged, for this session and the asker's others that opened or pushed to them. Only
+    // the repositories with a CI job send what became of a PR (`pr_event`); an agent that merges on the person's
+    // word shows it in the transcript.
+    let merges = transcript
+        .as_deref()
+        .map(crate::session_prs::merges_in)
+        .unwrap_or_default();
+    let others = match merges.is_empty() {
+        true => vec![],
+        false => list(store, scope).await?,
+    };
+    let event = crate::session_prs::Event {
+        kind: "merged".into(),
+        at: now_micros(),
+        by: None,
+    };
+    let merged: Vec<(String, u64)> = merges
+        .into_iter()
+        .filter_map(|(repo, n)| Some((repo.or_else(|| repo_of(&others, asker, n))?, n)))
+        .collect();
+    let s = l.session.as_mut().expect("a session");
+    for (repo, n) in &merged {
+        for p in s.prs.iter_mut().filter(|p| p.is(repo, *n, None)) {
+            crate::session_prs::note(p, event.clone());
+        }
+    }
     put(store, scope, asker, l.clone());
+    for (repo, n) in &merged {
+        let reached = reach(
+            store,
+            scope,
+            asker,
+            others.clone(),
+            repo,
+            *n,
+            None,
+            &event,
+            Some(&id),
+        );
+        eprintln!(
+            "sessions {scope}: {repo}#{n} merged in session {id}: {reached} other sessions of {asker}"
+        );
+    }
     Ok(l)
+}
+
+/// The repository of `asker`'s PR `number` a merge named none of (gh run in its checkout): the one their sessions
+/// link a PR of that number in, when it is one.
+fn repo_of(rows: &[Logged], asker: &str, number: u64) -> Option<String> {
+    let mut repos: Vec<String> = rows
+        .iter()
+        .filter(|l| l.asker == asker)
+        .filter_map(|l| l.session.as_ref())
+        .flat_map(|s| s.prs.iter())
+        .filter(|p| p.number == Some(number))
+        .map(|p| p.repo.to_ascii_lowercase())
+        .collect();
+    repos.sort();
+    repos.dedup();
+    match repos.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
+/// `event` for `user`'s sessions in `rows` that opened `repo`'s PR `number` or pushed to its `branch`, but session
+/// `except`; how many it reached.
+#[allow(clippy::too_many_arguments)]
+fn reach(
+    store: &Store,
+    scope: &Scope,
+    user: &str,
+    rows: Vec<Logged>,
+    repo: &str,
+    number: u64,
+    branch: Option<&str>,
+    event: &crate::session_prs::Event,
+    except: Option<&str>,
+) -> usize {
+    let mut reached = 0;
+    for mut l in rows {
+        if l.asker != user || except == Some(l.answer_id.as_str()) {
+            continue;
+        }
+        let Some(s) = l.session.as_mut() else {
+            continue;
+        };
+        let mut changed = false;
+        for p in s.prs.iter_mut().filter(|p| p.is(repo, number, branch)) {
+            if p.number.is_none() {
+                p.number = Some(number);
+                changed = true;
+            }
+            changed |= crate::session_prs::note(p, event.clone());
+        }
+        if changed {
+            crate::session_prs::dedupe(&mut s.prs);
+            reached += 1;
+            put(store, scope, user, l);
+        }
+    }
+    reached
 }
 
 /// Session `id`'s transcript `t` as the episode its end keeps (`<signed>memstore:session:<id>`, readable by `acl`), with its
@@ -3275,28 +3449,18 @@ pub async fn pr_event(
         at,
         by: args["by"].as_u64(),
     };
-    let mut reached = 0;
-    for mut l in list(store, scope).await? {
-        if l.asker != who.user() {
-            continue;
-        }
-        let Some(s) = l.session.as_mut() else {
-            continue;
-        };
-        let mut changed = false;
-        for p in s.prs.iter_mut().filter(|p| p.is(repo, number, branch)) {
-            if p.number.is_none() {
-                p.number = Some(number);
-                changed = true;
-            }
-            changed |= crate::session_prs::note(p, event.clone());
-        }
-        if changed {
-            crate::session_prs::dedupe(&mut s.prs);
-            reached += 1;
-            put(store, scope, who.user(), l);
-        }
-    }
+    let rows = list(store, scope).await?;
+    let reached = reach(
+        store,
+        scope,
+        who.user(),
+        rows,
+        repo,
+        number,
+        branch,
+        &event,
+        None,
+    );
     eprintln!(
         "sessions {scope}: {repo}#{number} {kind}: {reached} sessions of {}",
         who.user()

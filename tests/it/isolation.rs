@@ -661,6 +661,45 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
         .find(|l| l.answer_id == sid)
         .and_then(|l| l.episodes.first().cloned())
         .expect("the session's transcript");
+    // A start hands back what its caller did lately (`your_recent_sessions`): carol's next start has her ended
+    // session; anyone else's start in the org, by the tool or `POST /sessions`, has nothing of hers.
+    let (_, raw) = mcp_call(
+        s,
+        "?org=acme",
+        &carol,
+        "start_session",
+        json!({"context": "what next"}),
+    )
+    .await;
+    assert!(
+        raw.contains("your_recent_sessions") && raw.contains(SESSION),
+        "carol's start lists her own ended session: {raw}"
+    );
+    for other in ["alice@acme.com", "bob@acme.com"] {
+        let (_, raw) = mcp_call(
+            s,
+            "?org=acme",
+            &person(other),
+            "start_session",
+            json!({"context": "what next"}),
+        )
+        .await;
+        assert!(!tool_text(&raw).1, "{other} start_session: {raw}");
+        assert!(
+            !raw.contains(SESSION),
+            "{other} start_session lists carol's session: {raw}"
+        );
+        let (code, raw) = post(
+            &format!("{s}/sessions?org=acme"),
+            &person(other),
+            &json!({"context": "what next"}),
+        )
+        .await;
+        assert!(
+            !raw.contains(SESSION),
+            "{other} POST /sessions ({code}) lists carol's session: {raw}"
+        );
+    }
     // A session's own records may reach reads with the next background build of what they see
     // (`AMPUP_MEMORY_VIS_REFRESH_MS`): before anyone asks, carol reads her transcript.
     let start = Instant::now();
