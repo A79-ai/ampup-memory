@@ -1701,13 +1701,14 @@ fn names_work(said: &str) -> bool {
 /// session's own run did, so curation ([`curate`]) still sets the requests served a note against their
 /// situation's others.
 fn task_runs(l: &crate::qa_log::Logged, body: &str, graded: &[(usize, usize, bool)]) -> Vec<Run> {
-    let asks = crate::sessions::asks(body);
+    let asks = crate::sessions::requests(body);
     graded
         .iter()
         .filter_map(|&(at, to, accepted)| {
             let i = asks.iter().position(|a| a.at == at)?;
             let a = &asks[i];
-            let next = asks.iter().find(|a| a.at == to)?;
+            // The request after it, or none where the person's next session graded it (its last).
+            let next = asks.iter().find(|a| a.at == to);
             // What the request was made during: the one it corrects, else the latest earlier one that names work,
             // else the session's first. A request that only steers that work ("go on", "yes", a constraint, a
             // correction) is sorted where the work goes, never as a kind of task of its own ([`SORT_PROMPT`]):
@@ -1752,7 +1753,7 @@ fn task_runs(l: &crate::qa_log::Logged, body: &str, graded: &[(usize, usize, boo
                     }
                 )),
                 trace,
-                next: Some(cut(&next.said, NOTE_TASK).to_string()),
+                next: next.map(|n| cut(&n.said, NOTE_TASK).to_string()),
                 whole,
                 advice: l
                     .session

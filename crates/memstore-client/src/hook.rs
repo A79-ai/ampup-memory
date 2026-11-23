@@ -1092,7 +1092,7 @@ impl Harness {
     }
 
     /// How the transcript names the agent: Claude Code's "Claude", else its label.
-    pub(crate) fn speaker(self) -> &'static str {
+    pub fn speaker(self) -> &'static str {
         match self {
             Harness::ClaudeCode => "Claude",
             h => h.label(),
@@ -1697,6 +1697,9 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             let every = std::env::var("AMPUP_MEMORY_RECALL").is_ok_and(|v| v == "every");
             if prompt.trim().is_empty() {
                 return Ok(());
+            }
+            if std::env::var("AMPUP_MEMORY_CAPTURE").unwrap_or_default() != "off" {
+                note_said(&input, prompt);
             }
             let recall_now = every || first("recalled", session);
             let (advised, recalled) =
@@ -3070,9 +3073,13 @@ async fn keep_session(client: &Client, input: &Value, harness: Harness) -> Resul
     let Some(id) = session_id(input) else {
         return Ok(());
     };
-    let trace = trace_since(input, harness).trace;
+    let mut trace = trace_since(input, harness).trace;
     if trace.trim().is_empty() {
-        return Ok(());
+        // No transcript to read: what the person typed is its conversation so far.
+        match said_log(input) {
+            Some(said) => trace = said,
+            None => return Ok(()),
+        }
     }
     let n = trace.chars().count();
     let tail: String = trace.chars().skip(n.saturating_sub(KEEP_CHARS)).collect();
@@ -3132,6 +3139,12 @@ async fn end_session(client: &Client, input: &Value, harness: Harness) -> Result
     if let Some(seg) = seg {
         if !seg.trace.trim().is_empty() {
             args["transcript"] = json!(seg.trace);
+        } else if let Some(said) = said_log(input) {
+            // No transcript to read: what the person typed is its conversation.
+            if let Some(t) = said.lines().find_map(|l| l.strip_prefix("User: ")) {
+                args["task"] = json!(t);
+            }
+            args["transcript"] = json!(said);
         }
         if let Some(o) = seg.outcome {
             args["outcome"] = json!(o);
@@ -3167,10 +3180,47 @@ async fn end_session(client: &Client, input: &Value, harness: Harness) -> Result
     ended.map(|_| ())
 }
 
+/// The most of what the person typed that a session of a harness without a transcript keeps ([`note_said`]): its end.
+const SAID_CHARS: usize = 16_000;
+
+/// Notes `prompt`, typed in a session whose harness keeps no transcript (Grok Bot, Kiro, Devin), as a `User:` turn
+/// beside the session's markers. With no transcript to read, it is what the session's stop and end send as its
+/// conversation ([`said_log`]): the server hears only a session's first prompt, and each request in it is graded by
+/// the person's next message.
+fn note_said(input: &Value, prompt: &str) {
+    if transcript_of(input).is_some() {
+        return;
+    }
+    let Some(m) = marker("said", session_of(input)) else {
+        return;
+    };
+    let mut said = std::fs::read_to_string(&m).unwrap_or_default();
+    said.push_str(&format!("User: {}\n", prompt.trim()));
+    let n = said.chars().count();
+    if n > SAID_CHARS {
+        let tail: String = said.chars().skip(n - SAID_CHARS).collect();
+        // From a turn's start, not mid-message.
+        said = match tail.find("\nUser: ") {
+            Some(i) => tail[i + 1..].to_string(),
+            None => tail,
+        };
+    }
+    let _ = write_whole(&m, &said);
+}
+
+/// What the person typed in this session, where its harness keeps no transcript ([`note_said`]).
+fn said_log(input: &Value) -> Option<String> {
+    if transcript_of(input).is_some() {
+        return None;
+    }
+    let said = std::fs::read_to_string(marker("said", session_of(input))?).ok()?;
+    (!said.trim().is_empty()).then_some(said)
+}
+
 /// Drops this harness session's memstore session markers: the next hook opens a new one.
 fn forget_session(input: &Value) {
     for kind in [
-        "session", "advised", "asked", "from", "kept", "opening", "handed", "lined",
+        "session", "advised", "asked", "from", "kept", "opening", "handed", "lined", "said",
     ] {
         if let Some(m) = marker(kind, session_of(input)) {
             let _ = std::fs::remove_file(m);

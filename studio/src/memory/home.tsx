@@ -6,7 +6,7 @@ import { appliedSaid, DreamSaid, dreamState } from "./review";
 import { needsMe, review, type DreamList } from "./review-api";
 import type { Branch, Child, Focus, Listing, Selection } from "./types";
 import { EmptyState, Icon } from "./ui";
-import type { Resolved } from "../transport";
+import { transport, type Resolved } from "../transport";
 
 // Studio's Home (`#/home`): the memory being read (the org's, or the team picked) as its builders see it. What
 // changed this week, what was answered from it, and what waits on the reader, each number a link into the
@@ -77,10 +77,57 @@ export interface HomeSummary {
  * them out. */
 const ASK_AGAIN = 5;
 
+/** The fields a pending part stands for: `week` brings the sources and the advice served too. */
+const fieldsOf = (part: string) => (part === "week" ? ["week", "sources", "advice"] : [part]);
+
 /** `h` with what is still pending left out: null, as a part that failed. */
 function settled(h: HomeSummary): HomeSummary {
-  const gone = (h.pending ?? []).flatMap((p) => (p === "week" ? ["week", "sources", "advice"] : [p]));
+  const gone = (h.pending ?? []).flatMap(fieldsOf);
   return { ...h, ...Object.fromEntries(gone.map((p) => [p, null])), pending: [] };
+}
+
+/**
+ * Where the host keeps Home's last complete answer (`Transport.kept`), with its shape's version: a change to
+ * `HomeSummary` that an older kept answer wouldn't fit takes the next number.
+ */
+const KEPT = "home/1";
+
+/**
+ * Whether `h` is worth keeping for the next open: the server worked out every part (none pending, none given up)
+ * and counted every root folder. An empty memory isn't kept either: one filled since would open on the new memory's
+ * guide.
+ */
+function keepable(h: HomeSummary): boolean {
+  const counts = h.counts;
+  return (
+    !h.pending?.length &&
+    !!counts &&
+    Object.values(counts).every((n) => typeof n === "number") &&
+    !(counts.sources === 0 && counts.entities === 0)
+  );
+}
+
+/** What the host kept for this selection, if it is a Home answer at all. */
+function keptHome(sel: Selection): HomeSummary | undefined {
+  try {
+    const h = transport().kept?.get(sel, KEPT) as HomeSummary | undefined;
+    return h && typeof h === "object" && typeof h.since === "number" && !h.pending?.length
+      ? h
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The fresh answer so far, its pending parts filled from the kept one: a part the server is still working out shows
+ * what it was last time instead of a skeleton, until its own answer lands.
+ */
+function overKept(h: HomeSummary, kept: HomeSummary): HomeSummary {
+  const filled = (h.pending ?? []).filter((p) => fieldsOf(p).every((f) => f in kept));
+  if (!filled.length) return h;
+  const from = filled.flatMap(fieldsOf).map((f) => [f, kept[f as keyof HomeSummary]]);
+  return { ...h, ...Object.fromEntries(from), pending: h.pending!.filter((p) => !filled.includes(p)) };
 }
 
 type Got<T> = { key: string; data?: T; failed?: boolean };
@@ -181,6 +228,9 @@ export function Home({
   // Every number in one read, shown as it answers: the parts not worked out in time are asked for again. null: a
   // server with no such read (or the read failed), and Home makes a read each, as before it.
   const [said, setSaid] = useState<{ key: string; h: HomeSummary | null } | null>(null);
+  // The answer the host kept from the last open, shown at once while the read is out (and, part by part, while the
+  // server works out the rest), with a quiet "updating" beside the title. The fresh answer replaces it.
+  const kept = useMemo(() => keptHome(sel), [key]);
   useEffect(() => {
     let live = true;
     void (async () => {
@@ -204,6 +254,13 @@ export function Home({
       for (let again = 0; live; again++) {
         if (!h.pending?.length || again === ASK_AGAIN) {
           setSaid({ key, h: settled(h) });
+          if (keepable(h)) {
+            try {
+              transport().kept?.set(sel, KEPT, h);
+            } catch {
+              // Not kept: the next open reads it again, as before.
+            }
+          }
           return;
         }
         setSaid({ key, h });
@@ -219,7 +276,16 @@ export function Home({
     };
   }, [key]);
   // undefined until it answers; null: a read each.
-  const one = said?.key === key ? said.h : undefined;
+  const fresh = said?.key === key ? said.h : undefined;
+  // Until the fresh answer is whole, the kept one fills in for what it hasn't answered yet. A fresh read that
+  // failed (null) drops it: Home then reads each part, as with a server before the one read. Made once per answer:
+  // a new object each render would tell the page around Home (`onSummary`) again on every render, which renders
+  // Home again.
+  const one = useMemo(
+    () => (fresh === undefined ? kept : fresh && kept ? overKept(fresh, kept) : fresh),
+    [fresh, kept],
+  );
+  const updating = !!kept && (fresh === undefined || !!fresh?.pending?.length);
   const each = one === null;
   useEffect(() => {
     if (one !== undefined) onSummary?.(one);
@@ -375,6 +441,15 @@ export function Home({
             {sel.branch && sel.branch !== "main" ? (
               <span className="mono">· branch {sel.branch}</span>
             ) : null}
+            {updating && (
+              <span
+                className="hm-updating"
+                role="status"
+                title="Shown from your last visit while the memory is read again"
+              >
+                · updating
+              </span>
+            )}
           </p>
         </div>
         {!empty && actions}

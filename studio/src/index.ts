@@ -25,6 +25,7 @@ export {
   type ArmStore,
   type Capabilities,
   type Capability,
+  type KeptAnswers,
   type Transport,
 } from "./transport";
 export { LocalTransport } from "./local-transport";

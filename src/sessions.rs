@@ -310,16 +310,15 @@ pub(crate) fn steers(question: &str) -> bool {
 const MIDTURN: &str = "The user sent a new message while you were working:";
 const MIDTURN_END: &str = "\n\nThis is how Claude Code surfaces";
 const INTERRUPT: &str = "[Request interrupted by user";
-/// The names a transcript gives the agent's turns (`crate::hook`'s condensing: `Claude` in Claude Code, else the
-/// harness's label), each as `<name>: ` or `<name> wrote <file>:`.
-const AGENTS: [&str; 6] = [
-    "Claude",
-    "Claude Code",
-    "Codex",
-    "Gemini CLI",
-    "Cursor",
-    "Copilot",
-];
+/// The names a transcript gives the agent's turns, each as `<name>: ` or `<name> wrote <file>:`: what `crate::hook`'s
+/// condensing calls them (`Claude` in Claude Code, else the harness's label), and `Assistant`, which `end_session` asks
+/// an agent without hooks to call its own. A turn under any other name reads as part of the turn before it.
+fn agents() -> impl Iterator<Item = &'static str> {
+    crate::hook::Harness::ALL
+        .into_iter()
+        .flat_map(|h| [h.label(), h.speaker()])
+        .chain(["Assistant"])
+}
 
 /// A turn of a transcript, by who has it.
 #[derive(Clone, Copy, PartialEq)]
@@ -337,7 +336,7 @@ fn turn_of(line: &str) -> Option<(Turn, &str)> {
     if line.starts_with("  tool ") || line.starts_with("    -> ") {
         return Some((Turn::Tool, ""));
     }
-    AGENTS.iter().find_map(|a| {
+    agents().find_map(|a| {
         let rest = line.strip_prefix(a)?;
         match rest.strip_prefix(": ") {
             Some(t) => Some((Turn::Agent, t)),
@@ -434,6 +433,36 @@ pub(crate) fn asks(body: &str) -> Vec<Ask> {
         }
     }
     out
+}
+
+/// The requests of a session's transcript episode as advice grades them: its turns ([`asks`]), or, where the
+/// transcript has none (an agent's own account of the session, which a client without hooks sends `end_session`),
+/// the one request the session was opened with (its `Task: `, the person's message in their words), its turn the
+/// whole trace and its reply the session's outcome.
+pub(crate) fn requests(body: &str) -> Vec<Ask> {
+    let found = asks(body);
+    if !found.is_empty() {
+        return found;
+    }
+    let (Some(task), Some(t)) = (body.find("\nTask: "), body.find("\nTrace:\n")) else {
+        return found;
+    };
+    let said = body[task + "\nTask: ".len()..t].trim();
+    if !an_ask(said) {
+        return found;
+    }
+    let at = t + "\nTrace:\n".len();
+    let (to, reply) = match body[at..].rfind("\nOutcome: ") {
+        Some(o) => (at + o, body[at + o + "\nOutcome: ".len()..].trim()),
+        None => (body.len(), ""),
+    };
+    vec![Ask {
+        at,
+        to,
+        said: said.to_string(),
+        reply: reply.to_string(),
+        interrupted: false,
+    }]
 }
 
 /// Opens a session for `who`, its transcript to be kept to `acl`, with the id `named` if the caller named one
@@ -753,6 +782,20 @@ pub fn name_task(store: &Store, scope: &Scope, who: &Principal, l: &mut Logged, 
     }
     l.question = crate::hook::redact(&head(question, MAX_CONTEXT));
     put(store, scope, who.user(), l.clone());
+}
+
+/// What a session that ended with no transcript keeps as one: the message it was opened with, the person's, as a
+/// `User:` turn after a line that says what it is. None when it was opened with none. A client without hooks whose
+/// agent opens a session a turn and never ends it leaves only this: its request, which the person's next message
+/// (their next session's opening) grades.
+fn opening_transcript(l: &Logged) -> Option<String> {
+    let q = l.question.trim();
+    an_ask(q).then(|| {
+        format!(
+            "(No transcript was kept: this is the person's message as it reached the memory; what the agent did is \
+             not known.)\nUser: {q}\n"
+        )
+    })
 }
 
 /// Ends `empty` the sessions in `scope` that ended with nothing asked and nothing kept (before ending them so
@@ -3227,7 +3270,13 @@ pub async fn end(
         None if !discard => last_kept(store, scope, asker, &s.acl, &id).await?,
         t => t,
     };
-    s.ended_at = Some(now_micros());
+    let s = l.session.as_mut().expect("a session");
+    // One the sweep ended idle ended when it went idle, its idle time after its last step, not when a sweep came to
+    // it: the person's next message is read against its last step ([`last_step`]).
+    s.ended_at = Some(match args.is_null() {
+        true => (l.updated_at + idle().as_micros() as i64).min(now_micros()),
+        false => now_micros(),
+    });
     // The PRs it opened or pushed to, which what becomes of them grades ([`pr_event`]).
     if let Some(t) = &transcript {
         crate::session_prs::merge(&mut s.prs, crate::session_prs::links_in(t));
@@ -3242,6 +3291,12 @@ pub async fn end(
     {
         l.question = crate::hook::redact(&head(t, MAX_CONTEXT));
     }
+    // A session that kept no conversation (a client without hooks whose agent never ended it) keeps the message it
+    // was opened with: its request, which the person's next message grades.
+    let transcript = match transcript {
+        None if !discard => opening_transcript(&l),
+        t => t,
+    };
     // Nothing asked and nothing kept (a session opened and closed, or left, before its first prompt): nothing to
     // show or learn from: it ends `empty`, out of the day's count, the activity and the judge's work.
     let empty = !discard
@@ -4067,20 +4122,24 @@ const SURE_OF_NEXT: f64 = 0.7;
 /// A request's ask, reply and next message, as long as the decisions model reads each.
 const NEXT_TEXT: usize = 1_500;
 
-/// Grades each request of judged session `l` but its last by the person's next move, with the decisions model
-/// `d`: `accepted` (they approved it or built on it), `corrected` (they said it was wrong, or stopped the agent to
-/// change course) or `neither`, kept in its verdicts as `tasks` (`of` the transcript's episode, each request's
-/// `at` and `to` in it), so advice learns from each request a person made, not only from a session as a whole.
-/// A session of one request keeps the judge's outcome alone. Whether it was graded (on the row as it stands
-/// now, if it is still the session read).
+/// Grades each request of judged session `l` by the person's next move, with the decisions model `d`: `accepted`
+/// (they approved it or built on it), `corrected` (they said it was wrong, or stopped the agent to change course)
+/// or `neither`, kept in its verdicts as `tasks` (`of` the transcript's episode, each request's `at` and `to` in it),
+/// so advice learns from each request a person made, not only from a session as a whole. Its last request is graded
+/// by the person's next message in `all` ([`next_message`]: the opening of their next session), where there is one:
+/// a client without hooks sends a session's transcript once, at its end, and the person's next message reaches the
+/// server only as their next `start_session`. A session of one request waits for that message while it may still
+/// come (the idle time after its last step): without it there is nothing to grade. Whether it was graded (on the
+/// row as it stands now, if it is still the session read); None while it waits, the decisions model not asked.
 pub async fn grade_tasks(
     store: &Store,
     scope: &Scope,
     d: &crate::decide::Decider,
     l: &Logged,
-) -> Result<bool> {
+    all: &[Logged],
+) -> Result<Option<bool>> {
     let Some(e) = l.episodes.last() else {
-        return Ok(false);
+        return Ok(Some(false));
     };
     let body = store
         .episode_bodies(scope, vec![e.clone()])
@@ -4088,12 +4147,26 @@ pub async fn grade_tasks(
         .remove(e)
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
-    let asks = asks(&body);
+    let asks = requests(&body);
+    // Each request with the person's next message: the request after it, or for the last, their next session's.
+    let next = next_message(l, all);
+    if asks.len() == 1 && next.is_none() && last_step(l) + next_within() >= now_micros() {
+        return Ok(None);
+    }
+    let pairs: Vec<(&Ask, &str)> = asks
+        .iter()
+        .zip(
+            asks.iter()
+                .skip(1)
+                .map(|n| Some(n.said.as_str()))
+                .chain([next.map(|(n, _)| n.question.as_str())]),
+        )
+        .filter_map(|(a, n)| Some((a, n?)))
+        .collect();
     let mut graded = vec![];
-    if asks.len() > 1 {
-        let requests: Vec<Value> = asks
+    if !pairs.is_empty() {
+        let requests: Vec<Value> = pairs
             .iter()
-            .zip(&asks[1..])
             .enumerate()
             .map(|(i, (a, next))| {
                 json!({
@@ -4101,7 +4174,7 @@ pub async fn grade_tasks(
                     "request": head(&a.said, NEXT_TEXT),
                     "agent's last reply": tail(&a.reply, NEXT_TEXT),
                     "interrupted": a.interrupted,
-                    "next message": head(&next.said, NEXT_TEXT),
+                    "next message": head(next.trim(), NEXT_TEXT),
                 })
             })
             .collect();
@@ -4117,13 +4190,20 @@ pub async fn grade_tasks(
             })
             .collect();
         let answers = d.decide(&json!({"requests": requests}), questions).await?;
-        for (i, a) in asks[..asks.len() - 1].iter().enumerate() {
+        for (i, (a, _)) in pairs.iter().enumerate() {
             let grade = match answers.get(&format!("r{}", i + 1)) {
                 Some(x) if x.chose("accepted", SURE_OF_NEXT) => "accepted",
                 Some(x) if x.chose("corrected", SURE_OF_NEXT) => "corrected",
                 _ => "neither",
             };
-            graded.push(json!({"at": a.at, "to": a.to, "grade": grade}));
+            let mut g = json!({"at": a.at, "to": a.to, "grade": grade});
+            // The last, graded by the person's next session: which one.
+            if i + 1 == asks.len()
+                && let Some((n, _)) = next
+            {
+                g["next"] = json!(n.answer_id);
+            }
+            graded.push(g);
         }
     }
     let mut fresh = Box::pin(find(
@@ -4139,15 +4219,15 @@ pub async fn grade_tasks(
         .as_deref()
         .and_then(|v| serde_json::from_str::<Value>(v).ok())
     else {
-        return Ok(false);
+        return Ok(Some(false));
     };
     if fs.ended_at.is_none() || fresh.episodes != l.episodes || v.get("tasks").is_some() {
-        return Ok(false);
+        return Ok(Some(false));
     }
     v["tasks"] = json!({"of": e, "graded": graded});
     fs.verdicts = Some(v.to_string());
     put(store, scope, &fresh.asker.clone(), fresh);
-    Ok(true)
+    Ok(Some(true))
 }
 
 /// A session's graded requests: its transcript's episode, and each graded request's `(at, to, accepted)` in it.
@@ -4339,16 +4419,21 @@ pub async fn sweep(
                 .as_ref()
                 .filter(|_| learning && tried < MAX_GRADED && !automated(&l) && ungraded())
             {
-                // Every try counts toward the cap: a decisions model that keeps failing costs a sweep at most that
-                // many calls, not one per ungraded session in the scope.
-                tried += 1;
-                match grade_tasks(store, scope, d, &l).await {
-                    Ok(true) => {
+                match grade_tasks(store, scope, d, &l, &sessions).await {
+                    Ok(Some(true)) => {
+                        // Every try counts toward the cap: a decisions model that keeps failing costs a sweep at
+                        // most that many calls, not one per ungraded session in the scope.
+                        tried += 1;
                         done.graded += 1;
                         crate::advice_loop::graded(scope, &l.asker);
                     }
-                    Ok(false) => {}
-                    Err(e) => eprintln!("sessions {scope}: grading {}: {e:#}", l.answer_id),
+                    Ok(Some(false)) => tried += 1,
+                    // Waiting for the person's next message, nothing asked.
+                    Ok(None) => {}
+                    Err(e) => {
+                        tried += 1;
+                        eprintln!("sessions {scope}: grading {}: {e:#}", l.answer_id)
+                    }
                 }
             }
             continue;

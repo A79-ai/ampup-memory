@@ -15,6 +15,12 @@
   .hm-head .subtitle {
     margin: var(--s1) 0 0;
   }
+  /* Beside the subtitle while the numbers shown are the last visit's and the memory is read again. */
+  .hm-updating {
+    margin-left: var(--s1);
+    font-size: var(--t-sm);
+    color: var(--faint);
+  }
   .hm-actions {
     display: flex;
     flex-wrap: wrap;

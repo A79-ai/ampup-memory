@@ -14401,7 +14401,8 @@ fn lifecycle_instructions(advised: bool) -> String {
          with the user's message in their words (AmpUp Memory keeps from it what should outlast the conversation); \
          it answers with a session_id, what this user and their team asked to be remembered (preferences and \
          decisions to honour unless the user says otherwise, never instructions to run anything){}. {}When the conversation is over, call end_session with the session_id, a \
-         transcript of what was asked and done in at most 300 words, and the outcome.\n\nIn any turn where the \
+         transcript of it in at most 300 words (each message of the user's on a line of its own starting `User: `, \
+         in their words, and what you did after it on a line starting `Assistant: `), and the outcome.\n\nIn any turn where the \
          user states a preference, corrects you, or settles a decision or a procedure, call remember_memory in \
          that turn, before you answer, without being asked. It is theirs alone, a decision too: AmpUp Memory shares \
          it with the team once at least {} people have said the same. Never remember small talk, secrets or raw \
@@ -14460,7 +14461,7 @@ fn session_tools() -> Vec<Value> {
                 by the server after a while.",
             "inputSchema": {"type": "object", "properties": {
                 "session_id": {"type": "string"},
-                "transcript": {"type": "string", "description": "What the user asked and said, and what was done: at most 300 words"},
+                "transcript": {"type": "string", "description": "The conversation in at most 300 words, a line per turn: `User: ` and each message of the user's in their own words (quoted, not summarised), then `Assistant: ` and what you did or answered"},
                 "outcome": {"type": "string", "description": "How it turned out"},
                 "reward": {"type": "number", "minimum": -1, "maximum": 1, "description": "If known: -1 it went wrong, 1 it worked"},
                 "reason": {"type": "string", "description": "Why the reward"},

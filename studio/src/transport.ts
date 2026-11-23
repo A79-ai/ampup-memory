@@ -134,9 +134,24 @@ export interface AreaOwnerStore {
   set(org: string, kind: AreaOwnerKind, area: string, owner: string | null): Promise<AreaOwner[]>;
 }
 
+/**
+ * Where a host keeps a page's last complete answer for the person reading (Home's numbers), so the page shows it at
+ * once the next time it opens, marked as updating, while it reads the memory again. `name` carries the answer's
+ * shape and its version (`home/1`): a host keeps it as given and answers it back unchanged. The host decides for how
+ * long and for whom: it must never answer one person's or one org's to another.
+ */
+export interface KeptAnswers {
+  /** The answer last kept under `name` for this selection, if the host still has it. */
+  get(sel: Selection, name: string): unknown;
+  /** Keeps `value`, an answer the page worked out completely, in place of the one before. */
+  set(sel: Selection, name: string, value: unknown): void;
+}
+
 export interface Transport {
   /** One call to the memory (see `Area`). Rejects with an `ApiError` on a refusal. */
   call<T>(sel: Selection, area: Area, body?: Record<string, unknown>): Promise<T>;
+  /** Where the slowest pages' last answers are kept between visits; without it, every open reads anew. */
+  kept?: KeptAnswers;
   /** What it reaches; what it leaves out is hidden. */
   capabilities: Capabilities;
   /** The org's own saved arms (Ask); without it, the arms every memory has. */
