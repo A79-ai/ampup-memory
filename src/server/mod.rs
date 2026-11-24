@@ -38,6 +38,7 @@ mod episode_page;
 mod file_keys;
 mod governance;
 mod home;
+mod index_notes;
 mod join;
 mod learn;
 mod lobby;
@@ -6137,6 +6138,13 @@ async fn handle(
     };
     let browse = !internal && (path == "/browse" || list_op.is_some());
     let agent_route = !internal && path == "/agent/run";
+    let index_notes_route = !internal && path == "/index/notes";
+    if index_notes_route && req.method() != hyper::Method::POST {
+        return Ok(reply(
+            StatusCode::METHOD_NOT_ALLOWED,
+            json!({"error": "POST {items, model?} to /index/notes"}),
+        ));
+    }
     // A platform's tenants (`tenants`): a platform key's alone.
     let tenants_route = !internal && (path == "/tenants" || path.starts_with("/tenants/"));
     if agent_route && req.method() != hyper::Method::POST {
@@ -6294,6 +6302,7 @@ async fn handle(
         && !learn_status
         && !browse
         && !agent_route
+        && !index_notes_route
         && !retract_route
         && !pin_route
         && !forget_route
@@ -7723,6 +7732,41 @@ async fn handle(
                 },
             },
         );
+    }
+    if index_notes_route {
+        let who = who.expect("public port");
+        let ask = match serde_json::from_slice::<Value>(&body)
+            .map_err(|_| "body is a JSON object: {items, model?}".to_string())
+            .and_then(|v| index_notes::Ask::parse(&v))
+        {
+            Ok(a) => a,
+            Err(e) => return Ok(reply(StatusCode::BAD_REQUEST, json!({"error": e}))),
+        };
+        // Notes asked of the server's own model account: stopped and metered as an ask is, past the org's month's
+        // model allowance refused, and a person's calls a day held to a most.
+        if let Some(why) = stopped_why(&state, "ask") {
+            return Ok(reply(StatusCode::TOO_MANY_REQUESTS, json!({"error": why})));
+        }
+        if let Some(l) = crate::limits::model_gate(scope.org_name()) {
+            return Ok(reply(limit_status(&l), l.body()));
+        }
+        if let Err(why) = index_notes::take(&who) {
+            return Ok(reply(StatusCode::TOO_MANY_REQUESTS, json!({"error": why})));
+        }
+        crate::usage::METER.op(crate::usage::Op::Ask { byok: state.byok }, who.user());
+        return Ok(match Box::pin(index_notes::run(ask)).await {
+            Ok(v) => reply(StatusCode::OK, v),
+            Err(e) => match e.downcast_ref::<ToolError>() {
+                Some(m) => reply(StatusCode::SERVICE_UNAVAILABLE, json!({"error": m.0})),
+                None => {
+                    eprintln!("index notes failed: {e:#}");
+                    reply(
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error": "the notes couldn't be written"}),
+                    )
+                }
+            },
+        });
     }
     if runs_route {
         let who = who.expect("public port");
@@ -14864,7 +14908,7 @@ async fn open_session(
         false => args,
     };
     // Its row is written once the advice is found, in the background (`crate::sessions::opened`).
-    let l = crate::sessions::start(store, session.scope(), who, &acl, args, None).await?;
+    let l = crate::sessions::start(store, session.scope(), who, &acl, args, None, false).await?;
     crate::phases::mark("session opened");
     let context = args["context"].as_str().unwrap_or_default().trim();
     // Nothing is routed for a program's session unless its scope asks ([`routes_for`]).
@@ -15913,6 +15957,7 @@ async fn get_advice_step(
                 i,
                 question,
                 args["harness"].as_str(),
+                false,
             )
             .await
             .map_err(runs_error)?,
@@ -16171,6 +16216,16 @@ async fn end_session(
         return Err(crate::runs::Refused("session_id is required".into()).into());
     }
     let task = args["task"].as_str().unwrap_or_default();
+    // A session first heard of at its end, dated when it ran (`occurred_at`, the hook client's alone) at least
+    // `sessions::BACKFILL_AGE` ago: a past one sent long after (`ampup-memory-client index`), opened backfilled so it
+    // never counts toward the person's day. One dated nearer now is today's, and counts as any other.
+    let ran = match &args["occurred_at"] {
+        Value::String(t) => chrono::DateTime::parse_from_rfc3339(t)
+            .ok()
+            .map(|t| t.timestamp_micros()),
+        v => v.as_i64(),
+    };
+    let backfill = ran.is_some_and(|t| t <= crate::now_micros() - crate::sessions::BACKFILL_AGE_US);
     let resolved = open_named(
         state,
         store,
@@ -16180,6 +16235,7 @@ async fn end_session(
         id,
         task,
         args["harness"].as_str(),
+        backfill,
     )
     .await?;
     let l = crate::sessions::find(store, scope, who, &resolved).await?;
@@ -16198,7 +16254,8 @@ async fn end_session(
 /// The session `id` stands for, for `who` (`crate::sessions::open_named`): a session's own id, or a name the caller
 /// gave it, opened on its first step or its end, so a harness can use its own session id and skip start_session. A
 /// caller whose sessions can't be kept to it (a key) opens nothing, and is refused by the step as before. A session
-/// it opens takes the `harness` the call names, if any.
+/// it opens takes the `harness` the call names, if any, marked backfilled when `backfill`
+/// ([`crate::sessions::BACKFILL`]).
 #[allow(clippy::too_many_arguments)]
 async fn open_named(
     state: &State,
@@ -16209,6 +16266,7 @@ async fn open_named(
     id: &str,
     context: &str,
     harness: Option<&str>,
+    backfill: bool,
 ) -> Result<String> {
     if !via.may_write() {
         return Ok(id.to_string());
@@ -16220,7 +16278,7 @@ async fn open_named(
         .recorded
         .then(|| crate::sessions::recorded_harness(harness));
     let harness = marked.as_deref().or(harness);
-    crate::sessions::open_named(store, scope, who, &acl, id, context, harness).await
+    crate::sessions::open_named(store, scope, who, &acl, id, context, harness, backfill).await
 }
 
 /// `start_session`'s answer: the session id, and the advice for the opening context.

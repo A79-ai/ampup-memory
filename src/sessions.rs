@@ -491,7 +491,9 @@ pub(crate) fn requests(body: &str) -> Vec<Ask> {
 
 /// Opens a session for `who`, its transcript to be kept to `acl`, with the id `named` if the caller named one
 /// (else a new one). Its row is held in [`BUFFER`] at once, so its steps find it; the caller records its advice
-/// with [`opened`], or drops it with [`abandon`].
+/// with [`opened`], or drops it with [`abandon`]. A `backfill` session (one sent long after it ran, [`BACKFILL`]) has
+/// no day's most; any other counts against the day's most entries and sessions, which backfilled ones never count
+/// toward.
 pub async fn start(
     store: &Store,
     scope: &Scope,
@@ -499,10 +501,30 @@ pub async fn start(
     acl: &[String],
     args: &Value,
     named: Option<&str>,
+    backfill: bool,
 ) -> Result<Logged> {
-    crate::qa_log::daily_cap(store, scope, who)
-        .await
-        .map_err(relay)?;
+    // The mark is the server's to give: a caller naming its harness `…:backfill` is not one.
+    // Cut first, then the mark taken out: cutting after could leave one (`x:backfillzzz` cut to `x:backfill`).
+    let harness = text(args, "harness").map(|h| {
+        let mark = BACKFILL.trim_start_matches(':');
+        let h = head(h, 40);
+        let h: Vec<&str> = h
+            .split(':')
+            .enumerate()
+            .filter(|(i, t)| *i == 0 || *t != mark)
+            .map(|(_, t)| t)
+            .collect();
+        h.join(":")
+    });
+    let harness = match backfill {
+        true => Some(backfill_harness(harness.as_deref())),
+        false => harness,
+    };
+    if !backfill {
+        crate::qa_log::daily_cap(store, scope, who)
+            .await
+            .map_err(relay)?;
+    }
     crate::phases::mark("daily cap");
     let since = now_micros() - 86_400_000_000;
     let all = crate::qa_log::list(store, scope, None).await?;
@@ -512,7 +534,8 @@ pub async fn start(
     {
         return Err(refuse(format!("no session {n} that you started")));
     }
-    // A run that kept no transcript (a summarizer's) ends its session discarded: it never counts toward the cap.
+    // A run that kept no transcript (a summarizer's) ends its session discarded: it never counts toward the cap,
+    // nor does a backfilled one, and a backfilled one has none: nothing is counted for it.
     let mut logged: std::collections::HashMap<String, i64> = all
         .into_iter()
         .filter(|l| {
@@ -520,11 +543,12 @@ pub async fn start(
                 && l.asker == who.user()
                 && l.asked_at >= since
                 && !discarded(l)
+                && !backfill
+                && !backfilled(l)
         })
         .map(|l| (l.answer_id, l.asked_at))
         .collect();
     crate::phases::mark("sessions today");
-    let harness = text(args, "harness").map(|h| head(h, 40));
     // An eval's split: `test` anywhere (it only keeps the session from teaching), `train` where the scope runs evals.
     let split = match text(args, "split").map(str::trim) {
         None | Some("") => None,
@@ -591,21 +615,26 @@ pub async fn start(
                     && h.l.kind.as_deref() == Some(KIND)
                     && h.l.asked_at >= since
                     && !discarded(&h.l)
+                    && !backfill
+                    && !backfilled(&h.l)
                     && !logged.contains_key(id)
             })
             .map(|(_, h)| h.l.asked_at),
     );
     times.sort_unstable();
     let today = times.len();
-    // Noted so the caller's next start is refused before it reads anything (`crate::qa_log::capped`).
-    crate::qa_log::note_capped(
-        scope,
-        who.user(),
-        crate::qa_log::Cap::Sessions,
-        &times,
-        max_per_day(),
-    );
-    if today >= max_per_day() {
+    // Noted so the caller's next start is refused before it reads anything (`crate::qa_log::capped`). Backfilled
+    // sessions have no day's most: the past is sent whole, and never refuses what the person does now.
+    if !backfill {
+        crate::qa_log::note_capped(
+            scope,
+            who.user(),
+            crate::qa_log::Cap::Sessions,
+            &times,
+            max_per_day(),
+        );
+    }
+    if !backfill && today >= max_per_day() {
         return Err(refuse(format!(
             "{} has started {today} sessions in {scope} today, the most a day",
             who.user()
@@ -658,7 +687,9 @@ pub async fn opened(
 /// The session `id` stands for, for `who`: itself if a session has that id (one start_session opened), else the
 /// session `who` named `id` (a harness's own session id, say), opened now if it isn't yet. A name is its caller's
 /// own: kept as the name and a hash of who named it, so no one else naming it reaches or takes it. A session someone
-/// else opened is left alone, and [`find`] refuses the caller.
+/// else opened is left alone, and [`find`] refuses the caller. One opened `backfill` (at the end of a session sent
+/// long after it ran) is marked so ([`BACKFILL`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn open_named(
     store: &Store,
     scope: &Scope,
@@ -667,6 +698,7 @@ pub async fn open_named(
     id: &str,
     context: &str,
     harness: Option<&str>,
+    backfill: bool,
 ) -> Result<String> {
     let sessions = list(store, scope).await?;
     if sessions.iter().any(|l| l.answer_id == id) {
@@ -695,7 +727,7 @@ pub async fn open_named(
         .filter(|h| !h.is_empty())
         .map_or("named".to_string(), |h| head(h, 40));
     let opening = json!({"harness": harness, "context": context});
-    let l = start(store, scope, who, acl, &opening, Some(&own)).await?;
+    let l = start(store, scope, who, acl, &opening, Some(&own), backfill).await?;
     opened(store, scope, l, None).await?;
     Ok(own)
 }
@@ -3148,6 +3180,47 @@ pub fn recorded_harness(harness: Option<&str>) -> String {
     }
 }
 
+/// The suffix of the harness of a session sent long after it ran (`ampup-memory-client index` backfilling a machine's
+/// past sessions: an `end_session` dated `occurred_at` for a session the memory never had). It has no day's most, and
+/// never counts toward the day's most entries or sessions, so sending the past never refuses what the person does now.
+pub const BACKFILL: &str = ":backfill";
+
+/// How long ago a session ended late must have run to be backfilled ([`BACKFILL`]), in microseconds: an hour. One
+/// dated nearer now counts toward the day's most as a live one does, so dating a session doesn't lift the cap.
+pub const BACKFILL_AGE_US: i64 = 3_600_000_000;
+
+/// A backfilled session's harness: `harness` (else `named`), cut to fit, with [`BACKFILL`] after it, before a
+/// recorder key's mark, which stays last ([`recorded`]).
+pub fn backfill_harness(harness: Option<&str>) -> String {
+    let h = harness
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or("named");
+    if is_backfill(h) {
+        return h.to_string();
+    }
+    let (h, rec) = match h.strip_suffix(RECORDED) {
+        Some(h) => (h, RECORDED),
+        None => (h, ""),
+    };
+    let h: String = h.chars().take(30).collect();
+    format!("{h}{BACKFILL}{rec}")
+}
+
+/// Whether `harness` is a backfilled session's ([`BACKFILL`]), in any part of it (a recorder key's mark comes after).
+pub fn is_backfill(harness: &str) -> bool {
+    let mark = BACKFILL.trim_start_matches(':');
+    harness.split(':').skip(1).any(|t| t == mark)
+}
+
+/// Whether session `l` was backfilled ([`BACKFILL`]).
+pub fn backfilled(l: &Logged) -> bool {
+    l.session
+        .as_ref()
+        .and_then(|s| s.harness.as_deref())
+        .is_some_and(is_backfill)
+}
+
 /// Whether a recorder key opened session `l` for its person ([`RECORDED`]).
 pub fn recorded(l: &Logged) -> bool {
     l.session
@@ -3282,7 +3355,8 @@ pub async fn end(
     // When the session happened, for a session ended long after it ran (`ampup-memory-client index` backfilling a
     // machine's past sessions): its conversation's episode is dated then, so what is learned from it is too. Only the
     // hook client's (the server drops it from an agent's own call); never ahead of now. The session's row keeps its
-    // own times, which its grading and the day's count read.
+    // own times, which its grading reads; it was opened backfilled ([`BACKFILL`]), so it never counts toward the person's
+    // day's most.
     let occurred = match &args["occurred_at"] {
         Value::Null => None,
         Value::String(t) => Some(

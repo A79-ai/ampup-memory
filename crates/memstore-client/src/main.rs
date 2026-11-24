@@ -115,8 +115,8 @@ enum Cmd {
     /// written by Claude through your own Claude Code (`claude -p`: its login, or CLAUDE_CODE_OAUTH_TOKEN from
     /// `claude setup-token`)
     Index {
-        /// How far back, in days
-        #[arg(long, default_value_t = 14)]
+        /// How far back, in days: Claude Code keeps 30 by default, so the default reads all it has
+        #[arg(long, default_value_t = 30)]
         days: u64,
         /// Write the report only: send nothing to the memory
         #[arg(long)]
@@ -124,9 +124,16 @@ enum Cmd {
         /// At most this many notes Claude writes (0: none, and Claude isn't run)
         #[arg(long, default_value_t = 12)]
         notes: usize,
-        /// The model Claude Code writes the notes with
+        /// The model the notes are written with
         #[arg(long, env = "AMPUP_MEMORY_INDEX_MODEL", default_value = "sonnet")]
         model: String,
+        /// Whose model writes the notes: `memory` (the memory's server, on its own account: nothing to set up) or
+        /// `claude` (Claude Code here, on your sign-in or a `claude setup-token` token)
+        #[arg(long, value_enum, default_value = "memory")]
+        notes_with: hook::index::NotesWith,
+        /// Say how many sessions it would send and the tokens it would take, and do nothing
+        #[arg(long)]
+        estimate: bool,
         /// Don't open the report in the browser
         #[arg(long)]
         no_open: bool,
@@ -239,6 +246,8 @@ async fn run() -> Result<()> {
             report_only,
             notes,
             model,
+            notes_with,
+            estimate,
             no_open,
         } => {
             hook::index::run(hook::index::Options {
@@ -246,6 +255,8 @@ async fn run() -> Result<()> {
                 send: !report_only,
                 notes,
                 model,
+                notes_with,
+                estimate,
                 open: !no_open,
             })
             .await

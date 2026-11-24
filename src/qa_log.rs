@@ -1172,20 +1172,34 @@ pub(crate) trait StoreQaLog {
 impl StoreQaLog for Store {
     /// When each row `asker` added to the log since `since` (µs) was recorded, oldest first, ratings included; not
     /// the one row ending a session `empty` (an admin's `clear_empty_sessions` writes one per session it clears, in
-    /// the asker's name). Its start was a row of its own, which counts, as does any other row of it.
+    /// the asker's name). Its start was a row of its own, which counts, as does any other row of it. Nor an ended
+    /// backfilled session's rows (`crate::sessions::BACKFILL`: past sessions sent long after they ran), which have a
+    /// day's most of their own, so sending them never refuses what the person does now. One left open (its end
+    /// failed) counts like any other: steps in it are the person's own activity.
     async fn qa_row_times_since(&self, scope: &Scope, asker: &str, since: i64) -> Result<Vec<i64>> {
         let rows = self.side_rows(&scope.namespace(), QA_LOG).await?;
         let mut ended_empty = std::collections::HashSet::new();
         let mut n = vec![];
         for b in rows.iter() {
             let ended_by = optional_strings(b, "ended_by");
-            for (((a, t), e), id) in strings(b, "asker")
+            let harness = optional_strings(b, "harness");
+            // A batch from before sessions had an end has no such column: none of its rows ended.
+            let ended_at = match b.schema().column_with_name("ended_at") {
+                Some(_) => timestamps(b, "ended_at"),
+                None => vec![None; b.num_rows()],
+            };
+            for (((((a, t), e), id), h), end) in strings(b, "asker")
                 .iter()
                 .zip(timestamps(b, "recorded_at"))
                 .zip(&ended_by)
                 .zip(strings(b, "answer_id"))
+                .zip(&harness)
+                .zip(&ended_at)
             {
                 if a.as_str() != asker || !t.is_some_and(|t| t >= since) {
+                    continue;
+                }
+                if end.is_some() && h.as_deref().is_some_and(crate::sessions::is_backfill) {
                     continue;
                 }
                 if e.as_deref() == Some("empty") && ended_empty.insert(id) {

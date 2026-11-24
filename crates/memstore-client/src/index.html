@@ -503,7 +503,7 @@ function holds() {
     if (c.kind === 'claude-code' && c.local) {
       const l = c.local;
       return `${n(l.on_disk)} sessions on this machine in the window: ${n(l.already)} were captured already by the plugin's hooks as they ended (or an earlier index), ` +
-        (l.skipped ? `the rest weren't sent (${esc(l.skipped)}).` : `${n(l.sent)} sent now${l.failed ? `, ${n(l.failed)} not sent` : ''}.`);
+        (l.skipped ? `the rest weren't sent (${esc(l.skipped)}).` : `${n(l.sent)} sent now${l.short ? `, ${n(l.short)} too short to keep` : ''}${l.failed ? `, ${n(l.failed)} not sent` : ''}.`);
     }
     if (c.status === 'recent') return `${n(c.episodes)} episodes, the newest ${esc(c.last || '?')}. How far back it goes isn't known: your memory's server is older than this report.`;
     if (c.status === 'stale') return `Nothing in the window. ${n(c.episodes)} episodes, the newest ${esc(c.last || '?')}.`;

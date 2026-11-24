@@ -26,7 +26,8 @@ A session is one conversation, start to end.
 - A session nobody ends is ended after `AMPUP_MEMORY_SESSION_IDLE_SECS` (1800) without a step, with the last
   conversation it was sent as its transcript.
 - The opening context, transcript and conversation are the caller's own episodes, readable by them alone, with
-  secret-looking words redacted. At most `AMPUP_MEMORY_SESSIONS_PER_DAY` (1000) sessions a person a day.
+  secret-looking words redacted. At most `AMPUP_MEMORY_SESSIONS_PER_DAY` (1000) sessions a person a day; past sessions `index` sends have no
+  daily most and never count toward it.
 
 ### Judging
 

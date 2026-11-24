@@ -42,11 +42,27 @@ pub struct Options {
     pub send: bool,
     /// At most this many notes written by Claude (0: none).
     pub notes: usize,
-    /// The model `claude -p` writes them with.
+    /// The model they are written with.
     pub model: String,
+    /// Whose model writes them.
+    pub notes_with: NotesWith,
+    /// Say what it would read, send and spend, and do nothing.
+    pub estimate: bool,
     /// Open the report in the browser.
     pub open: bool,
 }
+
+/// Whose model writes the notes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum NotesWith {
+    /// The memory's server, on its own model account: nothing to set up.
+    Memory,
+    /// Claude Code on this machine (`claude -p`), on the person's own sign-in or `claude setup-token` token.
+    Claude,
+}
+
+/// Tokens a note's answer takes, about: for the estimate before it is written.
+const NOTE_OUT_TOKENS: u64 = 250;
 
 /// The kinds of repeat, in the page's order, with its label.
 const KINDS: [(&str, &str); 6] = [
@@ -158,7 +174,21 @@ struct Session {
     /// What `end_session` takes for it (its trace, task, outcome and when it happened), for one the hooks didn't
     /// keep: worked out as it is read, so no session's transcript is held past its reading.
     end: Option<Value>,
+    /// Too short to keep ([`too_short`]): nothing to learn from, never sent.
+    short: bool,
 }
+
+/// A session too short to keep: under [`SHORT_TRACE`] characters of conversation in all (opened and left, a slash
+/// command), or one ask, no tool call and under [`SHORT_ASK`] (a quick question and its answer).
+fn too_short(prompts: usize, calls: usize, trace: &str) -> bool {
+    let len = trace.trim().chars().count();
+    len < SHORT_TRACE || (prompts < 2 && calls == 0 && len < SHORT_ASK)
+}
+
+/// A session's conversation, at least this many characters to be kept.
+const SHORT_TRACE: usize = 400;
+/// A one-ask session that called no tool, at least this many characters to be kept.
+const SHORT_ASK: usize = 1_500;
 
 /// One thing repeated across sessions: per session (in start order) its tokens and first sample.
 struct Repeat<'a> {
@@ -216,6 +246,11 @@ pub async fn run(opts: Options) -> Result<()> {
         repeats.len()
     );
 
+    if opts.estimate {
+        say_estimate(&sessions, &repeats, &opts);
+        return Ok(());
+    }
+
     let client = Client::from_env(Duration::from_secs(60));
     // What the memory holds already, before anything is sent: each connector's sources, how far back they go.
     let held = holdings(&client, since).await;
@@ -232,7 +267,15 @@ pub async fn run(opts: Options) -> Result<()> {
     };
     let held = coverage(held, &sessions, &indexed, since);
 
-    let (items, written) = notes(&sessions, &repeats, opts.notes, &opts.model);
+    let (items, written, used) = notes(
+        &client,
+        &sessions,
+        &repeats,
+        opts.notes,
+        &opts.model,
+        opts.notes_with,
+    )
+    .await;
     let mut data = report(
         &sessions, &repeats, items, &written, &indexed, opts.days, now,
     );
@@ -259,10 +302,12 @@ pub async fn run(opts: Options) -> Result<()> {
     match &indexed.skipped {
         Some(why) => println!("Not sent to the memory ({why})."),
         None => println!(
-            "Sent to the memory at {}: {} sessions ({} were there already, kept by the hooks or an earlier index{}).",
+            "Sent to the memory at {}: {} sessions ({} were there already, kept by the hooks or an earlier index; {} too \
+             short to keep{}).",
             indexed.server,
             indexed.sent,
             indexed.already,
+            indexed.short,
             match (indexed.failed, &indexed.error) {
                 (0, _) => String::new(),
                 (n, Some(e)) => format!("; {n} not sent: {e}"),
@@ -289,6 +334,16 @@ pub async fn run(opts: Options) -> Result<()> {
     );
     say_holdings(&held, opts.days);
     println!("Notes: {written}");
+    if let (Some(i), Some(o)) = (used["in"].as_u64(), used["out"].as_u64()) {
+        println!(
+            "Tokens the notes took: {} in, {} out{}.",
+            short(i),
+            short(o),
+            used["cost_usd"]
+                .as_f64()
+                .map_or(String::new(), |c| format!(" (${c:.2})"))
+        );
+    }
     println!("Report: {}", path.display());
     if opts.open {
         open(&path);
@@ -375,7 +430,8 @@ fn read_session(path: &Path, since: f64) -> Option<Session> {
     if seg.prompts.is_empty() {
         return None;
     }
-    let end = (!kept).then(|| {
+    let short = too_short(seg.prompts.len(), seg.calls, &seg.trace);
+    let end = (!kept && !short).then(|| {
         let mut args = json!({"session_id": id, "harness": Harness::ClaudeCode.name(), "transcript": seg.trace,
                               "occurred_at": (start * 1e6) as i64});
         if let Some(t) = seg.prompts.first() {
@@ -394,6 +450,7 @@ fn read_session(path: &Path, since: f64) -> Option<Session> {
         calls,
         kept,
         end,
+        short,
     })
 }
 
@@ -621,12 +678,65 @@ fn repeats(sessions: &[Session]) -> Vec<Repeat<'_>> {
     out
 }
 
+/// What `index` would read, send and spend, said before it runs (`--estimate`): the sessions, those it would send
+/// and those too short to, and the tokens: the notes' (on the model that writes them) and what the memory reads of
+/// the sessions sent (on the memory's own account, whichever writes the notes). About four characters a token.
+fn say_estimate(sessions: &[Session], repeats: &[Repeat], opts: &Options) {
+    let here = std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_default();
+    let todo: Vec<&Session> = sessions
+        .iter()
+        .filter(|s| !s.kept && !s.short && s.id != here)
+        .collect();
+    let short_n = sessions.iter().filter(|s| !s.kept && s.short).count();
+    let sent_chars: usize = todo
+        .iter()
+        .filter_map(|s| s.end.as_ref())
+        .map(|e| e["transcript"].as_str().map_or(0, str::len))
+        .sum();
+    let top = top_of(repeats, opts.notes);
+    let (notes_in, notes_out) = match top.is_empty() {
+        true => (0, 0),
+        false => {
+            let prompt = notes_prompt(&asked_of(&top)).unwrap_or_default();
+            let schema = notes_schema().to_string();
+            (
+                (prompt.len() + schema.len()) as u64 / 4,
+                top.len() as u64 * NOTE_OUT_TOKENS,
+            )
+        }
+    };
+    let by = match opts.notes_with {
+        NotesWith::Memory => "the memory's server (nothing to set up)",
+        NotesWith::Claude => "your own Claude Code sign-in",
+    };
+    println!(
+        "Last {} days: {} Claude Code sessions. Would send {} to the memory ({} kept already, {} too short to keep).",
+        opts.days,
+        sessions.len(),
+        todo.len(),
+        sessions.iter().filter(|s| s.kept).count(),
+        short_n
+    );
+    println!(
+        "Tokens, about: {} notes written on {} take ~{} in and ~{} out; the memory reads ~{} of the sessions sent, \
+         on its own account.",
+        top.len(),
+        by,
+        short(notes_in),
+        short(notes_out),
+        short(sent_chars as u64 / 4)
+    );
+    println!("Estimate only: nothing was sent and no notes were written.");
+}
+
 /// What sending the sessions did.
 #[derive(Default)]
 struct Indexed {
     server: String,
     sent: usize,
     already: usize,
+    /// Too short to keep ([`too_short`]), not sent.
+    short: usize,
     failed: usize,
     error: Option<String>,
     /// Why nothing was sent.
@@ -650,9 +760,10 @@ async fn send(client: &Client, sessions: &[Session]) -> Indexed {
     let here = std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_default();
     let todo: Vec<&Session> = sessions
         .iter()
-        .filter(|s| !s.kept && s.id != here)
+        .filter(|s| !s.kept && s.id != here && !s.short)
         .collect();
-    done.already = sessions.len() - todo.len();
+    done.short = sessions.iter().filter(|s| !s.kept && s.short).count();
+    done.already = sessions.len() - todo.len() - done.short;
     for (n, s) in todo.iter().enumerate() {
         let Some(args) = s.end.clone() else { continue };
         eprint!("\rSending sessions to the memory: {}/{}", n + 1, todo.len());
@@ -805,6 +916,7 @@ fn coverage(
             None => indexed.already,
         },
         "sent": indexed.sent,
+        "short": indexed.short,
         "failed": indexed.failed,
         "skipped": indexed.skipped,
     });
@@ -920,18 +1032,38 @@ fn say_holdings(held: &Value, days: u64) {
 
 /// Notes for the costliest repeats, written by Claude through the person's Claude Code; where it can't, each says
 /// what was repeated, and the second value says why it wasn't written.
-fn notes(
-    sessions: &[Session],
-    repeats: &[Repeat],
-    max: usize,
-    model: &str,
-) -> (Vec<Value>, String) {
-    let top: Vec<&Repeat> = repeats
+/// The repeats the notes are asked for (`top`) as the model gets them.
+fn asked_of(top: &[&Repeat]) -> Vec<Value> {
+    top.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            json!({"id": i, "kind": r.kind, "repo": r.repo, "key": redact(r.key), "sessions": r.sessions.len(),
+                   "tokens_spent_again": r.respent(), "steps_after_it": r.after, "first_time": redact(r.sessions[0].2)})
+        })
+        .collect()
+}
+
+/// The repeats worth a note, the most first, at most `max`.
+fn top_of<'a>(repeats: &'a [Repeat<'a>], max: usize) -> Vec<&'a Repeat<'a>> {
+    repeats
         .iter()
         .filter(|r| r.weight() > 0)
-        // With none to write, the page still shows what was repeated most.
-        .take(if max == 0 { 12 } else { max })
-        .collect();
+        .take(max)
+        .collect()
+}
+
+/// The page's items, one a repeat, with the notes written where `max` asks for them; what was written, and the tokens
+/// that took (`{in, out, cost_usd}`, null where nothing was asked).
+async fn notes(
+    client: &Client,
+    sessions: &[Session],
+    repeats: &[Repeat<'_>],
+    max: usize,
+    model: &str,
+    with: NotesWith,
+) -> (Vec<Value>, String, Value) {
+    // With none to write, the page still shows what was repeated most.
+    let top = top_of(repeats, if max == 0 { 12 } else { max });
     let mut items: Vec<Value> = top
         .iter()
         .map(|r| {
@@ -956,25 +1088,44 @@ fn notes(
         })
         .collect();
     if max == 0 {
-        return (items, "not written by Claude (--notes 0).".into());
+        return (
+            items,
+            "not written by Claude (--notes 0).".into(),
+            Value::Null,
+        );
     }
     if top.is_empty() {
-        return (items, "nothing repeated, so none to write.".into());
+        return (
+            items,
+            "nothing repeated, so none to write.".into(),
+            Value::Null,
+        );
     }
-    eprintln!(
-        "Writing {} notes with Claude ({model}) through Claude Code",
-        top.len()
-    );
-    let asked: Vec<Value> = top
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            json!({"id": i, "kind": r.kind, "repo": r.repo, "key": redact(r.key), "sessions": r.sessions.len(),
-                   "tokens_spent_again": r.respent(), "steps_after_it": r.after, "first_time": redact(r.sessions[0].2)})
-        })
-        .collect();
-    match write_notes(&asked, model) {
-        Ok(written) => {
+    let asked = asked_of(&top);
+    let (got, by) = match with {
+        NotesWith::Claude => {
+            eprintln!(
+                "Writing {} notes with Claude ({model}) through Claude Code",
+                top.len()
+            );
+            (
+                write_notes(&asked, model),
+                format!("Claude ({model}) through your Claude Code sign-in"),
+            )
+        }
+        NotesWith::Memory => {
+            eprintln!(
+                "Writing {} notes with Claude ({model}) on the memory's server",
+                top.len()
+            );
+            (
+                notes_on_server(client, &asked, model).await,
+                format!("Claude ({model}) on the memory's server"),
+            )
+        }
+    };
+    match got {
+        Ok((written, used)) => {
             let mut n = 0;
             for w in written {
                 let Some(item) = w["id"].as_u64().and_then(|i| items.get_mut(i as usize)) else {
@@ -990,28 +1141,61 @@ fn notes(
                 }
                 n += 1;
             }
-            (
-                items,
-                format!("{n} written by Claude ({model}) through your Claude Code sign-in."),
-            )
+            (items, format!("{n} written by {by}."), used)
         }
         Err(e) => {
-            eprintln!("Claude Code didn't write the notes: {e:#}");
+            eprintln!("The notes weren't written: {e:#}");
+            let why = clip(&format!("{e:#}"), 200);
+            let fix = match with {
+                NotesWith::Claude => {
+                    "Sign in with `claude`, or make a token with `claude setup-token` and set \
+                     CLAUDE_CODE_OAUTH_TOKEN to it, then run this again, or write them on the memory's server \
+                     (--notes-with memory)."
+                }
+                NotesWith::Memory => {
+                    "Run this again later, or write them through your own Claude Code (--notes-with claude)."
+                }
+            };
             (
                 items,
-                format!(
-                    "not written: Claude Code couldn't ({}). Sign in with `claude`, or make a token with `claude \
-                     setup-token` and set CLAUDE_CODE_OAUTH_TOKEN to it, then run this again.",
-                    clip(&format!("{e:#}"), 200)
-                ),
+                format!("not written: {by} couldn't ({why}). {fix}"),
+                Value::Null,
             )
         }
     }
 }
 
-/// The notes, from `claude -p`: no tools, hooks, plugins or MCP servers, and no session kept.
-fn write_notes(asked: &[Value], model: &str) -> Result<Vec<Value>> {
-    let schema = json!({
+/// The notes, written on the memory's server (`POST /index/notes`): it holds the prompt and runs it on its own model
+/// account, taking only the repeats. Answers them and what they took (`{in, out, cost_usd}`).
+async fn notes_on_server(
+    client: &Client,
+    asked: &[Value],
+    model: &str,
+) -> Result<(Vec<Value>, Value)> {
+    if client.unsigned_remote() {
+        bail!("nobody is signed in to {}", client.url);
+    }
+    // Its own wait: writing a dozen notes takes longer than a read.
+    let client = Client::from_env(NOTES_WAIT);
+    let v = client
+        .post("/index/notes", &json!({"items": asked, "model": model}))
+        .await?;
+    if let Some(e) = v["error"].as_str() {
+        bail!("{e}");
+    }
+    let notes = v["notes"]
+        .as_array()
+        .cloned()
+        .context("the server's answer has no notes")?;
+    Ok((
+        notes,
+        json!({"in": v["tokens"]["in"], "out": v["tokens"]["out"], "cost_usd": v["cost_usd"]}),
+    ))
+}
+
+/// The notes' shape: one a repeat, by its id.
+pub fn notes_schema() -> Value {
+    json!({
         "type": "object",
         "required": ["notes"],
         "properties": {"notes": {"type": "array", "items": {
@@ -1027,8 +1211,13 @@ fn write_notes(asked: &[Value], model: &str) -> Result<Vec<Value>> {
                 "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
             }
         }}}
-    });
-    let prompt = format!(
+    })
+}
+
+/// What the model is asked, to write the notes from `asked` (the repeats, each with its id and first sample): the
+/// same through Claude Code or the memory's server, which holds this text itself and takes only the repeats.
+pub fn notes_prompt(asked: &[Value]) -> Result<String> {
+    Ok(format!(
         "These are things a person's coding agent sessions went back for again: a later session of the same \
          repository re-read the same file, re-ran the same command, hit the same error, re-did the same lookup or \
          search, or asked a sub-agent the same thing, after an earlier session already had the answer. Each comes with \
@@ -1043,7 +1232,14 @@ fn write_notes(asked: &[Value], model: &str) -> Result<Vec<Value>> {
          tokens it would have saved them, at most tokens_spent_again plus steps_after_it (for an error, what the later sessions spent getting past it). `confidence`: how sure the sample makes you. \
          Write nothing you can't see in the sample; never repeat a secret. Answer with one note per id.\n\n{}",
         serde_json::to_string_pretty(asked)?
-    );
+    ))
+}
+
+/// The notes, from `claude -p`: no tools, hooks, plugins or MCP servers, and no session kept. Answers them and
+/// what they took (`{in, out, cost_usd}`).
+fn write_notes(asked: &[Value], model: &str) -> Result<(Vec<Value>, Value)> {
+    let schema = notes_schema();
+    let prompt = notes_prompt(asked)?;
     let mut child = std::process::Command::new("claude")
         .args([
             "-p",
@@ -1136,7 +1332,19 @@ fn write_notes(asked: &[Value], model: &str) -> Result<Vec<Value>> {
                 .and_then(|r| r["notes"].as_array().cloned())
         })
         .context("claude's answer has no notes")?;
-    Ok(notes)
+    let u = &v["usage"];
+    let tokens_in: u64 = [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .iter()
+    .map(|k| u[*k].as_u64().unwrap_or(0))
+    .sum();
+    let used = json!({"in": tokens_in,
+                      "out": u["output_tokens"].as_u64().unwrap_or(0),
+                      "cost_usd": v["total_cost_usd"]});
+    Ok((notes, used))
 }
 
 /// The page's data.
