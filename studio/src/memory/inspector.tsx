@@ -999,6 +999,13 @@ function Body({ text }: { text: string }) {
       </div>
     );
   }
+  // Markdown (advice, a compiled skill, a doc): drawn as markdown, its hidden item markers left out.
+  if (/^#{1,4} \S/m.test(trimmed))
+    return (
+      <div className="card-pad">
+        <Markdown text={trimmed.replace(/ ?<!--i:[0-9a-f]+-->/g, "")} />
+      </div>
+    );
   return <div className="card-pad body-text">{trimmed}</div>;
 }
 

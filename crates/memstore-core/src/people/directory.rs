@@ -163,6 +163,7 @@ pub const OPS: &[&str] = &[
     "org.create",
     "org.delete",
     "org.purged",
+    "org.cleared",
     "org.profile",
     "org.settings",
     "org.auth0",
@@ -208,6 +209,32 @@ fn limits_in(detail: Option<&str>) -> Option<Option<crate::limits::OrgLimits>> {
     let v: Value = serde_json::from_str(detail?).ok()?;
     let l = v.get(LIMITS_KEY)?;
     Some(serde_json::from_value(l.clone()).ok())
+}
+
+/// The key an org's display name and aliases (`set_names`) are written under, in an org-wide `org.settings`
+/// change, as its limits are ([`LIMITS_KEY`]): an engine from before them folds the change as settings that set
+/// nothing and folds on, serving the org under its name alone. [`Settings`] has no field of this name.
+const NAMES_KEY: &str = "names";
+
+/// The longest display name (`set_names`), in characters.
+const MAX_DISPLAY_NAME: usize = 100;
+
+/// The most aliases an org has (`set_names`).
+const MAX_ALIASES: usize = 10;
+
+/// An org's display name and aliases, as a `set_names` change writes them: all of both, each time.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Names {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub aliases: BTreeSet<String>,
+}
+
+/// The names an `org.settings` change's detail sets, if it is a `set_names` change.
+fn names_in(detail: Option<&str>) -> Option<Names> {
+    let v: Value = serde_json::from_str(detail?).ok()?;
+    serde_json::from_value(v.get(NAMES_KEY)?.clone()).ok()
 }
 
 /// Whether this engine folds `e`: a version it reads, of an op it knows.
@@ -316,6 +343,7 @@ impl Event {
             "org.create" => format!("create org {org}"),
             "org.delete" => format!("delete org {org}"),
             "org.purged" => format!("purge the memory of org {org}"),
+            "org.cleared" => format!("clear the memory of org {org}"),
             "member.forget" => match self
                 .detail
                 .as_deref()
@@ -600,6 +628,18 @@ pub struct Org {
     /// another incarnation; audit rows carry the one they were recorded for ([`crate::audit`]).
     #[serde(skip)]
     pub created_at: i64,
+    /// When its memory was last emptied (`org.cleared`, the operator's `clear_org`), µs; 0: never. What was asked or
+    /// written before it is no longer the org's: a slow writer that read it before the clear writes none of it after.
+    #[serde(skip)]
+    pub cleared_at: i64,
+    /// What people see it called (`set_names`). None: its name, which is what its memory is kept under and
+    /// never changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Other names that select it (`set_names`, the operator's): `x-memstore-org`, `?org=`, `/admin`'s `org`
+    /// and `join --org` take each as this org ([`Directory::org_named`]). Its memory stays under its name.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub aliases: BTreeSet<String>,
 }
 
 /// The domain of a platform's member addresses ([`crate::people::tenants::member_name`]): reserved, so no identity
@@ -625,6 +665,11 @@ pub struct SignInRequest {
 }
 
 impl Org {
+    /// Since when what is asked or written is this org's: its making, or the last time its memory was emptied.
+    pub fn since(&self) -> i64 {
+        self.created_at.max(self.cleared_at)
+    }
+
     /// The org as one of its members who isn't an admin sees it (`/admin {"op": "show"}`): themselves, with
     /// their role and teams, and the org's profile (which agents that connect are shown anyway). Not the
     /// other members, other people's keys, the provider, the domains or who asked to join: those are its admins'.
@@ -1588,6 +1633,8 @@ struct SnapOrg {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     signin_declined: BTreeMap<String, i64>,
     created_at: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    cleared_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_by: Option<String>,
     #[serde(default, skip_serializing_if = "crate::limits::OrgLimits::is_empty")]
@@ -1599,11 +1646,19 @@ struct SnapOrg {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     team_settings: BTreeMap<String, Settings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    aliases: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tenant: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     attrs: BTreeMap<String, MemberAttrs>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     forgotten: BTreeSet<String>,
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 /// A service key as a snapshot keeps it: with its hash, never when it was last used (not the log's).
@@ -1694,7 +1749,7 @@ fn chain(prev: &str, e: &Event) -> String {
 
 /// What a snapshot's state means changes when the fold does: a snapshot of another format is never
 /// loaded (the log is replayed instead). Bump it with any change to what [`Directory::apply_events`] does.
-pub const SNAPSHOT_FORMAT: i64 = 15;
+pub const SNAPSHOT_FORMAT: i64 = 16;
 
 /// A folded snapshot of the directory log (`memory_system.directory_snapshot`): the state after the log's
 /// first `events` changes, the last of them at `at`.
@@ -2022,6 +2077,7 @@ impl Directory {
                 continue;
             };
             match (e.op.as_str(), team, user) {
+                ("org.cleared", _, _) => org.cleared_at = e.at,
                 ("team.create", Some(t), _) => {
                     org.teams.entry(t.into()).or_default();
                 }
@@ -2131,6 +2187,13 @@ impl Directory {
                         && let Some(l) = limits_in(e.detail.as_deref())
                     {
                         org.own_limits = l.unwrap_or_default();
+                    }
+                    // So do its display name and aliases ([`names_in`]).
+                    if t.is_none()
+                        && let Some(n) = names_in(e.detail.as_deref())
+                    {
+                        org.display_name = n.display_name;
+                        org.aliases = n.aliases;
                     }
                     if let Some(set) = e
                         .detail
@@ -2287,11 +2350,14 @@ impl Directory {
                     signin_approved: o.signin_approved.clone(),
                     signin_declined: o.signin_declined.clone(),
                     created_at: o.created_at,
+                    cleared_at: o.cleared_at,
                     created_by: o.created_by.clone(),
                     limits: o.own_limits.clone(),
                     workspace: o.workspace.clone(),
                     settings: o.own_settings.clone(),
                     team_settings: o.team_settings.clone(),
+                    display_name: o.display_name.clone(),
+                    aliases: o.aliases.clone(),
                     tenant: o.tenant.clone(),
                     attrs: o.attrs.clone(),
                     forgotten: o.forgotten.clone(),
@@ -2369,6 +2435,7 @@ impl Directory {
                     signin_approved: o.signin_approved,
                     signin_declined: o.signin_declined,
                     created_at: o.created_at,
+                    cleared_at: o.cleared_at,
                     created_by: o.created_by,
                     limits: Default::default(),
                     workspace: o.workspace,
@@ -2376,6 +2443,8 @@ impl Directory {
                     team_settings: o.team_settings,
                     own_settings: o.settings,
                     own_limits: o.limits,
+                    display_name: o.display_name,
+                    aliases: o.aliases,
                     tenant: o.tenant,
                     attrs: o.attrs,
                     forgotten: o.forgotten,
@@ -2406,6 +2475,18 @@ impl Directory {
             k.last_used_at = usage.get(&k.sha256).copied();
         }
         self
+    }
+
+    /// The org `name` selects: the org of that name, else the one that has it as an alias (`set_names`). An org's
+    /// own name always wins over another's alias.
+    pub fn org_named<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+        if self.orgs.contains_key(name) {
+            return Some(name);
+        }
+        self.orgs
+            .iter()
+            .find(|(_, o)| o.aliases.contains(name))
+            .map(|(n, _)| n.as_str())
     }
 
     fn org(&self, org: &str) -> Result<&Org> {
@@ -3355,6 +3436,22 @@ pub enum Change {
         org: String,
         profile: Profile,
     },
+    /// Set what the org is shown as and the other names that select it (what it names; the rest stays as it
+    /// was). A display name is its admins' to set; aliases take names from everyone's, so they are the operator's,
+    /// as creating an org is. Its memory stays under its name either way.
+    SetNames {
+        org: String,
+        /// Null removes it.
+        #[serde(
+            default,
+            deserialize_with = "given",
+            skip_serializing_if = "Option::is_none"
+        )]
+        display_name: Option<Option<String>>,
+        /// All of them: an empty list removes every one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        aliases: Option<Vec<String>>,
+    },
     /// Set how the org's memory runs, or one team's (what it names; the rest stays as it was).
     SetSettings {
         org: String,
@@ -3528,6 +3625,7 @@ impl Change {
             | Change::Decline { .. }
             | Change::ApproveSignIn { .. }
             | Change::DeclineSignIn { .. }
+            | Change::SetNames { .. }
             | Change::SetLimits { .. } => true,
             // An org's models, its training log, which scopes its readers also search and which sign-ins it
             // takes (as binding it to Auth0 is theirs), and nothing else of its settings.
@@ -3593,6 +3691,7 @@ impl Change {
             | Change::ApproveSignIn { org, .. }
             | Change::DeclineSignIn { org, .. }
             | Change::SetProfile { org, .. }
+            | Change::SetNames { org, .. }
             | Change::SetSettings { org, .. }
             | Change::Sync { org, .. }
             | Change::SetProvider { org, .. }
@@ -4064,6 +4163,10 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             | Change::DeleteOrg { .. }
             | Change::SetAuth0Org { .. }
             | Change::SetLimits { .. }
+            | Change::SetNames {
+                aliases: Some(_),
+                ..
+            }
     );
     let imports = matches!(change, Change::ImportKeys { .. });
     // Asking to join is the asker's own: checked below, where the org is known.
@@ -4100,7 +4203,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
         refuse!(
             "{me} may not change org {org_name}{}",
             if owner_only {
-                " (creating and deleting orgs, binding them to Auth0 and setting their limits needs the catalog owner or an admin key)"
+                " (creating and deleting orgs, binding them to Auth0, setting their limits and giving them aliases needs the catalog owner or an admin key)"
             } else {
                 " (only its admins may)"
             }
@@ -4110,6 +4213,9 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
     if let Change::CreateWorkspace { spec, .. } = change {
         if dir.orgs.contains_key(org_name) {
             refuse!("org {org_name} already exists");
+        }
+        if let Some(other) = dir.org_named(org_name) {
+            refuse!("{org_name} is org {other}'s alias");
         }
         if dir.purging.contains(org_name) {
             refuse!(
@@ -4141,6 +4247,9 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
     {
         if dir.orgs.contains_key(org_name) {
             refuse!("org {org_name} already exists");
+        }
+        if let Some(other) = dir.org_named(org_name) {
+            refuse!("{org_name} is org {other}'s alias");
         }
         // Its old memory may still be in the catalog: a new org of that name must never read it.
         if dir.purging.contains(org_name) {
@@ -4435,6 +4544,60 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             let mut e = ev("org.profile");
             e.detail = Some(serde_json::to_string(profile)?);
             vec![e]
+        }
+        Change::SetNames {
+            display_name,
+            aliases,
+            ..
+        } => {
+            let mut n = Names {
+                display_name: org.display_name.clone(),
+                aliases: org.aliases.clone(),
+            };
+            if let Some(d) = display_name {
+                n.display_name = match d.as_deref().map(str::trim) {
+                    None | Some("") => None,
+                    Some(d) if d.chars().count() > MAX_DISPLAY_NAME => {
+                        invalid!("a display name is at most {MAX_DISPLAY_NAME} characters")
+                    }
+                    Some(d) if d.chars().any(char::is_control) => {
+                        invalid!("a display name is one line of text, with no control characters")
+                    }
+                    Some(d) => Some(d.to_string()),
+                };
+            }
+            if let Some(a) = aliases {
+                let a: BTreeSet<String> = a.iter().map(|x| x.trim().to_string()).collect();
+                if a.len() > MAX_ALIASES {
+                    invalid!("an org has at most {MAX_ALIASES} aliases");
+                }
+                for x in &a {
+                    if check_name("org", x).is_err() {
+                        invalid!(
+                            "invalid alias {x:?}: an alias is an org name (lower-case letters, digits and single underscores)"
+                        );
+                    }
+                    if x == org_name {
+                        invalid!("{x} is the org's own name, not an alias");
+                    }
+                    if let Some(other) = dir.org_named(x).filter(|o| *o != org_name) {
+                        refuse!("{x} is taken: it selects org {other}");
+                    }
+                    // Its old memory is still in the catalog, and the name will be free once it is purged.
+                    if dir.purging.contains(x) {
+                        refuse!(
+                            "{x} was an org whose memory isn't purged yet: it can't be an alias"
+                        );
+                    }
+                }
+                n.aliases = a;
+            }
+            if n.display_name == org.display_name && n.aliases == org.aliases {
+                vec![]
+            } else {
+                // As an org-wide settings change ([`names_in`]), written at version 1.
+                vec![ev("org.settings").detail(&json!({NAMES_KEY: n}).to_string())]
+            }
         }
         Change::SetSettings { team, settings, .. } => {
             if team.is_some() && settings.activity.is_some() {

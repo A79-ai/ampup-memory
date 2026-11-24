@@ -214,6 +214,15 @@ pub enum OrgCmd {
         #[arg(long)]
         confirm: Option<String>,
     },
+    /// Empty an org's memory and keep the org (the operator only): every episode, fact, session, note and piece of
+    /// advice of it and its teams goes, with their search indexes; its members, teams, keys and settings stay, so the
+    /// same people sign in to an empty memory. For an org nobody is using while it runs
+    Clear {
+        org: String,
+        /// The org's name again: there is no undo
+        #[arg(long)]
+        confirm: Option<String>,
+    },
     /// Write the org's memory (its own and each team's) to a directory: facts, entities and episodes
     /// as JSON lines, one directory per scope (org admins, or the operator). No keys or secrets
     Export {
@@ -395,6 +404,18 @@ pub enum OrgCmd {
         /// went, where the server sends mail (default true; each person can still unsubscribe)
         #[arg(long)]
         digest: Option<bool>,
+    },
+    /// Set what the org is shown as (org admins), or the other names that select it wherever its name goes:
+    /// `?org=`, `x-memstore-org`, `join --org` (the operator only). Its memory stays under its name, which
+    /// never changes. What isn't given stays as it is
+    Names {
+        org: String,
+        /// What it is shown as ("" removes it)
+        #[arg(long)]
+        display_name: Option<String>,
+        /// Every alias it has, comma-separated, replacing the ones it had ("" removes them all)
+        #[arg(long)]
+        aliases: Option<String>,
     },
     /// Bind the org to an Auth0 Organization (the operator only): a sign-in through the platform's Auth0
     /// tenant counts in the org only from that Organization (for example, the host application's org id)
@@ -1114,6 +1135,20 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             };
             print_json(&v)?;
         }
+        PeopleCmd::Org(OrgCmd::Clear { org, confirm }) => {
+            let v = match to.store {
+                Some(store) => {
+                    crate::offboard::clear_org(store, &owner(), org, confirm.as_deref()).await?
+                }
+                None => {
+                    let body = json!({"op": "clear_org", "org": org, "confirm": confirm});
+                    // Minutes on a busy catalog; the server finishes it even if this stops waiting.
+                    let wait = std::time::Duration::from_secs(30 * 60);
+                    client::call_waiting("POST", "/admin", Some(body), wait).await?
+                }
+            };
+            print_json(&v)?;
+        }
         PeopleCmd::Org(OrgCmd::Purge { org }) => {
             let v = match to.store {
                 Some(store) => crate::offboard::purge_retracted(store, &owner(), org).await?,
@@ -1281,6 +1316,27 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 )
                 .await?;
             }
+        }
+        PeopleCmd::Org(OrgCmd::Names {
+            org,
+            display_name,
+            aliases,
+        }) => {
+            anyhow::ensure!(
+                display_name.is_some() || aliases.is_some(),
+                "name what to set: --display-name, --aliases or both"
+            );
+            to.change(
+                Change::SetNames {
+                    org: org.clone(),
+                    display_name: display_name
+                        .clone()
+                        .map(|d| Some(d).filter(|d| !d.is_empty())),
+                    aliases: aliases.as_deref().map(|a| list(a, ',')),
+                },
+                false,
+            )
+            .await?;
         }
         PeopleCmd::Org(OrgCmd::BindAuth0 { org, auth0_org }) => {
             to.change(
@@ -2122,12 +2178,16 @@ async fn set_up_machine(
         );
     }
     // Already signed in there, as a member of the org: keep that sign-in and point the context at it.
-    let signed_in = match org {
+    // An alias of one of theirs is that org, kept under its own name.
+    let own = match org {
         Some(o) => client::call_on(server, Some(o), team, "GET", "/me", None)
             .await
-            .is_ok_and(|me| me["memberships"].get(o).is_some()),
-        None => false,
+            .ok()
+            .and_then(|me| client::member_org(&me, o)),
+        None => None,
     };
+    let signed_in = own.is_some();
+    let org = own.as_deref().or(org);
     match (dry, signed_in) {
         (true, true) => println!("signed in to {server} already: would keep it"),
         (true, false) => println!("would sign in to {server} (ampup-memory join)"),

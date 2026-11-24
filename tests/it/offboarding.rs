@@ -11,6 +11,9 @@
 //! - acme's admin forgets carol: her episodes are gone from search, queries and episode reads, through pins taken
 //!   before the forget too (a forget wins over a pin), and from every file in the warehouse and the search index;
 //!   everyone else's memory stays; a tombstone is in acme's audit and carol no longer belongs to acme;
+//! - the operator clears an org's memory (`clear_org`, its name repeated) and keeps the org: its admin and
+//!   another org's are refused and an unconfirmed clear changes nothing; after it nothing of the org's memory is
+//!   read or stored, and its admin still signs in and writes to it;
 //! - an org deleted only in the directory (a delete that stopped halfway) can't be created again until
 //!   `org delete` is run again, which finishes it;
 //! - `memstore org delete acme --confirm acme` (the operator): acme's key and people are refused, its
@@ -2037,6 +2040,102 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     until(s, "?org=initech", &ivy, &[], "a new initech", |r| {
         r.as_ref().is_some_and(|r| !r.contains("xqlatewrite"))
     })
+    .await;
+
+    // The operator clears initech's memory and keeps initech: ivy still signs in, to an empty memory that takes new
+    // writes. Only the operator, only with the org's name repeated; its admin and another org's are refused.
+    let cleared = remember(s, "?org=initech", &ivy, "xqclearme the initech owner note").await;
+    until(
+        s,
+        "?org=initech",
+        &ivy,
+        &[&cleared],
+        "initech's note read",
+        |r| r.as_ref().is_some_and(|r| r.contains("xqclearme")),
+    )
+    .await;
+    for who in [&ivy, &alice] {
+        let (status, body) = admin_as(
+            s,
+            who,
+            json!({"op": "clear_org", "org": "initech", "confirm": "initech"}),
+        )
+        .await;
+        assert_eq!(status, 403, "clear_org by a non-operator: {body}");
+    }
+    let (status, body) = admin_as(
+        s,
+        ADMIN_KEY,
+        json!({"op": "clear_org", "org": "initech", "confirm": "initch"}),
+    )
+    .await;
+    assert_eq!(status, 400, "clear_org unconfirmed: {body}");
+    assert!(
+        reads(s, "?org=initech", &ivy, &[&cleared])
+            .await
+            .is_some_and(|r| r.contains("xqclearme")),
+        "a refused clear took initech's memory"
+    );
+    let done = admin(
+        s,
+        json!({"op": "clear_org", "org": "initech", "confirm": "initech"}),
+    )
+    .await;
+    assert_eq!(done["cleared"], true, "{done}");
+    until(
+        s,
+        "?org=initech",
+        &ivy,
+        &[&cleared],
+        "initech cleared",
+        |r| r.as_ref().is_some_and(|r| !r.contains("xqclearme")),
+    )
+    .await;
+    assert!(
+        in_files("xqclearme").is_empty(),
+        "{:?}",
+        in_files("xqclearme")
+    );
+    // A clear done where a session ivy opened before it is still held (another server's buffer, flushed after):
+    // what it held is older than the clear, and is not initech's any more.
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "start_session",
+        "arguments": {"context": "xqheldsession deploy the initech api"}}});
+    let (status, held) = post(&format!("{s}/mcp?org=initech"), &ivy, &call).await;
+    assert_eq!(status, 200, "{held}");
+    memstore::offboard::clear_org(
+        &store,
+        &memstore::people::cli::owner(),
+        "initech",
+        Some("initech"),
+    )
+    .await
+    .unwrap();
+    memstore::sessions::flush().await.unwrap();
+    let activity = admin(s, json!({"op": "activity", "org": "initech"})).await;
+    assert!(
+        !activity.to_string().contains("xqheldsession"),
+        "a session from before the clear came back: {activity}"
+    );
+    assert!(
+        in_files("xqheldsession").is_empty(),
+        "{:?}",
+        in_files("xqheldsession")
+    );
+    let again = remember(
+        s,
+        "?org=initech",
+        &ivy,
+        "xqafterclear a note after the clear",
+    )
+    .await;
+    until(
+        s,
+        "?org=initech",
+        &ivy,
+        &[&again],
+        "a write after the clear",
+        |r| r.as_ref().is_some_and(|r| r.contains("xqafterclear")),
+    )
     .await;
 
     // Acme is deleted by the operator: only with its name repeated. Its commits are in the ledger until then.

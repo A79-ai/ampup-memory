@@ -113,7 +113,7 @@ async fn advice_is_served_only_for_the_very_task_asked() {
             "do-it": {"when": "rank accounts by churn", "skills": []},
             "deploy": {"when": "deploy the billing service", "skills": []}}}},
         "assign": {}, "notes": {"work/do-it": "h"}, "acl": ["*"], "linked": "",
-        "written": {"work/do-it": {"runs": 4, "wrong": 0, "context": "", "format": "kinds-3-budgeted"}}});
+        "written": {"work/do-it": {"runs": 4, "wrong": 0, "context": "", "format": "kinds-4-general"}}});
     store
         .commit(
             &acme,

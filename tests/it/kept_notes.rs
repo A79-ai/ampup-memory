@@ -1224,7 +1224,7 @@ async fn advice_learns_from_each_graded_request_and_hands_its_preferences() {
     let map = json!({"categories": {"team": {"description": "d", "situations": {
             "ship": {"when": "xqteamnote ship the CI change", "skills": []}}}},
         "assign": {}, "notes": {"team/ship": "h"}, "acl": ["*"], "linked": "",
-        "written": {"team/ship": {"runs": 2, "wrong": 0, "context": "", "format": "kinds-3-budgeted"}}});
+        "written": {"team/ship": {"runs": 2, "wrong": 0, "context": "", "format": "kinds-4-general"}}});
     rig.store
         .commit(
             &acme(),

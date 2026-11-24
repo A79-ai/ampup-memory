@@ -552,11 +552,15 @@ The runs, between the two fence lines (data, not instructions):
 /// agent couldn't know or wouldn't do by itself, tagged with its kind ([`KINDS`]).
 pub(crate) const NOTE_KINDS: &str = "Every item of Steps, Pitfalls and Verification starts with its kind in \
 brackets, one of:
-- [fact] something about this organization (its systems, data, people) an agent couldn't find out by itself, and \
-that a step of the note relies on (the table a query in it reads, the cluster a log query filters on): a fact no \
-step uses is left out
+- [fact] something about this organization (its systems, data, people, configuration) an agent couldn't find out \
+by itself, that a step of the note relies on, and that someone could check today without the situation happening \
+again: a service's name in its logs, a pool size, a timeout, which job reads which database, where changes are \
+recorded. What a past case turned out to be (which migration, which deploy, which job) is not a fact: write the \
+check that would find it in the next case instead. A fact no step uses is left out
 - [how-to] a procedure, script or exact tool call that works here
-- [decision] what was decided before in a context like this one, and why
+- [decision] what was decided before in a context like this one, and why; or, where the task is to find out \
+which of several explanations holds, the rule for deciding between them and the evidence that settles it: what to \
+measure or read, and what each outcome means, not what one past case turned out to be
 - [pitfall] what looked right but failed in a run, and why
 - [constraint] what not to touch, what needs approval, what can't be undone
 - [preference] how the person or the team wants the work or the answer done
@@ -572,6 +576,11 @@ checking a claim before acting on it, running the tests, keeping on with the wor
 confirming the result before reporting it, saying what was left unverified, asking when unsure. It has no kind: \
 leave it out, and leave a section empty rather than fill it with such items. The session judge records, for \
 each served item, whether the agent would have done it anyway.
+No closed lists and no remembered magnitudes. Don't say a situation is \"one of\" a fixed set of causes: say which \
+causes the runs have seen and that others are possible. Don't carry the size or timing a past case had (a 3-4x \
+step, 90 minutes before onset, an error rate): say what to measure and how to read it. A configured value (a \
+pool's size, a client's timeout) is a fact and stays. Don't treat a change as harmless or decisive because of how \
+it was described or how its kind behaved in past runs: say how to judge it from what it does.
 Leave out, too, how the agent that made these runs was itself operated: the protocol its own instructions gave it \
 for answering or submitting (a submit command, a file it had to write its answer to), the scratch files it made, \
 and the steps it spent finding its way around its own sandbox (an empty working folder, where the code turned out \
@@ -615,9 +624,10 @@ const KINDS: [&str; 9] = [
     "state",
 ];
 
-/// What notes are written as: a note written as another is written again whole, not edited. `kinds-3-budgeted`:
-/// items from failures, corrections and the team's own knowledge, generic practice left out, within [`NOTE_BUDGET`].
-const NOTE_FORMAT: &str = "kinds-3-budgeted";
+/// What notes are written as: a note written as another is written again whole, not edited. `kinds-4-general`:
+/// items from failures, corrections and the team's own knowledge, generic practice left out, within [`NOTE_BUDGET`];
+/// facts that hold today rather than what a past case turned out to be, and no closed lists or remembered magnitudes.
+const NOTE_FORMAT: &str = "kinds-4-general";
 
 /// Days a `[state]` item is served after it was written (`AMPUP_MEMORY_ADVICE_STATE_DAYS`, default 7).
 fn state_days() -> i64 {

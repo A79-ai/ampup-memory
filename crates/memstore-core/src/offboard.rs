@@ -3035,6 +3035,91 @@ pub async fn purge_memory(store: &Store, org: &str) -> Result<(usize, usize)> {
     Ok((namespaces.len(), tables))
 }
 
+/// `clear_org`: empty `org`'s memory and keep the org. Every namespace of it and its teams goes with its search
+/// indexes, and its ledger rows with it: every episode, fact, session, note, piece of advice and lesson. Its members,
+/// teams, keys and settings stay in the directory, so the same people sign in to an empty memory (a rehearsal org
+/// cleared between runs, a trial org started over). The operator's alone, with the org's name in `confirm`, as a
+/// delete is. For an org nobody is using while it runs: what is written to it meanwhile may outlive the clear.
+/// Recorded in the org's audit. Run again, it clears what is there then.
+pub async fn clear_org(
+    store: &Store,
+    actor: &Actor,
+    org: &str,
+    confirm: Option<&str>,
+) -> Result<Value> {
+    if !actor.superuser {
+        return Err(refused(format!(
+            "{} may not clear org {org}'s memory: only the operator (an admin key or an operator sign-in) may",
+            actor.user
+        )));
+    }
+    if crate::check_name("org", org).is_err() {
+        return Err(Invalid(format!("invalid org name {org:?}")).into());
+    }
+    if confirm != Some(org) {
+        return Err(Invalid(format!(
+            "clearing deletes all of org {org}'s memory for good: confirm with \"confirm\": \"{org}\""
+        ))
+        .into());
+    }
+    if org == DEFAULT_ORG {
+        return Err(Invalid("the default org's memory can't be cleared".into()).into());
+    }
+    // Another cell's org: refused here, never cleared halfway from a server that doesn't hold it.
+    crate::cell::check_org(org)?;
+    let dir = Directory::load(store).await?;
+    let Some(entry) = dir.orgs.get(org) else {
+        return Err(refused(format!("no org {org}")));
+    };
+    let teams: Vec<String> = entry.teams.keys().cloned().collect();
+    // Before anything changes: a catalog that can't rewrite the ledger would leave the clear halfway.
+    store.check_rewrites().await?;
+    // First, in the directory: from now on nothing asked or written before it is the org's, so a slow writer that
+    // read it before the purge (a keep, a note's facts, a session held on a server) writes none of it after.
+    let me = actor.user.clone();
+    store
+        .append_directory_with(|dir| match dir.orgs.contains_key(org) {
+            // A new op: written at the version an engine from before it stops at, rather than skipping it.
+            true => {
+                let mut e = Event::new(&me, "org.cleared", org);
+                e.version = crate::people::directory::OPS_VERSION;
+                Ok(vec![e])
+            }
+            false => Err(refused(format!("no org {org}"))),
+        })
+        .await?;
+    let (namespaces, tables) = purge_memory(store, org).await?;
+    let ledger_rows = store.forget_ledger(org).await?;
+    // The org and its teams are scopes again, empty, as when they were made.
+    store.ensure_scope(&Scope::org(org)?).await?;
+    for t in &teams {
+        store.ensure_scope(&Scope::team(org, t)?).await?;
+    }
+    let detail = format!(
+        "clear org {org}: {namespaces} namespaces and {tables} tables purged, {ledger_rows} ledger rows removed; members, teams, keys and settings kept"
+    );
+    store
+        .append_audit(&[crate::audit::Entry {
+            at: chrono::Utc::now().timestamp_micros(),
+            kind: crate::audit::Kind::Change,
+            org: Some(org.to_string()),
+            actor: crate::audit::clean(&actor.user),
+            scope: None,
+            path: None,
+            detail: Some(detail),
+            status: None,
+            count: 1,
+            reads: 0,
+            writes: 0,
+            incarnation: None,
+        }])
+        .await?;
+    Ok(
+        serde_json::json!({"org": org, "cleared": true, "namespaces": namespaces, "tables": tables,
+                          "ledger_rows": ledger_rows, "teams": teams}),
+    )
+}
+
 /// `memstore org delete`, after the directory change: purge the org's namespaces and its search indexes,
 /// remove its rows from the ledger, the audit table and the key usage table, and record the delete in the audit log
 /// under no org (the org is gone; only the operator sees it). Can be run again.

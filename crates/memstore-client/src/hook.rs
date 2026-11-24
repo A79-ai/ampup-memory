@@ -1545,7 +1545,7 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
     }
     // What the person waits on is cut short: a slow memory adds nothing to the context rather than holding it up.
     let timeout = match (ending || event == "end", detached) {
-        _ if tries => FIRST_PROMPT_TRY,
+        _ if tries => first_prompt_try(harness),
         (_, true) => Duration::from_secs(30),
         (true, false) => Duration::from_millis(900),
         (false, false) => match event {
@@ -1712,9 +1712,13 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             // Once a session: a memory too slow for one try is not waited on again.
             let tries = tries && first("tried", session);
             // Each lookup by the try's deadline on its own: one that came back in time is kept when the other didn't.
-            let deadline = tokio::time::Instant::now() + FIRST_PROMPT_TRY;
+            let deadline = tokio::time::Instant::now() + first_prompt_try(harness);
             let (advised, recalled) = tokio::join!(
-                by(tries, deadline, advise(&client, &input, harness, prompt)),
+                by(
+                    tries,
+                    deadline,
+                    advise_until(&client, &input, harness, prompt, deadline)
+                ),
                 by(tries, deadline, async {
                     match recall_now {
                         true => {
@@ -2883,6 +2887,63 @@ async fn by<T>(
 /// hundred milliseconds, and the person barely notices this much before the agent starts.
 const FIRST_PROMPT_TRY: Duration = Duration::from_millis(1_500);
 
+/// How long a program's first prompt (`claude -p` or an SDK run, [`Harness::session_name`] `:sdk`) waits for the
+/// task's advice: nobody is at the keyboard, and a run shorter than the lookup otherwise ends before any later hook
+/// hands it on. Inside the harness's 15 s for the hook.
+const PROGRAM_FIRST_PROMPT_WAIT: Duration = Duration::from_secs(10);
+
+/// How long Claude Code's first prompt tries the memory: briefly where a person waits on it, longer for a program.
+fn first_prompt_try(harness: Harness) -> Duration {
+    match harness.session_name().ends_with(AUTOMATED) {
+        true => PROGRAM_FIRST_PROMPT_WAIT,
+        false => FIRST_PROMPT_TRY,
+    }
+}
+
+/// A session's name for a program's run.
+const AUTOMATED: &str = ":sdk";
+
+/// [`advise`], asked again until the task's advice comes or `deadline` passes, for a program's first prompt
+/// ([`first_prompt_try`]): a server past its wait for a hook answers nothing yet and keeps what its lookup finds for the
+/// session's next call, and a session still opening has no advice to ask for. A person's first prompt asks once.
+async fn advise_until(
+    client: &Client,
+    input: &Value,
+    harness: Harness,
+    prompt: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Option<String>> {
+    let program = harness.session_name().ends_with(AUTOMATED);
+    let mut line: Option<String> = None;
+    loop {
+        let asked = advise(client, input, harness, prompt).await;
+        let got = match asked {
+            Ok(Some(t)) if t.contains(ADVICE_LEAD) => {
+                return Ok(Some(match line {
+                    Some(l) => format!("{l}\n{t}"),
+                    None => t,
+                }));
+            }
+            Ok(got) => got,
+            Err(e) if line.is_none() => return Err(e),
+            Err(_) => None,
+        };
+        line = line.or(got);
+        let pause = Duration::from_millis(300);
+        if !program || tokio::time::Instant::now() + pause >= deadline {
+            // Nothing in time: a program's prompt goes on, and a copy asks again for the next hook to hand on.
+            if program && let Some(m) = marker("asked", session_of(input)) {
+                let _ = std::fs::remove_file(m);
+            }
+            return Ok(line);
+        }
+        if let Some(m) = marker("asked", session_of(input)) {
+            let _ = std::fs::remove_file(m);
+        }
+        tokio::time::sleep(pause).await;
+    }
+}
+
 /// Claude Code's first prompt of a session, which tries the memory for up to [`FIRST_PROMPT_TRY`] before going on
 /// as any other prompt does. Its copy's answer would reach the agent only at its first tool call's hook: after the
 /// first thing it did, which the session's notes and advice were about (a commit written one way, then amended to
@@ -3073,6 +3134,14 @@ async fn open_session(
     // last one went idle) carries it, so they read as one conversation.
     if !session_of(input).is_empty() {
         args["thread"] = json!(session_of(input));
+    }
+    // `AMPUP_MEMORY_SPLIT=train|test`, for an eval harness that runs its agent through the plugin: a test session
+    // reads advice and teaches nothing, so held-out tasks stay held out.
+    if let Ok(split) = std::env::var("AMPUP_MEMORY_SPLIT") {
+        let split = split.trim().to_ascii_lowercase();
+        if split == "train" || split == "test" {
+            args["split"] = json!(split);
+        }
     }
     let text = client.tool("start_session", kept_unless_off(args)).await?;
     let v: Value = serde_json::from_str(&text).context("start_session answered no JSON")?;

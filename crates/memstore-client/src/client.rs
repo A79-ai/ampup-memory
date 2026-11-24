@@ -375,8 +375,12 @@ fn random() -> String {
 }
 
 fn http() -> reqwest::Client {
+    http_for(Duration::from_secs(30))
+}
+
+fn http_for(wait: Duration) -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(wait)
         .build()
         .expect("http client")
 }
@@ -721,6 +725,21 @@ pub async fn call(method: &str, path: &str, body: Option<Value>) -> Result<Value
     call_on(server, ctx.get("org"), ctx.get("team"), method, path, body).await
 }
 
+/// `call`, waiting up to `wait` for the answer: for what takes minutes on the server (an org's clear).
+pub async fn call_waiting(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    wait: Duration,
+) -> Result<Value> {
+    let ctx = Config::load()?.context();
+    let server = ctx.get("server").context(
+        "no server: `ampup-memory join <url>`, or `ampup-memory config set server <url>`",
+    )?;
+    let org = ctx.get("org");
+    call_as(server, org, org, ctx.get("team"), method, path, body, wait).await
+}
+
 /// A request to `server` as the user signed in to it, selecting `org` and `team`.
 pub async fn call_on(
     server: &str,
@@ -730,11 +749,22 @@ pub async fn call_on(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value> {
-    call_as(server, org, org, team, method, path, body).await
+    call_as(
+        server,
+        org,
+        org,
+        team,
+        method,
+        path,
+        body,
+        Duration::from_secs(30),
+    )
+    .await
 }
 
 /// A request to `server` with the sign-in kept for `signed_in` (an org's own, else the server's), selecting
 /// `org` and `team`: `join` asks who it signed in as before any org is selected, with the sign-in it just made.
+#[allow(clippy::too_many_arguments)]
 async fn call_as(
     server: &str,
     signed_in: Option<&str>,
@@ -743,14 +773,15 @@ async fn call_as(
     method: &str,
     path: &str,
     body: Option<Value>,
+    wait: Duration,
 ) -> Result<Value> {
     let mut creds = Credentials::load_for(server, signed_in)?
         .with_context(|| format!("not signed in to {server}: run {}", sign_in_hint()))?;
     let bearer = creds.bearer().await?;
     let url = format!("{server}{path}");
     let mut req = match method {
-        "GET" => http().get(&url),
-        _ => http().post(&url).json(&body.unwrap_or(json!({}))),
+        "GET" => http_for(wait).get(&url),
+        _ => http_for(wait).post(&url).json(&body.unwrap_or(json!({}))),
     }
     .bearer_auth(bearer);
     if let Some(o) = org {
@@ -798,7 +829,18 @@ pub async fn join(
     println!("Signed in as {}", creds.user);
     // Through an org's own provider the sign-in is kept under that org (`<server>#<org>`), not the server.
     let signed_in = creds.org();
-    let me = match call_as(server, signed_in, None, None, "GET", "/me", None).await {
+    let me = match call_as(
+        server,
+        signed_in,
+        None,
+        None,
+        "GET",
+        "/me",
+        None,
+        Duration::from_secs(30),
+    )
+    .await
+    {
         Ok(me) => me,
         // The provider says it hasn't verified the email: the server takes such a sign-in nowhere but an org
         // whose admins approved it. Say so, rather than the server's bare refusal.
@@ -810,11 +852,12 @@ pub async fn join(
         ),
         Err(e) => return Err(e),
     };
-    let member_of = |o: &str| me["memberships"].get(o).is_some();
-    let org = match org {
-        Some(o) if member_of(o) => o.to_string(),
-        Some(o) => return request_join(server, signed_in, o, &creds.user, &me).await,
-        None => {
+    // An alias of one of theirs is that org, kept under its own name.
+    let own = org.and_then(|o| member_org(&me, o));
+    let org = match (org, own) {
+        (_, Some(own)) => own,
+        (Some(o), None) => return request_join(server, signed_in, o, &creds.user, &me).await,
+        (None, None) => {
             let orgs: Vec<String> = me["memberships"]
                 .as_object()
                 .map(|m| m.keys().cloned().collect())
@@ -900,7 +943,17 @@ pub async fn join_with_key(
     let org = match org {
         Some(o) => o.to_string(),
         None => {
-            let me = call_as(server, None, None, None, "GET", "/me", None).await?;
+            let me = call_as(
+                server,
+                None,
+                None,
+                None,
+                "GET",
+                "/me",
+                None,
+                Duration::from_secs(30),
+            )
+            .await?;
             let orgs: Vec<String> = me["memberships"]
                 .as_object()
                 .map(|m| m.keys().cloned().collect())
@@ -917,6 +970,20 @@ pub async fn join_with_key(
         }
     };
     use_context(server, &org, team)
+}
+
+/// The org of the caller's (`/me`) that `named` selects: one of that name, else the one that has it as an alias.
+pub fn member_org(me: &Value, named: &str) -> Option<String> {
+    if me["memberships"].get(named).is_some() {
+        return Some(named.to_string());
+    }
+    me["names"].as_object()?.iter().find_map(|(org, n)| {
+        n["aliases"]
+            .as_array()?
+            .iter()
+            .any(|a| a == named)
+            .then(|| org.clone())
+    })
 }
 
 /// Add a context for `org` (and `team`) on `server` and switch to it.
@@ -1012,7 +1079,17 @@ async fn make_own_org(
 
     // The directory lists them in it now, or within a few seconds on another replica.
     for _ in 0..10 {
-        if let Ok(me) = call_as(server, None, None, None, "GET", "/me", None).await
+        if let Ok(me) = call_as(
+            server,
+            None,
+            None,
+            None,
+            "GET",
+            "/me",
+            None,
+            Duration::from_secs(30),
+        )
+        .await
             && me["memberships"].get(&org).is_some()
         {
             return Ok(org);
@@ -1027,7 +1104,17 @@ async fn make_own_org(
         ..Default::default()
     };
     let again = login(Some(server), &opts).await?;
-    let me = call_as(server, again.org(), Some(&org), None, "GET", "/me", None).await?;
+    let me = call_as(
+        server,
+        again.org(),
+        Some(&org),
+        None,
+        "GET",
+        "/me",
+        None,
+        Duration::from_secs(30),
+    )
+    .await?;
     anyhow::ensure!(
         me["memberships"].get(&org).is_some(),
         "{org} was made, but {server} doesn't count {} in it yet: run this again in a minute",
@@ -1111,7 +1198,18 @@ async fn request_join(
         return Ok(());
     }
     let body = json!({"op": "request_join", "org": org});
-    match call_as(server, signed_in, None, None, "POST", "/admin", Some(body)).await {
+    match call_as(
+        server,
+        signed_in,
+        None,
+        None,
+        "POST",
+        "/admin",
+        Some(body),
+        Duration::from_secs(30),
+    )
+    .await
+    {
         Ok(_) => println!(
             "{user} isn't a member of {org} on {server} yet: asked to join it. The org's admins have been emailed to approve; once they do, run this again."
         ),

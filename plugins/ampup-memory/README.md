@@ -136,6 +136,7 @@ OPENROUTER_API_KEY=... ampup-memory service install   # ampup-memory service sta
 | `AMPUP_MEMORY_TOKEN` | the CLI's sign-in to that server | A bearer token to send to `AMPUP_MEMORY_URL` instead (an API key, for CI); ignored without `AMPUP_MEMORY_URL`. |
 | `AMPUP_MEMORY_SCOPE` | the team's | `mine` keeps sessions, notes and recall in your own memory, which only you can read. |
 | `AMPUP_MEMORY_CAPTURE` | on | Set it to `off` to stop sessions being remembered: no trace when they end, and the server keeps nothing you say in them as your memory (from 0.4.6). Advice and recall still work. |
+| `AMPUP_MEMORY_SPLIT` | unset | For an eval harness running its agent through the plugin: `train` sessions teach advice by their reward, `test` sessions read advice and teach nothing. |
 | `AMPUP_MEMORY_RECALL` | first prompt | `every` recalls facts on every prompt. Advice comes on the first prompt only. |
 | `AMPUP_MEMORY_QUICK_RATE` | on | `quiet`: `+` and `-` still rate the session, but Stop never says so. `off`: neither; a bare `+` or `-` goes to Claude. The rating commands work either way. |
 | `AMPUP_MEMORY_INSTALL_DIR` | `~/.local/bin` | Where the plugin looks for `ampup-memory-client` and installs it, and for `ampup-memory`, the local server. |

@@ -295,6 +295,8 @@ struct Caller {
 /// The memory a caller is entitled to for a selection (`Err`: refused), per the rule in this file's header.
 /// For an ingest key this is where its selection points; it reads nothing there.
 fn entitled(kind: &Kind, org: Option<&str>, team: Option<&str>) -> Result<Scope, ()> {
+    // An alias selects the org it is one of, and nothing more.
+    let org = org.map(|o| if o == ACME_ALIAS { "acme" } else { o });
     match kind {
         Kind::Operator => match (org, team) {
             (None, None) => Ok(Scope::Org),
@@ -402,6 +404,9 @@ fn assert_sees(what: &str, body: &str, want: &[String]) {
     );
 }
 
+/// The other name acme goes by (`set_names`): selecting it is selecting acme, for every caller on every path.
+const ACME_ALIAS: &str = "acme_co";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
     let issuer = start_idp().await;
@@ -462,6 +467,7 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
             {"user": "carol@acme.com", "teams": ["a1"]},
             {"user": "dan@acme.com", "teams": ["a2"]}]}),
         json!({"op": "set_profile", "org": "acme", "profile": {"description": "xprofalpha"}}),
+        json!({"op": "set_names", "org": "acme", "aliases": [ACME_ALIAS]}),
         json!({"op": "create_org", "org": "globex", "admin": "gary@globex.com"}),
         json!({"op": "create_team", "org": "globex", "team": "b1"}),
         json!({"op": "invite", "org": "globex", "members": [{"user": "erin@globex.com", "teams": ["b1"]}]}),
@@ -554,6 +560,16 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
         "{raw}"
     );
     let person = |email: &str| id_token(&issuer, email);
+    // Aliases take names from everyone's: an org's own admin can't give it one, or point one at it.
+    for (who, org) in [("alice@acme.com", "acme"), ("gary@globex.com", "globex")] {
+        let (status, body) = post(
+            &format!("{s}/admin"),
+            &person(who),
+            &json!({"op": "set_names", "org": org, "aliases": ["initech"]}),
+        )
+        .await;
+        assert_eq!(status, 403, "{who} gave {org} an alias: {body}");
+    }
     // A session is its owner's alone, though it lives in the org's memory: its transcript reaches no one else on
     // any path (by id included), and no one else, in the org or not, can advise in it, keep in it or end it.
     let (_, raw) = mcp_call(
@@ -887,10 +903,12 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
             kind: Kind::Operator,
         },
     ];
-    let selections: [(Option<&str>, Option<&str>); 9] = [
+    let selections: [(Option<&str>, Option<&str>); 11] = [
         (None, None),
         (Some("acme"), None),
         (Some("acme"), Some("a1")),
+        (Some(ACME_ALIAS), None),
+        (Some(ACME_ALIAS), Some("a1")),
         (Some("acme"), Some("a2")),
         (None, Some("a1")),
         (None, Some("a2")),

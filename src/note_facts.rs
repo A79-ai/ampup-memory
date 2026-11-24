@@ -44,11 +44,18 @@ pub fn is_shared(source: &str) -> bool {
         .is_some_and(|(author, rest)| author == crate::keep::SHARER && rest == "shared")
 }
 
-/// Whether the writer of note `source` may still have it in `scope`: not disabled, not removed from its org, and the
-/// org not being deleted. The team's shared notes are the org's.
-fn still_theirs(dir: &crate::people::directory::Directory, scope: &Scope, source: &str) -> bool {
+/// Whether the writer of note `source`, written at `at`, may still have it in `scope`: not disabled, not removed from
+/// its org, and the org neither being deleted nor emptied since (`clear_org`). The team's shared notes are the org's.
+fn still_theirs(
+    dir: &crate::people::directory::Directory,
+    scope: &Scope,
+    source: &str,
+    at: i64,
+) -> bool {
     if let Some(org) = scope.org_name()
-        && (dir.purging.contains(org) || dir.purged.contains(org))
+        && (dir.purging.contains(org)
+            || dir.purged.contains(org)
+            || dir.orgs.get(org).is_some_and(|o| at < o.cleared_at))
     {
         return false;
     }
@@ -137,7 +144,7 @@ pub async fn backfill(store: &Store, scope: &Scope) -> Result<usize> {
         let dir = store.directory().await?;
         let facts: Vec<Fact> = chunk
             .iter()
-            .filter(|(_, source, _)| still_theirs(&dir.dir, scope, source))
+            .filter(|(_, source, at)| still_theirs(&dir.dir, scope, source, *at))
             .filter_map(|(id, source, at)| fact_of(id, source, bodies.get(*id)?, *at))
             .collect();
         if facts.is_empty() {

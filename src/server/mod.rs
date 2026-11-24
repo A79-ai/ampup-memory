@@ -2226,7 +2226,7 @@ async fn listen(
         let mut closing = state.closing.subscribe();
         tokio::spawn(async move {
             let _held = held;
-            let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
+            let svc = hyper::service::service_fn(move |mut req: Request<Incoming>| {
                 let state = state.clone();
                 let answering = answering.clone();
                 async move {
@@ -2242,7 +2242,8 @@ async fn listen(
                     let route = audit::metric_route(req.uri().path());
                     let started = Instant::now();
                     // Its lines name the org it selected, then the one its scope is in (`log_org`).
-                    let selected = selection(&req).0;
+                    // An alias is taken as the org it names, from here on ([`named_org`]).
+                    let selected = named_org(&state, &mut req).await;
                     crate::log_org::with(selected.clone().as_deref(), async move {
                         // A request for another cell's org, answered by that cell (or 503), never here.
                         let to = (!internal)
@@ -6896,6 +6897,22 @@ async fn handle(
             .ok()
             .filter(|_| reads)
             .map_or(json!({}), |d| d.memberships(who.user(), &via));
+        // What each of their orgs is shown as, and the other names that select it (`set_names`): `join --org` takes
+        // an alias as the org it is one of. Their own orgs' only.
+        let names: serde_json::Map<String, Value> = match (&dir, memberships.as_object()) {
+            (Ok(d), Some(m)) => m
+                .keys()
+                .filter_map(|o| d.orgs.get(o).map(|org| (o, org)))
+                .filter(|(_, org)| org.display_name.is_some() || !org.aliases.is_empty())
+                .map(|(o, org)| {
+                    (
+                        o.clone(),
+                        json!({"display_name": org.display_name, "aliases": org.aliases}),
+                    )
+                })
+                .collect(),
+            _ => Default::default(),
+        };
         // The orgs this person asked to join and no admin has answered yet (`request_join`).
         let pending: Vec<String> = dir
             .as_ref()
@@ -6933,7 +6950,7 @@ async fn handle(
             StatusCode::OK,
             // `admin`: may manage orgs (an admin key, or an operator; the control plane's operator screens).
             json!({"user": who.user(), "groups": who.groups(), "admin": superuser || via.operator, "scope": scope,
-                   "refused": refused, "memberships": memberships, "profile": profile,
+                   "refused": refused, "memberships": memberships, "names": names, "profile": profile,
                    "signed_in_for": via.orgs, "provider_groups": via.groups, "api_key": via.key,
                    "auth0_orgs": auth0_orgs, "pending": pending, "signin": signin}),
         ));
@@ -8800,6 +8817,31 @@ impl View {
     }
 }
 
+/// The org a request selects ([`selection`]), an alias (`set_names`) taken as the org it is one of: the request
+/// then names that org in `x-memstore-org`, so everything after (its cell, the provider it signs in with, its
+/// scope, `/admin`) sees the org's own name, and membership is checked against that org alone. A name that is
+/// no alias stays as it is.
+async fn named_org(state: &State, req: &mut Request<Incoming>) -> Option<String> {
+    let named = selection(req).0?;
+    let store = state.store.read().unwrap().clone();
+    let org = store
+        .directory_behind()
+        .await
+        .ok()
+        .and_then(|f| f.dir.org_named(&named).map(str::to_string))
+        .filter(|o| *o != named);
+    let Some(org) = org else {
+        return Some(named);
+    };
+    match org.parse() {
+        Ok(v) => {
+            req.headers_mut().insert("x-memstore-org", v);
+            Some(org)
+        }
+        Err(_) => Some(named),
+    }
+}
+
 fn selection(req: &Request<Incoming>) -> (Option<String>, Option<String>) {
     let query: HashMap<&str, &str> = req
         .uri()
@@ -9730,6 +9772,23 @@ async fn directory_change(
     }
     let mut req: Value =
         serde_json::from_slice(body).map_err(|_| Invalid("body is not JSON".into()))?;
+    // An alias names the org it is one of (`set_names`), as it does in `x-memstore-org`: the change is checked
+    // and made against that org. Not when creating one, where the name is the new org's own (and refused if it
+    // is an alias).
+    if !matches!(req["op"].as_str(), Some("create_org" | "create_workspace"))
+        && let Some(named) = req["org"].as_str().map(str::to_string)
+    {
+        let store = state.store.read().unwrap().clone();
+        if let Some(org) = store
+            .directory_behind()
+            .await?
+            .dir
+            .org_named(&named)
+            .filter(|o| *o != named)
+        {
+            req["org"] = json!(org);
+        }
+    }
     // The op, for a slow request's line: what it went on to wait on is marked after it.
     crate::phases::mark(op_label(req["op"].as_str().unwrap_or_default()));
     // A provisioner key's ops, and nothing else, whatever comes below: what each may change is
@@ -10827,6 +10886,51 @@ async fn directory_change(
             json!({"org": org, "team": req["team"], "learning": true, "resort": resort,
                    "rewrite": req["rewrite"], "force": force}),
         );
+    }
+    if req["op"] == "clear_org" {
+        // The operator empties an org's memory and keeps the org (`crate::offboard::clear_org`).
+        let actor = Actor {
+            user: who.user().to_string(),
+            superuser,
+            via: via.clone(),
+            owner: false,
+            file_keys: Default::default(),
+        };
+        let org = req["org"]
+            .as_str()
+            .ok_or_else(|| Invalid("which org?".into()))?;
+        let org = org.to_string();
+        let confirm = req["confirm"].as_str().map(String::from);
+        let state = state.clone();
+        // A clear takes minutes on a busy catalog: it runs on its own, so a caller that stops waiting (a client's
+        // timeout, a closed connection) never stops it halfway. The caller hears how it ended when it waits that long.
+        let clearing = tokio::spawn(async move {
+            // Sessions held here are written first, so none is left to write into the empty memory after (one
+            // written later anyway is older than the clear, and dropped: `sessions::still_theirs`).
+            if superuser {
+                crate::sessions::flush().await.context(
+                    "sessions held here couldn't be written before the clear: nothing cleared",
+                )?;
+            }
+            let done = crate::offboard::clear_org(&store, &actor, &org, confirm.as_deref()).await;
+            // Nothing of what was there is served from this server's caches, nor kept in the training log: also
+            // after a clear that stopped partway (run again, it finishes). Not after a refusal, which changed nothing.
+            let refused = done.as_ref().err().is_some_and(|e| {
+                e.downcast_ref::<crate::people::directory::Invalid>()
+                    .is_some()
+                    || e.downcast_ref::<crate::people::directory::Refused>()
+                        .is_some()
+            });
+            if superuser && !refused {
+                after_org_delete(&state, &org).await;
+            }
+            match &done {
+                Ok(v) => eprintln!("clear_org {org}: done: {v}"),
+                Err(e) => eprintln!("clear_org {org}: failed: {e:#}"),
+            }
+            done
+        });
+        return clearing.await.context("the clear stopped")?;
     }
     if req["op"] == "forget_user"
         || req["op"] == "export_org"

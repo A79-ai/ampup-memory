@@ -1102,7 +1102,8 @@ async fn settle(done: &[(Key, u64)]) {
 }
 
 /// Whether row `l`'s asker may still have it in `scope`: not disabled, not removed from its org, and the org neither
-/// deleted nor made again since the session opened (a new org of the same name is another tenant).
+/// deleted, made again nor emptied (`clear_org`) since the session opened (a new org of the same name is another
+/// tenant).
 pub(crate) fn still_theirs(dir: &Directory, scope: &Scope, l: &Logged) -> bool {
     let id = crate::people::directory::user_id(&l.asker);
     if dir.disabled.get(&id) == Some(&true) {
@@ -1116,7 +1117,7 @@ pub(crate) fn still_theirs(dir: &Directory, scope: &Scope, l: &Logged) -> bool {
     }
     dir.orgs
         .get(org)
-        .is_some_and(|o| !o.removed(&id) && l.asked_at >= o.created_at)
+        .is_some_and(|o| !o.removed(&id) && l.asked_at >= o.since())
 }
 
 /// The messages each session's keep read already, by session, in this process ([`keep_later`]), as their words
