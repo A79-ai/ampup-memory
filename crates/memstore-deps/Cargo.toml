@@ -16,6 +16,10 @@ crate-type = ["dylib"]
 
 [dependencies]
 aes-gcm.workspace = true
+pdf-extract.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+htmd.workspace = true
 base64.workspace = true
 anyhow.workspace = true
 arrow-arith.workspace = true
@@ -64,6 +68,7 @@ quick_cache.workspace = true
 libc.workspace = true
 tikv-jemalloc-ctl.workspace = true
 tikv-jemallocator.workspace = true
+backtrace.workspace = true
 prometheus.workspace = true
 schemars.workspace = true
 ed25519-dalek.workspace = true

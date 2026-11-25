@@ -47,6 +47,11 @@ pub enum Origin {
 /// several people said it.
 pub const KEPT: &str = "keep";
 pub const SHARED: &str = "memstore:shared";
+/// What follows the remembered-note prefix in the source of a fact the server wrote as the org's because enough
+/// people's own memories showed it (`memstore::facts_share`), then the weakest origin among those it rests on
+/// (`agent` or `stated`), its entity and its predicate: `mcp:remember_memory:memstore:shared-fact:agent:repo:acme/api:
+/// command`. Its origin is that one: a fact learned from coding sessions (an agent's records) stays an agent's.
+pub const SHARED_FACT: &str = "memstore:shared-fact";
 /// What follows a person in the source of a fact they added themselves (`add_fact`), before the source they
 /// named: `mcp:remember_memory:<them>:memstore:fact:<label>`. Under `memstore:`, which no note may take, so only
 /// the server files it.
@@ -80,10 +85,14 @@ impl Origin {
                 return Origin::Stated;
             }
             let kept = rest == KEPT || rest.strip_prefix(KEPT).is_some_and(|r| r.starts_with(':'));
-            let shared = source
+            let after = source
                 .strip_prefix(crate::REMEMBER_SOURCE)
-                .and_then(|s| s.strip_prefix(':'))
-                == Some(SHARED);
+                .and_then(|s| s.strip_prefix(':'));
+            // A fact shared from people's own memories is stated only where each it rests on was.
+            let shared = after == Some(SHARED)
+                || after
+                    .and_then(|s| s.strip_prefix(SHARED_FACT))
+                    .is_some_and(|r| r.starts_with(":stated:"));
             let added = added(rest) && !author_is_key(source);
             return match kept || shared || added {
                 true => Origin::Stated,

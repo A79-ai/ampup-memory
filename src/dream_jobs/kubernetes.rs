@@ -355,7 +355,7 @@ impl Launcher {
             return Ok(job);
         }
         let Some(ex) = job.executions.last() else {
-            return Ok(job);
+            return fail_unlaunched(store, scope, who, job, NEVER_LAUNCHED).await;
         };
         let failure = |observed: &Option<Value>| -> Result<Option<String>> {
             let error = match observed {
@@ -475,6 +475,45 @@ fn unlaunched_grace_micros() -> i64 {
         .saturating_mul(1_000_000)
 }
 
+/// Why a run [`fail_unlaunched`] failed, when no later scheduled pass took its place.
+pub(crate) const NEVER_LAUNCHED: &str = "never launched (its API process stopped, or missed the launch lease, before launching it); resume it with run_dream";
+
+/// A run recorded but never launched (its API process stopped, or never got the launch lease, between recording and
+/// launching it) has no execution to observe, so nothing else ever settles it: past [`unlaunched_grace_micros`],
+/// it is failed with `why`, and `run_dream` launches it. Rechecked under its launch lease, so a launch that got
+/// there first stands. Any other run is returned as it is.
+pub(crate) async fn fail_unlaunched(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    job: Job,
+    why: &str,
+) -> Result<Job> {
+    if !job.executions.is_empty()
+        || !matches!(job.status, Status::Pending | Status::Running)
+        || crate::now_micros() - job.created_at <= unlaunched_grace_micros()
+    {
+        return Ok(job);
+    }
+    let lock = control(store, scope, &job.id).await?;
+    let controlled = lock.store(store);
+    let failed = async {
+        let mut latest = super::get(&controlled, scope, who, &job.id).await?;
+        if latest.executions.is_empty()
+            && matches!(latest.status, Status::Pending | Status::Running)
+        {
+            latest.status = Status::Failed;
+            latest.error = Some(why.into());
+            latest.ended_at = Some(crate::now_micros());
+            latest = super::save(&controlled, scope, who, latest).await?;
+        }
+        anyhow::Ok(latest)
+    }
+    .await;
+    lock.finish(&controlled).await;
+    failed
+}
+
 pub(crate) async fn control(store: &Store, scope: &Scope, id: &str) -> Result<Turn> {
     Turn::acquire(
         store,
@@ -562,35 +601,18 @@ pub async fn schedule(
                         // A manual run recorded but never launched (its API process died or lost the launch
                         // lease) would otherwise hold every later tick back forever. Past the time a launch
                         // takes, fail it and let this tick record its own pass.
-                        if observed.executions.is_empty()
-                            && crate::now_micros() - observed.created_at > unlaunched_grace_micros()
-                        {
-                            let lock = control(&writing, scope, &observed.id).await?;
-                            let controlled = lock.store(&writing);
-                            let failed = async {
-                                let mut latest =
-                                    super::get(&controlled, scope, &creator, &observed.id).await?;
-                                if latest.executions.is_empty()
-                                    && matches!(latest.status, Status::Pending | Status::Running)
-                                {
-                                    latest.status = Status::Failed;
-                                    latest.error = Some(
-                                        "never launched; a later scheduled pass superseded it"
-                                            .into(),
-                                    );
-                                    latest.ended_at = Some(crate::now_micros());
-                                    latest =
-                                        super::save(&controlled, scope, &creator, latest).await?;
-                                }
-                                anyhow::Ok(latest)
-                            }
-                            .await;
-                            lock.finish(&controlled).await;
-                            if matches!(failed?.status, Status::Failed) {
-                                continue;
-                            }
+                        let settled = fail_unlaunched(
+                            &writing,
+                            scope,
+                            &creator,
+                            observed,
+                            "never launched; a later scheduled pass superseded it",
+                        )
+                        .await?;
+                        if settled.status == Status::Failed {
+                            continue;
                         }
-                        return Ok(observed);
+                        return Ok(settled);
                     }
                 }
             }

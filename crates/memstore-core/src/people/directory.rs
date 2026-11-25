@@ -79,6 +79,8 @@ pub const MAX_PENDING: usize = 100;
 const MAX_READS: usize = 8;
 /// The most sources one compile round may take (`Settings::compile_batch`).
 const MAX_COMPILE_BATCH: usize = 100;
+/// The most people `share_people` may ask for: past an org's size, nothing is ever shared.
+const MAX_SHARE_PEOPLE: usize = 50;
 /// The most rewarded runs `advice_personal_runs` may name: the server's own bar for a person's first map
 /// (`AMPUP_MEMORY_ADVICE_MIN_NEW`) is 10 by default, and the setting only ever lowers bars.
 const MAX_PERSONAL_RUNS: usize = 10;
@@ -134,7 +136,7 @@ impl std::str::FromStr for PersonalRuns {
     }
 }
 /// What a scope's compile sources may be said to be (`Settings::compile_kind`); `""` unsets it.
-pub const COMPILE_KINDS: &[&str] = &["", "errors", "changes"];
+pub const COMPILE_KINDS: &[&str] = &["", "errors", "changes", "conversations"];
 /// How advice routes over a scope's compiled skills (`Settings::advice_skills`); `""` unsets it.
 pub const ADVICE_SKILLS: &[&str] = &["", "fallback", "together", "off"];
 /// How the MCP instructions and the session tools' descriptions read (`Settings::instructions`); `""` unsets it.
@@ -1172,6 +1174,13 @@ pub struct Settings {
     /// org's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compile_kind_sources: Option<Vec<String>>,
+    /// A kind for each group of the scope's compile sources: kind -> the source prefixes it is about
+    /// (`{"changes": ["github:"], "conversations": ["slack:", "email:"]}`). Each kind's sources compile with its
+    /// prompt, under a compiler id of their own (`crate::compile::plan`), so adding a group compiles no other again;
+    /// sources no kind here names compile as `compile_kind` and `compile_kind_sources` say. An empty map unsets it,
+    /// back to the org's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_kinds: Option<BTreeMap<String, Vec<String>>>,
     /// Whether the engine learns advice from the scope's rewarded runs and sessions on its own, and judges those
     /// nobody rewarded (`crate::advice_loop`): model calls over every recorder's traces. On unless set false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1218,6 +1227,18 @@ pub struct Settings {
     /// the org's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advice_learn_exclude: Option<Vec<String>>,
+    /// How many people must each show the same thing, each in their own memory, before everyone in the scope reads
+    /// it: a note the server kept from what they typed (`memstore::keep`), and, where `share_facts` is on, a fact of a
+    /// predicate the schema marks `share` (`memstore::facts_share`). Over the server's `AMPUP_MEMORY_SHARE_PEOPLE` (3).
+    /// At least 2: one person's memory never crosses. 0 unsets it, back to the org's (or the server's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_people: Option<usize>,
+    /// Whether a fact of a predicate the schema marks `share` (a repository's commands and conventions) that
+    /// `share_people` people each showed in their own memory (their coding sessions, notes) is written once as the
+    /// org's, in a sentence of words they all used, citing none of their sources (`memstore::facts_share`). An org
+    /// setting (a team's is refused); off unless set true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_facts: Option<bool>,
     /// Whether advice asked about an error (a Sentry short ID or issue link, an exception and its message, or stack
     /// frames) also leads to up to 3 similar past errors and the PRs that fixed them (`crate::error_leads`), from
     /// the `sentry:` and `github:` episodes the caller may read here and in the scopes this one reads: matched by
@@ -1407,6 +1428,7 @@ impl Settings {
             && self.compile_batch.is_none()
             && self.compile_kind.is_none()
             && self.compile_kind_sources.is_none()
+            && self.compile_kinds.is_none()
             && self.advice.is_none()
             && self.advice_procedures.is_none()
             && self.advice_evidence.is_none()
@@ -1414,6 +1436,8 @@ impl Settings {
             && self.advice_personal_runs.is_none()
             && self.advice_skills.is_none()
             && self.advice_learn_exclude.is_none()
+            && self.share_people.is_none()
+            && self.share_facts.is_none()
             && self.error_leads.is_none()
             && self.extract.is_none()
             && self.train_log.is_none()
@@ -1467,6 +1491,9 @@ impl Settings {
         if other.compile_kind_sources.is_some() {
             self.compile_kind_sources = other.compile_kind_sources;
         }
+        if other.compile_kinds.is_some() {
+            self.compile_kinds = other.compile_kinds;
+        }
         if other.advice.is_some() {
             self.advice = other.advice;
         }
@@ -1511,6 +1538,12 @@ impl Settings {
         }
         if other.advice_learn_exclude.is_some() {
             self.advice_learn_exclude = other.advice_learn_exclude.clone();
+        }
+        if other.share_people.is_some() {
+            self.share_people = other.share_people;
+        }
+        if other.share_facts.is_some() {
+            self.share_facts = other.share_facts;
         }
         if other.error_leads.is_some() {
             self.error_leads = other.error_leads;
@@ -2784,6 +2817,12 @@ impl Directory {
         })
     }
 
+    /// The kind for each group of `scope`'s compile sources (`Settings::compile_kinds`): its team's, else its org's;
+    /// none where neither sets one (`{}` is unset), or in a scope the directory doesn't hold.
+    pub fn compile_kinds(&self, scope: &crate::Scope) -> Option<BTreeMap<String, Vec<String>>> {
+        self.team_or_org(scope, |s| s.compile_kinds.clone().filter(|m| !m.is_empty()))
+    }
+
     /// A setting of `scope`'s team where it sets one, else of its org; none in a scope the directory doesn't hold.
     fn team_or_org<T>(
         &self,
@@ -2957,6 +2996,19 @@ impl Directory {
             .iter()
             .map(|u| crate::auth::acl::norm_id(u.trim()))
             .collect()
+    }
+
+    /// How many people must each show the same thing before `scope` shares it ([`Settings::share_people`]): its
+    /// team's setting, else its org's (0 is unset); none (the server's) where neither sets it, or in a scope the
+    /// directory doesn't hold.
+    pub fn share_people(&self, scope: &crate::Scope) -> Option<usize> {
+        self.team_or_org(scope, |s| s.share_people.filter(|n| *n > 0))
+    }
+
+    /// Whether `scope` shares facts enough people showed ([`Settings::share_facts`]): its org's setting; off where
+    /// it isn't set, and in a scope the directory doesn't hold.
+    pub fn shares_facts(&self, scope: &crate::Scope) -> bool {
+        self.setting(scope, |s| s.share_facts, false)
     }
 
     /// The model `scope` runs a job on (`pick`: [`Settings::extract_model`], `compile_model` or `aip_model`):
@@ -3677,6 +3729,8 @@ impl Change {
                     && settings.advice_personal_runs.is_none()
                     && settings.advice_skills.is_none()
                     && settings.advice_learn_exclude.is_none()
+                    && settings.share_people.is_none()
+                    && settings.share_facts.is_none()
                     && settings.extract.is_none()
                     && settings.classic_ranking.is_none()
                     && settings.freshness.is_none()
@@ -3838,6 +3892,29 @@ pub(crate) fn check_values(settings: &Settings) -> Result<()> {
             }
         }
     }
+    if let Some(kinds) = &settings.compile_kinds {
+        if kinds.values().map(Vec::len).sum::<usize>() > 50 {
+            invalid!("compile_kinds names at most 50 source prefixes");
+        }
+        let mut named = BTreeSet::new();
+        for (k, prefixes) in kinds {
+            if k.is_empty() || !COMPILE_KINDS.contains(&k.as_str()) || prefixes.is_empty() {
+                invalid!(
+                    "invalid compile_kinds entry {k:?}: a kind (\"errors\", \"changes\", \"conversations\") and the source prefixes it is about; {{}} unsets it"
+                );
+            }
+            for p in prefixes {
+                if p.trim().is_empty() || p.trim() != p || p.len() > 200 || p == "*" {
+                    invalid!(
+                        "invalid compile_kinds prefix {p:?} for {k}: a source prefix (slack:) the kind is about"
+                    );
+                }
+                if !named.insert(p.as_str()) {
+                    invalid!("compile_kinds names {p:?} for more than one kind");
+                }
+            }
+        }
+    }
     if let Some(users) = &settings.advice_learn_exclude {
         if users.len() > 50 {
             invalid!("advice_learn_exclude names at most 50 accounts");
@@ -3849,6 +3926,14 @@ pub(crate) fn check_values(settings: &Settings) -> Result<()> {
                 );
             }
         }
+    }
+    if settings
+        .share_people
+        .is_some_and(|n| n == 1 || n > MAX_SHARE_PEOPLE)
+    {
+        invalid!(
+            "share_people is 2 to {MAX_SHARE_PEOPLE} people (0 unsets it): at 1, one person's memory would reach everyone"
+        );
     }
     if settings
         .compile_batch
@@ -3881,7 +3966,7 @@ pub(crate) fn check_values(settings: &Settings) -> Result<()> {
         && !COMPILE_KINDS.contains(&k.as_str())
     {
         invalid!(
-            "invalid compile_kind {k:?}: \"errors\" (the sources are error reports), \"changes\" (records of single changes: one skill per procedure they repeat), or \"\" to unset it"
+            "invalid compile_kind {k:?}: \"errors\" (the sources are error reports), \"changes\" (records of single changes: one skill per procedure they repeat), \"conversations\" (meetings, chat threads, email: one skill per procedure that recurs in them), or \"\" to unset it"
         );
     }
     Ok(())
@@ -4649,6 +4734,9 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             if team.is_some() && settings.digest.is_some() {
                 invalid!("digest is the org's setting, not a team's: set it without a team");
             }
+            if team.is_some() && settings.share_facts.is_some() {
+                invalid!("share_facts is the org's setting, not a team's: set it without a team");
+            }
             let sets_signin = settings.require_mfa.is_some() || settings.require_sso.is_some();
             if team.is_some() && sets_signin {
                 invalid!(
@@ -4666,7 +4754,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             if settings.is_empty() {
                 invalid!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"compile_kind_sources\": [\"<source prefix>\"], \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"schema_growth\": true|false, \"pii\": true|false, \"digest\": true|false, \"require_mfa\": true|false, \"require_sso\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"advice_eval\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"fact_checks\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\"|\"changes\"|\"conversations\", \"compile_kind_sources\": [\"<source prefix>\"], \"compile_kinds\": {{\"<kind>\": [\"<source prefix>\"]}}, \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"share_people\": <people>, \"share_facts\": true|false, \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"schema_growth\": true|false, \"pii\": true|false, \"digest\": true|false, \"require_mfa\": true|false, \"require_sso\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"advice_eval\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"fact_checks\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             check_values(settings)?;

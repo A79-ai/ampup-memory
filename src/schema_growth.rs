@@ -511,6 +511,7 @@ fn drafted(
                     plan: false,
                     pending: vec![],
                     list: false,
+                    share: false,
                     same_as: None,
                 },
             );
@@ -529,6 +530,7 @@ fn drafted(
                     None => short(&d["description"]),
                 },
                 id_prefix: None,
+                org_knowledge: false,
                 predicates,
             },
         );

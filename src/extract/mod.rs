@@ -2687,6 +2687,11 @@ pub(crate) fn typed(scope: &Scope, ep: &Episode) -> bool {
     if crate::keep::hook_session_note(&ep.source) {
         return false;
     }
+    // A fact the server shared as the org's ([`crate::facts_share`]): its episode is the citation of the fact committed
+    // with it. Read, it would state the same value a second time.
+    if crate::facts_share::is_source(&ep.source) {
+        return false;
+    }
     // What a note's writer was served before writing it ([`crate::echo`]): ids, not words.
     if crate::echo::is_record(&ep.source) {
         return false;

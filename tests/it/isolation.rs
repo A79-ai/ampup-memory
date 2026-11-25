@@ -4078,6 +4078,8 @@ pub(crate) async fn dream_notes(
     )
     .await;
     assert!(!tool_text(&raw).1, "{raw}");
+    // The end holds its transcript for the next flush; the dream reads what is committed.
+    memstore::sessions::flush().await.unwrap();
     let ex = memstore::extract::Extractor::notes_dream_from_env()
         .unwrap()
         .expect("a model");
@@ -4306,6 +4308,20 @@ async fn an_approved_value_reaches_only_its_readers() {
         .await
         .unwrap();
     let p = call(&alice, json!({"op":"propose_branch","branch":"draft"})).await;
+    // Who may see a proposal is read from main's state and the rows its branch wrote, not from a build of the branch:
+    // Carol, who may read the note, is shown it; Dave, who may not, never is, and the branch's state says the same
+    // (checked beside it in debug builds).
+    for (token, shown) in [(&carol, true), (&dave, false)] {
+        let listed = call(token, json!({"op":"list_proposals"})).await;
+        let ids: Vec<&Value> = listed["proposals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| &p["id"])
+            .collect();
+        assert_eq!(ids.contains(&&p["proposal"]["id"]), shown, "{listed}");
+    }
+    assert_eq!(memstore::metrics::PROPOSAL_READ_DIVERGENCE.get(), 0);
     let r = call(&carol, json!({"op":"review_proposal","proposal":p["proposal"]["id"],"digest":p["proposal"]["digest"],"decision":"approve","expires_days":30})).await;
     assert_eq!(r["status"], "published", "{r}");
     // No one owns it now, so a later call goes straight to main (an owned thing's would wait for its owner), and
@@ -4913,11 +4929,73 @@ async fn a_platform_key_reaches_only_the_tenants_it_names() {
         }
     }
 
+    // A person's own document, kept in versions under its key: they read its newest version; another user of the
+    // tenant, the tenant itself and another platform's tenant of the same id read nothing of it.
+    for version in ["xdocfirst rep notes", "xdocsecond rep notes"] {
+        let (status, body) = platform_call(
+            s,
+            Method::POST,
+            "/ingest",
+            ACME_KEY,
+            &as_user("t_x", "u1"),
+            Some(
+                &json!({"episodes": [{"source": "note:xdoc", "document": "rep/u1", "body": version,
+                                       "occurred_at": now, "acl": ["user:u1"]}]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "a version of u1's document: {body}");
+    }
+    let doc = json!({"calls": [["rep/u1"]]});
+    for (key, tenant, user, want) in [
+        (ACME_KEY, "t_x", "u1", Some("xdocsecond")),
+        (ACME_KEY, "t_x", "u2", None),
+        (GLOBEX_KEY, "t_x", "u1", None),
+    ] {
+        let who = format!("{key} {tenant}/{user}");
+        let (status, body) = platform_call(
+            s,
+            Method::POST,
+            "/document",
+            key,
+            &as_user(tenant, user),
+            Some(&doc),
+        )
+        .await;
+        assert_eq!(status, 200, "{who} /document: {body}");
+        let reply = &serde_json::from_str::<Value>(&body).unwrap()["replies"][0];
+        match want {
+            Some(tag) => {
+                let text = reply["text"].as_str().unwrap_or_default();
+                assert!(
+                    text.contains(tag) && !text.contains("xdocfirst"),
+                    "{who} reads the newest version: {body}"
+                );
+            }
+            None => assert!(reply.is_null(), "{who} reads nothing: {body}"),
+        }
+    }
+    let (status, body) = platform_call(
+        s,
+        Method::POST,
+        "/document",
+        ACME_KEY,
+        &as_user("t_x", ""),
+        Some(&doc),
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "the tenant itself reads no one's document: {body}"
+    );
+    assert!(body.contains("user_required"), "{body}");
+
     // Without a tenant a platform key reads and writes nothing; it says who it is, and lists its tenants.
     for path in [
         "/search",
         "/query",
         "/episode",
+        "/document",
         "/ingest",
         "/remember",
         "/sessions",
@@ -5106,4 +5184,355 @@ async fn a_platform_key_reaches_only_the_tenants_it_names() {
             platform_call(s, Method::POST, "/episode", ACME_KEY, &h, Some(&episodes)).await;
         assert_eq!(status, 400, "{h:?}: {body}");
     }
+}
+
+/// A model API (OpenAI-compatible) standing in for the one an org fact's share asks (`memstore::facts_share`), out
+/// to leak: it groups every fact it is shown into one group, in a sentence that carries the one-person command and
+/// the unflagged contact title, and into another that is the one-person command alone. Asked to write a sentence
+/// again, it answers the shared command alone where the sentence names it, else the sentence unchanged.
+/// Anything else (extraction) finds nothing.
+async fn share_model() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        loop {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = vec![];
+                let mut chunk = [0u8; 8192];
+                let (start, len) = loop {
+                    let n = conn.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                        break (i + 4, len);
+                    }
+                };
+                while buf.len() < start + len {
+                    let n = conn.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let req: Value = serde_json::from_slice(&buf[start..start + len]).unwrap();
+                let prompt = req["messages"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find_map(|m| m["content"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let content = if prompt
+                    .starts_with("Below are facts about the organization's own things")
+                {
+                    let all: Vec<usize> = prompt
+                        .lines()
+                        .filter_map(|l| l.strip_prefix('[')?.split_once(']')?.0.parse().ok())
+                        .collect();
+                    json!({"shared": [
+                        {"text": "Run `make test-all` to run the tests, or `make test-xsecretcustomer` for xcontacttitle.", "notes": all},
+                        {"text": "Run `make test-xsecretcustomer` for the customer build.", "notes": all},
+                    ]})
+                    .to_string()
+                } else if prompt.starts_with("Rewrite this") {
+                    let sentence = prompt
+                        .split("Sentence: ")
+                        .nth(1)
+                        .and_then(|r| r.split("\n\n").next())
+                        .unwrap_or_default();
+                    match sentence.contains("test-all") {
+                        true => "Run `make test-all` to run the tests.".to_string(),
+                        false => sentence.to_string(),
+                    }
+                } else {
+                    "{}".to_string()
+                };
+                let body = json!({"choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+                                  "usage": {"prompt_tokens": 10, "completion_tokens": 10}})
+                .to_string();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                conn.write_all(head.as_bytes()).await.unwrap();
+                conn.write_all(body.as_bytes()).await.unwrap();
+                conn.shutdown().await.ok();
+            });
+        }
+    });
+    url
+}
+
+/// An org fact learned from people's own memories (`memstore::facts_share`, `share_facts` on, `share_people` 3) holds
+/// only what three members' memories each show, of a predicate the schema marks `share`, and cites none of them.
+/// Ana's, Ben's and Cy's coding sessions in acme/api, each theirs alone, say `make test-all` runs the tests; Ana's also
+/// names a command for one customer (`xsecretcustomer`), as do the sessions of a member set apart from the team's
+/// learning (`advice_learn_exclude`) and of someone outside the org filed in acme (four sessions, two people who
+/// count); all three say a contact's title (`xcontacttitle`), which no `share` predicate holds. The stand-in model
+/// groups everything together, planted words and all. Sam, who said nothing, reads the shared command and nothing
+/// else: by search (as a fact and as passages), and by the org fact's episode, which holds the sentence alone. No
+/// session is readable by him. Once Ana forgets her session, the next pass ends the org fact for everyone.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_org_fact_holds_only_what_enough_peoples_memories_show() {
+    if !crate::own_process("isolation::an_org_fact_holds_only_what_enough_peoples_memories_show") {
+        return;
+    }
+    let url = share_model().await;
+    // SAFETY: this test runs in a process of its own (`own_process`), before its server starts.
+    unsafe {
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "openai");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_KEEP", "off");
+        std::env::set_var("AMPUP_MEMORY_DECIDE", "off");
+        std::env::remove_var("AMPUP_MEMORY_SHARE_PEOPLE");
+    }
+    let issuer = start_idp().await;
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = platform::local_dir(dir.path()).await.unwrap();
+    let store =
+        Store::new(catalog.clone()).with_index_base(dir.path().join("index").display().to_string());
+    store.ensure_scope(&Scope::Org).await.unwrap();
+    let keys = json!([{"id": "platform", "sha256": auth::hex(&sha2::Sha256::digest(ADMIN_KEY.as_bytes())),
+                       "user": "svc:platform", "admin": true}]);
+    let tauth = TokenAuth::new(Some(&keys.to_string()), None)
+        .unwrap()
+        .allow_local_issuers()
+        .with_oidc(
+            OidcConfig::discover(&issuer, vec![CLIENT_ID.into()])
+                .await
+                .unwrap(),
+        );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(serve_with(
+        port,
+        Scope::Org,
+        vec![],
+        Options {
+            listener: Some(listener),
+            catalog: Some(catalog.clone()),
+            index_base: Some(store.index_base().to_string()),
+            token_auth: Some(tauth),
+            ..Default::default()
+        },
+    ));
+    let s = format!("http://127.0.0.1:{port}");
+    let s = s.as_str();
+    let up = Instant::now();
+    while CLIENT.get(s).send().await.is_err() {
+        assert!(
+            up.elapsed() < Duration::from_secs(30),
+            "server never came up"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let schema = json!({"name": "eng", "types": {
+        "repo": {"org_knowledge": true,
+                 "predicates": {"command": {"type": "text", "card": "many", "share": true}}},
+        "contact": {"predicates": {"title": {"type": "string"}}}}});
+    // What people know of a contact (a customer, a colleague) is never shared, however many know it: a schema
+    // marking it `share` is refused.
+    let mut shares_contacts = schema.clone();
+    shares_contacts["types"]["contact"]["predicates"]["title"]["share"] = json!(true);
+    let (status, body) = post(
+        &format!("{s}/admin"),
+        ADMIN_KEY,
+        &json!({"op": "create_org", "org": "initech", "admin": "alice@acme.com"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(
+        &format!("{s}/admin"),
+        ADMIN_KEY,
+        &json!({"op": "set_schema", "org": "initech", "schema": shares_contacts}),
+    )
+    .await;
+    assert_ne!(
+        status, 200,
+        "a schema sharing a contact's title was taken: {body}"
+    );
+    for change in [
+        json!({"op": "create_org", "org": "acme", "admin": "alice@acme.com"}),
+        json!({"op": "invite", "org": "acme", "members": [
+            {"user": "ana@acme.com"}, {"user": "ben@acme.com"}, {"user": "cy@acme.com"},
+            {"user": "sam@acme.com"}, {"user": "bot@acme.com"}]}),
+        json!({"op": "set_schema", "org": "acme", "schema": schema}),
+        json!({"op": "set_settings", "org": "acme", "settings": {"share_facts": true, "advice_learn_exclude": ["bot@acme.com"]}}),
+    ] {
+        admin(s, change).await;
+    }
+    let acme = Scope::org("acme").unwrap();
+    // Each person's session record, theirs alone, about the repository, with the facts extraction would find in it.
+    let session = |user: &str, id: &str, says: &[(&str, &str, &str)]| {
+        let body = says
+            .iter()
+            .map(|(_, _, v)| format!("User: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ep = Episode::sourced(
+            &format!("mcp:remember_memory:{user}:memstore:session:{id}"),
+            format!("Session {id}\n\nRepo: acme/api\n\nTask: tests\n\nTrace:\n{body}\n").as_bytes(),
+            &[format!("user:{user}").as_str()],
+        )
+        .with_about(&["repo:acme/api"]);
+        let facts: Vec<Fact> = says
+            .iter()
+            .map(|(e, p, v)| Fact::new(e, p, v).from_episodes(&[&ep]))
+            .collect();
+        (ep, facts)
+    };
+    let shared = ("repo:acme/api", "command", "`make test-all` runs the tests");
+    let secret = (
+        "repo:acme/api",
+        "command",
+        "`make test-xsecretcustomer` runs for xcontacttitle",
+    );
+    let title = ("contact:dana", "title", "xcontacttitle");
+    let mut ana_session = String::new();
+    for (user, says) in [
+        ("ana@acme.com", vec![shared, secret, title]),
+        ("ben@acme.com", vec![shared, title]),
+        ("cy@acme.com", vec![shared, title]),
+        ("bot@acme.com", vec![secret]),
+        ("outsider@globex.com", vec![secret]),
+    ] {
+        let (ep, facts) = session(user, &format!("s-{user}"), &says);
+        if user == "ana@acme.com" {
+            ana_session = ep.episode_id.clone();
+        }
+        store
+            .commit(&acme, "extract", std::slice::from_ref(&ep), &facts)
+            .await
+            .unwrap();
+    }
+    let ex = memstore::extract::Extractor::from_env()
+        .unwrap()
+        .expect("a model");
+    let wrote = memstore::facts_share::share(&store, &acme, &ex)
+        .await
+        .unwrap();
+    assert_eq!(
+        wrote, 1,
+        "the command three members' sessions show is shared, once"
+    );
+    let sam = id_token(&issuer, "sam@acme.com");
+    let search = async |q: &str| {
+        let (_, raw) = mcp_call(s, "?org=acme", &sam, "search_memory", json!({"query": q})).await;
+        tool_text(&raw).0
+    };
+    // An answer echoes its query: each is asked in words that aren't what it must not hold.
+    const SENTENCE: &str = "Run `make test-all` to run the tests.";
+    let mut answer = String::new();
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(20) {
+        answer = search("how do I run the acme api tests").await;
+        if answer.contains(SENTENCE) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        answer.contains(SENTENCE),
+        "Sam reads the org fact: {answer}"
+    );
+    for (q, planted) in [
+        ("how do I run the acme api tests", "secretcustomer"),
+        ("which command runs the customer build", "secretcustomer"),
+        ("what is dana's title at the contact", "xcontacttitle"),
+        ("how do I run the acme api tests", "s-ana"),
+    ] {
+        let answer = search(q).await;
+        assert!(!answer.contains(planted), "Sam read {planted:?}: {answer}");
+    }
+    // The org fact's episode holds the sentence alone; no one's session is Sam's to read.
+    let org_ep = memstore::Episode::sourced(
+        &memstore::facts_share::source(memstore::origin::Origin::Agent, "repo:acme/api", "command"),
+        SENTENCE.as_bytes(),
+        &["*"],
+    )
+    .episode_id;
+    let (_, raw) = mcp_call(
+        s,
+        "?org=acme",
+        &sam,
+        "get_episode",
+        json!({"episode_id": org_ep}),
+    )
+    .await;
+    assert_eq!(tool_text(&raw).0.trim(), SENTENCE, "{raw}");
+    let (_, raw) = mcp_call(
+        s,
+        "?org=acme",
+        &sam,
+        "get_episode",
+        json!({"episode_id": ana_session}),
+    )
+    .await;
+    assert!(
+        !tool_text(&raw).0.contains("make test-all"),
+        "Sam read Ana's session: {raw}"
+    );
+    // A pass as the next one would run: the tables as they are now.
+    let pass = async || {
+        let store = Store::new(catalog.clone())
+            .with_index_base(dir.path().join("index").display().to_string());
+        memstore::facts_share::share(&store, &acme, &ex)
+            .await
+            .unwrap();
+    };
+    let sees = async |want: bool| {
+        let t = Instant::now();
+        loop {
+            let answer = search("how do I run the acme api tests").await;
+            if answer.contains(SENTENCE) == want || t.elapsed() > Duration::from_secs(20) {
+                return answer;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    // The org turns sharing off: what it shared ends on the next pass, and comes back once it is on again.
+    let share_facts = async |on: bool| {
+        admin(
+            s,
+            json!({"op": "set_settings", "org": "acme", "settings": {"share_facts": on}}),
+        )
+        .await;
+    };
+    share_facts(false).await;
+    pass().await;
+    let answer = sees(false).await;
+    assert!(
+        !answer.contains(SENTENCE),
+        "the org fact outlived share_facts off: {answer}"
+    );
+    share_facts(true).await;
+    pass().await;
+    let answer = sees(true).await;
+    assert!(
+        answer.contains(SENTENCE),
+        "the org fact didn't come back with share_facts on: {answer}"
+    );
+    // Ana forgets her session: two people's memories show the command now, and the org fact ends for everyone.
+    let ana = id_token(&issuer, "ana@acme.com");
+    let (_, raw) = mcp_call(
+        s,
+        "?org=acme",
+        &ana,
+        "forget_memory",
+        json!({"episode_id": ana_session}),
+    )
+    .await;
+    assert!(!tool_text(&raw).1, "{raw}");
+    pass().await;
+    let answer = sees(false).await;
+    assert!(
+        !answer.contains(SENTENCE),
+        "the org fact outlived Ana's forget: {answer}"
+    );
 }

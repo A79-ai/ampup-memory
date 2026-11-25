@@ -188,7 +188,7 @@ impl StoreAggregates for Store {
                 // A value a merge set aside for the other side's never held on main: left out, or the newest
                 // version would be it and the value kept would read as superseded.
                 if vis.committed.contains(&commit)
-                    && !vis.retracted_facts.contains(&f.fact_id)
+                    && !vis.withheld(&f)
                     && !vis.closed_by_merge(&f.fact_id)
                     && !f.source_episodes.is_empty()
                     && f.source_episodes.iter().all(|e| episodes.contains_key(e))

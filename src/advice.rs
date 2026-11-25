@@ -1535,7 +1535,8 @@ async fn runs_and_overrides(
         .filter(|l| matches!(l.kind.as_deref(), Some("run" | "session")))
         .filter_map(|l| l.episodes.last().cloned())
         .collect();
-    let bodies = store.episode_bodies(scope, traces).await?;
+    // A session ended a moment ago has its transcript held for the next flush: read from there.
+    let bodies = crate::sessions::bodies(store, scope, traces).await?;
     let mut overrides = 0;
     let runs = logged
         .into_iter()
@@ -3119,7 +3120,7 @@ async fn reflect(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let bodies = match store.episode_bodies(scope, ids).await {
+    let bodies = match crate::sessions::bodies(store, scope, ids).await {
         Ok(b) => b,
         Err(e) => {
             eprintln!("advice reflect: {e:#}");

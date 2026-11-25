@@ -11,7 +11,9 @@
 //!   (`last_run`: its last commit in the ledger, a change or not, and the pass it was), and whether one is running.
 //! - `undo_dream_decision`: takes back one applied decision: an ended fact is current again, a link or a name is
 //!   gone, a team share is the people's own again. `dismiss_dream_decision` does the same for one waiting.
-//!   `apply_dream_decision` applies one waiting (or one undone or dismissed before).
+//!   `apply_dream_decision` applies one waiting (or one undone or dismissed before, or one the dream released once
+//!   what it rests on is readable by its audience again: no pass decides it again, its parts being weighed). A
+//!   released share stays released: what it rests on was forgotten or deleted.
 //! - `dream_now`: a pass over the scope now, within the dream's budget (`AMPUP_MEMORY_DREAM_CALLS`) and under its scope
 //!   lock, in the background.
 //!
@@ -71,20 +73,18 @@ pub(super) async fn handle(
     let reader = as_member(who, org);
     let id = req["id"].as_str().unwrap_or_default();
     let result = match req["op"].as_str().unwrap_or_default() {
-        "dream_decisions" => list(store, &scope, &reader, req).await?,
-        "undo_dream_decision" => review(store, &scope, who, &reader, id, Action::Undo).await?,
-        "dismiss_dream_decision" => {
-            review(store, &scope, who, &reader, id, Action::Dismiss).await?
-        }
-        "apply_dream_decision" => review(store, &scope, who, &reader, id, Action::Apply).await?,
-        "dream_now" => now(state, store, &scope, who).await?,
+        "dream_decisions" => list(store, &scope, &reader, req).await,
+        "undo_dream_decision" => review(store, &scope, who, &reader, id, Action::Undo).await,
+        "dismiss_dream_decision" => review(store, &scope, who, &reader, id, Action::Dismiss).await,
+        "apply_dream_decision" => review(store, &scope, who, &reader, id, Action::Apply).await,
+        "dream_now" => now(state, store, &scope, who).await,
         _ => unreachable!(),
     };
-    // What a review changed shows on the next list, its maker's first of all.
+    // What a review changed shows on the next list, its maker's first of all: also one that failed part way.
     if req["op"] != "dream_decisions" {
         crate::kept_answers::changed(&scope.namespace());
     }
-    Ok(json!({"org": org, "scope": scope.to_string(), "result": result}))
+    Ok(json!({"org": org, "scope": scope.to_string(), "result": result?}))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -104,6 +104,53 @@ impl Action {
     }
 }
 
+/// Where a decision stands, from its record's ACL and its newest review. The words are its wire status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Status {
+    /// Its record waits for review ([`WAITING_ACL`]).
+    Waiting,
+    /// It stands: its record applies to its audience.
+    Applied,
+    /// Its record applies to no one, taken back by a review: `undo`, `dismiss`, or by the dream itself (`released`,
+    /// once what it rests on is gone for its audience).
+    Undone,
+    Dismissed,
+    Released,
+}
+
+impl Status {
+    fn as_str(self) -> &'static str {
+        match self {
+            Status::Waiting => "waiting",
+            Status::Applied => "applied",
+            Status::Undone => "undone",
+            Status::Dismissed => "dismissed",
+            Status::Released => "released",
+        }
+    }
+
+    /// Whether a reviewer may take `action` on a decision standing here. A released one may be applied again: no
+    /// pass decides it again, its parts being weighed.
+    fn allows(self, action: Action) -> bool {
+        match self {
+            Status::Waiting => matches!(action, Action::Apply | Action::Dismiss),
+            Status::Applied => action == Action::Undo,
+            Status::Undone | Status::Dismissed | Status::Released => action == Action::Apply,
+        }
+    }
+
+    /// Never applied: what it would do rather than what it did.
+    fn unapplied(self) -> bool {
+        matches!(self, Status::Waiting | Status::Dismissed)
+    }
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One decision as the page shows it.
 #[derive(Clone)]
 struct Decision {
@@ -112,7 +159,7 @@ struct Decision {
     /// What its review is filed under: the record's key, or `keep/shared/<note>`.
     key: String,
     kind: &'static str,
-    status: &'static str,
+    status: Status,
     /// Who it applies to once applied.
     audience: String,
     /// When it was decided, and the pass it was decided in (none for a share, or a record from before passes were
@@ -128,6 +175,14 @@ struct Decision {
     /// What keeps a pass from deciding it again ([`dream::block_of`]).
     block: Option<String>,
     review: Option<Value>,
+}
+
+impl Decision {
+    /// What may be done with it now: as its status allows, except that a released share stays released. A share is
+    /// released when what it rests on was forgotten or deleted, and applying one isn't checked against its parts.
+    fn allows(&self, action: Action) -> bool {
+        self.status.allows(action) && !(self.status == Status::Released && self.kind == "share")
+    }
 }
 
 /// What a list of the dream's decisions reads, as one reader reads it at one memory state.
@@ -254,6 +309,8 @@ async fn decisions(store: &Store, scope: &Scope, reader: &Principal, fresh: bool
         }
     };
     let shared_source = format!("{}:{}", crate::REMEMBER_SOURCE, crate::origin::SHARED);
+    // The team's shares: a note enough people said, and a fact enough people's own memories showed.
+    let is_share = |source: &str| source == shared_source || crate::facts_share::is_source(source);
     let decided = |e: &Episode| {
         e.document.as_deref().is_some_and(|d| {
             d.starts_with(ENDS) || d.starts_with(DREAM_SAME) || d.starts_with(ALIASES)
@@ -262,7 +319,7 @@ async fn decisions(store: &Store, scope: &Scope, reader: &Principal, fresh: bool
     };
     let mut records: Vec<&Episode> = eps
         .values()
-        .filter(|e| decided(e) || e.source == shared_source)
+        .filter(|e| decided(e) || is_share(&e.source))
         .collect();
     records.sort_by_key(|e| std::cmp::Reverse(e.recorded_at.unwrap_or_default()));
     records.truncate(MAX_READ);
@@ -283,7 +340,7 @@ async fn decisions(store: &Store, scope: &Scope, reader: &Principal, fresh: bool
     }
     let mut want: Vec<String> = records
         .iter()
-        .filter(|e| e.source != shared_source)
+        .filter(|e| !is_share(&e.source))
         .map(|e| e.episode_id.clone())
         .collect();
     want.extend(reviews.values().map(|(_, id)| id.clone()));
@@ -328,7 +385,7 @@ async fn decisions(store: &Store, scope: &Scope, reader: &Principal, fresh: bool
     // dream's record aside: it is the decision, not its evidence).
     let readable = |c: &str, f: &Fact| {
         vis.committed.contains(c)
-            && !vis.retracted_facts.contains(&f.fact_id)
+            && !vis.withheld(f)
             && f.source_episodes
                 .iter()
                 .all(|e| eps.get(e).is_some_and(decided) || vis.can_see_episode(e, reader))
@@ -340,7 +397,7 @@ async fn decisions(store: &Store, scope: &Scope, reader: &Principal, fresh: bool
         let gone = !acl.is_empty() && acl.iter().all(|a| a == FORGOTTEN);
         let waiting = acl.iter().any(|a| a == WAITING_ACL);
         let (kind, key, mut parts): (&str, String, Vec<(&'static str, &str)>) =
-            if e.source == shared_source {
+            if is_share(&e.source) {
                 (
                     "share",
                     format!("{}{}", crate::keep::SHARED_KEY, e.episode_id),
@@ -387,15 +444,15 @@ async fn decisions(store: &Store, scope: &Scope, reader: &Principal, fresh: bool
             .filter(|r| !r.is_null());
         let action = review.as_ref().and_then(|r| r["action"].as_str());
         let status = if waiting {
-            "waiting"
+            Status::Waiting
         } else if gone {
             match action {
-                Some("undo") => "undone",
-                Some("dismiss") => "dismissed",
-                _ => "released",
+                Some("undo") => Status::Undone,
+                Some("dismiss") => Status::Dismissed,
+                _ => Status::Released,
             }
         } else {
-            "applied"
+            Status::Applied
         };
         let alias = fs.iter().find(|(r, _, _)| *r == "alias" || *r == "name");
         out.push(Decision {
@@ -438,7 +495,7 @@ async fn share_texts(
 ) -> Result<HashMap<String, String>> {
     let ids: Vec<String> = page
         .iter()
-        .filter(|d| d.kind == "share" && d.status == "applied")
+        .filter(|d| d.kind == "share" && d.status == Status::Applied)
         .map(|d| d.id.clone())
         .collect();
     if ids.is_empty() {
@@ -483,7 +540,7 @@ fn summary(d: &Decision) -> String {
     };
     let pred = |f: &Fact| f.predicate.replace('_', " ");
     // One never applied (waiting, or dismissed) says what it would do.
-    let waiting = matches!(d.status, "waiting" | "dismissed");
+    let waiting = d.status.unapplied();
     match d.kind {
         "end" => match (fact("old"), fact("by")) {
             (Some(o), Some(b)) => format!(
@@ -526,7 +583,7 @@ fn summary(d: &Decision) -> String {
     }
 }
 
-fn view(d: &Decision, why: Option<&String>) -> Value {
+fn view(d: &Decision, why: Option<&String>, shared_at: usize) -> Value {
     let facts: Vec<Value> = d
         .facts
         .iter()
@@ -539,15 +596,14 @@ fn view(d: &Decision, why: Option<&String>) -> Value {
         .collect();
     let why = why.cloned().or_else(|| match d.kind {
         "share" => Some(format!(
-            "At least {} people said the same, each in their own memory",
-            crate::keep::SHARED_AT
+            "At least {shared_at} people said the same, each in their own memory"
         )),
         _ => None,
     });
     json!({
         "id": d.id,
         "kind": d.kind,
-        "status": d.status,
+        "status": d.status.as_str(),
         "summary": summary(d),
         "why": why,
         "at": d.at,
@@ -556,9 +612,9 @@ fn view(d: &Decision, why: Option<&String>) -> Value {
         "audience": d.audience,
         "facts": facts,
         "reviewed": d.review.as_ref().map(|r| json!({"action": r["action"], "by": r["by"], "at": r["at"]})),
-        "can_undo": d.status == "applied",
-        "can_apply": matches!(d.status, "waiting" | "undone" | "dismissed"),
-        "can_dismiss": d.status == "waiting",
+        "can_undo": d.allows(Action::Undo),
+        "can_apply": d.allows(Action::Apply),
+        "can_dismiss": d.allows(Action::Dismiss),
     })
 }
 
@@ -622,7 +678,7 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
         let n = |k: &str| {
             of_last
                 .iter()
-                .filter(|d| d.kind == k && d.status != "waiting")
+                .filter(|d| d.kind == k && d.status != Status::Waiting)
                 .count()
         };
         json!({
@@ -630,7 +686,7 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
             "ended": n("end"),
             "linked": n("link"),
             "named": n("name"),
-            "waiting": of_last.iter().filter(|d| d.status == "waiting").count(),
+            "waiting": of_last.iter().filter(|d| d.status == Status::Waiting).count(),
         })
     });
     // When a pass last ran at all, a change or not, and which: its last commit in the ledger, or this process's last
@@ -644,15 +700,15 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
     };
     let week = crate::now_micros() - WEEK_MICROS;
     let counts = json!({
-        "waiting": all.iter().filter(|d| d.status == "waiting").count(),
-        "applied": all.iter().filter(|d| d.status == "applied").count(),
-        "applied_week": all.iter().filter(|d| d.status == "applied" && d.at >= week).count(),
-        "history": all.iter().filter(|d| !matches!(d.status, "waiting" | "applied")).count(),
+        "waiting": all.iter().filter(|d| d.status == Status::Waiting).count(),
+        "applied": all.iter().filter(|d| d.status == Status::Applied).count(),
+        "applied_week": all.iter().filter(|d| d.status == Status::Applied && d.at >= week).count(),
+        "history": all.iter().filter(|d| !matches!(d.status, Status::Waiting | Status::Applied)).count(),
     });
     let shown: Vec<&Decision> = all
         .iter()
         .filter(|d| kind.is_none_or(|k| d.kind == k))
-        .filter(|d| statuses.is_empty() || statuses.contains(&d.status))
+        .filter(|d| statuses.is_empty() || statuses.contains(&d.status.as_str()))
         .filter(|d| entity.is_none_or(|e| d.facts.iter().any(|(_, f, _)| f.entity == e)))
         .filter(|d| since.is_none_or(|t| d.at >= t))
         .collect();
@@ -678,6 +734,7 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
         })
         .collect();
     let reasons = &kept.reasons;
+    let shared_at = crate::keep::people_in(store, scope).await;
     let key = scope.to_string();
     let available = dream::internal_scheduler().unwrap_or(false)
         && crate::extract::Extractor::dream_from_env()
@@ -685,7 +742,7 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
             .flatten()
             .is_some();
     Ok(json!({
-        "decisions": page.iter().map(|d| view(d, reasons.get(&d.id))).collect::<Vec<_>>(),
+        "decisions": page.iter().map(|d| view(d, reasons.get(&d.id), shared_at)).collect::<Vec<_>>(),
         "next_page": next.flatten(),
         "total": total,
         "counts": counts,
@@ -701,8 +758,8 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
     }))
 }
 
-/// Apply, undo or dismiss one decision: its record's ACL to its audience or to no one, with a review recorded first
-/// (so a pass that reads one reads the other).
+/// Apply, undo or dismiss one decision: its record's ACL to its audience or to no one, and a review recorded beside
+/// it (in the order below, so a failure between the two leaves the decision as it was).
 async fn review(
     store: &Store,
     scope: &Scope,
@@ -722,12 +779,7 @@ async fn review(
         ))
         .into());
     };
-    let allowed = match action {
-        Action::Undo => d.status == "applied",
-        Action::Dismiss => d.status == "waiting",
-        Action::Apply => matches!(d.status, "waiting" | "undone" | "dismissed"),
-    };
-    if !allowed {
+    if !d.allows(action) {
         return Err(Refused(format!(
             "this decision is {}: it can't be {}",
             d.status,
@@ -768,16 +820,41 @@ async fn review(
         .without_text_index()
         .version_of(&format!("{REVIEWED}{}", d.key));
     mark.occurred_at = now;
-    store
-        .commit_derived(scope, who.user(), &[mark], &[], &[], &[])
-        .await?;
     let acl = match action {
         Action::Apply => vec![d.audience.clone()],
         _ => vec![FORGOTTEN.to_string()],
     };
-    store
-        .change_acl_all(scope, who.user(), &[AclTarget::Episode(d.id.clone())], &acl)
-        .await?;
+    // Two commits, ordered so that one failing between them leaves the decision as it was, to be retried. A record
+    // that applies to no one reads its status from its newest review (`undone`, `dismissed`, else `released`), so
+    // taking one back records the review first: until its ACL changes the record still stands (`applied` or
+    // `waiting`), and the review's block only keeps a pass from deciding again what it is taking back. Applying one
+    // changes the ACL first: it then stands under its old review (`applied`), never an `apply` review over a record
+    // that applies to no one, which reads as `released`.
+    let reviewed = async {
+        store
+            .commit_derived(scope, who.user(), &[mark], &[], &[], &[])
+            .await
+    };
+    let changed = async {
+        store
+            .change_acl_all(scope, who.user(), &[AclTarget::Episode(d.id.clone())], &acl)
+            .await
+    };
+    if action == Action::Apply {
+        changed.await?;
+        reviewed
+            .await
+            .context("the decision applies, but who applied it wasn't recorded")?;
+    } else {
+        reviewed.await?;
+        changed.await.with_context(|| {
+            format!(
+                "the decision is still {}: {} it again",
+                d.status,
+                action.word()
+            )
+        })?;
+    }
     eprintln!(
         "dream review: {} {} a {} decision in {scope}",
         who.user(),
@@ -795,10 +872,11 @@ async fn review(
         .filter(|l| l.kind.as_deref() == Some(dream::REASON_KIND) && l.answer_id == id)
         .filter_map(|l| l.answer.map(|a| (l.answer_id, a)))
         .collect();
+    let shared_at = crate::keep::people_in(store, scope).await;
     Ok(after
         .iter()
         .find(|x| x.id == id)
-        .map(|x| view(x, reasons.get(id)))
+        .map(|x| view(x, reasons.get(id), shared_at))
         .unwrap_or(json!({"id": id})))
 }
 

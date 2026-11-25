@@ -39,18 +39,6 @@ use tokio::sync::watch;
 /// How old a kept answer may be and still be answered while the memory moved on (it never is past a loss).
 pub const STALE: Duration = Duration::from_secs(600);
 
-tokio::task_local! {
-    /// Set while an answer is worked out ahead of its reads ([`exact`]).
-    static EXACT: ();
-}
-
-/// `fut`, an answer worked out ahead of the reads that want it (and kept as at the state it read): the kept answers
-/// it reads are each worked out at that state, never one from before it answered while the next is worked out
-/// ([`Kept::get`]'s `lag`), or what it keeps would be one state behind and taken for current.
-pub async fn exact<F: Future>(fut: F) -> F::Output {
-    EXACT.scope((), fut).await
-}
-
 /// The [`STALE`]-long span of time now falls in: in the key of an answer over a window that ends now (the last 30 days),
 /// so a kept one is never answered for a window that ended more than [`STALE`] ago.
 pub fn span() -> u64 {
@@ -266,7 +254,6 @@ impl<T: Send + Sync + 'static> Kept<T> {
     {
         let key = format!("{ns}\n{reader}");
         let generation = generation(ns);
-        let lag = lag && EXACT.try_with(|_| ()).is_err();
         {
             let mut kept = self.entries.lock().unwrap();
             if let Some(e) = kept.get_mut(&key)

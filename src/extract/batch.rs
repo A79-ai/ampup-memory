@@ -8,8 +8,9 @@
 //! In batch mode the extractor and the compiler put every request of a run in flight together
 //! ([`super::Extractor::parallel`]), so a run's requests share batches.
 //!
-//! The batch is polled until it ends, its results go back to their callers, and it is deleted, so the text
-//! doesn't stay at OpenRouter for the 30 days it otherwise keeps a batch. As with a synchronous call, a request
+//! The batch is polled until it ends, its results go back to their callers, and it is deleted however it ended
+//! (failed, expired, cancelled or not done within a day too), so the text doesn't stay at OpenRouter for the 30 days
+//! it otherwise keeps a batch; a delete OpenRouter refuses is said in the log. As with a synchronous call, a request
 //! the API refuses (a 4xx, a failed batch) costs its episode a try, and one it couldn't answer (a 5xx, an
 //! expired or cancelled batch, no answer within a day) costs none.
 
@@ -134,13 +135,25 @@ async fn drain(
     }
 }
 
-/// One batch: submit it, wait for it to end, hand each caller its reply, delete it.
+/// One batch: submit it, wait for it to end, hand each caller its reply, delete it. It is deleted however it ended
+/// (answered, failed, expired, cancelled or not done within a day), once it has an id: what it ends as decides only
+/// what its callers are told.
 async fn send(url: String, key: Option<String>, model: String, jobs: Vec<Job>) {
     let (bodies, replies): (Vec<Value>, Vec<_>) =
         jobs.into_iter().map(|j| (j.body, j.reply)).unzip();
     let n = bodies.len();
-    match run(&url, key.as_deref(), &model, bodies).await {
-        Ok((id, mut results)) => {
+    let id = match submit(&url, key.as_deref(), &model, bodies).await {
+        Ok(id) => id,
+        Err(f) => {
+            eprintln!("batch of {n} requests to {model} failed: {f:?}");
+            for reply in replies {
+                let _ = reply.send(Err(f.clone()));
+            }
+            return;
+        }
+    };
+    match wait(&url, key.as_deref(), &id).await {
+        Ok(mut results) => {
             for (i, reply) in replies.into_iter().enumerate() {
                 let r = results.remove(&format!("r{i}")).unwrap_or_else(|| {
                     Err(Failure::Down(format!(
@@ -149,18 +162,37 @@ async fn send(url: String, key: Option<String>, model: String, jobs: Vec<Job>) {
                 });
                 let _ = reply.send(r);
             }
-            // Once read, the batch's text needn't stay at OpenRouter.
-            let _ = authed(HTTP.delete(format!("{url}/batches/{id}")), key.as_deref())
-                .send()
-                .await;
             eprintln!("batch {id}: {n} requests to {model} answered");
         }
         Err(f) => {
-            eprintln!("batch of {n} requests to {model} failed: {f:?}");
+            eprintln!("batch {id} of {n} requests to {model} failed: {f:?}");
             for reply in replies {
                 let _ = reply.send(Err(f.clone()));
             }
         }
+    }
+    // Its callers answered, the batch's text needn't stay at OpenRouter.
+    delete(&url, key.as_deref(), &id).await;
+}
+
+/// Delete batch `id`, saying in the log when that didn't happen (OpenRouter then keeps it for its 30 days).
+async fn delete(url: &str, key: Option<&str>, id: &str) {
+    match authed(HTTP.delete(format!("{url}/batches/{id}")), key)
+        .send()
+        .await
+    {
+        Ok(res) if res.status().is_success() => {}
+        Ok(res) => eprintln!(
+            "batch {id}: not deleted: {}: {}",
+            res.status(),
+            res.text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect::<String>()
+        ),
+        Err(e) => eprintln!("batch {id}: not deleted: {e}"),
     }
 }
 
@@ -186,12 +218,13 @@ fn classify(status: u16, msg: String) -> Failure {
 
 type Results = HashMap<String, Result<Value, Failure>>;
 
-async fn run(
+/// Submit `bodies` as one batch: its id.
+async fn submit(
     url: &str,
     key: Option<&str>,
     model: &str,
     bodies: Vec<Value>,
-) -> Result<(String, Results), Failure> {
+) -> Result<String, Failure> {
     let requests: Vec<Value> = bodies
         .into_iter()
         .enumerate()
@@ -214,10 +247,14 @@ async fn run(
         );
         return Err(classify(status.as_u16(), msg));
     }
-    let id = serde_json::from_str::<Value>(&text)
+    serde_json::from_str::<Value>(&text)
         .ok()
         .and_then(|v| v["id"].as_str().map(String::from))
-        .ok_or_else(|| Failure::Refused(format!("{url}/batches: no batch id in the reply")))?;
+        .ok_or_else(|| Failure::Refused(format!("{url}/batches: no batch id in the reply")))
+}
+
+/// Batch `id`'s results once it ends, or why it gave none.
+async fn wait(url: &str, key: Option<&str>, id: &str) -> Result<Results, Failure> {
     // Poll until it ends: every 10 s at first, then less often, at most once a minute.
     let started = tokio::time::Instant::now();
     let mut every = Duration::from_secs(10);
@@ -239,7 +276,7 @@ async fn run(
             continue;
         };
         match v["status"].as_str().unwrap_or_default() {
-            "completed" => return Ok((id.clone(), results(&id, &v))),
+            "completed" => return Ok(results(id, &v)),
             "failed" => {
                 return Err(Failure::Refused(format!(
                     "{url}/batches/{id} failed: {}",

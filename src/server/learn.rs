@@ -8,7 +8,9 @@
 //!   an agent's note; an Ask answer kept stays a note (its words are the model's). Each is filed as a starter
 //!   document (`starter/added/...`), so extraction reads it wherever it reads anything ([`crate::extract::STARTER`]),
 //!   even where it reads nothing else no goal names. The same text added again is the same episode, not a new one.
-//!   Items are `file` (text, by its name), `paste`, `answer` (a question and its answer) and `recording`: a
+//!   Items are `file` (text, by its name; a PDF or Word file's text, [`crate::doc_text`], filed as parts cut at
+//!   paragraph breaks where it is longer than one item holds, each `<name> (part <n>)`), `paste`, `answer` (a
+//!   question and its answer) and `recording`: a
 //!   recording's transcript (`turns` of `{speaker, start_ms?, text}`, the media file's `sha256`, `title?`,
 //!   `recorded_at?`), filed as one call or meeting ([`crate::episode_types::sales_call`]) whose facts cite its turns.
 //!   It is what its speakers said, not the person's own statement: filed under [`crate::origin::RECORDED`], not
@@ -29,7 +31,7 @@
 //! An ingest key may use neither: the receipt reads memory. A queued memory (an inbox) refuses: what it would
 //! learn comes at the next ingest, with nothing to show now.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::LazyLock;
 
 use anyhow::Result;
@@ -51,6 +53,20 @@ const MAX_TEXT: usize = super::STARTER_MAX_BYTES;
 const TEXT_TYPES: [&str; 12] = [
     "txt", "text", "md", "markdown", "csv", "tsv", "json", "jsonl", "ndjson", "yaml", "yml", "log",
 ];
+/// Largest document file (a PDF, a Word file) one item may be: what fits, as base64, in a request `/learn` takes.
+const MAX_DOCUMENT: usize = 5 << 20;
+/// Largest web page fetched for one `url` item.
+const MAX_PAGE: usize = 5 << 20;
+/// Most pages one request fetches: the rest are refused, to be added again.
+const MAX_URLS: usize = 5;
+/// How long one request's pages may take, fetched together.
+const PAGES_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+/// Least text a page must have to be added: less is a page that draws itself with JavaScript, or a sign-in.
+const MIN_PAGE_TEXT: usize = 200;
+/// How the server names itself to the sites it fetches pages from.
+const AGENT: &str = concat!("AmpUp-Memory/", env!("CARGO_PKG_VERSION"), " (page import)");
+/// Most parts one document is filed as ([`read_document`]): about 2 MB of text.
+const MAX_PARTS: usize = 32;
 /// What a file's name ends in where it is a recording, as Studio names them: transcribed where the server is set to
 /// ([`crate::transcribe`]) and its type is one [`TRANSCRIBED`] names, else refused, saying why.
 const MEDIA_TYPES: [&str; 14] = [
@@ -83,6 +99,9 @@ struct Item {
     recording: Option<Recording>,
     /// A recording's file (its type, its bytes), transcribed and then filed as one ([`file_media`]).
     media: Option<(String, Vec<u8>)>,
+    /// A web page's address (`<url>`, or `<url> (part <n>)` for a part of a long one): what it is filed by, so
+    /// the same page added again is its next version whatever its title says now.
+    origin: Option<String>,
 }
 
 /// A recording's transcript: the media file it is of (its name, and its SHA-256 in hex, which keys it), who spoke
@@ -155,7 +174,32 @@ pub(super) async fn add(
     let mut kept: Vec<Episode> = vec![];
     let mut readers = String::new();
     let mut fresh = false;
-    for raw in items {
+    // The pages, fetched at once, before anything is filed: at most MAX_URLS a request, all within PAGES_TIME, so a
+    // request with slow pages still answers within a load balancer's patience. Each is filed in its place below.
+    let deadline = tokio::time::Instant::now() + PAGES_TIME;
+    let mut pages: HashMap<usize, std::result::Result<Vec<Item>, String>> =
+        futures::future::join_all(
+            items
+                .iter()
+                .enumerate()
+                .filter(|(_, raw)| raw["kind"].as_str() == Some("url"))
+                .enumerate()
+                .map(|(n, (i, raw))| async move {
+                    let got = match n < MAX_URLS {
+                        false => Err(format!(
+                            "at most {MAX_URLS} pages are added a request: add it again"
+                        )),
+                        true => tokio::time::timeout_at(deadline, read_url(raw))
+                            .await
+                            .unwrap_or_else(|_| Err("the page took too long to fetch".into())),
+                    };
+                    (i, got)
+                }),
+        )
+        .await
+        .into_iter()
+        .collect();
+    for (at, raw) in items.iter().enumerate() {
         // A piece of a recording sent in parts ([`super::upload`]): kept until the last, then transcribed apart.
         if raw["kind"].as_str() == Some("part") {
             match super::upload::part(state, store, scope, who, whose, &author, raw).await {
@@ -168,41 +212,54 @@ pub(super) async fn add(
             }
             continue;
         }
-        let item = match read(raw) {
+        // A document (a PDF, a Word file) is read off the runtime's threads, its parser being slow on a long one,
+        // and may come back as several parts.
+        let read_items = match (raw["kind"].as_str() == Some("url"), document_type(raw)) {
+            (true, _) => pages
+                .remove(&at)
+                .unwrap_or_else(|| Err("the page couldn't be read".into())),
+            (false, Some(ext)) => read_document(raw, &ext).await,
+            (false, None) => read(raw).map(|i| vec![i]),
+        };
+        let read_items = match read_items {
             Ok(i) => i,
             Err(why) => {
                 refused.push(json!({"name": item_name(raw), "reason": why}));
                 continue;
             }
         };
-        let commit = match (&item.recording, &item.media) {
-            (Some(rec), _) => file_recording(state, store, scope, who, whose, &author, rec).await,
-            (None, Some((ext, bytes))) => {
-                file_media(
-                    state, store, scope, who, whose, &author, &item.name, ext, bytes, None,
-                )
-                .await
+        for item in read_items {
+            let commit = match (&item.recording, &item.media) {
+                (Some(rec), _) => {
+                    file_recording(state, store, scope, who, whose, &author, rec).await
+                }
+                (None, Some((ext, bytes))) => {
+                    file_media(
+                        state, store, scope, who, whose, &author, &item.name, ext, bytes, None,
+                    )
+                    .await
+                }
+                (None, None) => file_text(state, store, scope, who, whose, &author, &item).await,
+            };
+            match commit {
+                Ok(f) => {
+                    fresh |= f.new;
+                    readers = f.readers;
+                    let mut ep = Episode::new(&super::provenance(who, &f.source), b"", &[]);
+                    ep.episode_id = f.id.clone();
+                    ep.document = Some(f.key);
+                    kept.push(ep);
+                    added.push(
+                        json!({"name": item.name, "kind": item.kind, "episode_id": f.id,
+                                      "source": f.source, "bytes": f.bytes, "new": f.new}),
+                    );
+                }
+                // What the item itself is refused for (a body no episode type reads, say): that item alone.
+                Err(e) => match refusal(&e) {
+                    Some(why) => refused.push(json!({"name": item.name, "reason": why})),
+                    None => return Err(e),
+                },
             }
-            (None, None) => file_text(state, store, scope, who, whose, &author, &item).await,
-        };
-        match commit {
-            Ok(f) => {
-                fresh |= f.new;
-                readers = f.readers;
-                let mut ep = Episode::new(&super::provenance(who, &f.source), b"", &[]);
-                ep.episode_id = f.id.clone();
-                ep.document = Some(f.key);
-                kept.push(ep);
-                added.push(
-                    json!({"name": item.name, "kind": item.kind, "episode_id": f.id,
-                                  "source": f.source, "bytes": f.bytes, "new": f.new}),
-                );
-            }
-            // What the item itself is refused for (a body no episode type reads, say): that item alone.
-            Err(e) => match refusal(&e) {
-                Some(why) => refused.push(json!({"name": item.name, "reason": why})),
-                None => return Err(e),
-            },
         }
     }
     let reading = to_read(store, scope, &kept).await?;
@@ -511,8 +568,22 @@ pub(super) async fn status(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
+    // `recent`: the caller's own latest imports, newest first, instead of ids they name (Studio's Processing panel).
+    let recent = args["recent"]
+        .as_u64()
+        .map(|n| (n as usize).clamp(1, MAX_STATUS));
+    let (ids, listed) = match recent {
+        Some(n) if ids.is_empty() => recent_imports(store, session, who, n).await?,
+        _ => (ids, HashMap::new()),
+    };
     if ids.is_empty() && upload_ids.is_empty() {
-        return Err(ToolError("body is {episode_ids: [...], upload_ids?: [...]}".into()).into());
+        if recent.is_some() {
+            return Ok(json!({"done": true, "items": [], "uploads": []}));
+        }
+        return Err(ToolError(
+            "body is {episode_ids: [...], upload_ids?: [...]} or {recent: n}".into(),
+        )
+        .into());
     }
     if ids.len() > MAX_STATUS || upload_ids.len() > MAX_STATUS {
         return Err(ToolError(format!("at most {MAX_STATUS} episodes a request")).into());
@@ -520,7 +591,9 @@ pub(super) async fn status(
     let scope = session.scope().clone();
     // Recordings sent in parts, as their transcription stands (an episode id once filed).
     let uploads = super::upload::states(store, &scope, &author_of(who), &upload_ids).await?;
-    let uploads_done = uploads.iter().all(|u| u["status"] != "transcribing");
+    let uploads_done = uploads
+        .iter()
+        .all(|u| u["status"] != "transcribing" && u["status"] != "uploading");
     if ids.is_empty() {
         return Ok(json!({"done": uploads_done, "items": [], "uploads": uploads}));
     }
@@ -590,6 +663,27 @@ pub(super) async fn status(
                 .await?
         }
     };
+    // Where each stands with compile, for the Processing panel (`recent`) alone: read into the skill library (and
+    // the skills it rests in that the caller may read), given up on, waiting (a source this server compiles), or
+    // not a source here. A receipt's quick looks don't pay for it.
+    let mut compile_of: HashMap<String, &'static str> = HashMap::new();
+    let mut skills: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    if recent.is_some() {
+        let dir = crate::people::directory::Directory::load(store).await.ok();
+        let standing = crate::compile::Standing::of(dir.as_ref(), &scope);
+        let sources = session.episode_sources(store, who, &seen).await?;
+        for id in &seen {
+            let rows = reads.get(id).map(Vec::as_slice).unwrap_or_default();
+            let src = sources.get(id).map(|(s, _)| s.as_str()).unwrap_or_default();
+            compile_of.insert(id.clone(), standing.state(src, vis.document_of(id), rows));
+        }
+        let compiled: HashSet<String> = compile_of
+            .iter()
+            .filter(|(_, s)| **s == "compiled")
+            .map(|(id, _)| id.clone())
+            .collect();
+        skills = crate::compile::citing(store, session, who, &compiled).await?;
+    }
     let refusals = crate::extract::refusals(&scope);
     let fact = |f: &crate::Fact| json!({"fact_id": f.fact_id, "entity": f.entity, "predicate": f.predicate, "value": f.value});
     // Where each stands with extraction, as its reads say: read (or citing facts already), given up on, or neither.
@@ -691,6 +785,20 @@ pub(super) async fn status(
             {
                 v["refused"] = json!({"facts": r.refused, "why": r.why});
             }
+            if let Some(c) = compile_of.get(id) {
+                v["compile"] = json!(c);
+            }
+            if let Some(sk) = skills.get(id) {
+                v["skills"] = sk
+                    .iter()
+                    .map(|(slug, title)| json!({"slug": slug, "title": title}))
+                    .collect();
+            }
+            if let Some(m) = listed.get(id).and_then(Value::as_object) {
+                for (k, x) in m {
+                    v[k] = x.clone();
+                }
+            }
             if state == "failed" {
                 v["reason"] = json!("extraction gave up on it after repeated failures");
             } else if state == "not_read" {
@@ -702,12 +810,56 @@ pub(super) async fn status(
     // On a server that doesn't extract (it doesn't hold the writer lease), what the one that does commits shows here
     // only once this one's cached tables are read again: while a person waits on a receipt, that is at its next
     // look, not when they next age out.
+    let compiling = compile_of.values().any(|c| *c == "pending");
     if pending && !state.writer.holds() {
         fresh(store, &scope);
     }
     Ok(
-        json!({"done": !pending && uploads_done, "extraction": mode, "items": items, "uploads": uploads}),
+        json!({"done": !pending && uploads_done, "compiling": compiling, "extraction": mode, "items": items,
+               "uploads": uploads}),
     )
+}
+
+/// The caller's own latest imports (what `/learn` filed for them under [`DOCUMENTS`]), newest first, at most `n`: each
+/// one's episode (its current version), with what the Processing panel shows of it (`name`, `kind`, `added_at`).
+async fn recent_imports(
+    store: &Store,
+    session: &Session,
+    who: &Principal,
+    n: usize,
+) -> Result<(Vec<String>, HashMap<String, Value>)> {
+    let prefix = format!("{DOCUMENTS}{}/", author_of(who));
+    let mut keyed: Vec<(i64, String)> = session
+        .documents(who, &prefix, None)
+        .into_iter()
+        .filter_map(|k| session.version_number(who, &k, None).map(|(_, t)| (t, k)))
+        .collect();
+    keyed.sort_by(|a, b| b.cmp(a));
+    keyed.truncate(n);
+    let (mut ids, mut listed) = (vec![], HashMap::new());
+    for (_, key) in keyed {
+        let Some((id, at, body)) = session.document(store, who, &key, None).await? else {
+            continue;
+        };
+        let rest = key.strip_prefix(&prefix).unwrap_or(&key);
+        let (kind, tail) = rest.split_once('/').unwrap_or(("file", rest));
+        // A page by its address (its text's first line); anything else by its key's last part.
+        let name = match kind {
+            "web" => String::from_utf8_lossy(&body[..body.len().min(2048)])
+                .lines()
+                .next()
+                .and_then(|l| l.strip_prefix("Source: "))
+                .map(str::to_string)
+                .unwrap_or_else(|| tail.to_string()),
+            _ => tail.to_string(),
+        };
+        listed.insert(
+            id.clone(),
+            json!({"name": name, "kind": kind, "key": key, "added_at": at}),
+        );
+        ids.push(id);
+    }
+    Ok((ids, listed))
 }
 
 /// The current facts citing any of `ids` that `who` may read, notes' own facts aside: a column scan for each id,
@@ -803,6 +955,7 @@ fn read(v: &Value) -> std::result::Result<Item, String> {
             text: String::new(),
             recording: Some(recording),
             media: None,
+            origin: None,
         });
     }
     let text = match kind {
@@ -821,9 +974,6 @@ fn read(v: &Value) -> std::result::Result<Item, String> {
                 .rsplit_once('.')
                 .map(|(_, e)| e.to_ascii_lowercase())
                 .unwrap_or_default();
-            if ext == "pdf" {
-                return Err("PDFs aren't read here yet: copy its text and paste it instead".into());
-            }
             if MEDIA_TYPES.contains(&ext.as_str()) {
                 let bytes = read_media(v, &ext)?;
                 return Ok(Item {
@@ -832,17 +982,23 @@ fn read(v: &Value) -> std::result::Result<Item, String> {
                     text: String::new(),
                     recording: None,
                     media: Some((ext, bytes)),
+                    origin: None,
                 });
             }
             if !TEXT_TYPES.contains(&ext.as_str()) {
                 return Err(format!(
-                    "{} files aren't read: text, Markdown, CSV, JSON and YAML are ({})",
+                    "{} files aren't read: text, Markdown, CSV, JSON, YAML, PDF and Word are ({})",
                     if ext.is_empty() {
                         "untyped".to_string()
                     } else {
                         format!(".{ext}")
                     },
-                    TEXT_TYPES.map(|t| format!(".{t}")).join(", ")
+                    TEXT_TYPES
+                        .iter()
+                        .chain(&crate::doc_text::TYPES)
+                        .map(|t| format!(".{t}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
             match (v["text"].as_str(), v["base64"].as_str()) {
@@ -878,7 +1034,150 @@ fn read(v: &Value) -> std::result::Result<Item, String> {
         text,
         recording: None,
         media: None,
+        origin: None,
     })
+}
+
+/// The type of a document file (`pdf`, `docx`: [`crate::doc_text::TYPES`]) an item is, if it is one.
+fn document_type(v: &Value) -> Option<String> {
+    if v["kind"].as_str().unwrap_or("file") != "file" {
+        return None;
+    }
+    let name = item_name(v);
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    crate::doc_text::TYPES
+        .contains(&ext.as_str())
+        .then_some(ext)
+}
+
+/// A document file as sent (base64): its text ([`crate::doc_text`]), as one item, or, where it is longer than one
+/// item holds ([`MAX_TEXT`]), as parts cut at paragraph breaks, each named `<name> (part <n>)`. A part keeps its
+/// name (and so its document) whatever the count, so the same file added again is a new version of each part.
+/// Err is why it is refused.
+async fn read_document(v: &Value, ext: &str) -> std::result::Result<Vec<Item>, String> {
+    let name = item_name(v);
+    let Some(b) = v["base64"].as_str().map(str::trim) else {
+        return Err("a document is sent as base64".into());
+    };
+    if b.len() / 4 * 3 > MAX_DOCUMENT + 3 {
+        return Err(format!(
+            "it's {:.1} MB: a document is at most {} MB",
+            (b.len() / 4 * 3) as f64 / (1 << 20) as f64,
+            MAX_DOCUMENT >> 20
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b)
+        .map_err(|_| "its base64 doesn't decode".to_string())?;
+    // NUL can't be stored as text.
+    // Read in a process of its own: a file that inflates without bound, or loops its parser, ends that one.
+    let text = crate::doc_text::isolated(ext, bytes)
+        .await?
+        .replace('\0', "");
+    let parts = crate::doc_text::parts(&text, MAX_TEXT);
+    if parts.len() > MAX_PARTS {
+        return Err(format!(
+            "it has {} KB of text: at most {} KB of one document is added, so split it",
+            text.len().div_ceil(1024),
+            MAX_PARTS * MAX_TEXT / 1024
+        ));
+    }
+    let n = parts.len();
+    Ok(parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| Item {
+            kind: "file",
+            name: match n {
+                1 => name.clone(),
+                _ => format!("{name} (part {})", i + 1),
+            },
+            text,
+            recording: None,
+            media: None,
+            origin: None,
+        })
+        .collect())
+}
+
+/// A public web page a person named (`{kind: "url", url}`): fetched where the server may fetch from
+/// ([`crate::auth::fetch::fetch_public`]: https, public addresses only, every redirect vetted), its text as
+/// Markdown ([`crate::doc_text::html`]; a PDF's or plain text's as it is), named by its title and filed by its
+/// address, in parts where long ([`read_document`]'s). A page with almost no text (one that draws itself with
+/// JavaScript, or a sign-in) is refused, saying so. Err is why it is refused.
+async fn read_url(v: &Value) -> std::result::Result<Vec<Item>, String> {
+    let url = v["url"].as_str().map(str::trim).unwrap_or_default();
+    if url.is_empty() {
+        return Err("a url item names its url".into());
+    }
+    let page = crate::auth::fetch::fetch_public(url, MAX_PAGE, AGENT).await?;
+    let ct = page
+        .content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let body = page.body;
+    // A PDF behind the link is read as an uploaded one is, in a process of its own.
+    let (title, text) = if ct == "application/pdf" {
+        (None, crate::doc_text::isolated("pdf", body).await?)
+    } else {
+        tokio::task::spawn_blocking(move || -> std::result::Result<_, String> {
+            match ct.as_str() {
+                "" | "text/html" | "application/xhtml+xml" => {
+                    Ok(crate::doc_text::html(&String::from_utf8_lossy(&body)))
+                }
+                t if t.starts_with("text/") => {
+                    Ok((None, String::from_utf8_lossy(&body).into_owned()))
+                }
+                t => Err(format!("it is {t}, not a page or a document that is read")),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err("the page couldn't be read".into()))?
+    };
+    let text = text.replace('\0', "");
+    if text.trim().len() < MIN_PAGE_TEXT {
+        return Err(
+            "the page has almost no text: one that needs JavaScript or a sign-in isn't read".into(),
+        );
+    }
+    // The address it ended at, less its fragment: what it is filed by.
+    let mut at = page.url;
+    at.set_fragment(None);
+    let at = at.to_string();
+    let name = title.unwrap_or_else(|| at.trim_start_matches("https://").to_string());
+    let parts = crate::doc_text::parts(&text, MAX_TEXT);
+    if parts.len() > MAX_PARTS {
+        return Err(format!(
+            "it has {} KB of text: at most {} KB of one page is added",
+            text.len().div_ceil(1024),
+            MAX_PARTS * MAX_TEXT / 1024
+        ));
+    }
+    let n = parts.len();
+    Ok(parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let (name, origin) = match n {
+                1 => (name.clone(), at.clone()),
+                _ => (
+                    format!("{name} (part {})", i + 1),
+                    format!("{at} (part {})", i + 1),
+                ),
+            };
+            Item {
+                kind: "web",
+                name,
+                text: format!("Source: {at}\n\n{text}"),
+                recording: None,
+                media: None,
+                origin: Some(origin),
+            }
+        })
+        .collect())
 }
 
 /// A recording's file as sent (base64), if this server transcribes it: Err is why not.
@@ -988,8 +1287,16 @@ fn read_recording(v: &Value, name: &str) -> std::result::Result<Recording, Strin
 
 /// An item's name as given (a file's, without its folders), else a name for its kind.
 pub(super) fn item_name(v: &Value) -> String {
-    let given = v["name"].as_str().unwrap_or_default();
-    let base = given.rsplit(['/', '\\']).next().unwrap_or_default();
+    // A page is named by its address until it is read.
+    let given = match (v["name"].as_str(), v["kind"].as_str()) {
+        (Some(n), _) => n,
+        (None, Some("url")) => v["url"].as_str().unwrap_or_default(),
+        _ => "",
+    };
+    let base = match v["kind"].as_str() {
+        Some("url") => given.trim(),
+        _ => given.rsplit(['/', '\\']).next().unwrap_or_default(),
+    };
     let clean: String = base
         .chars()
         .filter(|c| !c.is_control())
@@ -1043,6 +1350,18 @@ fn filed(item: &Item, author: &str) -> (String, String) {
             format!("{learned}:upload:{}", part(&item.name)),
             format!("{DOCUMENTS}{author}/file/{}", part(&item.name)),
         ),
+        // A page by its address: the host in its source, and the address (cut, with a digest of it whole so two
+        // long ones stay apart) in its key.
+        "web" => {
+            let origin = item.origin.as_deref().unwrap_or(&item.name);
+            let bare = origin.trim_start_matches("https://");
+            let host = bare.split(['/', '?', '#', ' ']).next().unwrap_or_default();
+            let whole = hex(&sha2::Sha256::digest(origin.as_bytes())[..4]);
+            (
+                format!("{learned}:web:{}", part(host)),
+                format!("{DOCUMENTS}{author}/web/{}-{whole}", part(bare)),
+            )
+        }
         kind => {
             // Named by its first words, as a reader would recognise it.
             let words: Vec<&str> = item.text.split_whitespace().take(8).collect();

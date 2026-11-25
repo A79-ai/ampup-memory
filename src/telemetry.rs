@@ -903,7 +903,8 @@ impl TryFrom<AdviceFields> for Advice {
 pub struct SessionTotals {
     pub started: u64,
     pub open: u64,
-    /// Ended by the agent (`end_session`, or its hook).
+    /// Ended by the agent (`end_session`, or its hook). A session ended discarded (its run kept no transcript) counts
+    /// in neither this nor `ended_idle`, only in `started`; one ended empty (nothing asked in it) counts nowhere.
     pub ended_by_agent: u64,
     /// Ended by the server once idle: an agent that never called `end_session`.
     pub ended_idle: u64,
@@ -1196,11 +1197,28 @@ impl Outbox {
     /// Queue `e`: into the mirror, then the spool.
     pub fn record(&self, e: &Envelope) -> anyhow::Result<()> {
         let line = self.mirrored(e)?;
+        let _held = self.hold()?;
         let mut lines = self.spooled()?;
         lines.push(line.trim_end().to_string());
         let keep = lines.len().saturating_sub(SPOOL_MAX);
         self.write_spool(&lines[keep..])
             .with_context(|| format!("the telemetry spool {}", self.spool.display()))
+    }
+
+    /// Held while the spool is read and written back: the engine records and sends it, and the deployment agent, a
+    /// process of its own, sends or clears the same file (`drain_spool`, `clear_spool`). Without it a payload
+    /// recorded between one's read and its write was lost. A lock file beside the spool, which is replaced on
+    /// every write; never held while sending.
+    fn hold(&self) -> anyhow::Result<std::fs::File> {
+        let path = self.spool.with_extension("jsonl.lock");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("the telemetry spool's lock {}", path.display()))?;
+        f.lock()?;
+        Ok(f)
     }
 
     /// Append `e` to the mirror; its line.
@@ -1287,7 +1305,7 @@ impl Outbox {
         let Some(l) = Limits::in_answer(body) else {
             return;
         };
-        let tmp = self.limits.with_extension("json.tmp");
+        let tmp = unique_tmp(&self.limits);
         if let Err(e) = serde_json::to_vec(&l)
             .map_err(anyhow::Error::from)
             .and_then(|b| Ok(std::fs::write(&tmp, b)?))
@@ -1313,15 +1331,18 @@ impl Outbox {
         }
     }
 
+    /// Caller holds [`Outbox::hold`].
     fn write_spool(&self, lines: &[String]) -> anyhow::Result<()> {
-        let tmp = self.spool.with_extension("jsonl.tmp");
+        let tmp = unique_tmp(&self.spool);
         let mut text = lines.join("\n");
         if !text.is_empty() {
             text.push('\n');
         }
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, &self.spool)?;
-        Ok(())
+        let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &self.spool));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Ok(written?)
     }
 
     /// Payloads waiting to be sent.
@@ -1331,6 +1352,7 @@ impl Outbox {
 
     /// Drop every payload waiting to be sent; how many there were. The mirror keeps its copy of each.
     pub fn clear(&self) -> anyhow::Result<usize> {
+        let _held = self.hold()?;
         let n = self.spooled()?.len();
         if n > 0 {
             self.write_spool(&[])?;
@@ -1390,7 +1412,10 @@ impl Outbox {
         let cred = crate::deployment::Credential::load(&self.credential)?;
         let mut sent = 0;
         loop {
-            let lines = self.spooled()?;
+            let lines = {
+                let _held = self.hold()?;
+                self.spooled()?
+            };
             if lines.is_empty() {
                 return Ok(sent);
             }
@@ -1410,9 +1435,20 @@ impl Outbox {
                 sent += self.send(&cred, &batch).await?;
             }
             // Re-read: a payload recorded while this batch was in flight stays.
+            let _held = self.hold()?;
             let now = self.spooled()?;
             let done = now.iter().take_while(|l| lines[..n].contains(l)).count();
             self.write_spool(&now[done..])?;
         }
     }
+}
+
+/// A temporary file beside `path` that no other writer uses: this process's id and a count of its own. The engine
+/// and the agent write beside the same files, and one renaming the other's half-written file over the real one, or
+/// away from under it, lost a write.
+fn unique_tmp(path: &std::path::Path) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()))
 }

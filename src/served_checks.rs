@@ -294,8 +294,8 @@ pub async fn check(
     let Some(e) = l.episodes.last().filter(|_| !served.is_empty()) else {
         return Ok(Checked::default());
     };
-    let body = store
-        .episode_bodies(scope, vec![e.clone()])
+    // Its transcript, held for the next flush when it ended a moment ago (the sweep that ended it idle checks it).
+    let body = crate::sessions::bodies(store, scope, vec![e.clone()])
         .await?
         .remove(e)
         .map(|b| String::from_utf8_lossy(&b).into_owned())

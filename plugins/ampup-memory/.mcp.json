@@ -3,7 +3,8 @@
     "ampup-memory": {
       "type": "stdio",
       "command": "${CLAUDE_PLUGIN_ROOT}/bin/ampup-memory-client",
-      "args": ["mcp"]
+      "args": ["mcp"],
+      "env": { "AMPUP_MEMORY_HOOKS": "sessions" }
     }
   }
 }

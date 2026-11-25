@@ -215,8 +215,11 @@ remain operator-managed.
   repairs. Before repairing, recheck the image signature and the local embedding-provider allowlist.
 
 A repair reports `applying` / `drift_repair`, then `healthy` only after rollout, health and configuration
-checks pass. A failed repair stops that generation until a newer one arrives; it never rolls back to
-the drifted configuration. If the configuration matches but the deployment is still rolling out or the
+checks pass. Drift is a condition of a healthy generation, not its outcome: a failed repair reports
+`failed` with its code and is tried again on later polls, waiting twice as long after each failure (from
+the poll interval up to an hour), while the generation stays accepted and healthy in the state file. It
+never rolls back to the drifted configuration. A repair interrupted by a restart in `report` mode reports
+`failed` / `repair_disabled` once and is not resumed. If the configuration matches but the deployment is still rolling out or the
 engine is unhealthy, its reported status reflects that observation instead of repeating an old healthy
 status. Report-only drift clears when the operator restores the accepted configuration.
 

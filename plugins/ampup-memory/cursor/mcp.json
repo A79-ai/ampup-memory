@@ -2,7 +2,8 @@
   "mcpServers": {
     "ampup-memory": {
       "command": "ampup-memory-client",
-      "args": ["mcp"]
+      "args": ["mcp"],
+      "env": { "AMPUP_MEMORY_HOOKS": "sessions" }
     }
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "sales",
-  "version": 5,
+  "version": 6,
   "description": "B2B sales memory: deals, accounts, contacts and reps from the CRM, plus what calls, emails and notes say about them (stakeholders, commitments, objections, competitors, qualification).",
   "types": {
     "deal": {
@@ -177,10 +177,11 @@
     },
     "repo": {
       "description": "A code repository. Ids are repo:<owner>/<repo>.",
+      "org_knowledge": true,
       "predicates": {
         "description": {"type": "text"},
-        "command": {"type": "text", "card": "many", "description": "A command the team runs in this repository (build, test, deploy, release), quoted exactly, with what it does; a renamed one names the old name too."},
-        "convention": {"type": "text", "card": "many", "description": "A rule the team follows in this repository (naming, branches, reviews, style, where things go), as stated."},
+        "command": {"type": "text", "card": "many", "share": true, "description": "A command the team runs in this repository (build, test, deploy, release), quoted exactly, with what it does; a renamed one names the old name too."},
+        "convention": {"type": "text", "card": "many", "share": true, "description": "A rule the team follows in this repository (naming, branches, reviews, style, where things go), as stated."},
         "decision": {"type": "text", "card": "many", "description": "A decision about this repository's code, tooling or process, with who took it when that is said."}
       }
     },

@@ -149,6 +149,7 @@ pub(super) fn schema(base: &Schema, kind: &dyn EpisodeType) -> anyhow::Result<Sc
                 TypeDef {
                     description: def.description.clone(),
                     id_prefix: def.id_prefix.clone(),
+                    org_knowledge: def.org_knowledge,
                     predicates: preds,
                 },
             );
@@ -163,6 +164,7 @@ pub(super) fn schema(base: &Schema, kind: &dyn EpisodeType) -> anyhow::Result<Sc
         let def = types.entry(ty.clone()).or_insert_with(|| TypeDef {
             description: description.clone(),
             id_prefix: None,
+            org_knowledge: false,
             predicates: BTreeMap::new(),
         });
         if def.description.is_empty() {
@@ -186,6 +188,7 @@ pub(super) fn schema(base: &Schema, kind: &dyn EpisodeType) -> anyhow::Result<Sc
                 plan: false,
                 pending: vec![],
                 list: false,
+                share: false,
                 same_as: None,
             });
         }

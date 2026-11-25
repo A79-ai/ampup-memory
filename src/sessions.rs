@@ -28,6 +28,8 @@
 
 use crate::qa_log::StoreQaLog as _;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -36,7 +38,7 @@ use serde_json::{Value, json};
 
 use crate::extract::Extractor;
 use crate::people::directory::Directory;
-use crate::qa_log::{Logged, SessionPart};
+use crate::qa_log::{Ended, Logged, SessionPart};
 use crate::runs::Refused;
 use crate::{Episode, MAIN, Principal, Scope, Store, now_micros};
 use sha2::Digest as _;
@@ -765,9 +767,185 @@ type Buffer = std::collections::HashMap<Key, Held>;
 /// commit per scope a minute, not one per step, each of which takes seconds on GCS), so no step waits on a commit.
 /// Reads ([`list`], [`find`]) see their own server's over the log. Held in this process: a cell's sessions are
 /// served by one, a server stopping flushes first, and one that dies loses at most the last interval's steps.
+/// A session's transcript is held the same way, beside its row ([`TRANSCRIPTS`]).
 static BUFFER: std::sync::LazyLock<std::sync::Mutex<Buffer>> =
     std::sync::LazyLock::new(Default::default);
+
+/// A session's transcript its end holds for the next [`flush`] ([`hold_transcript`]).
+#[derive(Clone)]
+struct HeldTranscript {
+    ep: std::sync::Arc<Episode>,
+    store: Store,
+    scope: Scope,
+    /// Its session's asker, who writes it, and when the session opened ([`still_theirs`]).
+    asker: String,
+    asked_at: i64,
+    /// Its session's id.
+    session: String,
+}
+
+impl HeldTranscript {
+    /// What it takes in memory, as [`transcript_budget`] counts it: its body, and the rest of what is held with it.
+    fn size(&self) -> usize {
+        self.ep.body.len() + self.ep.source.len() + 1_024
+    }
+
+    /// Its session, as [`still_theirs`] and [`recheck`] read it.
+    fn row(&self) -> Logged {
+        Logged {
+            answer_id: self.session.clone(),
+            asker: self.asker.clone(),
+            asked_at: self.asked_at,
+            ..Default::default()
+        }
+    }
+}
+
+/// The held transcripts, by server, namespace and episode id, and the bytes they take.
+#[derive(Default)]
+struct Transcripts {
+    by_id: std::collections::HashMap<Key, HeldTranscript>,
+    bytes: usize,
+}
+
+/// Session transcripts not committed yet. A session's end holds its transcript here and returns: [`flush`] commits
+/// them with the session rows, before the rows, so a committed row never names a transcript that isn't. Until then
+/// the transcript is read from here ([`bodies`]), and a held row naming it is not taken for one whose episode is
+/// gone ([`list`]). Bounded in bytes ([`transcript_budget`]). Held in this process, as the rows are: a server
+/// stopping flushes both, and one that dies loses the last interval's transcripts with their rows.
+static TRANSCRIPTS: std::sync::LazyLock<std::sync::Mutex<Transcripts>> =
+    std::sync::LazyLock::new(Default::default);
+/// Told when a flush has made room among the held transcripts.
+static ROOM: std::sync::LazyLock<tokio::sync::Notify> = std::sync::LazyLock::new(Default::default);
+/// How long an end waits for room among the held transcripts before it is refused for now ([`EndBusy`]).
+const ROOM_WAIT: Duration = Duration::from_secs(10);
+/// Commits of held transcripts a flush makes at once, each of one catalog, scope and asker ([`commit_held`]).
+const TRANSCRIPT_GROUPS_AT_ONCE: usize = 4;
+
+/// The most bytes of transcripts held at once: `AMPUP_MEMORY_SESSION_TRANSCRIPT_MB`, default 64, read once. Past half
+/// of it a flush starts at once; at it, an end waits for a flush to make room ([`hold_transcript`]).
+fn transcript_budget() -> usize {
+    static BUDGET: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("AMPUP_MEMORY_SESSION_TRANSCRIPT_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(64)
+            << 20
+    });
+    *BUDGET
+}
+
+/// Holds `ep`, session `l`'s transcript (its `asker`'s), for the next [`flush`]. Past half the
+/// [`transcript_budget`] a flush starts at once; at it, this waits for a flush to make room, and is refused for now
+/// ([`EndBusy`]) when none is made in [`ROOM_WAIT`] (the catalog refusing the flush): a burst of ends waits on the
+/// flush instead of holding more. One transcript is always taken, however large.
+async fn hold_transcript(
+    store: &Store,
+    scope: &Scope,
+    asker: &str,
+    l: &Logged,
+    ep: Episode,
+) -> Result<()> {
+    let k = key(store, scope, &ep.episode_id);
+    let t = HeldTranscript {
+        ep: std::sync::Arc::new(ep),
+        store: store.clone(),
+        scope: scope.clone(),
+        asker: asker.to_string(),
+        asked_at: l.asked_at,
+        session: l.answer_id.clone(),
+    };
+    let (size, budget) = (t.size(), transcript_budget());
+    let until = tokio::time::Instant::now() + ROOM_WAIT;
+    loop {
+        let room = ROOM.notified();
+        tokio::pin!(room);
+        room.as_mut().enable();
+        {
+            let mut held = TRANSCRIPTS.lock().unwrap();
+            // The same transcript held already (its end sent again) takes its place.
+            let had = held.by_id.get(&k).map_or(0, HeldTranscript::size);
+            let others = held.bytes - had;
+            if others == 0 || others + size <= budget {
+                held.bytes = others + size;
+                held.by_id.insert(k, t);
+                if held.bytes > budget / 2 {
+                    FLUSH_NOW.notify_one();
+                }
+                return Ok(());
+            }
+        }
+        FLUSH_NOW.notify_one();
+        if tokio::time::timeout_at(until, room).await.is_err() {
+            return Err(end_busy(
+                &l.answer_id,
+                "this server holds as many transcripts as it takes until a flush writes them",
+            ));
+        }
+    }
+}
+
+/// The ids of the transcripts held for `server`'s `ns`.
+fn held_transcripts(server: usize, ns: &str) -> std::collections::HashSet<String> {
+    TRANSCRIPTS
+        .lock()
+        .unwrap()
+        .by_id
+        .keys()
+        .filter(|(s, n, _)| *s == server && n == ns)
+        .map(|(_, _, id)| id.clone())
+        .collect()
+}
+
+/// The bodies of episodes `ids` of `scope` ([`Store::episode_bodies`]), a session's transcript still held for the next
+/// flush read from here: what reads a transcript right after its session ends (the judge, grading its requests, the
+/// served facts' check, advice learning) reads it before it is committed. One no longer held was committed before it
+/// left (or dropped, with its row's pointer to it).
+pub async fn bodies(
+    store: &Store,
+    scope: &Scope,
+    ids: Vec<String>,
+) -> Result<std::collections::HashMap<String, Vec<u8>>> {
+    let (server, ns) = (store.server_id(), scope.namespace());
+    let mut out = std::collections::HashMap::new();
+    let mut rest = vec![];
+    {
+        let held = TRANSCRIPTS.lock().unwrap();
+        for id in ids {
+            match held.by_id.get(&(server, ns.clone(), id.clone())) {
+                Some(t) => {
+                    out.insert(id, t.ep.body.clone());
+                }
+                None => rest.push(id),
+            }
+        }
+    }
+    if !rest.is_empty() {
+        out.extend(store.episode_bodies(scope, rest).await?);
+    }
+    Ok(out)
+}
 static VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What sessions hold in this process, for the server's memory log: rows not committed yet and their bytes,
+/// and the sessions whose hook state is tracked.
+pub fn memory_report() -> String {
+    let (held, bytes) = {
+        let b = BUFFER.lock().unwrap();
+        (
+            b.len(),
+            b.values()
+                .map(|h| crate::qa_log::logged_bytes(&h.l))
+                .sum::<usize>(),
+        )
+    };
+    format!(
+        "sessions held {held} ({} MB), tracked {}",
+        bytes >> 20,
+        ASKED.lock().unwrap().len()
+    )
+}
 /// Rows held that make [`flush_every`] flush before its interval is up.
 const FLUSH_ROWS: usize = 500;
 /// Rows held past which no session is opened (the catalog has been refusing the flush).
@@ -810,7 +988,7 @@ fn put(store: &Store, scope: &Scope, actor: &str, l: Logged) {
             || (l
                 .session
                 .as_ref()
-                .is_some_and(|s| s.ended_by.as_deref() == Some("idle"))
+                .is_some_and(|s| s.ended() == Some(Ended::Idle))
                 && h.l.updated_at > l.updated_at)
         {
             return;
@@ -871,9 +1049,7 @@ pub async fn clear_empty(
 ) -> Result<BTreeMap<String, usize>> {
     let empty = |l: &Logged| {
         l.session.as_ref().is_some_and(|s| {
-            s.ended_at.is_some()
-                && !matches!(s.ended_by.as_deref(), Some("discarded" | "empty"))
-                && s.conversation.is_none()
+            s.ended_at.is_some() && s.ended().is_none_or(Ended::counts) && s.conversation.is_none()
         }) && l.question.trim().is_empty()
             && l.episodes.is_empty()
             && l.answer.is_none()
@@ -898,7 +1074,7 @@ pub async fn clear_empty(
         }
         *counts.entry(l.asker.clone()).or_insert(0) += 1;
         if !dry_run {
-            l.session.as_mut().expect("a session").ended_by = Some("empty".into());
+            l.session.as_mut().expect("a session").end_as(Ended::Empty);
             hold(&mut buffer, store, scope, actor, l);
         }
     }
@@ -931,15 +1107,15 @@ pub async fn name_tasks(
         .filter(taskless)
         .collect();
     // A session's transcript is its only episode (`end`).
-    let bodies = store
-        .episode_bodies(
-            scope,
-            logged
-                .iter()
-                .filter_map(|l| l.episodes.last().cloned())
-                .collect(),
-        )
-        .await?;
+    let bodies = bodies(
+        store,
+        scope,
+        logged
+            .iter()
+            .filter_map(|l| l.episodes.last().cloned())
+            .collect(),
+    )
+    .await?;
     let mut counts = BTreeMap::new();
     let mut buffer = BUFFER.lock().unwrap();
     for l in logged {
@@ -991,45 +1167,44 @@ type Groups = BTreeMap<(usize, String, String), (Store, Scope, Vec<Logged>, Vec<
 /// (forgotten, offboarded) or disabled since, or whose org was deleted, is dropped, never written: it would bring
 /// back what the forget deleted. Rows that fail, or whose catalog's directory can't be read, stay for the next
 /// flush.
+///
+/// The held transcripts are committed first ([`flush_transcripts`]), and a row naming one still held (it failed, or
+/// its session ended after they were read) stays for the next flush: a committed row never names a transcript that
+/// isn't committed.
 pub async fn flush() -> Result<usize> {
     let _one = FLUSHING.lock().await;
     recheck().await;
+    let mut catalogs = Catalogs::new();
+    let mut failed = None;
+    let transcripts = flush_transcripts(&mut catalogs, &mut failed).await;
+    // The rows, then the transcripts still held: a row read here whose session's end held its transcript was held
+    // after it, so that transcript is among these.
     let held: Vec<(Key, Held)> = BUFFER
         .lock()
         .unwrap()
         .iter()
         .map(|(k, h)| (k.clone(), h.clone()))
         .collect();
+    let pending: std::collections::HashSet<Key> =
+        TRANSCRIPTS.lock().unwrap().by_id.keys().cloned().collect();
+    let held: Vec<(Key, Held)> = held
+        .into_iter()
+        .filter(|((server, ns, _), h)| {
+            !h.l.episodes
+                .iter()
+                .any(|e| pending.contains(&(*server, ns.clone(), e.clone())))
+        })
+        .collect();
     if held.is_empty() {
-        return Ok(0);
+        return match failed {
+            Some(e) if transcripts == 0 => Err(e),
+            _ => Ok(0),
+        };
     }
-    // The catalogs the rows were held for, each with its directory as it is now (none: it can't be read).
-    let mut catalogs: Vec<(std::sync::Arc<dyn iceberg::Catalog>, Option<Directory>)> = vec![];
     let mut groups = Groups::new();
     let mut dropped = vec![];
-    let mut failed = None;
     for (key, h) in held {
-        let catalog = h.store.catalog();
-        let at = match catalogs
-            .iter()
-            .position(|(c, _)| std::sync::Arc::ptr_eq(c, &catalog))
-        {
-            Some(at) => at,
-            None => {
-                let dir = match Directory::fresh(&h.store).await {
-                    Ok(dir) => Some(dir),
-                    Err(e) => {
-                        eprintln!(
-                            "memstore: session rows not written yet (kept): their directory can't be read: {e:#}"
-                        );
-                        failed.get_or_insert(e);
-                        None
-                    }
-                };
-                catalogs.push((catalog, dir));
-                catalogs.len() - 1
-            }
-        };
+        let at = directory_of(&mut catalogs, &h.store, &mut failed).await;
         let Some(dir) = &catalogs[at].1 else {
             continue;
         };
@@ -1074,9 +1249,231 @@ pub async fn flush() -> Result<usize> {
     }
     recheck().await;
     match failed {
-        Some(e) if written == 0 => Err(e),
+        Some(e) if written == 0 && transcripts == 0 => Err(e),
         _ => Ok(written),
     }
+}
+
+/// The catalogs a flush writes to, each with its directory as it is now (none: it can't be read).
+type Catalogs = Vec<(std::sync::Arc<dyn iceberg::Catalog>, Option<Directory>)>;
+
+/// Where `store`'s catalog is among `catalogs`, its directory read once per flush; a directory that can't be read is
+/// none, and its error kept in `failed`.
+async fn directory_of(
+    catalogs: &mut Catalogs,
+    store: &Store,
+    failed: &mut Option<anyhow::Error>,
+) -> usize {
+    let catalog = store.catalog();
+    if let Some(at) = catalogs
+        .iter()
+        .position(|(c, _)| std::sync::Arc::ptr_eq(c, &catalog))
+    {
+        return at;
+    }
+    let dir = match Directory::fresh(store).await {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            eprintln!(
+                "memstore: session rows not written yet (kept): their directory can't be read: {e:#}"
+            );
+            failed.get_or_insert(e);
+            None
+        }
+    };
+    catalogs.push((catalog, dir));
+    catalogs.len() - 1
+}
+
+/// Whether `e`, a transcript's commit failing, is a refusal that would refuse it again at every flush: its org's
+/// limits (its episode cap, its expiry, its ingestion stopped) or its scope's schema (an `about` it has no type for).
+fn refused_for_good(e: &anyhow::Error) -> bool {
+    crate::limits::LimitReached::of(e).is_some() || e.chain().any(|c| c.is::<crate::AboutRefused>())
+}
+
+/// Commits the held transcripts ([`TRANSCRIPTS`]): one commit per catalog, scope and asker ([`commit_held`]), those
+/// groups [`TRANSCRIPT_GROUPS_AT_ONCE`] at a time, so a flush of a burst of one person's ends is one commit, as their
+/// rows are. One whose asker left their org since is dropped, never written, as their rows are ([`still_theirs`]).
+/// One refused for good ([`refused_for_good`]) is dropped too, and its session's row no longer names it: the session
+/// is kept without its transcript, rather than held for ever. Any other failure keeps it for the next flush, its
+/// error in `failed`. How many were written.
+async fn flush_transcripts(catalogs: &mut Catalogs, failed: &mut Option<anyhow::Error>) -> usize {
+    use futures::StreamExt as _;
+    let held: Vec<(Key, HeldTranscript)> = TRANSCRIPTS
+        .lock()
+        .unwrap()
+        .by_id
+        .iter()
+        .map(|(k, t)| (k.clone(), t.clone()))
+        .collect();
+    if held.is_empty() {
+        return 0;
+    }
+    let mut groups: BTreeMap<(usize, String, String), Vec<(Key, HeldTranscript)>> = BTreeMap::new();
+    let mut gone = vec![];
+    for (k, t) in held {
+        let at = directory_of(catalogs, &t.store, failed).await;
+        let Some(dir) = &catalogs[at].1 else {
+            continue;
+        };
+        if still_theirs(dir, &t.scope, &t.row()) {
+            groups
+                .entry((at, k.1.clone(), t.asker.clone()))
+                .or_default()
+                .push((k, t));
+        } else {
+            gone.push((k, t));
+        }
+    }
+    if !gone.is_empty() {
+        eprintln!(
+            "memstore: {} session transcripts dropped, not written: their askers left their orgs",
+            gone.len()
+        );
+    }
+    let done: Vec<(Key, HeldTranscript, Result<()>)> = futures::stream::iter(groups.into_values())
+        .map(commit_held)
+        .buffer_unordered(TRANSCRIPT_GROUPS_AT_ONCE)
+        .flat_map(futures::stream::iter)
+        .collect()
+        .await;
+    let mut landed = vec![];
+    let mut refused = vec![];
+    for (k, t, r) in done {
+        match r {
+            Ok(()) => {
+                // As a row is: a forget that ran during the commit found none of it, and runs again until it has.
+                RECHECK
+                    .lock()
+                    .unwrap()
+                    .push((t.store.clone(), t.scope.clone(), vec![t.row()]));
+                landed.push((k, t));
+            }
+            Err(e) if refused_for_good(&e) => {
+                eprintln!(
+                    "memstore: session {}'s transcript in {} dropped, its session kept without it: {e:#}",
+                    t.session, t.scope
+                );
+                refused.push((k, t));
+            }
+            Err(e) => {
+                eprintln!(
+                    "memstore: session {}'s transcript in {} not written yet (kept): {e:#}",
+                    t.session, t.scope
+                );
+                *failed = Some(e);
+            }
+        }
+    }
+    let written = landed.len();
+    if written > 0 {
+        eprintln!("sessions: wrote {written} held transcripts");
+    }
+    settle_transcripts(landed, gone, refused).await;
+    written
+}
+
+/// Commits `group`, held transcripts of one catalog, scope and asker, in one commit, but those main holds already
+/// but for their time ([`Store::held_but_time`], as [`commit_unless_held`] checks one), each under its
+/// [`one_write`] turn. When that commit fails, each is committed on its own ([`commit_unless_held`]), so one the
+/// store refuses doesn't hold up the rest. Each with how it went.
+async fn commit_held(group: Vec<(Key, HeldTranscript)>) -> Vec<(Key, HeldTranscript, Result<()>)> {
+    let Some((_, first)) = group.first() else {
+        return vec![];
+    };
+    let (store, scope, asker) = (
+        first.store.clone(),
+        first.scope.clone(),
+        first.asker.clone(),
+    );
+    let together = async {
+        let mut ids: Vec<&str> = group.iter().map(|(k, _)| k.2.as_str()).collect();
+        ids.sort();
+        let mut turns = vec![];
+        for id in ids {
+            turns.push(one_write(&scope, id).await);
+        }
+        let all: Vec<Episode> = group.iter().map(|(_, t)| (*t.ep).clone()).collect();
+        let held = store.held_but_time(&scope, &all).await?;
+        let rest: Vec<Episode> = all
+            .into_iter()
+            .filter(|e| !held.contains(&e.episode_id))
+            .collect();
+        if !held.is_empty() {
+            eprintln!(
+                "sessions {scope}: {} held transcripts on main already, not written again",
+                held.len()
+            );
+        }
+        if !rest.is_empty() {
+            store.commit_record(&scope, &asker, &rest).await?;
+        }
+        drop(turns);
+        anyhow::Ok(())
+    };
+    match together.await {
+        Ok(()) => group.into_iter().map(|(k, t)| (k, t, Ok(()))).collect(),
+        Err(e) if group.len() == 1 => {
+            let (k, t) = group.into_iter().next().expect("one");
+            vec![(k, t, Err(e))]
+        }
+        Err(e) => {
+            eprintln!(
+                "sessions {scope}: {} held transcripts not written together, each on its own now: {e:#}",
+                group.len()
+            );
+            let mut done = vec![];
+            for (k, t) in group {
+                let r = commit_unless_held(&t.store, &t.scope, &t.asker, &t.ep).await;
+                done.push((k, t, r));
+            }
+            done
+        }
+    }
+}
+
+/// Drops from [`TRANSCRIPTS`] those a flush wrote (`landed`) or dropped (`gone`, `refused`), each unless held again
+/// since (its session ended again with the same transcript: that copy is the next flush's). The rows of the
+/// `refused` ones no longer name them. Tells the ends waiting for room ([`hold_transcript`]).
+async fn settle_transcripts(
+    landed: Vec<(Key, HeldTranscript)>,
+    gone: Vec<(Key, HeldTranscript)>,
+    refused: Vec<(Key, HeldTranscript)>,
+) {
+    if landed.is_empty() && gone.is_empty() && refused.is_empty() {
+        return;
+    }
+    let _settling = SETTLING.write().await;
+    let mut buffer = BUFFER.lock().unwrap();
+    let mut held = TRANSCRIPTS.lock().unwrap();
+    let mut take = |k: &Key, t: &HeldTranscript| {
+        let same = held
+            .by_id
+            .get(k)
+            .is_some_and(|h| std::sync::Arc::ptr_eq(&h.ep, &t.ep));
+        if same && let Some(h) = held.by_id.remove(k) {
+            held.bytes = held.bytes.saturating_sub(h.size());
+        }
+        same
+    };
+    for (k, t) in landed.iter().chain(&gone) {
+        take(k, t);
+    }
+    for (k, t) in &refused {
+        if !take(k, t) {
+            continue;
+        }
+        let row = key(&t.store, &t.scope, &t.session);
+        if let Some(h) = buffer.get(&row).filter(|h| h.l.episodes.contains(&k.2)) {
+            let mut l = h.l.clone();
+            l.episodes.retain(|e| *e != k.2);
+            let (store, scope, actor) = (h.store.clone(), h.scope.clone(), h.actor.clone());
+            hold(&mut buffer, &store, &scope, &actor, l);
+        }
+    }
+    drop(held);
+    drop(buffer);
+    ROOM.notify_waiters();
 }
 
 /// Session rows committed whose askers aren't known yet to still be in their orgs: see [`recheck`].
@@ -1212,6 +1609,41 @@ pub(crate) fn typed_in(text: &str, turns: bool) -> Vec<crate::keep::Typed> {
         .collect()
 }
 
+/// Each scope's turn at [`keep_later`]'s background reading, which reads the scope's kept notes whole: one reading
+/// at a time per scope, so one org's burst (a backfill of thousands of sessions) neither holds every reading in
+/// memory at once nor waits another org's turn. With how many wait for it.
+static KEEPING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, KeepTurn>>> =
+    std::sync::LazyLock::new(Default::default);
+/// A scope's turn at the reading, and how many wait for it.
+type KeepTurn = (Arc<tokio::sync::Semaphore>, Arc<AtomicUsize>);
+/// Most readings waiting for one scope's turn: past it, a session's messages stay unread, for a later call to read.
+const KEEP_WAITING: usize = 64;
+/// Readings at once across every scope in this process, however many scopes have one: each holds its scope's kept
+/// notes.
+static KEEPING_AT_ONCE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+/// Readings waiting in this process, across scopes: past [`KEEP_WAITING_ALL`] a session's messages stay unread.
+static KEEP_WAITING_NOW: AtomicUsize = AtomicUsize::new(0);
+const KEEP_WAITING_ALL: usize = 256;
+/// Longest one reading holds its scope's turn (it asks a model).
+const KEEP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// `scope`'s turn and its count of waiters, made when first asked; scopes nobody waits on are dropped past 1,000.
+fn keep_turn(scope: &Scope) -> KeepTurn {
+    let mut all = KEEPING.lock().unwrap();
+    if all.len() >= 1000 {
+        all.retain(|_, (sem, waiting)| {
+            Arc::strong_count(sem) > 1 || waiting.load(Ordering::SeqCst) > 0
+        });
+    }
+    let (sem, waiting) = all.entry(scope.namespace()).or_insert_with(|| {
+        (
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+    });
+    (sem.clone(), waiting.clone())
+}
+
 /// Keeps, in the background, the preferences the person shows in what they typed into session `l` (`text`, read as
 /// [`typed_in`] reads it), signed `signed` ([`crate::keep::from_user`]): each message once ([`KEEP_READ`]). Never
 /// from a recorder key's session (the key's account of their work isn't their words) or a program's, and never
@@ -1246,20 +1678,54 @@ pub fn keep_later(store: &Store, scope: &Scope, l: &Logged, signed: &str, text: 
     if typed.is_empty() {
         return;
     }
+    let said: Vec<_> = typed.iter().map(|t| words_of(&t.said)).collect();
+    // Messages not read after all stay unread, so a later call reads them.
+    let unread = move |id: &str| {
+        if let Some(seen) = KEEP_READ.lock().unwrap().get_mut(id) {
+            seen.retain(|s| !said.iter().any(|w| same_message(s, w)));
+        }
+    };
+    // Staging's backfill of thousands of sessions started a reading per session at once, each holding the scope's
+    // kept notes (~0.4 GB more every 10 minutes): they take turns per scope, and past a queue they wait for later.
+    let (turn, waiting) = keep_turn(scope);
+    let all = KEEP_WAITING_NOW.fetch_add(1, Ordering::SeqCst);
+    if waiting.fetch_add(1, Ordering::SeqCst) >= KEEP_WAITING || all >= KEEP_WAITING_ALL {
+        waiting.fetch_sub(1, Ordering::SeqCst);
+        KEEP_WAITING_NOW.fetch_sub(1, Ordering::SeqCst);
+        unread(&l.answer_id);
+        return;
+    }
     let (store, scope, l, signed) = (store.clone(), scope.clone(), l.clone(), signed.to_string());
     let org = scope.org_name().map(str::to_string);
     tokio::spawn(crate::log_org::with(org.as_deref(), async move {
+        // The scope's turn first (one org's burst waits on itself), then one of the process's few.
+        let held = turn.acquire_owned().await;
+        let at_once = match &held {
+            Ok(_) => KEEPING_AT_ONCE.acquire().await.ok(),
+            Err(_) => None,
+        };
+        waiting.fetch_sub(1, Ordering::SeqCst);
+        KEEP_WAITING_NOW.fetch_sub(1, Ordering::SeqCst);
+        let (Ok(_turn), Some(_at_once)) = (held, at_once) else {
+            return;
+        };
         let theirs = |dir: &Directory| still_theirs(dir, &scope, &l);
-        let said: Vec<_> = typed.iter().map(|t| words_of(&t.said)).collect();
-        if let Err(e) =
-            crate::keep::from_user(&store, &scope, &l.asker, &signed, typed, theirs).await
-        {
-            eprintln!("keep: {scope}: {e:#}");
-            // Refused by the org's limits: unread still, so a later call reads them.
-            if crate::limits::LimitReached::of(&e).is_some()
-                && let Some(seen) = KEEP_READ.lock().unwrap().get_mut(&l.answer_id)
-            {
-                seen.retain(|s| !said.iter().any(|w| same_message(s, w)));
+        let reading = crate::keep::from_user(&store, &scope, &l.asker, &signed, typed, theirs);
+        match tokio::time::timeout(KEEP_TIMEOUT, reading).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                eprintln!("keep: {scope}: {e:#}");
+                // Refused by the org's limits: unread still, so a later call reads them.
+                if crate::limits::LimitReached::of(&e).is_some() {
+                    unread(&l.answer_id);
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "keep: {scope}: no answer in {} s, left unread",
+                    KEEP_TIMEOUT.as_secs()
+                );
+                unread(&l.answer_id);
             }
         }
     }));
@@ -1282,10 +1748,24 @@ pub async fn flush_every() {
 
 /// An explicit or empty end is final; only an idle end can be resumed by its owner.
 fn ended_final(l: &Logged) -> bool {
-    l.session.as_ref().is_some_and(|s| {
-        s.ended_at.is_some()
-            && matches!(s.ended_by.as_deref(), Some("agent" | "discarded" | "empty"))
-    })
+    l.session
+        .as_ref()
+        .is_some_and(|s| s.ended_at.is_some() && s.ended().is_some_and(Ended::is_final))
+}
+
+/// This server's session rows of `scope` held for the next flush ([`BUFFER`]), as a mark that moves whenever one is
+/// held anew or leaves for the log: how many, and the newest one's version. What [`list`] reads over the log, without
+/// reading the log.
+pub fn held_mark(store: &Store, scope: &Scope) -> (usize, u64) {
+    let (server, ns) = (store.server_id(), scope.namespace());
+    let buffer = BUFFER.lock().unwrap();
+    let mut mark = (0, 0);
+    for ((s, n, _), h) in buffer.iter() {
+        if *s == server && *n == ns {
+            mark = (mark.0 + 1, mark.1.max(h.version));
+        }
+    }
+    mark
 }
 
 /// The scope's sessions as they stand: the log's, with the rows held for the next flush over them (an end its
@@ -1311,15 +1791,22 @@ pub async fn list_where(
         .filter(|((s, n, _), h)| *s == server && *n == ns && keep(&h.l))
         .map(|(_, h)| h.l.clone())
         .collect();
+    // Read under the same settling read: a transcript no longer held left for main before it began.
+    let pending = held_transcripts(server, &ns);
     drop(settling);
     if held.is_empty() {
         return Ok(all);
     }
-    // As the log's own rows are read: one citing an episode erased or retracted since is gone with it.
+    // As the log's own rows are read: one citing an episode erased or retracted since is gone with it. A transcript
+    // held for the next flush isn't on main yet, and isn't gone.
     let view = store.lagging_view(scope, MAIN).await?;
     let held: Vec<Logged> = held
         .into_iter()
-        .filter(|l| !l.episodes.iter().any(|e| view.is_gone(e)))
+        .filter(|l| {
+            !l.episodes
+                .iter()
+                .any(|e| !pending.contains(e) && view.is_gone(e))
+        })
         .collect();
     for mut h in held {
         match all.iter_mut().find(|l| l.answer_id == h.answer_id) {
@@ -1341,6 +1828,40 @@ pub async fn list_where(
     }
     all.sort_by_key(|l| std::cmp::Reverse(l.asked_at));
     Ok(all)
+}
+
+/// The session `who` has open for the conversation `args` names (`thread`, the harness's own id for it), started in
+/// the last day and neither ended nor discarded: the newest, if any. A thread is its caller's own: only `who`'s
+/// sessions are looked at.
+pub async fn open_in_thread(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    args: &Value,
+) -> Result<Option<Logged>> {
+    let Some(thread) = text(args, "thread").map(|t| head(t, MAX_THREAD)) else {
+        return Ok(None);
+    };
+    let since = now_micros() - 86_400_000_000;
+    let ours = |l: &Logged| {
+        l.kind.as_deref() == Some(KIND)
+            && l.asker == who.user()
+            && l.asked_at >= since
+            && l.session
+                .as_ref()
+                .is_some_and(|s| s.thread.as_deref() == Some(thread.as_str()))
+    };
+    let open = list_where(store, scope, ours)
+        .await?
+        .into_iter()
+        .filter(|l| {
+            ours(l)
+                && !discarded(l)
+                && !backfilled(l)
+                && l.session.as_ref().is_some_and(|s| s.ended_at.is_none())
+        })
+        .max_by_key(|l| l.asked_at);
+    Ok(open)
 }
 
 /// Session `id`, as it stands, if `who` started it.
@@ -1899,25 +2420,13 @@ pub(crate) async fn commit_unless_held(
     actor: &str,
     ep: &Episode,
 ) -> Result<()> {
-    commit_holding(store, scope, actor, ep, ()).await
-}
-
-/// [`commit_unless_held`], keeping `hold` until the commit lands, even when the request that asked for it is dropped
-/// first ([`landed`]): a session's end keeps its [`EndTurn`] so, and what is under way stays counted while it is.
-async fn commit_holding(
-    store: &Store,
-    scope: &Scope,
-    actor: &str,
-    ep: &Episode,
-    hold: impl Send + 'static,
-) -> Result<()> {
     let one = std::slice::from_ref(ep);
+    crate::phases::mark("end: waiting its turn");
     let turn = one_write(scope, &ep.episode_id).await;
-    if store
-        .held_but_time(scope, one)
-        .await?
-        .contains(&ep.episode_id)
-    {
+    crate::phases::mark("end: held check");
+    let held = store.held_but_time(scope, one).await?;
+    crate::phases::mark("end: held checked");
+    if held.contains(&ep.episode_id) {
         eprintln!(
             "sessions {scope}: {} held on main already, not written again",
             ep.episode_id
@@ -1927,7 +2436,6 @@ async fn commit_holding(
     let (store, scope_of, actor, ep) =
         (store.clone(), scope.clone(), actor.to_string(), ep.clone());
     landed(scope, turn, async move {
-        let _hold = hold;
         store
             .commit_record(&scope_of, &actor, std::slice::from_ref(&ep))
             .await
@@ -1936,9 +2444,12 @@ async fn commit_holding(
     Ok(())
 }
 
-/// How many sessions' ends one server works on at once (their transcripts read, built and committed):
-/// `AMPUP_MEMORY_SESSION_ENDS_AT_ONCE`, default 4, read once. Each end commits its transcript on its own, and a burst
-/// of them at once (a client sending every session's end again) holds that many transcripts and commits in memory.
+/// How many sessions' ends one server works on at once (their transcripts read, redacted, built and held for the
+/// flush, [`hold_transcript`]): `AMPUP_MEMORY_SESSION_ENDS_AT_ONCE`, default 4, read once. An end no longer commits,
+/// so a slot is let go in milliseconds; it still bounds the copies a burst of ends makes at once of what they were
+/// sent (a whole conversation each, before its tail is kept), and an end waiting for room among the held
+/// transcripts waits in its slot, so the ends behind it are refused for now ([`EndBusy`]) rather than queued. What
+/// the ends hold until the flush is bounded apart, in bytes ([`transcript_budget`]).
 fn ends_at_once() -> usize {
     static AT_ONCE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         std::env::var("AMPUP_MEMORY_SESSION_ENDS_AT_ONCE")
@@ -2053,10 +2564,8 @@ fn ends_under_way() -> usize {
     ends_at_once().saturating_sub(END_SLOTS.available_permits())
 }
 
-/// An end under way: its session's claim and one of the [`ends_at_once`], both let go once the end is answered and
-/// its transcript's commit landed, whichever is later (the commit keeps a copy, [`commit_holding`]).
-#[derive(Clone)]
-struct EndTurn(#[allow(dead_code)] std::sync::Arc<(EndClaim, tokio::sync::OwnedSemaphorePermit)>);
+/// An end under way: its session's claim and one of the [`ends_at_once`], both let go once the end is answered.
+struct EndTurn(#[allow(dead_code)] (EndClaim, tokio::sync::OwnedSemaphorePermit));
 
 impl EndClaim {
     /// Waits up to [`END_WAIT`] for one of the [`ends_at_once`]; refused for now ([`EndBusy`]) when none frees up.
@@ -2066,7 +2575,7 @@ impl EndClaim {
             Ok(Ok(permit)) => {
                 ENDS.most.fetch_max(ends_under_way(), Relaxed);
                 ENDS.begun.fetch_add(1, Relaxed);
-                Ok(EndTurn(std::sync::Arc::new((self, permit))))
+                Ok(EndTurn((self, permit)))
             }
             _ => Err(end_busy(
                 &self.id,
@@ -2229,7 +2738,7 @@ fn reopen_idle(l: &mut Logged) -> bool {
     let s = l.session.as_mut().expect("a session");
     // An empty end is final, as an agent's is (the log ranks it over later rows): a harness that comes back to one
     // starts a new session.
-    if s.ended_at.is_none() || s.ended_by.as_deref() != Some("idle") {
+    if s.ended_at.is_none() || s.ended() != Some(Ended::Idle) {
         return false;
     }
     s.ended_at = None;
@@ -3518,14 +4027,16 @@ pub async fn mark_automated(
 pub fn discarded(l: &Logged) -> bool {
     l.session
         .as_ref()
-        .is_some_and(|s| matches!(s.ended_by.as_deref(), Some("discarded" | "empty")))
+        .is_some_and(|s| s.ended().is_some_and(|e| !e.counts()))
 }
 
 /// Ends open session `l` of `asker`: its transcript (given, else the conversation so far) kept as an episode
 /// signed `signed` (`mcp:remember_memory:<asker>:`), its outcome and an explicit reward if given. Returns the
-/// entry as ended. With its `claim` ([`claim_end`], a caller's end; the idle sweep, one session at a time, has none),
-/// the transcript is read, built and committed only in one of the [`ends_at_once`], refused for now ([`EndBusy`])
-/// when none frees up.
+/// entry as ended. The transcript is held for the next [`flush`] with the session's row, not committed here
+/// ([`hold_transcript`]): the episode id the entry names is the one the flush commits, and what reads it meanwhile
+/// reads it from the buffer ([`bodies`]). With its `claim` ([`claim_end`], a caller's end; the idle sweep, one
+/// session at a time, has none), the transcript is read and built only in one of the [`ends_at_once`], refused for
+/// now ([`EndBusy`]) when none frees up.
 pub async fn end(
     store: &Store,
     scope: &Scope,
@@ -3587,12 +4098,13 @@ pub async fn end(
         ),
     }
     .map(|t| t.min(now_micros()));
-    // What costs memory and a commit starts here: an end that would be refused above never waits for its turn.
-    let turn = match claim {
+    // What costs memory starts here: an end that would be refused above never waits for its turn.
+    let _turn = match claim {
         Some(c) => Some(c.turn().await?),
         None => None,
     };
     // The transcript given, else the last conversation the session was sent (its episode).
+    crate::phases::mark("end: transcript");
     let transcript = match (text(args, "transcript"), s.conversation.take()) {
         _ if discard => None,
         (Some(t), _) => Some(crate::hook::redact(&tail(t, MAX_TRANSCRIPT))),
@@ -3649,18 +4161,15 @@ pub async fn end(
         && l.question.trim().is_empty();
     let s = l.session.as_mut().expect("a session");
     // The sweep ends a session with no arguments; an agent (or its hook) with its own.
-    s.ended_by = Some(
-        if discard {
-            "discarded"
-        } else if empty {
-            "empty"
-        } else if args.is_null() {
-            "idle"
-        } else {
-            "agent"
-        }
-        .into(),
-    );
+    s.end_as(if discard {
+        Ended::Discarded
+    } else if empty {
+        Ended::Empty
+    } else if args.is_null() {
+        Ended::Idle
+    } else {
+        Ended::Agent
+    });
     if let Some(t) = &transcript {
         let repo = repo_arg(args);
         let mut ep = transcript_episode(
@@ -3675,8 +4184,14 @@ pub async fn end(
         if let Some(at) = occurred {
             ep.occurred_at = at;
         }
-        commit_holding(store, scope, asker, &ep, turn.clone()).await?;
-        l.episodes.push(ep.episode_id);
+        // An org that takes no new memory now (past its expiry, its ingestion stopped) refuses the end here, as the
+        // commit would have: the flush is no place to hear it.
+        if let Some(limit) = crate::limits::write_gate(scope.org_name()) {
+            return Err(limit.into());
+        }
+        let kept = ep.episode_id.clone();
+        hold_transcript(store, scope, asker, &l, ep).await?;
+        l.episodes.push(kept);
     }
     l.answer = outcome.map(|o| head(o, MAX_OUTCOME));
     if reward.is_some() {
@@ -3698,9 +4213,11 @@ pub async fn end(
         .as_deref()
         .map(crate::session_prs::merges_in)
         .unwrap_or_default();
+    // The asker's own sessions only, all a merge reads (`repo_of`, `reach`): not a copy of the whole log.
+    crate::phases::mark("end: merges");
     let others = match merges.is_empty() {
         true => vec![],
-        false => list(store, scope).await?,
+        false => list_where(store, scope, |l| l.asker == asker).await?,
     };
     let event = crate::session_prs::Event {
         kind: "merged".into(),
@@ -3969,7 +4486,7 @@ When the user's requests are listed under \"Requests\", also say how each went, 
 /// sessions `all` ([`after`]), and keeps the verdicts on it. A session that ended with no transcript is judged on
 /// the conversation it last kept, where its row lost the pointer to it (kept now as its transcript, signed
 /// `signed`), else on a partial record of what it left, and only when something after it shows how it went. A
-/// judge that fails leaves the session unscored, saying why.
+/// judge that fails leaves the session unscored, saying why, and a later sweep asks again ([`judge_failed`]).
 pub async fn judge(
     store: &Store,
     scope: &Scope,
@@ -4019,10 +4536,10 @@ pub async fn judge(
         };
         notes.push(format!("Note `{k}`:\n{note}"));
     }
-    // Kept last, after the episodes its cited facts come from ([`end`]).
+    // Kept last, after the episodes its cited facts come from ([`end`]); held for the next flush when it ended a
+    // moment ago (the sweep that ended it idle judges it at once).
     let kept = match l.episodes.last() {
-        Some(e) => store
-            .episode_bodies(scope, vec![e.clone()])
+        Some(e) => bodies(store, scope, vec![e.clone()])
             .await?
             .remove(e)
             .map(|b| (e.clone(), String::from_utf8_lossy(&b).into_owned())),
@@ -4062,7 +4579,7 @@ pub async fn judge(
         // What it left shows what was asked but not what the agent did: with nothing after it either, there is
         // nothing to read for how it went, and no model is asked.
         None if after.is_empty() => {
-            json!({"unscored": "no transcript, and nothing after the session shows how it went"})
+            json!({"unscored": NOTHING_TO_READ})
         }
         _ => {
             let notes = if notes.is_empty() {
@@ -4118,9 +4635,9 @@ pub async fn judge(
                         }
                         out
                     }
-                    None => json!({"unscored": "the judge's reply has no JSON"}),
+                    None => judge_failed(s, "the judge's reply has no JSON".into()),
                 },
-                Err(e) => json!({"unscored": head(&format!("{e:#}"), 300)}),
+                Err(e) => judge_failed(s, head(&format!("{e:#}"), 300)),
             }
         }
     };
@@ -4321,9 +4838,9 @@ fn next_within() -> i64 {
 fn last_step(l: &Logged) -> i64 {
     let s = l.session.as_ref().expect("a session");
     let end = s.ended_at.unwrap_or(l.updated_at);
-    match s.ended_by.as_deref() {
-        Some("idle") => (end - idle().as_micros() as i64).max(l.asked_at),
-        _ => end,
+    match s.ended() {
+        Some(Ended::Idle) => (end - idle().as_micros() as i64).max(l.asked_at),
+        Some(Ended::Agent | Ended::Discarded | Ended::Empty) | None => end,
     }
 }
 
@@ -4484,9 +5001,9 @@ fn partial_record(l: &Logged) -> String {
         ));
     }
     if let Some(e) = s.ended_at {
-        let how = match s.ended_by.as_deref() {
-            Some("idle") => "ended idle",
-            _ => "was ended by its agent",
+        let how = match s.ended() {
+            Some(Ended::Idle) => "ended idle",
+            Some(Ended::Agent | Ended::Discarded | Ended::Empty) | None => "was ended by its agent",
         };
         out.push_str(&format!(
             "\nIt {how}, its last step {} after it opened.\n",
@@ -4540,8 +5057,7 @@ pub async fn grade_tasks(
     let Some(e) = l.episodes.last() else {
         return Ok(Some(false));
     };
-    let body = store
-        .episode_bodies(scope, vec![e.clone()])
+    let body = bodies(store, scope, vec![e.clone()])
         .await?
         .remove(e)
         .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -4698,14 +5214,72 @@ pub struct Swept {
 
 /// Sessions a sweep tries to grade at most ([`grade_tasks`]): a scope's backlog is worked through a sweep at a time.
 const MAX_GRADED: usize = 50;
-/// Sessions a sweep judges again at most of those an earlier judge left unscored for having no transcript
-/// ([`unjudged_before`]), so a scope's backlog of them is worked through a sweep at a time.
+/// Sessions a sweep judges again at most of those an earlier judge left unscored ([`judge_again`]), so a scope's
+/// backlog of them is worked through a sweep at a time, and a judge model that is down costs a sweep at most that
+/// many calls.
 const MAX_REJUDGED: usize = 50;
 
-/// Whether verdicts `v` are those a judge before partial records left on a session that ended with no transcript,
-/// asking no model: it is judged once more, on the conversation it last kept or what it left ([`judge`]).
-fn unjudged_before(v: &str) -> bool {
-    serde_json::from_str::<Value>(v).is_ok_and(|v| v == json!({"unscored": "no transcript"}))
+/// Why the judge left a session unscored when it ended with no transcript and nothing after it shows how it went: no
+/// model was asked, and none will be.
+const NOTHING_TO_READ: &str = "no transcript, and nothing after the session shows how it went";
+
+/// How many times the judge is asked about a session before its failing to answer stands ([`judge_failed`]).
+const JUDGE_TRIES: u64 = 5;
+
+/// How long after a judge that failed the sweep asks again: `AMPUP_MEMORY_SESSION_JUDGE_RETRY_SECS`, default an
+/// hour, doubled after each further failure, so [`JUDGE_TRIES`] span most of a day: an outage of the judge model
+/// is waited out rather than costing every session its verdict.
+fn judge_retry(tries: u64) -> Duration {
+    let first = std::env::var("AMPUP_MEMORY_SESSION_JUDGE_RETRY_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(3_600u64);
+    Duration::from_secs(first.saturating_mul(1 << tries.saturating_sub(1).min(16)))
+}
+
+/// The verdicts of session `s`'s judge that failed (its model call failed, or its reply held no verdict), saying
+/// why: unscored, with how many times the judge has now failed it and when, so a later sweep asks again
+/// ([`judge_again`]). Kept rather than left unjudged: a session with no verdicts is judged at every sweep, with no
+/// count to stop one the model always fails on.
+fn judge_failed(s: &SessionPart, why: String) -> Value {
+    let before = s
+        .verdicts
+        .as_deref()
+        .and_then(|v| serde_json::from_str::<Value>(v).ok())
+        .and_then(|v| failed_tries(&v))
+        .unwrap_or(0);
+    json!({"unscored": why, "tries": before + 1, "tried_at": now_micros()})
+}
+
+/// How many times the judge failed the session verdicts `v` are of; None when they aren't a failed judge's (judged,
+/// or unscored for a reason no model call changes). Those an engine kept before failures were counted say only why:
+/// their reason is the failure's own text, which is one failure.
+fn failed_tries(v: &Value) -> Option<u64> {
+    let why = v.get("unscored")?.as_str()?;
+    match v.get("tries").and_then(Value::as_u64) {
+        Some(n) => Some(n),
+        None => (why != NOTHING_TO_READ && why != "no transcript").then_some(1),
+    }
+}
+
+/// Whether the sweep judges session verdicts `v` again: those a judge before partial records left on a session
+/// that ended with no transcript, asking no model, once more on the conversation it last kept or what it left
+/// ([`judge`]); and those of a judge that failed, once [`judge_retry`] has passed since, until it has failed
+/// [`JUDGE_TRIES`] times.
+fn judge_again(v: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(v) else {
+        return false;
+    };
+    if v == json!({"unscored": "no transcript"}) {
+        return true;
+    }
+    match failed_tries(&v) {
+        Some(n) if n < JUDGE_TRIES => {
+            let at = v["tried_at"].as_i64().unwrap_or(0);
+            now_micros().saturating_sub(at) >= judge_retry(n).as_micros() as i64
+        }
+        _ => false,
+    }
 }
 
 /// Ends the scope's sessions idle for longer than `idle`, signing each transcript with `signed(asker)`, then
@@ -4838,7 +5412,7 @@ pub async fn sweep(
             continue;
         }
         // A judged session of a person's, where advice learns, is graded request by request once.
-        let again = s.verdicts.as_deref().is_some_and(unjudged_before);
+        let again = s.verdicts.as_deref().is_some_and(judge_again);
         if let Some(v) = s.verdicts.as_ref().filter(|_| !again) {
             let ungraded = || {
                 serde_json::from_str::<Value>(v)
@@ -4877,7 +5451,20 @@ pub async fn sweep(
             let who = Principal::from_parts(l.asker.clone(), vec![]);
             let (id, signed) = (l.answer_id.clone(), signed(&l.asker));
             match judge(store, scope, &who, cx, l, &sessions, &signed).await {
-                Ok(_) => done.judged += 1,
+                Ok(f) => match f.session.as_ref().and_then(|s| {
+                    let v = serde_json::from_str::<Value>(s.verdicts.as_deref()?).ok()?;
+                    failed_tries(&v).map(|n| (n, v["unscored"].as_str().unwrap_or("").to_string()))
+                }) {
+                    Some((n, why)) => eprintln!(
+                        "sessions {scope}: judging {id} failed ({n} of {JUDGE_TRIES} tries{}): {why}",
+                        if n < JUDGE_TRIES {
+                            ", asked again later"
+                        } else {
+                            ", left unscored"
+                        }
+                    ),
+                    None => done.judged += 1,
+                },
                 Err(e) => eprintln!("sessions {scope}: judging {id}: {e:#}"),
             }
         }
@@ -5051,6 +5638,11 @@ pub async fn outcomes(store: &Store, scope: &Scope) -> Result<Outcomes> {
         let Some(s) = l.session.as_ref() else {
             continue;
         };
+        // A session ended with nothing asked in it (by its agent, the idle sweep or an admin's clear) isn't shown:
+        // it counts nowhere, not even as started.
+        if s.ended() == Some(Ended::Empty) {
+            continue;
+        }
         o.started += 1;
         *o.by_harness
             .entry(s.harness.clone().unwrap_or_default())
@@ -5058,10 +5650,14 @@ pub async fn outcomes(store: &Store, scope: &Scope) -> Result<Outcomes> {
         if s.arm == HOLDOUT {
             o.holdout += 1;
         }
-        match (s.ended_at, s.ended_by.as_deref()) {
+        match (s.ended_at, s.ended()) {
             (None, _) => o.open += 1,
-            (Some(_), Some("idle")) => o.ended_idle += 1,
-            (Some(_), _) => o.ended_by_agent += 1,
+            (Some(_), Some(Ended::Idle)) => o.ended_idle += 1,
+            // Neither its agent's end nor the server's to count: a run that kept no transcript isn't one of the
+            // day's sessions ([`discarded`]). Counted as started only. (An empty one never gets here.)
+            (Some(_), Some(Ended::Discarded | Ended::Empty)) => {}
+            // An end its row doesn't name (from before ends were recorded) was its agent's, as it always counted.
+            (Some(_), Some(Ended::Agent) | None) => o.ended_by_agent += 1,
         }
         let v = s
             .verdicts

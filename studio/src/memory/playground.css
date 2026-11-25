@@ -281,6 +281,11 @@
       border-color 0.12s,
       background 0.12s;
   }
+  .pg-chip-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .pg-chip:hover {
     border-color: var(--line-strong);
     background: var(--surface-2);

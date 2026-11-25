@@ -24,6 +24,7 @@ mod compile_settings;
 mod dream_jobs;
 mod error_leads;
 mod governance;
+mod hooked_sessions;
 mod hooks_never_block;
 mod index_known_cap;
 mod index_old_versions;

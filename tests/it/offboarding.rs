@@ -401,6 +401,32 @@ async fn hits(s: &str, sel: &str, bearer: &str, query: &str) -> HashMap<String, 
     out
 }
 
+/// Every fact value `/search` serves `bearer` for `query`, those grouped under another hit's entity included.
+async fn values_served(s: &str, sel: &str, bearer: &str, query: &str) -> Vec<String> {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Object(o) => {
+                if o.contains_key("fact_id") {
+                    out.push(o["value"].as_str().unwrap_or_default().into());
+                }
+                o.values().for_each(|v| walk(v, out));
+            }
+            Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let (status, text) = post(
+        &format!("{s}/search{sel}"),
+        bearer,
+        &json!({"data": [[0, query, 50]]}),
+    )
+    .await;
+    assert_eq!(status, 200, "/search{sel}: {text}");
+    let mut out = vec![];
+    walk(&serde_json::from_str(&text).unwrap(), &mut out);
+    out
+}
+
 /// `POST /feedback` as `bearer`: the HTTP status and the raw answer.
 async fn feedback(
     s: &str,
@@ -1643,6 +1669,229 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         !body.contains("xqalicepasted"),
         "what she forgot is read: {body}"
     );
+    // Only part of a note goes: Carol forgets the fact drawn from one sentence of it, by its id. No one reads that
+    // fact, a copy drawn again from another record of her words (a second record of the same conversation), or a
+    // passage of hers holding the sentence. The note's other fact stays, the same sentence in Bob's words stays,
+    // Bob may not forget her fact, and she may not forget one his words support too.
+    let sentence = "This week's xqoncall engineer for xqledger is Priya Raman (pager @praman).";
+    let note = remember(
+        s,
+        "?org=acme",
+        &carol,
+        &format!("xqledger runs on cluster xqblue7. {sentence}"),
+    )
+    .await;
+    let again = remember(
+        s,
+        "?org=acme",
+        &carol,
+        &format!("From the session: {sentence}"),
+    )
+    .await;
+    let bobs = remember(s, "?org=acme", &bob, sentence).await;
+    let quoted = |value: &str, from: &str, quote: &str| {
+        let mut f = Fact::new("deal:xqledger", "owner", value);
+        f.source_episodes = vec![from.to_string()];
+        f.quote = Some(quote.to_string());
+        f
+    };
+    let oncall = quoted("xqpriya", &note, sentence);
+    let facts = [
+        oncall.clone(),
+        quoted("xqblue7", &note, "xqledger runs on cluster xqblue7"),
+        quoted(
+            "xqpriyacopy",
+            &again,
+            "xqoncall engineer for xqledger is Priya Raman",
+        ),
+        quoted("xqpriyabob", &bobs, sentence),
+        {
+            let mut both = quoted("xqpriyaboth", &note, sentence);
+            both.source_episodes.push(bobs.clone());
+            both
+        },
+    ];
+    let both = facts[4].fact_id.clone();
+    store.commit(&acme, "extractor", &[], &facts).await.unwrap();
+    index(&store, std::slice::from_ref(&acme)).await;
+    // Within the server's staleness window.
+    let t = Instant::now();
+    loop {
+        let found = values_served(s, "?org=acme", &carol, "xqledger xqoncall priya cluster").await;
+        if [
+            "xqpriya",
+            "xqblue7",
+            "xqpriyacopy",
+            "xqpriyabob",
+            "xqpriyaboth",
+        ]
+        .iter()
+        .all(|v| found.iter().any(|f| f == v))
+        {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "not found before the forget: {found:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let as_bob = |name: &str, args: Value| {
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": name, "arguments": args}});
+        let who = bob.clone();
+        async move { post(&format!("{s}/mcp?org=acme"), &who, &call).await.1 }
+    };
+    let body = as_bob("forget_memory", json!({"fact_id": oncall.fact_id})).await;
+    assert!(
+        body.contains("no fact") && !body.contains("forgot fact"),
+        "Bob forgot a fact drawn from Carol's words: {body}"
+    );
+    let found = values_served(s, "?org=acme", &carol, "xqledger xqoncall priya cluster").await;
+    assert!(found.iter().any(|f| f == "xqpriya"), "{found:?}");
+    let passages = json!({"data": [[0, {"find": "passages", "text": "xqoncall xqledger priya", "limit": 100}]]});
+    let (status, body) = post(&format!("{s}/query?org=acme"), &carol, &passages).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains(&note[..16]) && body.contains(&again[..16]),
+        "her passages aren't found before the forget: {body}"
+    );
+    let body = tool("forget_memory", json!({"fact_id": both})).await;
+    assert!(
+        body.contains("no fact") && !body.contains("forgot fact"),
+        "Carol forgot a fact Bob's words support too: {body}"
+    );
+    let body = tool("forget_memory", json!({"fact_id": oncall.fact_id})).await;
+    assert!(
+        body.contains(&format!("forgot fact {}", oncall.fact_id)),
+        "{body}"
+    );
+    for who in [&carol, &bob, &alice] {
+        let found = values_served(s, "?org=acme", who, "xqledger xqoncall priya cluster").await;
+        for v in ["xqpriya", "xqpriyacopy"] {
+            assert!(
+                !found.iter().any(|f| f == v),
+                "{who} is served {v}, which Carol forgot: {found:?}"
+            );
+        }
+        assert!(
+            !found.iter().any(|f| f.contains("xqblue7. This week")),
+            "{who} is served Carol's note holding what she forgot: {found:?}"
+        );
+        for v in ["xqblue7", "xqpriyabob", "xqpriyaboth"] {
+            assert!(
+                found.iter().any(|f| f == v),
+                "{who} lost {v}, which nobody forgot: {found:?}"
+            );
+        }
+        let (status, body) = post(&format!("{s}/query?org=acme"), who, &passages).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !body.contains(&note[..16]) && !body.contains(&again[..16]),
+            "{who} is served a passage of Carol's holding what she forgot: {body}"
+        );
+        assert!(
+            body.contains(&bobs[..16]),
+            "{who} lost Bob's passage: {body}"
+        );
+    }
+    // A sentence goes before any fact is drawn from it: Carol finds it with `matching`, Bob may not forget it from
+    // her note, she forgets it by the note's id and the sentence, and what extraction draws from the note afterwards
+    // serves no one the sentence: not a fact quoting it, not the note's own fact, not a passage of the note. The
+    // note's other sentence stays.
+    let gone = "The xqvault xqpager holder is Dana Kim (pager @dkim).";
+    let vault = remember(
+        s,
+        "?org=acme",
+        &carol,
+        &format!("xqvault runs on cluster xqgreen3. {gone}"),
+    )
+    .await;
+    // The same words in another record of hers (a recap of the conversation).
+    let recap = remember(s, "?org=acme", &carol, &format!("Recap: {gone}")).await;
+    let body = tool("forget_memory", json!({"matching": "xqvault xqpager"})).await;
+    assert!(
+        body.contains(&vault) && body.contains("Dana Kim (pager @dkim)."),
+        "the matching answer doesn't list the sentence: {body}"
+    );
+    let body = as_bob(
+        "forget_memory",
+        json!({"episode_id": vault, "sentence": gone}),
+    )
+    .await;
+    assert!(
+        body.contains("no episode") && !body.contains("forgot"),
+        "Bob forgot a sentence of Carol's note: {body}"
+    );
+    let body = tool(
+        "forget_memory",
+        json!({"episode_id": vault, "sentence": "xqvault"}),
+    )
+    .await;
+    assert!(
+        !body.contains("forgot"),
+        "a single word was forgotten as a sentence: {body}"
+    );
+    let body = tool(
+        "forget_memory",
+        json!({"episode_id": vault, "sentence": gone}),
+    )
+    .await;
+    assert!(body.contains("forgot") && body.contains(&vault), "{body}");
+    let drawn = [
+        quoted("xqdana", &vault, gone),
+        quoted("xqgreen3", &vault, "xqvault runs on cluster xqgreen3"),
+    ];
+    store.commit(&acme, "extractor", &[], &drawn).await.unwrap();
+    index(&store, std::slice::from_ref(&acme)).await;
+    let vault_passages =
+        json!({"data": [[0, {"find": "passages", "text": "xqvault xqpager dana", "limit": 100}]]});
+    let t = Instant::now();
+    loop {
+        let found = values_served(s, "?org=acme", &carol, "xqvault xqpager dana cluster").await;
+        if found.iter().any(|f| f == "xqgreen3") {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "what the note holds besides is not found: {found:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    for who in [&carol, &bob, &alice] {
+        let found = values_served(s, "?org=acme", who, "xqvault xqpager dana cluster").await;
+        assert!(
+            !found
+                .iter()
+                .any(|f| f == "xqdana" || f.contains("Dana Kim")),
+            "{who} is served the sentence Carol forgot before it was drawn on: {found:?}"
+        );
+        assert!(
+            found.iter().any(|f| f == "xqgreen3"),
+            "{who} lost xqgreen3: {found:?}"
+        );
+        let (status, body) = post(&format!("{s}/query?org=acme"), who, &vault_passages).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !body.contains(&vault[..16]),
+            "{who} is served a passage holding the sentence Carol forgot: {body}"
+        );
+        assert!(
+            !body.contains(&recap[..16]),
+            "{who} is served Carol's recap holding the sentence she forgot: {body}"
+        );
+    }
+    // Forgetting the whole note it was forgotten from leaves the sentence forgotten in her other records.
+    let body = tool("forget_memory", json!({"episode_id": vault})).await;
+    assert!(body.contains(&format!("forgot episode {vault}")), "{body}");
+    for who in [&carol, &bob] {
+        let (status, body) = post(&format!("{s}/query?org=acme"), who, &vault_passages).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !body.contains(&recap[..16]),
+            "{who} is served Carol's recap once the note it was forgotten from went: {body}"
+        );
+    }
     let forgot = dir.path().join("export-forgot");
     let (ok, out, err) = memstore(
         &home,
@@ -1817,11 +2066,15 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         );
     }
     let done: Value = serde_json::from_str(&body).unwrap();
-    // Her four notes, both parts of her advice trace, her session transcript's three versions of two parts (the
-    // two she forgot too) and her session's conversation so far.
-    assert_eq!(done["forgotten"]["acme"]["episodes"], 10, "{body}");
-    // Her facts: three extracted, and her four notes' own (each note is a fact citing it alone).
-    assert_eq!(done["forgotten"]["acme"]["facts"], 7, "{body}");
+    // Her eight notes with the records of what she was served before the last four, both parts of her advice trace,
+    // her session transcript's three versions of two parts (the two she forgot too) and her session's conversation
+    // so far.
+    assert_eq!(done["forgotten"]["acme"]["episodes"], 18, "{body}");
+    // Her facts: nine extracted (the one she forgot and one Bob's words support too among them), and her eight
+    // notes' own (each note is a fact citing it alone). The sentences she forgot go with them: the fact's, and the
+    // one she forgot before any fact was drawn from it.
+    assert_eq!(done["forgotten"]["acme"]["facts"], 17, "{body}");
+    assert_eq!(done["forgotten"]["acme"]["quotes"], 2, "{body}");
     // Her ownership, her decision and the proposal built on her note are in no file; the entity is unowned, the
     // inbox doesn't list the proposal, and a change to the entity publishes without review.
     for t in [
@@ -2901,6 +3154,15 @@ async fn a_forgotten_note_leaves_its_owners_profile() {
         !in_files("xpfoldzero").is_empty() && !files_with(&warehouse, &dream_id).is_empty(),
         "her notes, profile and notes dream are stored"
     );
+    // A session she ends just before: its transcript is held for the next flush, not committed by its end.
+    let ended = tool(
+        &carol,
+        "end_session",
+        json!({"session_id": "held-transcript-session", "task": "tidy the docs",
+               "transcript": "User: tidy the docs, xpheldtranscript\nClaude: tidied", "outcome": "done"}),
+    )
+    .await;
+    assert!(ended.contains("\"ended\""), "{ended}");
     let (status, body) = admin_as(
         s,
         &alice,
@@ -2908,6 +3170,13 @@ async fn a_forgotten_note_leaves_its_owners_profile() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
+    // The flush after the forget writes nothing of hers: her held transcript is dropped, not committed.
+    memstore::sessions::flush().await.unwrap();
+    assert_eq!(
+        in_files("xpheldtranscript"),
+        Vec::<PathBuf>::new(),
+        "her session's transcript, held when she was forgotten, was written after"
+    );
     assert!(
         profile().await.is_none(),
         "her profile after she was forgotten"

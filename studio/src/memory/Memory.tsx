@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { createPortal } from "react-dom";
 import { ApiError, browse, me as loadMe } from "./api";
 import { displayName } from "./format";
 import { Agent } from "./agent";
@@ -12,7 +13,8 @@ import { Icon } from "./ui";
 import { ReviewSection } from "./review";
 import { GraphSection } from "./graph";
 import { Home, type HomeSummary } from "./home";
-import { AddToMemoryDialog } from "./addToMemory";
+import { AddToMemory, AddToMemoryDialog } from "./addToMemory";
+import { ImportActivity } from "./importActivity";
 import { Advice, AdviceServing, Branches, NotAnswered, Owners, People } from "../studio/Admin";
 import { AdvicePage } from "../studio/AdvicePage";
 import { PersonPicker, SCOPE_OPTIONS } from "../studio/adviceScope";
@@ -27,6 +29,7 @@ import "../theme.css";
 // The focus lives in the address bar's hash, named for the page it opens, so a view can be linked to, read at a
 // glance and survives a reload:
 //   #/home                      Home (what changed, what it answered, what needs you)
+//   #/import                    Import (add files or text to the memory: Add to memory as a page)
 //   #/explorer/sources/slack/C09  a folder    #/entity/entities/deal/42  an entity
 //   #/sessions/…                the reader's sessions     #/skills/<goal>/<slug>  compiled skills (a folder)
 //   #/episode/<episode id>      an episode    #/search/<text>  a search (Search › Facts)
@@ -83,6 +86,8 @@ function toHash(f: Focus | null): string {
   switch (f.kind) {
     case "home":
       return at("home");
+    case "import":
+      return at("import");
     case "folder":
       // Sessions and Skills are pages of their own: their folders are linked by their names.
       if (f.path[0] === "sessions" || f.path[0] === "skills")
@@ -170,6 +175,8 @@ function fromHash(hash: string): Focus | null {
       return { kind: "serving" };
     case "branches":
       return { kind: "branches" };
+    case "import":
+      return { kind: "import" };
     case "owners":
       return { kind: "owners" };
     case "not-answered":
@@ -213,6 +220,7 @@ function navigate(url: string) {
  */
 type Section =
   | "home"
+  | "import"
   | "handover"
   | "people"
   | "advice"
@@ -255,6 +263,8 @@ function sectionOf(f: Focus | null, start: Section): Section {
   switch (f.kind) {
     case "home":
       return "home";
+    case "import":
+      return "import";
     case "tools":
       return "tools";
     case "search":
@@ -303,6 +313,8 @@ const SECTIONS: { group: string; items: Item[] }[] = [
   {
     group: "Memory",
     items: [
+      // Feeding it comes first: files and text added by hand, before (or beside) a connected source.
+      { id: "import", label: "Import", icon: "upload", to: { kind: "import" }, reads: true },
       {
         id: "explorer",
         label: "Explorer",
@@ -427,6 +439,11 @@ export interface MemoryStudioProps {
   navigation?: "sidebar" | "host";
   /** The sections this person has, and the one open, each time they change (for a host that draws them). */
   onNavigation?: (nav: StudioNavigation) => void;
+  /**
+   * With `host` navigation, an element of the host's (its sidebar's foot, say) where the memory and branch pickers
+   * are drawn instead of in a bar above the section.
+   */
+  pickersIn?: HTMLElement | null;
 }
 
 /** A section the host may draw: its link is the hash to set on the page that shows the studio. */
@@ -467,6 +484,7 @@ export function MemoryStudio({
   connect,
   navigation = "sidebar",
   onNavigation,
+  pickersIn,
 }: MemoryStudioProps) {
   const hostNav = navigation === "host";
   // Every call the pages make below goes through it.
@@ -504,6 +522,7 @@ export function MemoryStudio({
         (canBrowse || !i.reads) &&
         (i.id !== "goals" || goals) &&
         (i.id !== "handover" || handover) &&
+        (i.id !== "import" || transport.capabilities.learn === true) &&
         (!ADMIN.includes(i.id) || admin) &&
         (!NEEDS[i.id] || can[NEEDS[i.id]!]),
     ),
@@ -529,6 +548,8 @@ export function MemoryStudio({
   }, [org, search]);
   const [who, setWho] = useState<{ key: string; me?: Me; error?: ApiError | Error } | null>(null);
   const [query, setQuery] = useState("");
+  // Bumped when Import adds something, so its Processing panel reads again at once.
+  const [imported, setImported] = useState(0);
   // The memory's branches with their skills (null: a memstore that can't name them).
   const [branches, setBranches] = useState<{
     key: string;
@@ -738,7 +759,18 @@ export function MemoryStudio({
   }, [navigationKey, onNavigation]);
 
   const nav = hostNav ? (
-    pickers ? (
+    pickersIn ? (
+      pickers ? (
+        createPortal(
+          <div className="memory-studio studio-pickers-root" data-studio-theme={theme}>
+            <div className="memory studio-pickers-host" aria-label="Memory being read">
+              {pickers}
+            </div>
+          </div>,
+          pickersIn,
+        )
+      ) : null
+    ) : pickers ? (
       <div className="memory studio-bar" aria-label="Memory being read">
         {pickers}
       </div>
@@ -1059,8 +1091,28 @@ export function MemoryStudio({
         {banners}
         <section className="pane">
           {/* The playground fills the pane: its conversation scrolls inside, under a composer that stays. */}
-          <div className={`pane-inner ${section === "ask" ? "pane-fill" : ""}`}>
-            {section === "home" ? (
+          <div
+            className={`pane-inner ${section === "ask" ? "pane-fill" : section === "import" ? "pane-hold" : ""}`}
+          >
+            {section === "import" ? (
+              <div className="import-page">
+                <h2>Import</h2>
+                <p className="muted">
+                  What a document says is learned as facts, and the procedures it describes are compiled into skills
+                  where this memory compiles them.
+                </p>
+                <div className="import-grid">
+                  <AddToMemory
+                    key={selKey}
+                    sel={sel}
+                    onOpen={go}
+                    onAdded={() => setImported((n) => n + 1)}
+                    title="Add files, pages or text"
+                  />
+                  <ImportActivity sel={sel} bump={imported} onOpen={go} />
+                </div>
+              </div>
+            ) : section === "home" ? (
               <Home
                 key={selKey}
                 sel={sel}

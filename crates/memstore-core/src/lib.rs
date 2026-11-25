@@ -946,6 +946,9 @@ pub struct Vis {
     pub retracted_facts: HashSet<String>,
     /// What committed deletes name (`id:` or `source:` and the name).
     retraction_targets: HashSet<String>,
+    /// The sentences people forgot ([`Store::forget_fact`]), as [`forgettable`] gives them, each with whose words
+    /// they were ([`origin::sayer_id`]): no reader sees a fact quoting one, or a passage holding one, from that person.
+    forgotten: HashMap<u64, Vec<String>>,
     /// The scope's retention policy. Episodes past it are in `retracted`.
     pub retention: retention::Retention,
     /// When the next kept episode ages out (microseconds): this state is stale from then on.
@@ -2204,6 +2207,7 @@ impl Vis {
             released: self.released.clone(),
             retracted_facts: self.retracted_facts.clone(),
             retraction_targets: self.retraction_targets.clone(),
+            forgotten: self.forgotten.clone(),
             retention: self.retention.clone(),
             fresh_until,
             heads: heads.into_iter().collect(),
@@ -2555,6 +2559,62 @@ impl Vis {
 
     /// Who said what an episode holds ([`origin::sayer`]), as a number only this state compares; None for one this
     /// state doesn't hold, or one of the engine's own documents.
+    /// Whether a reader is kept from `f`: retracted by id, or a copy of a sentence its sayer forgot
+    /// ([`Vis::quotes_forgotten`]). For the readers that check facts without [`Vis::allows`] (summaries, dreams).
+    pub fn withheld(&self, f: &Fact) -> bool {
+        self.retracted_facts.contains(&f.fact_id) || self.quotes_forgotten(f)
+    }
+
+    /// Whether `f`, drawn only from one person's words, quotes a sentence they forgot ([`Store::forget_fact`]),
+    /// or its value holds one (a note's own fact holds the whole note): a copy of a forgotten fact, extracted again
+    /// from another record of the same words, stays hidden like the fact. A fact others' words support too stays.
+    pub fn quotes_forgotten(&self, f: &Fact) -> bool {
+        if self.forgotten.is_empty() {
+            return false;
+        }
+        // An episode of no sayer (the engine's own record, a dream's) speaks for no one: skipped. One no reader may
+        // see already keeps the fact from them ([`Vis::allows`]).
+        let mut by = None;
+        for e in &f.source_episodes {
+            let Some(s) = self.episode_sayer(e) else {
+                continue;
+            };
+            if by.is_some_and(|b| b != s) {
+                return false;
+            }
+            by = Some(s);
+        }
+        let Some(theirs) = by.and_then(|b| self.forgotten.get(&b)) else {
+            return false;
+        };
+        let value = forgettable(&f.value);
+        let quote = f
+            .quote
+            .as_deref()
+            .or_else(|| self.quotes.get(&f.fact_id).map(String::as_str))
+            .map(forgettable)
+            .filter(|q| q.len() >= MIN_FORGOTTEN);
+        theirs.iter().any(|q| {
+            value.contains(q.as_str())
+                || quote
+                    .as_deref()
+                    .is_some_and(|quote| quote.contains(q.as_str()) || q.contains(quote))
+        })
+    }
+
+    /// Whether `text`, from an episode with `source`, holds a sentence its sayer forgot ([`Store::forget_fact`]):
+    /// a passage holding one is left out of search.
+    pub fn holds_forgotten(&self, source: &str, text: &str) -> bool {
+        if self.forgotten.is_empty() {
+            return false;
+        }
+        let Some(theirs) = self.forgotten.get(&origin::sayer_id(source)) else {
+            return false;
+        };
+        let text = forgettable(text);
+        theirs.iter().any(|q| text.contains(q.as_str()))
+    }
+
     pub fn episode_sayer(&self, episode: &str) -> Option<u64> {
         self.kinds.get(episode).map(|(_, _, s)| *s)
     }
@@ -2699,6 +2759,7 @@ impl Vis {
     /// principal can see every episode it cites (D-6, fail closed).
     pub fn allows(&self, commit: &str, f: &Fact, who: &Principal, valid_at: Option<i64>) -> bool {
         !self.retracted_facts.contains(&f.fact_id)
+            && !self.quotes_forgotten(f)
             && self.allows_parts(
                 commit,
                 Some(f.valid_from),
@@ -5502,8 +5563,11 @@ impl Store {
         {
             return Err(l.into());
         }
+        crate::phases::mark("commit: reserving");
         let capped = workspace::reserve(self, episodes.len()).await?;
+        crate::phases::mark("commit: workspace limits");
         let _workspace = workspace::check_write(self, scope, episodes.len(), facts.len()).await?;
+        crate::phases::mark("commit: closures");
         let ends: Vec<(&str, i64)> = closures
             .iter()
             .map(|c| (c.fact_id.as_str(), c.valid_to))
@@ -5513,8 +5577,11 @@ impl Store {
             .map(|c| (c.episode_id.as_str(), episodes))
             .collect();
         self.check_closures(scope, branch, &ends, &cited).await?;
+        crate::phases::mark("commit: typing facts");
         let facts = &self.typed(scope, branch, facts, adds).await?;
+        crate::phases::mark("commit: about");
         self.check_about(scope, branch, episodes).await?;
+        crate::phases::mark("commit: queued");
         // Main always exists; only a named branch needs a ledger read to check.
         if branch != MAIN {
             let ledger = self.ledger(scope).await?;
@@ -5557,7 +5624,8 @@ impl Store {
         }
         let committed = wait
             .await
-            .map_err(|_| anyhow::anyhow!("the group-commit leader stopped"))?
+            .map_err(|_| anyhow::anyhow!("the group-commit leader stopped"))
+            .inspect(|_| crate::phases::mark("commit: landed"))?
             // The leader hands each commit its outcome as text (one failure can be several commits'); an owner's
             // refusal is typed again here, so a caller can tell it apart (`commit_extracted_on`).
             .map_err(
@@ -8924,6 +8992,22 @@ impl Store {
             // withdrawal takes back every commit the extractor made before it, so a re-run after it stands.
             step("retracted");
             let (retracted_facts, withdrawals) = retracted_writes(&retractions, &deleted);
+            // What people forgot ([`Store::forget_fact`]): each forget's commit retracts the fact and records the
+            // sentence it came from. Like a retraction, main's word holds on every branch.
+            let mut forgetters: HashMap<String, String> = HashMap::new();
+            for b in retractions.iter() {
+                let (commit, fact) = (strings(b, "commit_id"), optional_strings(b, "fact_id"));
+                for i in 0..b.num_rows() {
+                    if fact[i].is_some()
+                        && deleted(&commit[i])
+                        && let Some(user) = actors
+                            .get(&commit[i])
+                            .and_then(|a| a.strip_prefix(FORGET_ACTOR))
+                    {
+                        forgetters.insert(commit[i].clone(), user.to_string());
+                    }
+                }
+            }
             // A withdrawal takes the extractor's commits that came before it: its ancestors in the ledger,
             // whatever the writers' clocks said.
             step("retracted writes");
@@ -9031,6 +9115,21 @@ impl Store {
             }
             step("conflicts and quotes");
             let quote_of = latest.into_iter().map(|(f, (_, q))| (f, q)).collect();
+            let mut forgotten: HashMap<u64, Vec<String>> = HashMap::new();
+            for b in quotes.rows.iter() {
+                let (commit, q) = (strings(b, "commit_id"), strings(b, "quote"));
+                for i in 0..b.num_rows() {
+                    if let Some(user) = forgetters.get(commit[i].as_str()) {
+                        let q = forgettable(&q[i]);
+                        if q.len() >= MIN_FORGOTTEN {
+                            forgotten
+                                .entry(origin::sayer_id(&format!("{REMEMBER_SOURCE}:{user}")))
+                                .or_default()
+                                .push(q);
+                        }
+                    }
+                }
+            }
             // The branch's schemas, oldest first: its latest committed row is its schema.
             let mut rows: Vec<(i64, String, String)> = vec![];
             for b in schemas.iter() {
@@ -9102,6 +9201,7 @@ impl Store {
                 released,
                 retracted_facts,
                 retraction_targets,
+                forgotten,
                 retention,
                 fresh_until,
                 heads,
@@ -10351,6 +10451,79 @@ impl Store {
             .await?;
         let after = self.visibility(scope, MAIN).await?;
         Ok(n_before.saturating_sub(gone(&after)))
+    }
+
+    /// `user` forgets fact `fact_id`, which quotes `quote` from their own words: one commit on main (by
+    /// [`FORGET_ACTOR`]`user`) retracts the fact by id and records the sentence, so no reader sees the fact, any
+    /// other fact quoting that sentence from `user`'s words (one extracted again from another record of the same
+    /// conversation, now or later), or a passage of theirs holding it ([`Vis::quotes_forgotten`],
+    /// [`Vis::holds_forgotten`]). Nothing stored is rewritten: an erasure of the words takes the sentence with them.
+    pub async fn forget_fact(
+        &self,
+        scope: &Scope,
+        user: &str,
+        fact_id: &str,
+        quote: Option<&str>,
+    ) -> Result<()> {
+        let _losing = Losing::of(scope.namespace());
+        self.ensure_scope(scope).await?;
+        let ns = scope.namespace();
+        let commit_id = uuid::Uuid::new_v4().to_string();
+        let now = now_micros();
+        if let Some(q) = quote {
+            let table = self.write_target(&ns, QUOTES).await?;
+            self.append_own(
+                &ns,
+                QUOTES,
+                &table,
+                vec![
+                    (
+                        "commit_id",
+                        Arc::new(StringArray::from(vec![commit_id.as_str()])) as ArrayRef,
+                    ),
+                    (
+                        "fact_id",
+                        Arc::new(StringArray::from(vec![fact_id])) as ArrayRef,
+                    ),
+                    ("quote", Arc::new(StringArray::from(vec![q])) as ArrayRef),
+                    ("recorded_at", ts(std::iter::once(Some(now)))),
+                ],
+                OnConflict::Recommit,
+            )
+            .await?;
+        }
+        let table = self.write_target(&ns, RETRACTIONS).await?;
+        let none = || Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef;
+        self.append_own(
+            &ns,
+            RETRACTIONS,
+            &table,
+            vec![
+                (
+                    "commit_id",
+                    Arc::new(StringArray::from(vec![commit_id.as_str()])) as ArrayRef,
+                ),
+                ("episode_id", none()),
+                ("source", none()),
+                ("recorded_at", ts(std::iter::once(Some(now)))),
+                (
+                    "fact_id",
+                    Arc::new(StringArray::from(vec![Some(fact_id)])) as ArrayRef,
+                ),
+                ("actor_prefix", none()),
+            ],
+            OnConflict::Recommit,
+        )
+        .await?;
+        self.append_ledger(
+            &commit_id,
+            scope,
+            MAIN,
+            &format!("{FORGET_ACTOR}{user}"),
+            &|l: &Ledger| Ok(l.heads(MAIN)),
+        )
+        .await?;
+        Ok(())
     }
 
     /// One commit on main retracting each fact in `fact_ids` by id, and the extractor `actor_prefix` names.
@@ -12592,6 +12765,54 @@ pub struct ConflictValues {
 
 /// The source of a merge's record of the conflicts it resolved: `merge:<branch>`.
 pub const MERGE_SOURCE: &str = "merge:";
+
+/// The ledger actor of a forget ([`Store::forget_fact`]): `forget:` and who forgot.
+pub const FORGET_ACTOR: &str = "forget:";
+
+/// What a sentence its sayer forgot before any fact was drawn from it is recorded under, in place of a fact's id
+/// ([`sentence_key`]): `sentence:<hash>:<sayer>`. It names no fact, so it hides none by id; its quote hides what
+/// holds the sentence, as a forgotten fact's does. It is the sayer's, not one episode's: it outlives the episode it
+/// was forgotten from (their other records of the same words stay hidden) and goes when the sayer is forgotten
+/// (`offboard`).
+pub const FORGOTTEN_SENTENCE: &str = "sentence:";
+
+/// The key `user`'s forgetting of `sentence` is recorded under ([`FORGOTTEN_SENTENCE`]).
+pub fn sentence_key(user: &str, sentence: &str) -> String {
+    use sha2::Digest as _;
+    let h = sha2::Sha256::digest(forgettable(sentence).as_bytes());
+    let hash: String = h[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{FORGOTTEN_SENTENCE}{hash}:{}",
+        auth::acl::norm_id(user.trim())
+    )
+}
+
+/// Who forgot the sentence a [`sentence_key`] records, as the ACL names them, if `key` is one.
+pub fn sentence_sayer(key: &str) -> Option<&str> {
+    key.strip_prefix(FORGOTTEN_SENTENCE)?
+        .split_once(':')
+        .map(|(_, u)| u)
+}
+
+/// Whether `sentence` is long enough to forget on its own and is in `text`, as forgotten sentences are matched.
+pub fn holds_sentence(text: &str, sentence: &str) -> bool {
+    let s = forgettable(sentence);
+    s.len() >= MIN_FORGOTTEN && forgettable(text).contains(&s)
+}
+
+/// Shortest forgotten sentence matched against other text, in characters (as [`forgettable`] gives it): a shorter
+/// one would hide text that merely shares a phrase.
+const MIN_FORGOTTEN: usize = 12;
+
+/// `text` as forgotten sentences are matched against it: lower case, every run of whitespace one space, without
+/// the punctuation and quotes around it.
+fn forgettable(text: &str) -> String {
+    let words: Vec<String> = text.split_whitespace().map(str::to_lowercase).collect();
+    words
+        .join(" ")
+        .trim_matches(|c: char| ".,;:!?\"'\u{201c}\u{201d}\u{2018}\u{2019}".contains(c))
+        .to_string()
+}
 
 /// What main and a branch each changed since the branch's base ([`Store::branch_diff`]).
 #[derive(Clone, Debug, Default, serde::Serialize)]

@@ -136,6 +136,8 @@ export type Selection = { org: string; team?: string; branch?: string };
 export type Focus =
   /** Home: what changed in the memory, what it answered, what needs the reader. */
   | { kind: "home" }
+  /** Import: add files (text, PDF, Word, recordings) or pasted text to the memory. */
+  | { kind: "import" }
   | { kind: "folder"; path: string[] }
   | { kind: "entity"; path: string[] }
   | { kind: "skill"; path: string[] }

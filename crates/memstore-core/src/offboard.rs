@@ -1960,6 +1960,17 @@ impl Store {
                     .collect())
             })
             .await?;
+        // The sentences they forgot before any fact held them (`crate::sentence_key`): their words, kept only so no
+        // other record of them is served, which go with the rest.
+        let me = crate::auth::acl::norm_id(user.trim());
+        let sentences = self
+            .rewrite_table(ns, QUOTES, &mut |b| {
+                Ok(strings(b, "fact_id")
+                    .iter()
+                    .map(|f| Some(crate::sentence_sayer(f) != Some(me.as_str())))
+                    .collect())
+            })
+            .await?;
         // Ownership they held, the reviews they decided, and the proposals they made are theirs: an owned
         // entity is unowned afterwards (the admin assigns another), and a proposal of theirs goes with the
         // decisions on it.
@@ -2007,6 +2018,7 @@ impl Store {
             return Ok(Forgotten {
                 answers: asked,
                 feedback: voted,
+                quotes: sentences,
                 ..Default::default()
             });
         }
@@ -2021,6 +2033,7 @@ impl Store {
         out.episodes = theirs.union(&sole).count();
         out.answers += asked;
         out.feedback += voted;
+        out.quotes += sentences;
         Ok(out)
     }
 
@@ -3582,7 +3595,7 @@ async fn export_facts(
             let shown = match reader {
                 None => {
                     vis.committed.contains(&commit)
-                        && !vis.retracted_facts.contains(&f.fact_id)
+                        && !vis.withheld(&f)
                         && !f
                             .source_episodes
                             .iter()

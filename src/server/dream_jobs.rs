@@ -1,7 +1,9 @@
 //! Admin operations record and launch Kubernetes Jobs. No dream work runs in the API process.
 use super::*;
 use crate::dream_jobs::Request;
-use crate::dream_jobs::kubernetes::{Authorization, Launcher, control};
+use crate::dream_jobs::kubernetes::{
+    Authorization, Launcher, NEVER_LAUNCHED, control, fail_unlaunched,
+};
 
 pub(super) async fn handle(
     state: &Arc<State>,
@@ -51,6 +53,18 @@ pub(super) async fn handle(
         } else {
             &reader
         };
+        // A run that was never launched has nothing to observe: past the launch grace it is failed here (in the
+        // org's cell, which writes its runs), so it can be resumed rather than wait for good.
+        if job.executions.is_empty() && cell::mine(&scope) {
+            match fail_unlaunched(&store, &scope, observer, job.clone(), NEVER_LAUNCHED).await {
+                Ok(settled) => job = settled,
+                Err(e) => eprintln!(
+                    "dream {}: an unlaunched run not settled: {}",
+                    job.id,
+                    writer::redacted(&e)
+                ),
+            }
+        }
         let observation = if job.executions.is_empty()
             || matches!(
                 job.status,

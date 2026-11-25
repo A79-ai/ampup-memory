@@ -19,7 +19,7 @@
 //!   are refused, and nothing is kept for it any more. So an agent that died blocks no cleanup past its lease.
 //!
 //! Stored per scope, in `<namespace>.pins` (one row per change: taken, renewed, released; the newest row of a pin
-//! is its state), not through the ledger: a pin is no memory. Deleting the org deletes its pins with it.
+//! is its state, and a pin any row says was released stays released), not through the ledger: a pin is no memory. Deleting the org deletes its pins with it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,9 +134,12 @@ fn pins_schema() -> Result<iceberg::spec::Schema> {
     ])
 }
 
-/// Each pin as its newest row says.
+/// Each pin as its newest row says, except that a release is for good: once any row of a pin says it was released,
+/// it stays released. A renewal writes the pin as it read it with a later lease, so one that read the pin before a
+/// release landed and wrote after it would otherwise bring the released pin back to life.
 fn fold(rows: &[RecordBatch]) -> Vec<Pin> {
     let mut newest: std::collections::HashMap<String, (i64, Pin)> = Default::default();
+    let mut released: std::collections::HashSet<String> = Default::default();
     for b in rows {
         let (id, body, at) = (
             strings(b, "pin_id"),
@@ -147,13 +150,22 @@ fn fold(rows: &[RecordBatch]) -> Vec<Pin> {
             let Ok(pin) = serde_json::from_str::<Pin>(&body[i]) else {
                 continue;
             };
+            if pin.released {
+                released.insert(id[i].clone());
+            }
             let t = at[i].unwrap_or_default();
             if newest.get(&id[i]).is_none_or(|(seen, _)| t >= *seen) {
                 newest.insert(id[i].clone(), (t, pin));
             }
         }
     }
-    let mut out: Vec<Pin> = newest.into_values().map(|(_, p)| p).collect();
+    let mut out: Vec<Pin> = newest
+        .into_values()
+        .map(|(_, mut p)| {
+            p.released |= released.contains(&p.id);
+            p
+        })
+        .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
 }

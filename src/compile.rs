@@ -32,24 +32,34 @@
 //! batch size (`compile_batch`, sources per round, over `AMPUP_MEMORY_COMPILE_BATCH`; a round writes at most 8
 //! skills, so sources that are each a situation of their own want 8 or fewer), and what its sources are
 //! (`compile_kind`: `errors` has each skill's `when` name the exception and its message as reported; `changes` has a
-//! skill be a procedure people repeat, which each change record is folded into, not one skill per change). A kind
+//! skill be a procedure people repeat, which each change record is folded into, not one skill per change;
+//! `conversations` the same for meetings, chat threads and email, where a skill is written only once its procedure
+//! recurs across several conversations ([`RECURS`]) and chatter, status updates and small talk give none). A kind
 //! changes the prompt and so the compiler's id; the batch size doesn't, and a scope that sets neither compiles
 //! with the same prompt, under the same id, as before either existed. A scope whose sources are of more than one
-//! kind names those its kind is about (`compile_kind_sources`, [`plan`]): they compile with the kind's prompt, the
-//! others with the one prompt, each group under a compiler id of its own, so adding sources of another kind
-//! compiles none of the kind's again.
+//! kind names a kind for each group of them (`compile_kinds`: `{"changes": ["github:"], "conversations": ["slack:",
+//! "email:"]}`), or those its one kind is about (`compile_kind_sources`), [`plan`]: each group compiles with its
+//! kind's prompt (the rest with the one prompt), under a compiler id of its own, so adding a group of sources of
+//! another kind compiles none of another group's again.
 //!
-//! **Rebuilding.** In a `changes` group, skills written under other prompts (before the kind was set, a changed
-//! prompt) from the group's sources aren't shown to the model ([`rebuilt`]): the library is compiled again from the sources, not from what the old
-//! prompts made of them. The old skills are served until `memstore compile --retire` retires each one whose every
-//! source the current compiler has read ([`retire`]), on main, every version, kept in the ledger.
+//! **Rebuilding.** In a `changes` or `conversations` group, skills written under other prompts (before the kind was
+//! set, a changed prompt) from the group's sources aren't shown to the model ([`rebuilt`]): the library is compiled
+//! again from the sources, not from what the old prompts made of them. The old skills are served until
+//! `memstore compile --retire` retires each one whose every source the current compiler has read ([`retire`]), on
+//! main, every version, kept in the ledger.
 //!
-//! **Audiences.** Sources whose ACLs differ never share a batch. A skill, its graph and its index are
-//! readable by exactly the ACL of the sources they were compiled from, so a skill never shows a reader what
-//! a source they can't read said. A skill whose audience isn't everyone carries its audience in its slug
-//! (`<slug>~<hash>`), so two audiences' skills for one situation stay apart. A skill many changes are folded into
-//! is no exception: every source it rests on has its audience's ACL, so whoever reads it may read all of them, and
-//! a change only another audience may read goes into that audience's own skill.
+//! **Audiences.** Sources whose audiences differ never share a batch. A source's audience is its ACL less the
+//! entries another of its entries already covers ([`effective_acl`]): beside the entry an org shares a record with
+//! all of it by, no other entry adds a reader (everyone the directory admits there holds that entry), so an email
+//! shared with the org and its owner, or with the org and someone who has since left it, compiles with what is shared
+//! with the org alone, while one shared only with a person, or only with a team, stays in its own audience. A skill, its graph and its index are readable by exactly
+//! that audience, a subset of each of its sources' ACLs, so a skill never shows a reader what a source they can't
+//! read said. A skill whose audience isn't everyone carries its audience in its slug (`<slug>~<hash>`), so two
+//! audiences' skills for one situation stay apart. A skill many sources are folded into is no exception: every
+//! source it rests on has its audience, so whoever reads it may read all of them, and a source only another
+//! audience may read goes into that audience's own skill. A skill written under an ACL its audience has since
+//! dropped entries from (before audiences were reduced) stays served under it, and isn't updated: the reduced
+//! audience's skill is.
 //!
 //! **Grounding.** The model sees each new source under a handle (`SRC1`, `SRC2`, …) and must cite the handles a
 //! skill rests on. A skill that cites none of them, or only handles it wasn't given, is dropped, as an
@@ -123,6 +133,58 @@ pub struct Options {
     /// What the sources are (`compile_kind`), where the prompt says so. Part of the compiler's id, as the
     /// prompt is.
     pub kind: Option<Kind>,
+    /// What the scope's org shares with all of it ([`OrgWide`]), so a source shared with the org and anyone else
+    /// compiles with what is shared with the org alone ([`effective_acl`]). [`plan`] sets it; not part of the
+    /// compiler's id.
+    pub org_wide: Option<OrgWide>,
+}
+
+/// The entry a scope's org shares a record with all of it by (`group:<org>.all`, [`crate::auth::acl::org_wide`]),
+/// where everyone who reads the scope was admitted by the directory and so holds it: its members, people at a domain
+/// it admits and its own keys alike. Anyone else reads nothing there, whatever an ACL names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OrgWide {
+    pub entry: String,
+}
+
+impl OrgWide {
+    /// `scope`'s org-wide entry, where every reader here was admitted by the directory and so holds it
+    /// ([`crate::extract::readers_hold_org_wide`]); none for a user's scope, an org the directory doesn't hold, or on
+    /// a server whose callers may read a scope without the directory (they hold only the groups they bring).
+    pub fn of(dir: Option<&crate::people::directory::Directory>, scope: &Scope) -> Option<OrgWide> {
+        let (dir, org) = (dir?, scope.org_name()?);
+        if !crate::extract::readers_hold_org_wide() || !dir.orgs.contains_key(org) {
+            return None;
+        }
+        Some(OrgWide {
+            entry: format!("group:{}", crate::auth::acl::org_wide(org)),
+        })
+    }
+}
+
+/// The audience a source with `acl` compiles in: `acl` sorted, less each entry another of its entries already
+/// covers, so sources whose readers are the same share batches and skills. ACL entries are any-of
+/// (`Principal::can_see`), so dropping an entry never adds a reader; only these are dropped:
+/// - every other entry, beside `*` (everyone);
+/// - every other entry, beside the org-wide entry ([`OrgWide`]): everyone who reads the scope holds it, so a member's
+///   `user:` entry, a team's group, or the entry of someone the directory no longer admits (a person who left the
+///   org) adds no reader, and a skill compiled for the org alone is readable by exactly the same people.
+///
+/// Without the org-wide entry nothing else is dropped: a `user:` entry, a team's or a channel's group, and a
+/// `role:` entry each stay, as whether one holds another isn't known here.
+pub fn effective_acl(acl: &[String], org_wide: Option<&OrgWide>) -> Vec<String> {
+    let mut out = acl.to_vec();
+    out.sort();
+    out.dedup();
+    if out.iter().any(|a| a == "*") {
+        return vec!["*".to_string()];
+    }
+    if let Some(w) = org_wide
+        && out.contains(&w.entry)
+    {
+        return vec![w.entry.clone()];
+    }
+    out
 }
 
 /// What a scope's compile sources are, where the compile prompt says so (`compile_kind`).
@@ -136,18 +198,33 @@ pub enum Kind {
     /// several changes are instances of, not one change. Compiled with the one prompt, a library of change records
     /// read like a changelog, one skill per change, and lookups routed to those skills were mostly off-task.
     Changes,
+    /// Conversations (meetings, chat threads, email): a skill is a procedure people repeat in them, written once
+    /// it recurs across several conversations ([`RECURS`]) and folded into by later ones; one-off chatter, status
+    /// updates and small talk give none.
+    Conversations,
 }
 
 impl Kind {
-    /// The kind a `compile_kind` setting names (`errors`, `changes`); none for any other.
+    /// The kind a `compile_kind` setting names (`errors`, `changes`, `conversations`); none for any other.
     pub fn parse(name: &str) -> Option<Kind> {
         match name {
             "errors" => Some(Kind::Errors),
             "changes" => Some(Kind::Changes),
+            "conversations" => Some(Kind::Conversations),
             _ => None,
         }
     }
+
+    /// Whether a skill of this kind is a procedure many sources are folded into: its group rebuilds what other
+    /// prompts compiled from its sources ([`rebuilt`]) and `compile --retire` retires those ([`retire`]).
+    pub fn folds(self) -> bool {
+        matches!(self, Kind::Changes | Kind::Conversations)
+    }
 }
+
+/// The fewest sources a new [`Kind::Conversations`] skill cites: a procedure seen in one conversation isn't yet one
+/// people repeat. A later conversation folds into a skill the library has with one source.
+const RECURS: usize = 2;
 
 /// The kind `AMPUP_MEMORY_COMPILE_KIND` names, for a scope whose settings name none (a `serve --local` store has no
 /// settings).
@@ -172,35 +249,61 @@ pub fn options_for(dir: Option<&crate::people::directory::Directory>, scope: &Sc
             .as_deref()
             .and_then(Kind::parse)
             .or_else(env_kind),
+        org_wide: None,
     }
 }
 
-/// How `scope` compiles `sources`: one group per prompt, each with its options and so its own compiler id. Where
-/// the scope's kind is about only some of its sources (`compile_kind_sources`), the sources under those prefixes
-/// compile with the kind and the others without it; else all of them compile as [`options_for`] says, in one
-/// group, as before groups existed. `*` can't be split: with it the kind is about every source.
+/// How `scope` compiles `sources`: one group per prompt, each with its options and so its own compiler id.
+/// - A source under a prefix one of the scope's `compile_kinds` names compiles with that kind (the first kind, in
+///   name order, whose prefixes hold it).
+/// - Any other compiles as `compile_kind` and `compile_kind_sources` say: with the kind where the kind is about it
+///   (it is about every source when `compile_kind_sources` is unset), else with the one prompt.
+///
+/// Sources of one kind are one group, so a group's sources, and its compiler id, change only when its own sources
+/// do: adding a group of sources of another kind compiles none of this one's again. With neither `compile_kinds`
+/// nor `compile_kind_sources` set, every source is in one group, as before groups existed. `*` can't be split:
+/// with it the scope's `compile_kind` is about every source.
 pub fn plan(
     dir: Option<&crate::people::directory::Directory>,
     scope: &Scope,
     sources: &[String],
 ) -> Vec<(Vec<String>, Options)> {
-    let opts = options_for(dir, scope);
-    let about = match (opts.kind, dir.and_then(|d| d.compile_kind_sources(scope))) {
-        (Some(_), Some(about)) if !sources.iter().any(|s| s == "*") => about,
-        _ => return vec![(sources.to_vec(), opts)],
+    let opts = Options {
+        org_wide: OrgWide::of(dir, scope),
+        ..options_for(dir, scope)
     };
-    let (kind, rest): (Vec<String>, Vec<String>) = sources
-        .iter()
-        .cloned()
-        .partition(|s| about.iter().any(|p| s.starts_with(p.as_str())));
-    let plain = Options {
-        kind: None,
-        ..opts.clone()
-    };
-    [(kind, opts), (rest, plain)]
+    if sources.iter().any(|s| s == "*") {
+        return vec![(sources.to_vec(), opts)];
+    }
+    let under = |s: &str, prefixes: &[String]| prefixes.iter().any(|p| s.starts_with(p.as_str()));
+    let kinds: Vec<(Kind, Vec<String>)> = dir
+        .and_then(|d| d.compile_kinds(scope))
+        .unwrap_or_default()
         .into_iter()
-        .filter(|(s, _)| !s.is_empty())
-        .collect()
+        .filter_map(|(k, prefixes)| Some((Kind::parse(&k)?, prefixes)))
+        .collect();
+    let about = dir.and_then(|d| d.compile_kind_sources(scope));
+    let mut groups: Vec<(Vec<String>, Options)> = vec![];
+    for s in sources {
+        let kind = match kinds.iter().find(|(_, p)| under(s, p)) {
+            Some((k, _)) => Some(*k),
+            None if about.as_ref().is_none_or(|a| under(s, a)) => opts.kind,
+            None => None,
+        };
+        match groups.iter_mut().find(|(_, o)| o.kind == kind) {
+            Some((g, _)) => g.push(s.clone()),
+            None => groups.push((
+                vec![s.clone()],
+                Options {
+                    kind,
+                    ..opts.clone()
+                },
+            )),
+        }
+    }
+    // The groups with a kind first, the one prompt's last, as before.
+    groups.sort_by_key(|(_, o)| o.kind.is_none());
+    groups
 }
 
 /// Compile sources from a comma-separated list: `kb:,file:`, or `*`.
@@ -213,12 +316,24 @@ pub fn parse_sources(list: &str) -> Vec<String> {
 }
 
 /// Whether an episode is one of the compile sources: its source has one of the prefixes (any, with `*`).
-/// Documents (skills, notes, other kept-in-versions writes) are never sources.
-fn selects(sources: &[String], source: &str, document: Option<&str>) -> bool {
-    document.is_none()
-        && sources
-            .iter()
-            .any(|p| p == "*" || source.starts_with(p.as_str()))
+/// Documents (skills, notes, other kept-in-versions writes) are never sources, but for a file or a web page a person
+/// added in Studio (`/learn`, [`crate::extract::ADDED`]`<who>/file/<name>` or `<who>/web/<address>`): that one is
+/// named by its document key, so
+/// `starter/added/` compiles every file added there (its source, `mcp:remember_memory:<who>:...`, is every note's).
+pub(crate) fn selects(sources: &[String], source: &str, document: Option<&str>) -> bool {
+    let name = match document {
+        None => source,
+        Some(d)
+            if d.starts_with(crate::extract::ADDED)
+                && (d.contains("/file/") || d.contains("/web/")) =>
+        {
+            d
+        }
+        Some(_) => return false,
+    };
+    sources
+        .iter()
+        .any(|p| p == "*" || name.starts_with(p.as_str()))
 }
 
 /// Sources per model call, and their text in all: `AMPUP_MEMORY_COMPILE_BATCH` (default 12; a scope's `compile_batch`
@@ -309,6 +424,16 @@ only when no skill in the library is that procedure, named for the procedure (`d
 task as someone starting it would put it. Changes that are instances of one procedure give one skill citing all of \
 them. A change that is no instance of a procedure anyone will repeat gives no skill;\n";
 
+/// What [`Kind::Conversations`] adds to the C2S prompt, after its `when` line.
+const CONVERSATIONS_LINE: &str = "- the sources are conversations (meetings, chat threads, email). A skill is a procedure \
+people here repeat in them, never one conversation: fold each conversation into the skill for the procedure it shows, \
+reusing that skill's slug and adding or correcting the steps, phrasings, values and checks it shows; create a skill \
+only when no skill in the library is that procedure and at least two of the new sources, separate conversations, \
+show it, named for the procedure (`run-a-first-call`, `triage-a-reported-bug`), never for one conversation or the \
+people in it, with a `when` that names the task as someone starting it would put it. Conversations that show one \
+procedure give one skill citing all of them. A conversation that shows no procedure anyone will repeat (chatter, \
+status updates, scheduling, small talk, one-off news) gives no skill;\n";
+
 /// The C2S prompt for sources of `kind`: [`C2S_PROMPT`] itself where none is set, so a scope that sets no kind
 /// keeps its compiler id.
 fn c2s_prompt(kind: Option<Kind>) -> std::borrow::Cow<'static, str> {
@@ -316,6 +441,7 @@ fn c2s_prompt(kind: Option<Kind>) -> std::borrow::Cow<'static, str> {
         None => return std::borrow::Cow::Borrowed(C2S_PROMPT),
         Some(Kind::Errors) => ERRORS_LINE,
         Some(Kind::Changes) => CHANGES_LINE,
+        Some(Kind::Conversations) => CONVERSATIONS_LINE,
     };
     std::borrow::Cow::Owned(C2S_PROMPT.replacen(WHEN_LINE, &format!("{WHEN_LINE}{line}"), 1))
 }
@@ -605,6 +731,140 @@ fn index_key(acl: &[String]) -> String {
     format!("{SKILLS}index{}", audience_suffix(acl))
 }
 
+/// Most skills [`citing`] looks at.
+const MAX_CITING: usize = 500;
+/// Most skill versions [`SEEN`] holds before it starts over.
+const MAX_SEEN: usize = 4096;
+/// Each skill version's slug, title and sources, by its episode id: a version never changes, so its body is read
+/// once, not at every look at what an import went into.
+/// A skill version's slug, title and sources ([`citing`]); none where its body isn't a skill.
+type Seen = Option<(String, String, Vec<String>)>;
+static SEEN: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Seen>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The current skills `who` may read on `session` that rest on any of `ids`, by episode: each one's slug and title
+/// (its first heading), in key order. Looks at most [`MAX_CITING`] skills; reads only the versions not seen before.
+pub(crate) async fn citing(
+    store: &Store,
+    session: &crate::Session,
+    who: &Principal,
+    ids: &std::collections::HashSet<String>,
+) -> Result<HashMap<String, Vec<(String, String)>>> {
+    let mut out: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let vis = session.vis();
+    // Each skill's current version the reader may read: the newest one they see.
+    let current: Vec<String> = vis
+        .document_versions(SKILLS)
+        .into_iter()
+        .filter(|(k, _)| !is_index(k))
+        .filter_map(|(_, versions)| {
+            versions
+                .into_iter()
+                .find(|id| vis.can_see_episode(id, who))
+                .map(String::from)
+        })
+        .take(MAX_CITING)
+        .collect();
+    for id in current {
+        let known = SEEN.lock().unwrap().get(&id).cloned();
+        let meta = match known {
+            Some(m) => m,
+            None => {
+                let m = session
+                    .episode_body(store, who, &id)
+                    .await?
+                    .and_then(|body| parse_skill(&body))
+                    .map(|(meta, text)| {
+                        let title = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("# "))
+                            .unwrap_or(&meta.slug)
+                            .to_string();
+                        (meta.slug, title, meta.sources)
+                    });
+                let mut seen = SEEN.lock().unwrap();
+                if seen.len() >= MAX_SEEN {
+                    seen.clear();
+                }
+                seen.insert(id.clone(), m.clone());
+                m
+            }
+        };
+        let Some((slug, title, sources)) = meta else {
+            continue;
+        };
+        for src in sources.iter().filter(|e| ids.contains(*e)) {
+            out.entry(src.clone())
+                .or_default()
+                .push((slug.clone(), title.clone()));
+        }
+    }
+    Ok(out)
+}
+
+/// The compiler this server runs (`AMPUP_MEMORY_COMPILE`…, as it started): none where it compiles nothing.
+static COMPILER: std::sync::LazyLock<Option<Extractor>> =
+    std::sync::LazyLock::new(|| Extractor::compile_from_env().ok().flatten());
+
+/// Whether a scope's imports are compiled here, and by which compilers: what an import's standing with compile
+/// ([`Standing::of`]) is read against.
+pub(crate) struct Standing {
+    /// The scope's compile sources, where this server compiles the scope at all; else none.
+    sources: Vec<String>,
+    /// The compiler ids its sources compile under now ([`plan`], [`compiler_id_with`]).
+    ids: Vec<String>,
+}
+
+impl Standing {
+    /// As `serve`'s compile loop decides it: a compile model on this server, and the scope's admins not having
+    /// turned compiling off, and compile sources.
+    pub(crate) fn of(dir: Option<&crate::people::directory::Directory>, scope: &Scope) -> Self {
+        let on = COMPILER.is_some() && dir.is_some_and(|d| d.compiles(scope));
+        let (Some(cx), true) = (COMPILER.as_ref(), on) else {
+            return Self {
+                sources: vec![],
+                ids: vec![],
+            };
+        };
+        let sources = sources_for(dir, scope);
+        let cx = scoped_models(cx, dir, scope);
+        let ids = plan(dir, scope, &sources)
+            .iter()
+            .map(|(srcs, opts)| compiler_id_with(srcs, &cx, opts))
+            .collect();
+        Self { sources, ids }
+    }
+
+    /// Where an episode stands: `compiled` (a current compiler read it), `failed` (it gave up on it), `pending`
+    /// (a source it will read), or `off` (not a source here, or this server compiles nothing). `reads` are the
+    /// episode's reads (reader, facts), as `Store::episode_reads` gives them.
+    pub(crate) fn state(
+        &self,
+        source: &str,
+        document: Option<&str>,
+        reads: &[(String, i64)],
+    ) -> &'static str {
+        let mine = |by: &str| self.ids.iter().any(|id| id == by);
+        if reads.iter().any(|(by, n)| mine(by) && *n != FAILED_TRY) {
+            "compiled"
+        } else if reads
+            .iter()
+            .filter(|(by, n)| mine(by) && *n == FAILED_TRY)
+            .count()
+            >= crate::EXTRACT_TRIES
+        {
+            "failed"
+        } else if selects(&self.sources, source, document) {
+            "pending"
+        } else {
+            "off"
+        }
+    }
+}
+
 /// A skill document's meta line and text.
 pub(crate) fn parse_skill(body: &[u8]) -> Option<(Meta, String)> {
     let text = String::from_utf8_lossy(body).into_owned();
@@ -767,8 +1027,14 @@ pub async fn run_with(
     let id = compiler_id_with(sources, cx, opts);
     let size = opts.batch.unwrap_or_else(batch);
     let template = c2s_prompt(opts.kind);
-    // A `changes` group rebuilds what other prompts compiled from its sources ([`rebuilt`]).
-    let rebuilds = (opts.kind == Some(Kind::Changes)).then_some(sources);
+    // A group whose skills fold many sources rebuilds what other prompts compiled from its sources ([`rebuilt`]).
+    let rebuilds = opts.kind.is_some_and(Kind::folds).then_some(sources);
+    // A new skill of a conversations group needs a procedure that recurs.
+    let recurs = if opts.kind == Some(Kind::Conversations) {
+        RECURS
+    } else {
+        1
+    };
     let actor = SOURCE;
     let mut tried = std::collections::HashSet::new();
     while done.episodes + done.failed < limit {
@@ -806,12 +1072,13 @@ pub async fn run_with(
             other.into_iter().map(|e| row(e.episode_id, 0)).collect();
         pending.extend(unreadable.into_iter().map(|e| row(e, FAILED_TRY)));
         done.skipped += pending.iter().filter(|r| r.facts == 0).count();
-        // Audiences apart, oldest first, in batches.
+        // Audiences apart (each source's effective audience), oldest first, in batches.
         let mut groups: BTreeMap<Vec<String>, Vec<Episode>> = BTreeMap::new();
         for e in mine {
-            let mut acl = e.acl.clone();
-            acl.sort();
-            groups.entry(acl).or_default().push(e);
+            groups
+                .entry(effective_acl(&e.acl, opts.org_wide.as_ref()))
+                .or_default()
+                .push(e);
         }
         let mut stop = false;
         for (acl, eps) in groups {
@@ -836,7 +1103,9 @@ pub async fn run_with(
                 let round = match library(store, scope, branch, &acl).await {
                     Ok(lib) => match ahead.take() {
                         Some((guess, r)) if guess == lib => r,
-                        _ => c2s_round(&template, &acl, batch, lib, cx, &id, rebuilds).await,
+                        _ => {
+                            c2s_round(&template, &acl, batch, lib, cx, &id, rebuilds, recurs).await
+                        }
                     },
                     Err(e) => Err(e),
                 };
@@ -869,7 +1138,7 @@ pub async fn run_with(
                         let (b, guess) = next?;
                         Some((
                             guess.clone(),
-                            c2s_round(&template, &acl, b, guess, cx, &id, rebuilds).await,
+                            c2s_round(&template, &acl, b, guess, cx, &id, rebuilds, recurs).await,
                         ))
                     }
                 );
@@ -932,7 +1201,8 @@ impl Round {
 }
 
 /// One batch's C2S round on the library `lib`, with the C2S prompt `template`: the skills it creates or changes,
-/// as documents.
+/// as documents. A skill the library doesn't have yet must cite at least `recurs` of the batch's sources.
+#[allow(clippy::too_many_arguments)]
 async fn c2s_round(
     template: &str,
     acl: &[String],
@@ -941,6 +1211,7 @@ async fn c2s_round(
     cx: &Extractor,
     compiler: &str,
     rebuilds: Option<&[String]>,
+    recurs: usize,
 ) -> Result<Round> {
     // What the model sees of the library, and what an update builds on: not the skills this compiler rebuilds.
     let seen: Library = lib
@@ -1029,6 +1300,11 @@ async fn c2s_round(
             continue;
         }
         let slug = format!("{base}{suffix}");
+        let distinct = cited.iter().collect::<BTreeSet<_>>().len();
+        if !seen.contains_key(&slug) && distinct < recurs {
+            dropped += 1;
+            continue;
+        }
         let (mut all, mut all_names) = match seen.get(&slug) {
             Some((m, _)) if m.names.len() == m.sources.len() => {
                 (m.sources.clone(), m.names.clone())
@@ -1139,8 +1415,9 @@ fn prompt_of(compiler: &str) -> &str {
     compiler.rsplit_once('@').map_or("", |(_, p)| p)
 }
 
-/// Whether the compiler `compiler` of a `changes` group, compiling `sources`, rebuilds the skill `meta` rather than
-/// updating it: it was written under other prompts (before the scope's kind was `changes`, or a prompt since changed)
+/// Whether the compiler `compiler` of a group that folds ([`Kind::folds`]: `changes`, `conversations`), compiling
+/// `sources`, rebuilds the skill `meta` rather than updating it: it was written under other prompts (before the
+/// scope's kind was set, or a prompt since changed)
 /// from sources every one of which `sources` select. The model isn't shown such a skill, so the library is compiled
 /// again from the sources rather than from the skills the old prompt wrote (one per change, where `changes` wants one
 /// per procedure); the old skill is served until `compile --retire` retires it ([`retire`]). A skill written under
@@ -1173,7 +1450,7 @@ pub struct Retired {
 }
 
 /// Retire, on main, the skills `scope`'s compile no longer stands behind, or (`apply` false) only say which:
-/// - each skill [`rebuilt`] by one of `groups`, the scope's groups that compile as `changes` (their sources and
+/// - each skill [`rebuilt`] by one of `groups`, the scope's groups that fold ([`Kind::folds`]; their sources and
 ///   compiler ids, as [`plan`] gives them; the others rebuild nothing), once that compiler has read every source the
 ///   skill rests on: what those sources hold is in the current library by then,
 ///   folded into the procedure skills that cite them, or judged no procedure at all;

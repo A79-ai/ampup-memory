@@ -288,6 +288,10 @@ pub struct TypeDef {
     /// Ids such as `p000123`: this prefix followed by a digit names this type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_prefix: Option<String>,
+    /// The organization's own things (its repositories, its procedures), never a customer, a contact or a
+    /// colleague: only on such a type may a predicate be `share`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub org_knowledge: bool,
     #[serde(default)]
     pub predicates: BTreeMap<String, PredicateDef>,
 }
@@ -340,6 +344,13 @@ pub struct PredicateDef {
     /// (`memstore::dream`) never ends one; an item dropped is said by a fact of its own. It changes no read.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub list: bool,
+    /// Org knowledge (a repository's commands and conventions), not a subject's private detail: a value enough
+    /// people each showed in their own memory (`share_people`, where the org turned `share_facts` on) is written
+    /// once as the org's, in words they all used, citing none of their sources (`memstore::facts_share`). Never on a
+    /// `ref` (one names an entity: a person, a customer). What people know of a customer or a colleague is theirs,
+    /// however many know it: mark only what the org itself owns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub share: bool,
     /// In an episode type's catalog: the predicate this one means on a schema that declares its type (an
     /// objection's `concern` is a schema's `text`). Where the scope's schema declares that predicate, extraction
     /// offers the model this one only (its description is the catalog's guidance) and stores what it writes as
@@ -565,6 +576,18 @@ impl Schema {
                     !pd.list || pd.card == Card::Many,
                     "predicate {ty}.{p}: `list` is only for card many (a list holds several values)"
                 );
+                ensure!(
+                    !pd.share
+                        || matches!(
+                            pd.value,
+                            ValueType::Text | ValueType::String | ValueType::Enum
+                        ),
+                    "predicate {ty}.{p}: `share` is only for text, string and enum values (a ref names an entity, such as a person)"
+                );
+                ensure!(
+                    !pd.share || def.org_knowledge,
+                    "predicate {ty}.{p}: `share` is only on a type marked `org_knowledge` (what people know of a customer or a colleague is theirs)"
+                );
                 if !pd.pending.is_empty() {
                     ensure!(
                         matches!(pd.value, ValueType::Enum | ValueType::String),
@@ -690,6 +713,7 @@ impl Schema {
             plan: false,
             pending: vec![],
             list: false,
+            share: false,
             same_as: None,
         };
         match predicate {
@@ -1001,6 +1025,9 @@ impl Schema {
                     && (np.to.is_empty() || np.to.iter().any(|t| !op.to.contains(t)));
                 if widened {
                     out.push(format!("{ty}.{p} ref to {:?} -> {:?}", op.to, np.to));
+                }
+                if np.share && !op.share {
+                    out.push(format!("{ty}.{p} shared once enough people show it"));
                 }
             }
         }

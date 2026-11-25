@@ -571,7 +571,23 @@ pub struct AgentState {
     /// The support session seen open, and the diagnostics run in support sessions.
     #[serde(default)]
     pub support: support::SupportState,
+    /// Repairs of drift from the healthy generation that failed in a row, and when the next may be tried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_failed: Option<RepairFailed>,
 }
+
+/// Drift is a condition of a healthy generation, not its outcome: a repair that fails leaves the generation healthy
+/// (its accepted fields are what the next repair restores) and says why, and the next is tried no sooner than
+/// `retry_at`, twice as long after each failure in a row (from one round, at most an hour).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairFailed {
+    pub failures: u32,
+    pub code: String,
+    pub retry_at: DateTime<Utc>,
+}
+
+/// The longest wait between two repairs of the same drift.
+const REPAIR_BACKOFF_MAX: Duration = Duration::from_secs(3600);
 
 impl AgentState {
     pub fn load(path: &Path) -> Result<Self> {
@@ -1533,6 +1549,10 @@ impl Agent {
             }
         };
         if matches {
+            // The drift is gone (repaired, or put back by the operator): a later one starts its repairs afresh.
+            if self.state.repair_failed.take().is_some() {
+                self.state.save(&self.cfg.state)?;
+            }
             match self.target.rollout().await {
                 Ok(r) if r.complete() && self.healthy().await => {}
                 Ok(r) if r.complete() => {
@@ -1585,6 +1605,13 @@ impl Agent {
             self.report(cred, &status).await;
             return Ok(());
         }
+        if let Some(r) = &self.state.repair_failed
+            && Utc::now() < r.retry_at
+        {
+            status.code = Some(r.code.clone());
+            self.report(cred, &status).await;
+            return Ok(());
+        }
         let f = InFlight {
             generation: status.generation,
             version: status.version.clone().unwrap_or_default(),
@@ -1610,11 +1637,14 @@ impl Agent {
             version: Some(f.version.clone()).filter(|t| is_tag(t)),
             code: code.map(String::from),
         };
+        // A repair left part way by an agent that may no longer repair: dropped, and the generation stays as it was
+        // (the drift is reported from the next round on).
         if f.repair && self.cfg.drift_mode != DriftMode::Repair {
             self.state.in_flight = None;
-            return self
-                .conclude(cred, status(Phase::Failed, Some("repair_disabled")))
+            self.state.save(&self.cfg.state)?;
+            self.report(cred, &status(Phase::Failed, Some("repair_disabled")))
                 .await;
+            return Ok(());
         }
         if f.rollback.is_none() {
             let failure = if let Some(desired) = &f.desired {
@@ -1646,11 +1676,31 @@ impl Agent {
             let Some(code) = failure else {
                 self.state.applied = f.desired.clone();
                 self.state.in_flight = None;
+                self.state.repair_failed = None;
                 return self.conclude(cred, status(Phase::Healthy, None)).await;
             };
+            // A failed repair is said, and tried again later ([`RepairFailed`]); the generation stays healthy.
             if f.repair {
+                let failures = self.state.repair_failed.as_ref().map_or(0, |r| r.failures) + 1;
+                let wait = self
+                    .cfg
+                    .poll
+                    .saturating_mul(1 << (failures - 1).min(16))
+                    .min(REPAIR_BACKOFF_MAX);
+                eprintln!(
+                    "agent: repairing drift from generation {} failed ({code}, {failures} in a row); next try in {}s",
+                    f.generation,
+                    wait.as_secs()
+                );
                 self.state.in_flight = None;
-                return self.conclude(cred, status(Phase::Failed, Some(code))).await;
+                self.state.repair_failed = Some(RepairFailed {
+                    failures,
+                    code: code.into(),
+                    retry_at: Utc::now() + chrono::Duration::from_std(wait)?,
+                });
+                self.state.save(&self.cfg.state)?;
+                self.report(cred, &status(Phase::Failed, Some(code))).await;
+                return Ok(());
             }
             f.rollback = Some(Rollback {
                 started: Utc::now(),

@@ -402,9 +402,11 @@ enum Cmd {
         /// At most this many sources this time
         #[arg(long, default_value_t = 100_000)]
         limit: usize,
-        /// What the sources are, over the scope's compile_kind setting (else AMPUP_MEMORY_COMPILE_KIND): errors
-        /// (error reports), or changes (pull requests, tickets, commits: one skill per procedure they repeat, not
-        /// one per change). Switching a library to changes compiles it again from the sources
+        /// What the sources are, over the scope's compile_kind and compile_kinds settings (else
+        /// AMPUP_MEMORY_COMPILE_KIND): errors (error reports), changes (pull requests, tickets, commits: one skill
+        /// per procedure they repeat, not one per change), or conversations (meetings, chat threads, email: one
+        /// skill per procedure that recurs in them). Switching a library to changes or conversations compiles it
+        /// again from the sources
         #[arg(long)]
         kind: Option<String>,
         /// Compile nothing: list the skills an older prompt compiled whose sources the current compile has
@@ -1319,6 +1321,9 @@ enum CheckCmd {
 /// Not in a dylib build: the dependencies' dylib allocates with the system allocator, and memory one allocator
 /// hands out and the other frees aborts the process at startup.
 #[cfg(not(feature = "dylib"))]
+mod heap_profile;
+
+#[cfg(not(feature = "dylib"))]
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -1353,6 +1358,11 @@ fn jemalloc_stats() -> String {
 }
 
 fn main() -> Result<()> {
+    // A document read for the server in a process of its own (`memstore::doc_text::isolated`): before anything starts.
+    let mut args = std::env::args();
+    if args.nth(1).as_deref() == Some(memstore::doc_text::CHILD_ARG) {
+        memstore::doc_text::child_main(&args.next().unwrap_or_default());
+    }
     // Under the background service (or `serve --local --background`): this process writes its own log, capped.
     // SAFETY: first in main: no other thread runs yet.
     unsafe { memstore::service::own_log_from_env() };
@@ -1374,6 +1384,8 @@ fn main() -> Result<()> {
     let _ = memstore::metrics::ALLOCATOR_STATS.set(jemalloc_stats);
     #[cfg(not(feature = "dylib"))]
     let _ = memstore::metrics::ALLOCATED.set(jemalloc_allocated);
+    #[cfg(not(feature = "dylib"))]
+    heap_profile::start();
     let cli = Cli::parse();
     if let Some(c) = &cli.context {
         memstore::people::client::override_context(c);
@@ -1610,10 +1622,9 @@ async fn compile(
     // The scope's batch size and what its sources are, as its settings say, as `serve` compiles it: a group of
     // sources per prompt. `--kind` names what they are for this run.
     let kind = match how.kind {
-        Some(k) => Some(
-            memstore::compile::Kind::parse(k)
-                .ok_or_else(|| anyhow::anyhow!("--kind is errors or changes, not {k:?}"))?,
-        ),
+        Some(k) => Some(memstore::compile::Kind::parse(k).ok_or_else(|| {
+            anyhow::anyhow!("--kind is errors, changes or conversations, not {k:?}")
+        })?),
         None => None,
     };
     let mut groups = memstore::compile::plan(dir.as_ref(), &scope_, &sources);
@@ -1627,10 +1638,11 @@ async fn compile(
             branch == memstore::MAIN,
             "--retire retires on main, for every branch: drop --branch"
         );
-        // Only a `changes` group rebuilds, so only its old skills are retired.
+        // Only a group whose skills fold many sources (changes, conversations) rebuilds, so only its old skills are
+        // retired.
         let ids: Vec<(Vec<String>, String)> = groups
             .iter()
-            .filter(|(_, o)| o.kind == Some(memstore::compile::Kind::Changes))
+            .filter(|(_, o)| o.kind.is_some_and(memstore::compile::Kind::folds))
             .map(|(s, o)| (s.clone(), memstore::compile::compiler_id_with(s, &cx, o)))
             .collect();
         let r = memstore::compile::retire(store, &scope_, &ids, how.apply).await?;
@@ -1664,12 +1676,13 @@ async fn compile(
     }
     let mut down = 0;
     for (sources, opts) in groups {
+        let id = memstore::compile::compiler_id_with(&sources, &cx, &opts);
         let r = memstore::compile::run_with(store, &scope_, branch, &sources, &cx, &opts, limit)
             .await?;
         println!(
-            "{scope} on {branch}: {} with {}: {} sources compiled ({} not compile sources), {} skills and {} AIP graphs written, {} dropped, {} failed ({} with the API down); {}",
+            "{scope} on {branch}: {} as {}: {} sources compiled ({} not compile sources), {} skills and {} AIP graphs written, {} dropped, {} failed ({} with the API down); {}",
             sources.join(","),
-            cx.model(),
+            id,
             r.episodes,
             r.skipped,
             r.skills,

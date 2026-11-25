@@ -219,10 +219,12 @@ async fn compile_settings_change_only_the_scopes_that_set_them() {
     let org_opts = Options {
         batch: Some(4),
         kind: None,
+        ..Options::default()
     };
     let eng_opts = Options {
         batch: Some(2),
         kind: Some(Kind::Errors),
+        ..Options::default()
     };
     assert_eq!(compile::options_for(Some(&d), &acme), org_opts);
     assert_eq!(compile::options_for(Some(&d), &ops), org_opts);
@@ -333,4 +335,48 @@ async fn compile_settings_change_only_the_scopes_that_set_them() {
         .unwrap();
     let d = Directory::load(&store).await.unwrap();
     assert_eq!(compile::options_for(Some(&d), &eng), org_opts);
+}
+
+/// A source's audience beside what the org shares with all of it is that entry alone: everyone who reads the org
+/// holds it, so a member, a team or someone who has left adds no reader. Without it, each entry stays, so a source
+/// only one person or one team reads never compiles into a skill the rest of the org reads.
+#[test]
+fn a_source_shared_with_the_org_compiles_for_the_org_alone() {
+    let w = compile::OrgWide {
+        entry: "group:acme.all".into(),
+    };
+    let acl = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let org = acl(&["group:acme.all"]);
+    for with in [
+        &["group:acme.all", "user:alice@acme.com"][..],
+        &["user:left@acme.com", "group:acme.all"],
+        &["group:acme.all", "group:sales.acme"],
+        &["group:acme.all", "user:outsider@other.com", "role:admin"],
+    ] {
+        assert_eq!(
+            compile::effective_acl(&acl(with), Some(&w)),
+            org,
+            "{with:?}"
+        );
+    }
+    for alone in [
+        &["user:left@acme.com"][..],
+        &["group:sales.acme"],
+        &["group:sales.acme", "user:alice@acme.com"],
+    ] {
+        let mut want = acl(alone);
+        want.sort();
+        assert_eq!(
+            compile::effective_acl(&acl(alone), Some(&w)),
+            want,
+            "{alone:?}"
+        );
+    }
+    // Where readers may come without the directory there is no org-wide entry to lean on: nothing is dropped.
+    let both = acl(&["group:acme.all", "user:left@acme.com"]);
+    assert_eq!(compile::effective_acl(&both, None), both);
+    assert_eq!(
+        compile::effective_acl(&acl(&["*", "user:x"]), Some(&w)),
+        acl(&["*"])
+    );
 }

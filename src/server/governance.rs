@@ -57,8 +57,9 @@ pub(super) async fn handle(
         "list_proposals" => {
             let limit = req["limit"].as_u64().unwrap_or(200).clamp(1, 500) as usize;
             let entity = req["entity"].as_str().filter(|e| !e.is_empty());
-            // `built: true` (Studio's Home): listed only once every proposal's branch has its state built, so the
-            // list waits for no build; until then `proposals` is null, and the branches are built in the background.
+            // `built: true` (Studio's Home): listed only once the list builds no branch's state (each proposal read
+            // from main's, or its branch's built already); until then `proposals` is null, and those branches are
+            // built in the background.
             // Governance read as this server holds it, as the list itself is: Home asks again while they build.
             if req["built"] == true && !store.held(store.proposal_branches_built(&scope)).await? {
                 crate::phases::mark("proposals building");

@@ -351,20 +351,27 @@ async fn run_dream(store: &Store, scope: &Scope, budget: Duration) -> Value {
     out
 }
 
-/// How a scope's turn in the window ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How a scope's turn in the window ended. Several steps of one turn may each end it some way: the turn ends as the
+/// worst of them ([`Ended::and`]), in the order below, so what one step said is never hidden by a milder one after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Ended {
     /// Every rewrite due ran (or wasn't due), and the sweep: recorded as maintained.
     Done,
     /// The budget ran out before a rewrite: the rest waits for the next night.
     OutOfBudget,
-    /// A catalog or store refused for load (429, 503): tried again later.
+    /// A catalog or store refused for load (429, 503): tried again later, this night while it has budget.
     Throttled,
     /// Something failed: logged; the next night tries again first.
     Failed,
 }
 
 impl Ended {
+    /// The turn as it ends once a step also ended it `other`: the worse of the two. A failure stays a failure; a
+    /// throttled turn that then runs out of budget stays throttled, so it is tried again tonight, not the next night.
+    fn and(self, other: Ended) -> Ended {
+        self.max(other)
+    }
+
     fn name(self) -> &'static str {
         match self {
             Ended::Done => "done",
@@ -378,13 +385,11 @@ impl Ended {
 /// What a step's failure makes of the turn: throttled for a refusal for load, failed otherwise.
 fn failed(ended: &mut Ended, e: &anyhow::Error) -> Value {
     let throttled = crate::is_transient(e);
-    if *ended != Ended::Failed {
-        *ended = if throttled {
-            Ended::Throttled
-        } else {
-            Ended::Failed
-        };
-    }
+    *ended = ended.and(if throttled {
+        Ended::Throttled
+    } else {
+        Ended::Failed
+    });
     json!({"result": if throttled { "throttled" } else { "failed" }, "error": super::writer::redacted(e)})
 }
 
@@ -459,7 +464,7 @@ async fn turn(
     let mut purged_episodes = false;
     for &table in &tables {
         if left().is_zero() {
-            ended = Ended::OutOfBudget;
+            ended = ended.and(Ended::OutOfBudget);
             rewrites.insert(table.into(), json!({"result": "skipped_for_budget"}));
             continue;
         }

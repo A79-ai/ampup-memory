@@ -9,7 +9,8 @@
 //!   secret, which the server would then hand out as theirs;
 //! - an org's admin can't make the server fetch from internal hosts (loopback, the private network,
 //!   the cloud's metadata service) through their provider's issuer, its keys' URL or a redirect, and the
-//!   refusal reads the same whether or not the host is up;
+//!   refusal reads the same whether or not the host is up; nor can a member through a web page they import
+//!   (`/learn`'s `url`), which is refused before anything is fetched, in the same words, and files nothing;
 //! - an org's schema is read by its members and set only by its admins (not a member, another org's admin
 //!   or a service key), over `/admin`, `/browse` and the CLI; a dry run sets nothing;
 //! - the keys file is read again when it changes: a key taken out stops working within seconds, a new one
@@ -974,6 +975,93 @@ async fn an_org_admin_can_t_point_the_provider_at_internal_hosts() {
     )
     .await;
     assert!(view["view"].get("provider").is_none(), "{view}");
+}
+
+/// A member imports a web page (Studio's Import, `/learn`'s `url` item) from hosts only the server can reach: the
+/// machine itself (in every way 127.0.0.1 is written), the private network and the cloud's metadata service. Each is
+/// refused before anything is fetched (a host that is up sees no connection), quickly, and in the same words
+/// whether the host is up, down or has no name, so the import maps nothing; nothing is filed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_can_t_import_a_page_from_internal_hosts() {
+    let (s, issuer, _dir) = start_with(false).await;
+    let bob = id_token(&issuer, "bob@acme.com");
+    let (status, body) = post(&s, "/me", &bob, &json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let (up, connections) = counting_listener("127.0.0.1:0").await.unwrap();
+    let up6 = counting_listener(&format!("[::1]:{up}")).await;
+    let down = free_port();
+    let server_port = s.rsplit(':').next().unwrap().trim_end_matches('/');
+    let targets = [
+        format!("https://127.0.0.1:{up}/runbook"),
+        format!("https://127.0.0.1:{down}/runbook"),
+        format!("https://localhost:{up}/runbook"),
+        format!("https://[::1]:{up}/runbook"),
+        format!("https://2130706433:{up}/"),
+        format!("https://0177.0.0.1:{up}/"),
+        format!("https://0x7f.1:{up}/"),
+        format!("https://[::ffff:127.0.0.1]:{up}/"),
+        format!("https://0.0.0.0:{up}/"),
+        format!("https://accounts.google.com@127.0.0.1:{up}/"),
+        // The server itself.
+        format!("https://127.0.0.1:{server_port}/me"),
+        "https://10.1.2.3/".into(),
+        "https://172.16.0.1/".into(),
+        "https://192.168.0.1/".into(),
+        "https://100.64.0.1/".into(),
+        "https://169.254.169.254/latest/meta-data/".into(),
+        "https://[::ffff:169.254.169.254]/".into(),
+        "https://[fd00:ec2::254]/".into(),
+        "https://[fe80::1]/".into(),
+        "https://no-such-host.invalid/".into(),
+    ];
+    // Five a request, as many as one fetches.
+    let mut refused: Vec<Value> = vec![];
+    for chunk in targets.chunks(5) {
+        let items: Vec<Value> = chunk
+            .iter()
+            .map(|u| json!({"kind": "url", "url": u}))
+            .collect();
+        let t = Instant::now();
+        let (status, body) =
+            post(&s, "/learn", &bob, &json!({"items": items, "for": "team"})).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "{chunk:?} took {:?}: was any tried?",
+            t.elapsed()
+        );
+        assert_eq!(body["added"], json!([]), "{body}");
+        refused.extend(body["refused"].as_array().unwrap().iter().cloned());
+    }
+    assert_eq!(refused.len(), targets.len(), "{refused:?}");
+    let said: std::collections::BTreeSet<&str> = refused
+        .iter()
+        .map(|r| r["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        said.into_iter().collect::<Vec<_>>(),
+        vec![auth::fetch::NOT_PUBLIC],
+        "the refusals differ: {refused:?}"
+    );
+    // The same over http: refused before anything is resolved.
+    let (_, body) = post(
+        &s,
+        "/learn",
+        &bob,
+        &json!({"items": [{"kind": "url", "url": format!("http://127.0.0.1:{up}/")}]}),
+    )
+    .await;
+    assert_eq!(
+        body["refused"][0]["reason"], "only https links are read",
+        "{body}"
+    );
+    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 0);
+    if let Some((_, n)) = up6 {
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    // Nothing was filed under bob's imports.
+    let (_, recent) = post(&s, "/learn/status", &bob, &json!({"recent": 50})).await;
+    assert_eq!(recent["items"], json!([]), "{recent}");
 }
 
 /// A stand-in provider whose discovery documents, under `/<case>/`, each try to send the server

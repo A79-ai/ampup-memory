@@ -332,3 +332,190 @@
     background: var(--surface-2);
   }
 }
+
+/* Import: the form beside its Processing panel, stacked where narrow. */
+.memory .import-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 340px);
+  gap: 16px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .memory .import-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.memory .learn-web {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.memory .learn-web-label {
+  font-size: 12px;
+}
+.memory .learn-web-note {
+  opacity: 0.7;
+}
+.memory .learn-web-row {
+  display: flex;
+  gap: 8px;
+}
+.memory .learn-url {
+  flex: 1;
+  min-width: 0;
+}
+.memory .learn-url-chip {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.memory .imp-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 220px;
+}
+.memory .imp-head {
+  padding: 12px 16px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border, rgba(127, 127, 127, 0.2));
+}
+.memory .imp-sub {
+  padding: 10px 16px 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.memory .imp-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px 16px;
+  text-align: center;
+}
+.memory .imp-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px 8px 10px;
+}
+.memory .imp-row {
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  align-items: flex-start;
+}
+.memory .imp-main {
+  min-width: 0;
+  flex: 1;
+}
+.memory .imp-panel {
+  min-width: 0;
+  overflow: hidden;
+}
+.memory .imp-name {
+  all: unset;
+  cursor: pointer;
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.memory .imp-name:hover {
+  text-decoration: underline;
+}
+.memory .imp-stage {
+  font-size: 12px;
+  opacity: 0.8;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.memory .imp-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: imp-pulse 1.2s ease-in-out infinite;
+}
+@keyframes imp-pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .memory .imp-dot {
+    animation: none;
+  }
+}
+.memory .imp-skills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.memory .imp-skills .chip {
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+}
+.memory .imp-empty.is-compact {
+  flex: 0;
+  padding: 18px 16px 8px;
+}
+/* Import holds the pane's height: the form and the Processing panel each scroll inside, the page itself doesn't. */
+.memory .pane-inner.pane-hold {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+.memory .import-page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.memory .import-page .import-grid {
+  flex: 1;
+  min-height: 0;
+  grid-template-rows: minmax(0, 1fr);
+}
+.memory .import-grid > .learn {
+  max-height: 100%;
+  overflow-y: auto;
+}
+.memory .imp-panel {
+  max-height: 100%;
+}
+.memory .imp-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+@media (max-width: 900px) {
+  .memory .pane-inner.pane-hold {
+    height: auto;
+  }
+  .memory .import-page .import-grid {
+    grid-template-rows: none;
+  }
+  .memory .imp-panel {
+    max-height: 70dvh;
+  }
+}
+.memory .imp-slow {
+  margin: 0;
+  padding: 0 16px 8px;
+  font-size: 12px;
+}

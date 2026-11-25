@@ -311,16 +311,19 @@ pub async fn enroll(control_plane: &str, token: &str, out: &Path) -> Result<Cred
 /// `memstore deployment rotate`: a new key, registered with a request the old one signs.
 ///
 /// The new key is written beside the credential (`.rotating`) before the control plane hears of it,
-/// so a crash after it accepts the key can't lose the only copy.
+/// so a crash after it accepts the key can't lose the only copy. One rotation at a time (the CLI and the
+/// agent's `rotate_key` both rotate): a lock file beside the credential is held throughout.
 pub async fn rotate(path: &Path) -> Result<()> {
     let pending = path.with_extension("rotating");
-    anyhow::ensure!(
-        !pending.exists(),
-        "an earlier rotation stopped part way: {} holds its new key. If `ampup-memory deployment whoami --credential {}` answers, move it over {}; otherwise remove it",
-        pending.display(),
-        pending.display(),
-        path.display()
-    );
+    let _held = {
+        let lock = path.with_extension("rotate.lock");
+        let f = open_lock(&lock).with_context(|| format!("{}", lock.display()))?;
+        f.lock()?;
+        f
+    };
+    if pending.exists() && settle(path, &pending).await? {
+        return Ok(());
+    }
     let mut c = Credential::load(path)?;
     let (secret, public) = new_key();
     let proof = sign_with(&secret, &possession_text("rotate", c.deployment.as_str()))?;
@@ -341,4 +344,65 @@ pub async fn rotate(path: &Path) -> Result<()> {
     );
     std::fs::rename(&pending, path)?;
     Ok(())
+}
+
+/// A rotation that stopped part way (refused, or its answer lost) left its new key in `pending`: whether the control
+/// plane took it is what `/v1/whoami` says to each key. The new key answers: it was taken, and replaces the
+/// credential (true: rotated). It is refused while the credential's own key answers: it never was, and goes
+/// (false: rotate now). Anything else (the control plane unreachable or erring, both keys refused) settles
+/// nothing and leaves both for a person: the one that works may be either.
+async fn settle(path: &Path, pending: &Path) -> Result<bool> {
+    let whoami = |c: Credential| async move {
+        c.call("GET", "/v1/whoami", &serde_json::json!({}))
+            .await
+            .map(|(status, _)| status)
+    };
+    let stuck = |why: String| {
+        anyhow::anyhow!(
+            "an earlier rotation stopped part way: {} holds its new key, and {why}. If `ampup-memory deployment whoami --credential {}` answers, move it over {}; otherwise remove it",
+            pending.display(),
+            pending.display(),
+            path.display()
+        )
+    };
+    let refused = |status: u16| matches!(status, 401 | 403);
+    match whoami(Credential::load(pending)?).await {
+        Ok(200) => {
+            std::fs::rename(pending, path)?;
+            eprintln!(
+                "deployment: the control plane took the new key an earlier rotation left in {}: {} holds it now",
+                pending.display(),
+                path.display()
+            );
+            Ok(true)
+        }
+        Ok(status) if refused(status) => match whoami(Credential::load(path)?).await {
+            Ok(200) => {
+                std::fs::remove_file(pending)?;
+                eprintln!(
+                    "deployment: the control plane never took the new key an earlier rotation left in {}: removed",
+                    pending.display()
+                );
+                Ok(false)
+            }
+            Ok(status) => Err(stuck(format!(
+                "the control plane refuses it and answers {status} to the current key"
+            ))),
+            Err(e) => Err(stuck(format!("the control plane didn't answer: {e:#}"))),
+        },
+        Ok(status) => Err(stuck(format!("the control plane answered {status}"))),
+        Err(e) => Err(stuck(format!("the control plane didn't answer: {e:#}"))),
+    }
+}
+
+/// A lock file, created if need be, never truncated (another holder's lock is on it).
+fn open_lock(path: &Path) -> Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    Ok(o.open(path)?)
 }

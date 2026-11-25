@@ -36,9 +36,11 @@
 //! hadn't seen are still unsorted after a pass (recorded while it learned).
 //!
 //! **Where it stands** ([`status`], the admin op `advice_status`): the scope's rewarded runs, how many the map has
-//! sorted and how many wait, its situations and notes, what the last learn did and skipped, the learn in progress
-//! and the last error. The learning server keeps the last three in a document of the scope (`advice-status`), so any
-//! server answers it, the one an admin reaches included.
+//! sorted and how many wait, its situations and notes, what the last learn did and skipped, the learn in progress,
+//! the last error and the queued requests given up on. The learning server keeps the last four in a document of the
+//! scope (`advice-status`), so any server answers it, the one an admin reaches included. A learn whose server stopped
+//! (or lost the writer lease) before it could say how it ended is said to have been interrupted, as the last error,
+//! once the next server to hold the lease looks ([`clear_interrupted`]); the server holding it says so at once.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -143,6 +145,11 @@ impl Drop for Claim {
     }
 }
 
+/// Whether `scope` is claimed for learning in this process now ([`claim`]).
+fn claimed(scope: &Scope) -> bool {
+    LEARNING.lock().unwrap().contains(scope)
+}
+
 /// Claims `scope` for learning advice, or none while it is learning already.
 pub fn claim(scope: &Scope) -> Option<Claim> {
     LEARNING
@@ -189,6 +196,12 @@ const STATUS_SOURCE: &str = "advice:status";
 const STATUS_ACL: &str = "user:advice-status@memstore.invalid";
 /// The actor its commits are made as.
 const STATUS_ACTOR: &str = "advice:status";
+/// What the status says of a learn its server stopped before it could say how it ended ([`clear_interrupted`]).
+const INTERRUPTED: &str = "interrupted: the server learning stopped (or stopped doing the background writing) \
+before it finished; learn again";
+/// Scopes whose learn ended here without its end being written ([`update_status`] failed), so their status may still
+/// say they are learning, and those [`clear_interrupted`] found claimed: it looks at them again.
+static UNSAID: LazyLock<Mutex<BTreeSet<Scope>>> = LazyLock::new(Default::default);
 
 /// How the scope's team learning stands, as the server that learns keeps it ([`STATUS`]). No person is named in it:
 /// who asked for a learn is in the server's log.
@@ -204,6 +217,25 @@ struct Status {
     /// it was before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<Failed>,
+    /// The last queued requests ([`crate::advice_requests`]) the writer gave up on ([`request_failed`]), oldest
+    /// first, at most [`FAILED_REQUESTS`]: the admin who queued one has its id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    failed_requests: Vec<FailedRequest>,
+}
+
+/// How many failed requests the status keeps.
+const FAILED_REQUESTS: usize = 20;
+
+#[derive(Serialize, Deserialize)]
+struct FailedRequest {
+    /// The request's id, as its queuing answered it.
+    id: String,
+    /// `learn`, `hold`, `ratify` or `write`.
+    op: String,
+    /// When it was queued, and when it was given up on (µs).
+    queued_at: i64,
+    at: i64,
+    error: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -255,9 +287,9 @@ async fn read_status(session: &crate::Session, store: &Store) -> Status {
     }
 }
 
-/// Changes the scope's [`Status`] as `change` does, and writes it. Saying where learning stands never fails the
-/// learn: a status not written is said in the log.
-async fn update_status(store: &Store, scope: &Scope, change: impl FnOnce(&mut Status)) {
+/// Changes the scope's [`Status`] as `change` does, and writes it; whether it was written. Saying where learning
+/// stands never fails the learn: a status not written is said in the log.
+async fn update_status(store: &Store, scope: &Scope, change: impl FnOnce(&mut Status)) -> bool {
     let wrote = async {
         let session = store.pin(scope, MAIN).await?;
         let mut s = read_status(&session, store).await;
@@ -268,8 +300,12 @@ async fn update_status(store: &Store, scope: &Scope, change: impl FnOnce(&mut St
         store.commit(scope, STATUS_ACTOR, &[doc], &[]).await?;
         anyhow::Ok(())
     };
-    if let Err(e) = wrote.await {
-        eprintln!("advice {scope}: its learning status wasn't written: {e:#}");
+    match wrote.await {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("advice {scope}: its learning status wasn't written: {e:#}");
+            false
+        }
     }
 }
 
@@ -291,6 +327,14 @@ async fn began(
     update_status(store, scope, |s| s.learning = Some(p)).await;
 }
 
+/// Says the learn ended (`change`), or, where that isn't written, remembers that the scope's status still says it is
+/// learning ([`UNSAID`]).
+async fn ended(store: &Store, scope: &Scope, change: impl FnOnce(&mut Status)) {
+    if !update_status(store, scope, change).await {
+        UNSAID.lock().unwrap().insert(scope.clone());
+    }
+}
+
 /// Says the learn that began at `since` finished, with what each pass did.
 async fn finished(
     store: &Store,
@@ -309,7 +353,7 @@ async fn finished(
         passes: passes.iter().map(|l| json!(l)).collect(),
         left_to_timer,
     };
-    update_status(store, scope, |s| {
+    ended(store, scope, |s| {
         s.learning = None;
         s.last = Some(f);
     })
@@ -323,11 +367,97 @@ async fn failed(store: &Store, scope: &Scope, by: &str, e: &anyhow::Error) {
         by: by.into(),
         error: format!("{e:#}"),
     };
-    update_status(store, scope, |s| {
+    ended(store, scope, |s| {
         s.learning = None;
         s.error = Some(f);
     })
     .await;
+}
+
+/// Says the queued request `id` (`op`, queued at `queued_at`) of `scope` failed for good, and why, in the scope's
+/// status, where `advice_status` shows it ([`FAILED_REQUESTS`] at most). Who asked isn't kept: the asker has its id.
+pub async fn request_failed(
+    store: &Store,
+    scope: &Scope,
+    id: &str,
+    op: &str,
+    queued_at: i64,
+    e: &anyhow::Error,
+) {
+    let f = FailedRequest {
+        id: id.into(),
+        op: op.into(),
+        queued_at,
+        at: crate::now_micros(),
+        error: format!("{e:#}"),
+    };
+    update_status(store, scope, |s| {
+        s.failed_requests.push(f);
+        let over = s.failed_requests.len().saturating_sub(FAILED_REQUESTS);
+        s.failed_requests.drain(..over);
+    })
+    .await;
+}
+
+/// The namespaces of the scopes whose learning status was ever written (from the ledger every server reads): where
+/// a learn can have been left saying it is learning.
+pub async fn status_namespaces(store: &Store) -> Result<BTreeSet<String>> {
+    Ok(store.committed_by(STATUS_ACTOR, 0).await?.0)
+}
+
+/// Scopes whose learn ended in this process without its end being written, or that were claimed when last looked at
+/// ([`UNSAID`]): [`clear_interrupted`] looks at them again.
+pub fn unsaid() -> Vec<Scope> {
+    UNSAID.lock().unwrap().iter().cloned().collect()
+}
+
+/// A learn under way in `scope` by the status's word that is over: a learn runs only on the server doing the
+/// background writing, under that server's [`claim`] of the scope, so there a learn the scope's claim doesn't hold is
+/// one whose server stopped, or stopped holding the writer lease (its commits fenced off), before it could say how
+/// it ended. Said as the last error now ([`INTERRUPTED`]). The caller does the background writing. The scope is
+/// claimed only once its status says a learn is under way, and while it is said over: an admin's `hold_advice` or
+/// learn is never turned away by a look at a scope with nothing to say over. A scope claimed here now (a learn, the
+/// timer's round, an admin's hold) is looked at again later ([`unsaid`]). Whether the status needed it.
+pub async fn clear_interrupted(store: &Store, scope: &Scope) -> Result<bool> {
+    let later = || {
+        UNSAID.lock().unwrap().insert(scope.clone());
+        Ok(false)
+    };
+    if claimed(scope) {
+        return later();
+    }
+    let under_way = |session| async move { read_status(&session, store).await.learning };
+    if under_way(store.pin(scope, MAIN).await?).await.is_none() {
+        UNSAID.lock().unwrap().remove(scope);
+        return Ok(false);
+    }
+    // Read again under the claim, so no learn starts meanwhile.
+    let Some(_claim) = claim(scope) else {
+        return later();
+    };
+    let Some(p) = under_way(store.pin(scope, MAIN).await?).await else {
+        UNSAID.lock().unwrap().remove(scope);
+        return Ok(false);
+    };
+    let f = Failed {
+        at: crate::now_micros(),
+        by: p.by,
+        error: INTERRUPTED.into(),
+    };
+    anyhow::ensure!(
+        update_status(store, scope, |s| {
+            s.learning = None;
+            s.error = Some(f);
+        })
+        .await,
+        "{scope}: the interrupted learn's status wasn't written"
+    );
+    UNSAID.lock().unwrap().remove(scope);
+    eprintln!(
+        "advice {scope}: the learn that began at {} was interrupted",
+        p.since
+    );
+    Ok(true)
 }
 
 /// Makes this server's next reads of `scope`'s runs read them as they are now, not as its cache last held them: the
@@ -415,8 +545,12 @@ pub async fn learn_all(
 /// and skipped, and the last error. It costs the log's rows as this server holds them (decoded once per data file, not
 /// per call) and a few documents. Read from main as built now ([`Store::pin`]), not the last state while the next is
 /// built: an admin following a learn on a server that isn't learning would otherwise see it run on for seconds after
-/// it ended. The timer's settings are this server's, which a deployment's servers share.
-pub async fn status(store: &Store, scope: &Scope) -> Result<Value> {
+/// it ended. The timer's settings are this server's, which a deployment's servers share. On the server doing the
+/// background writing (`writer`), a learn the status says is under way that this server doesn't claim is reported
+/// interrupted, as [`clear_interrupted`] will write it; elsewhere the status is as that server last wrote it.
+pub async fn status(store: &Store, scope: &Scope, writer: bool) -> Result<Value> {
+    // Claimed before or after the status is read: a learn that began or ended meanwhile is no leftover.
+    let claimed_before = claimed(scope);
     let session = store.pin(scope, MAIN).await?;
     let (rewarded, apart) = rewarded_runs(store, scope).await?;
     let map: Value = match session.engine_document(store, MAP).await? {
@@ -439,7 +573,18 @@ pub async fn status(store: &Store, scope: &Scope) -> Result<Value> {
         Value::Array(a) => a.len(),
         _ => 0,
     };
-    let s = read_status(&session, store).await;
+    let mut s = read_status(&session, store).await;
+    if writer
+        && !claimed_before
+        && !claimed(scope)
+        && let Some(p) = s.learning.take()
+    {
+        s.error = Some(Failed {
+            at: p.since,
+            by: p.by,
+            error: INTERRUPTED.into(),
+        });
+    }
     // Learns queued for the writer and not applied yet ([`crate::advice_requests`]), oldest first.
     let mut queued = vec![];
     for key in session.engine_documents(crate::advice_requests::PREFIX) {
@@ -520,6 +665,9 @@ pub async fn status(store: &Store, scope: &Scope) -> Result<Value> {
         "queued": queued.iter().map(|(t, id)| json!({"id": id, "at": at(*t)})).collect::<Vec<_>>(),
         "last_learn": last,
         "last_error": s.error.as_ref().map(|e| json!({"at": at(e.at), "by": e.by, "error": e.error})),
+        "failed_requests": s.failed_requests.iter().map(|f| json!({
+            "id": f.id, "op": f.op, "queued_at": at(f.queued_at), "failed_at": at(f.at), "error": f.error,
+        })).collect::<Vec<_>>(),
         "timer": {
             "on": enabled(),
             "every_secs": every().as_secs(),

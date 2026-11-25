@@ -22,6 +22,18 @@ pub async fn within<F: std::future::Future>(r: &Running, f: F) -> F::Output {
     CURRENT.scope(r.0, f).await
 }
 
+/// `f`, run as the running thing this task works for (if any): a task spawned for a request's work (its commit)
+/// keeps marking that request's phases.
+pub fn carry<F: std::future::Future>(f: F) -> impl std::future::Future<Output = F::Output> {
+    let id = CURRENT.try_with(|id| *id).ok();
+    async move {
+        match id {
+            Some(id) => CURRENT.scope(id, f).await,
+            None => f.await,
+        }
+    }
+}
+
 /// Notes that the running thing this task works for (if any) reached `phase`.
 pub fn at(phase: &'static str) {
     let _ = CURRENT.try_with(|id| {

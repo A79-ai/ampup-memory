@@ -626,6 +626,8 @@ pub async fn serve_with(
     metrics.register(Box::new(crate::metrics::VIS_BUILD_SECONDS.clone()));
     metrics.register(Box::new(crate::metrics::VIS_ORACLE_DIVERGENCE.clone()));
     metrics.register(Box::new(crate::metrics::VIS_BUILDS.clone()));
+    metrics.register(Box::new(crate::metrics::PROPOSAL_READS.clone()));
+    metrics.register(Box::new(crate::metrics::PROPOSAL_READ_DIVERGENCE.clone()));
     metrics.register(Box::new(crate::metrics::FACTS_PLANS.clone()));
     metrics.register(Box::new(crate::metrics::LEDGER_COMPACTION_FAILURES.clone()));
     metrics.register(Box::new(
@@ -1013,12 +1015,25 @@ pub async fn serve_with(
             state.background("digest", async move {
                 let mut walk = ScopeWalk::default();
                 let mut done = std::collections::BTreeSet::new();
+                // The last week whose leftover sends this server gave up, once its day of sending was over.
+                let mut closed = None;
                 loop {
                     tokio::time::sleep(every).await;
                     if !st.writer.holds() {
                         continue;
                     }
-                    let Some(week) = crate::digest::due(crate::now_micros()) else {
+                    let now = crate::now_micros();
+                    let Some(week) = crate::digest::due(now) else {
+                        // Outside the day of sending: what is left unsent of the weeks before is given up, once
+                        // after each such day (and once when this server starts outside one).
+                        let last = crate::digest::last_closed(now);
+                        if closed != Some(last) {
+                            let store = st.writing_store();
+                            match digest_give_up(&st, &store, &mut walk, now).await {
+                                Ok(()) => closed = Some(last),
+                                Err(e) => eprintln!("digest {}: {e:#}", last.label()),
+                            }
+                        }
                         continue;
                     };
                     let store = st.writing_store();
@@ -1136,6 +1151,19 @@ pub async fn serve_with(
                         {
                             quiet = false;
                             eprintln!("sharing what people said in {scope} failed: {e:#}");
+                        }
+                        // The facts of shared predicates enough people's own memories show, as the org's, where
+                        // its admins turned `share_facts` on (`crate::facts_share`); those fewer people back end.
+                        if let Err(e) = crate::log_org::with(
+                            org.as_deref(),
+                            crate::facts_share::share(store, &scope, agg),
+                        )
+                        .await
+                        {
+                            quiet = false;
+                            eprintln!(
+                                "sharing facts people's memories show in {scope} failed: {e:#}"
+                            );
                         }
                         let due = crate::aggregate::When::Due;
                         let run = crate::aggregate::run_unless_running(
@@ -1519,6 +1547,7 @@ pub async fn serve_with(
                     // Its batch size and what its sources are, where its admins said (`set_settings`): a group
                     // of sources per prompt.
                     for (sources, opts) in crate::compile::plan(dir.as_ref(), &scope, &sources) {
+                        let id = crate::compile::compiler_id_with(&sources, &cx, &opts);
                         match crate::compile::run_with(
                             &store,
                             &scope,
@@ -1534,7 +1563,7 @@ pub async fn serve_with(
                                 if r.episodes + r.failed > 0 {
                                     quiet = false;
                                     eprintln!(
-                                        "compiled {scope} ({}): {} sources, {} skills, {} AIP graphs ({} dropped), {} failed ({} with the API down)",
+                                        "compiled {scope} ({} as {id}): {} sources, {} skills, {} AIP graphs ({} dropped), {} failed ({} with the API down)",
                                         sources.join(","),
                                         r.episodes,
                                         r.skills,
@@ -1659,12 +1688,25 @@ pub async fn serve_with(
             let mut scopes: Vec<Scope> = vec![];
             // From the ledger's start: a request queued while no server held the lease is applied by the next one.
             let mut since = 0;
+            // Whether this server, since it last took the lease, has gone over the learns left saying they are under
+            // way (`crate::advice_loop::clear_interrupted`).
+            let mut swept = false;
+            let mut sweep_walk = ScopeWalk::default();
             loop {
                 tokio::time::sleep(every).await;
                 if !st.writer.holds() {
+                    swept = false;
                     continue;
                 }
                 let store = st.writing_store();
+                // Once each time this server takes the lease (its last holder may have stopped mid-learn), and for
+                // any learn here whose end wasn't written.
+                if !swept || !crate::advice_loop::unsaid().is_empty() {
+                    let all = !swept;
+                    if clear_interrupted_learns(&st, &store, &mut sweep_walk, all).await && all {
+                        swept = true;
+                    }
+                }
                 let (asked, newest) =
                     match crate::advice_requests::queued_since(&store, since).await {
                         Ok(q) => q,
@@ -1924,10 +1966,12 @@ pub async fn serve_with(
             loop {
                 let store = st.store.read().unwrap().clone();
                 eprintln!(
-                    "memory: {} | store: {} | search: {}",
+                    "memory: {} | store: {} | search: {} | {} | {}",
                     crate::metrics::process_memory(),
                     store.memory_report(),
-                    search::memory_report()
+                    search::memory_report(),
+                    crate::qa_log::memory_report(),
+                    crate::sessions::memory_report()
                 );
                 tokio::time::sleep(Duration::from_secs(memory_every)).await;
             }
@@ -5431,6 +5475,51 @@ async fn digest_preview(
     Ok(p.json())
 }
 
+/// Gives up the sends left unsent past their retries in every org this server serves (or its own scope, on a server
+/// that identifies no one), where they are kept: each org's own scope ([`crate::digest::give_up_overdue`]).
+async fn digest_give_up(
+    state: &Arc<State>,
+    store: &Store,
+    walk: &mut ScopeWalk,
+    now: i64,
+) -> Result<()> {
+    let mut homes = vec![];
+    if state.fixed() {
+        homes.push(state.scope.clone());
+    } else {
+        // The orgs a round sends for (`digest_round`): those the directory holds, whatever their setting now.
+        let dir = crate::people::directory::Directory::load(store).await?;
+        let mut orgs: std::collections::BTreeSet<String> = Default::default();
+        for s in walk.next(state, store).await {
+            if let Some(o) = s.org_name().filter(|o| dir.orgs.contains_key(*o)) {
+                orgs.insert(o.to_string());
+            }
+        }
+        for o in orgs {
+            homes.push(Scope::org(&o)?);
+        }
+    }
+    let mut failed = 0;
+    for home in homes {
+        if !state.writer.holds() {
+            anyhow::bail!("the writer lease moved: the next holder gives up the rest");
+        }
+        match crate::digest::give_up_overdue(store, &home, now).await {
+            Ok(0) => {}
+            Ok(n) => eprintln!("digest {home}: {n} sends past their retries given up"),
+            Err(e) => {
+                eprintln!("digest {home}: sends past their retries not given up: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} orgs' sends weren't gone over: tried again"
+    );
+    Ok(())
+}
+
 /// One round of the weekly digest of `week`: every org this server serves (or its own scope, on a server that
 /// identifies no one), each org whose round completed already in this process skipped (`done`); what was sent is
 /// recorded in the store, so a restart or another holder sends nothing twice.
@@ -6434,11 +6523,11 @@ async fn handle(
         .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
         .is_some_and(|n| n > max_body)
     {
-        // What `/learn` takes is said: a recording is sent whole, so a larger one can't be added this way.
+        // What `/learn` takes is said: send large files in requests of their own (a recording in parts).
         let error = match learn_route {
             true => format!(
-                "request too large: at most {} MB is added a request, and a recording is sent whole, so a larger \
-                 one can't be added this way yet",
+                "request too large: at most {} MB is added a request: send a large file in a request of its own \
+                 (a recording in parts, kind \"part\")",
                 MAX_INGEST_BODY >> 20
             ),
             false => "request too large".to_string(),
@@ -7808,7 +7897,7 @@ async fn handle(
             &reads,
             &who,
             (writes, &via),
-            (view.as_of.as_deref(), view.browser),
+            (view.as_of.as_deref(), view.browser, view.hooked),
             (acting.is_some(), &app, hook),
             &body,
         )
@@ -9003,6 +9092,10 @@ struct View {
     /// `x-memstore-surface` or `?surface=` is `browser`: `/mcp` also lists `list_facts` and `list_advice`, for
     /// the memory browser page. No other caller is offered them.
     browser: bool,
+    /// `x-memstore-hooks` or `?hooks=` is `sessions`: the client's hooks open and close each conversation's
+    /// session (the Claude Code and Cursor plugins), so its agent isn't offered start_session or end_session nor
+    /// told to call them. An agent that closed its own session spent its last turn on it, and its answer was lost.
+    hooked: bool,
 }
 
 impl View {
@@ -9027,6 +9120,7 @@ impl View {
             at: pick("x-memstore-at", "at"),
             as_of: pick("x-memstore-as-of", "as_of"),
             browser: pick("x-memstore-surface", "surface").as_deref() == Some("browser"),
+            hooked: pick("x-memstore-hooks", "hooks").as_deref() == Some("sessions"),
         }
     }
 
@@ -10983,7 +11077,9 @@ async fn directory_change(
                 .map_err(|e| Refused(format!("{e:#}")))?,
             None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
         };
-        let mut v = crate::advice_loop::status(&store, &scope).await?;
+        // The server doing the background writing for the scope's cell, which learns there.
+        let writer = state.writer.holds() && cell::mine(&scope);
+        let mut v = crate::advice_loop::status(&store, &scope, writer).await?;
         v["org"] = json!(org);
         v["scope"] = json!(scope.to_string());
         return Ok(v);
@@ -13505,7 +13601,7 @@ async fn mcp(
     reads: &Reads,
     who: &Principal,
     (writes, via): (Writes, &SignIn),
-    (as_of, browser): (Option<&str>, bool),
+    (as_of, browser, hooked): (Option<&str>, bool, bool),
     (acting, app, hook): (bool, &str, bool),
     body: &[u8],
 ) -> Option<Value> {
@@ -13545,12 +13641,15 @@ async fn mcp(
             };
             // Where sessions are kept, the lifecycle comes first: a client may read only the instructions' start.
             if writes == Writes::Scope {
+                let shared_at = crate::keep::people_in(&store, scope).await;
                 instructions = format!(
                     "{}\n\n{instructions}",
-                    if purpose {
-                        purpose::lifecycle(offers_advice(&listed))
+                    if hooked {
+                        hooked_instructions(offers_advice(&listed), shared_at)
+                    } else if purpose {
+                        purpose::lifecycle(offers_advice(&listed), shared_at)
                     } else {
-                        lifecycle_instructions(offers_advice(&listed))
+                        lifecycle_instructions(offers_advice(&listed), shared_at)
                     }
                 );
             }
@@ -13584,10 +13683,12 @@ async fn mcp(
                 json!([])
             };
             if may_write && writes != Writes::No {
+                let store = state.store.read().unwrap().clone();
+                let shared_at = crate::keep::people_in(&store, scope).await;
                 tools
                     .as_array_mut()
                     .unwrap()
-                    .push(remember_tool(writes, scope));
+                    .push(remember_tool(writes, scope, shared_at));
             }
             // Skills compiled from the scope's documents (`crate::compile`), and their AIP graphs, and those learned
             // from runs (`crate::advice`: a note is `advice/<category>/<situation>`).
@@ -13635,11 +13736,15 @@ async fn mcp(
                         answered with: no one reads it or the facts drawn from it any more. Only its author may. \
                         Given `matching` (words of it) instead, it forgets nothing: it lists your notes that hold \
                         them, with their ids, and the facts drawn from them that hold the words. When only part of a \
-                        note should go (one thing in it stopped being true), end that fact with close_memory and keep \
-                        the note; forget a whole note only when the user wants all of it gone, confirmed first.",
+                        note should go, forget that fact by its `fact_id`: search serves no one it, or the sentence it \
+                        came from in what you wrote, and the rest of the note stays. With no such fact yet, forget \
+                        the sentence itself: its `episode_id` and the `sentence`, as the `matching` answer lists it. \
+                        Forget a whole note only when the user wants all of it gone, confirmed first.",
                     "inputSchema": {"type": "object", "properties": {
                         "episode_id": {"type": "string"},
+                        "fact_id": {"type": "string", "description": "One fact of yours to forget, from a `matching` answer or search_memory"},
                         "matching": {"type": "string", "description": "Words of the note, when you don't have its id"},
+                        "sentence": {"type": "string", "description": "With episode_id: the one sentence of that note to forget, as it is written there (from a `matching` answer)"},
                     }},
                 }));
                 tools.as_array_mut().unwrap().push(json!({
@@ -13665,6 +13770,7 @@ async fn mcp(
                 let name = t["name"].as_str().unwrap_or_default();
                 (listed.offers(name) || (browser && name == "query_memory"))
                     && (!acting || ACTING_TOOLS.contains(&name))
+                    && !(hooked && matches!(name, "start_session" | "end_session"))
             });
             // The memory browser page's connector (`?surface=browser`) lists its two read tools, so a page can
             // name them; the agents' connector never does.
@@ -13680,7 +13786,8 @@ async fn mcp(
             let store = state.store.read().unwrap().clone();
             // What memory is for, with no call order, where the scope asks (`purpose`).
             if purpose::asks(&store, scope).await {
-                purpose::describe(tools, scope, writes == Writes::Scope);
+                let shared_at = crate::keep::people_in(&store, scope).await;
+                purpose::describe(tools, scope, writes == Writes::Scope, shared_at);
             }
             // Where the org gives each session a branch, the session's writes and reads name it.
             if let Some(org) = scope.org_name()
@@ -14097,10 +14204,22 @@ async fn mcp(
                     .map(|(fact, ep)| format!("ended fact {fact}; the reason is episode {ep}")),
                 "forget_memory" if writes == Writes::Scope => {
                     let eid = args["episode_id"].as_str().unwrap_or_default();
-                    match args["matching"].as_str().filter(|m| eid.is_empty() && !m.trim().is_empty()) {
+                    // One fact, not a note: ended as close_memory ends one (history kept), which the default tools
+                    // don't list, so an agent asked to forget one part of a note has a way to.
+                    let fact = args["fact_id"].as_str().filter(|f| eid.is_empty() && !f.trim().is_empty());
+                    let matching =
+                        args["matching"].as_str().filter(|m| eid.is_empty() && !m.trim().is_empty());
+                    // One sentence of a note of theirs, from it and from what quotes it, before any fact holds it.
+                    let sentence = args["sentence"].as_str().filter(|t| !eid.is_empty() && !t.trim().is_empty());
+                    match (fact, matching) {
+                        _ if sentence.is_some() => {
+                            Box::pin(forget_sentence(&store, scope, who, eid.trim(), sentence.unwrap_or_default()))
+                                .await
+                        }
+                        (Some(f), _) => Box::pin(forget_fact(&store, scope, who, f.trim())).await,
                         // Words, not an id: the caller's own notes that hold them, forgetting nothing yet.
-                        Some(m) => Box::pin(forget_matching(session, &store, scope, who, m)).await,
-                        None => forget(state, &store, scope, who, eid).await,
+                        (None, Some(m)) => Box::pin(forget_matching(session, &store, scope, who, m)).await,
+                        (None, None) => forget(state, &store, scope, who, eid).await,
                     }
                 }
                 "ask_memory" if answer_model().is_some() => ask(session, &store, who, args).await,
@@ -15347,7 +15466,7 @@ fn own_entry(who: &Principal) -> String {
         .unwrap_or_else(|| "user:<their email>".into())
 }
 
-fn lifecycle_instructions(advised: bool) -> String {
+fn lifecycle_instructions(advised: bool, shared_at: usize) -> String {
     // Where no hook records the conversation (ChatGPT, Claude Desktop, an IDE without memstore's hooks), what
     // should outlast it is kept only if the agent remembers it, in the turn it is said.
     format!(
@@ -15373,7 +15492,29 @@ fn lifecycle_instructions(advised: bool) -> String {
         } else {
             ""
         },
-        crate::keep::SHARED_AT
+        shared_at
+    )
+}
+
+/// [`lifecycle_instructions`] for a client whose hooks open and close the session ([`View::hooked`]): the agent
+/// only uses the session the hooks opened.
+fn hooked_instructions(advised: bool, shared_at: usize) -> String {
+    format!(
+        "AmpUp Memory's hooks open this conversation's session and close it when the conversation ends; there is \
+         nothing for you to open or close, and your last message is always your answer to the user.{}\n\nIn \
+         any turn where the user states a preference, corrects you, or settles a decision or a procedure, call \
+         remember_memory in that turn, before you answer, without being asked. It is theirs alone, a decision \
+         too: AmpUp Memory shares it with the team once at least {} people have said the same. Never remember \
+         small talk, secrets or raw tool output.",
+        if advised {
+            " When a new task starts, call get_advice with the task and the session_id the hooks gave you (the \
+             `AmpUp Memory session:` line in your context), once you've oriented and before substantive work; \
+             call it again whenever it would help: moment next when a step is finished and you move to the next, \
+             fork, stuck (you need help) or done."
+        } else {
+            ""
+        },
+        shared_at
     )
 }
 
@@ -15505,6 +15646,12 @@ async fn open_session(
         }
         false => args,
     };
+    // A start naming a conversation the caller has a session open for (the agent's own start, where the hooks
+    // opened one before their line reached it, or the hooks' start after the agent's) is that session: one
+    // conversation is one session, recorded and read for facts once. Its advice is the next get_advice's.
+    if let Some(l) = crate::sessions::open_in_thread(store, session.scope(), who, args).await? {
+        return Ok((l, std::sync::Arc::new(crate::sessions::Served::None)));
+    }
     // Its row is written once the advice is found, in the background (`crate::sessions::opened`).
     let l = crate::sessions::start(store, session.scope(), who, &acl, args, None, false).await?;
     crate::phases::mark("session opened");
@@ -15586,17 +15733,81 @@ async fn open_session(
 
 /// What an admin is told of an advice op queued for the writer ([`crate::advice_requests`]).
 const QUEUED_FOR_WRITER: &str = "queued for the server doing the background writing, which applies it within a minute \
-(see the server's log, or the advice trail)";
+(see the server's log, or the advice trail); one it can't apply is listed under failed_requests by \
+{\"op\": \"advice_status\"}, with why";
 
 /// What an admin is told of a learn queued for the writer: where to follow it.
 const LEARN_QUEUED_FOR_WRITER: &str = "queued for the server doing the background writing, which starts it within a \
 minute and learns from every rewarded run not sorted yet; follow it with {\"op\": \"advice_status\"} (runs sorted \
-and waiting, the learn under way, what the last one did and skipped)";
+and waiting, the learn under way, what the last one did and skipped, and failed_requests: a request it gave up on, \
+with why)";
+
+/// Says over every learn left saying it is under way that no learn here holds (`crate::advice_loop::clear_interrupted`):
+/// in every scope whose learning status was ever written (`all`), or only those whose learn here ended without its end
+/// being written. Whether every one was gone over.
+async fn clear_interrupted_learns(
+    st: &State,
+    store: &Store,
+    walk: &mut ScopeWalk,
+    all: bool,
+) -> bool {
+    let mut namespaces: std::collections::BTreeSet<String> = crate::advice_loop::unsaid()
+        .iter()
+        .map(Scope::namespace)
+        .collect();
+    if all {
+        match crate::advice_loop::status_namespaces(store).await {
+            Ok(n) => namespaces.extend(n),
+            Err(e) => {
+                eprintln!(
+                    "advice: learns left under way not gone over: the ledger couldn't be read: {e:#}"
+                );
+                return false;
+            }
+        }
+    }
+    if namespaces.is_empty() {
+        return true;
+    }
+    let mut complete = true;
+    for scope in walk
+        .next(st, store)
+        .await
+        .iter()
+        .filter(|s| namespaces.contains(&s.namespace()))
+    {
+        if !cell::mine(scope) {
+            continue;
+        }
+        if !st.writer.holds() {
+            return false;
+        }
+        let _org = LogOrg::of(scope);
+        if let Err(e) = crate::advice_loop::clear_interrupted(store, scope).await {
+            eprintln!("advice {scope}: a learn left under way not gone over: {e:#}");
+            complete = false;
+        }
+    }
+    complete
+}
+
+/// Queued advice requests that failed for a reason that may pass (the model or the store down), by id: how many times,
+/// and when they are tried next ([`apply_advice_requests`]).
+static RETRYING: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>> =
+    std::sync::LazyLock::new(Default::default);
+/// How many times a queued request that fails for a reason that may pass is tried before it is given up on.
+const REQUEST_TRIES: u32 = 6;
 
 /// Applies the advice requests queued in `scope` for this server, the writer ([`crate::advice_requests`]), under the
-/// scope's learn claim its caller holds; whether every one was dealt with (applied, or failed and said so). Ones it
-/// stopped writing during are left for the next holder of the lease.
+/// scope's learn claim its caller holds, oldest first; whether every one was dealt with (applied, or given up on and
+/// said so). One refused (the model refused it, or it can't be applied: a note that isn't there) is given up on at
+/// once. One that failed otherwise (the model or the store down) stays queued, it and those after it, and is tried
+/// again in a later round, after [`crate::advice_requests::every`] and twice as long each time, [`REQUEST_TRIES`]
+/// times in all (counted in this process: a new lease holder starts again); then it is given up on. A request given
+/// up on is said in the scope's status, where `advice_status` shows its id and why ([`crate::advice_loop::
+/// request_failed`]). Ones it stopped writing during are left for the next holder of the lease.
 async fn apply_advice_requests(st: &State, store: &Store, scope: &Scope) -> bool {
+    use crate::extract::Refused;
     let pending = match crate::advice_requests::pending(store, scope).await {
         Ok(p) => p,
         Err(e) => {
@@ -15610,6 +15821,15 @@ async fn apply_advice_requests(st: &State, store: &Store, scope: &Scope) -> bool
             complete = false;
             break;
         }
+        // Waiting to be tried again: it, and those queued after it, which go in order.
+        let tries = match RETRYING.lock().unwrap().get(&id) {
+            Some((_, next)) if std::time::Instant::now() < *next => {
+                complete = false;
+                break;
+            }
+            Some((tries, _)) => *tries,
+            None => 0,
+        };
         let outcome = match r.op.as_str() {
             "hold" => crate::advice::hold(store, scope, &r.acl, &r.keys, r.hold)
                 .await
@@ -15649,10 +15869,10 @@ async fn apply_advice_requests(st: &State, store: &Store, scope: &Scope) -> bool
                     .await
                     .map(|l| format!("learned: {}", json!(l)))
                 }
-                Ok(None) => Err(anyhow::anyhow!(
-                    "this server has no model to learn advice with"
-                )),
-                Err(e) => Err(e),
+                Ok(None) => {
+                    Err(Refused("this server has no model to learn advice with".into()).into())
+                }
+                Err(e) => Err(Refused(format!("{e:#}")).into()),
             },
             "write" => match &r.note {
                 Some(note) => {
@@ -15661,9 +15881,9 @@ async fn apply_advice_requests(st: &State, store: &Store, scope: &Scope) -> bool
                         .await
                         .map(|w| format!("{} {}", w.action, w.key))
                 }
-                None => Err(anyhow::anyhow!("a write request holds no note")),
+                None => Err(Refused("a write request holds no note".into()).into()),
             },
-            other => Err(anyhow::anyhow!("no advice op {other:?}")),
+            other => Err(Refused(format!("no advice op {other:?}")).into()),
         };
         // The lease lost meanwhile: what it did wasn't committed; the next holder applies it.
         if !st.writer.holds() {
@@ -15675,11 +15895,32 @@ async fn apply_advice_requests(st: &State, store: &Store, scope: &Scope) -> bool
                 "advice request {id} of {} in {scope} ({}): {said}",
                 r.by, r.op
             ),
-            Err(e) => eprintln!(
-                "advice request {id} of {} in {scope} ({}) failed: {e:#}",
-                r.by, r.op
-            ),
+            // It may pass: tried again later, it and those after it waiting.
+            Err(e) if e.downcast_ref::<Refused>().is_none() && tries + 1 < REQUEST_TRIES => {
+                let wait = crate::advice_requests::every() * 2u32.pow(tries);
+                RETRYING
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), (tries + 1, std::time::Instant::now() + wait));
+                eprintln!(
+                    "advice request {id} of {} in {scope} ({}) failed, tried again in {}s ({} of {REQUEST_TRIES}): {e:#}",
+                    r.by,
+                    r.op,
+                    wait.as_secs(),
+                    tries + 1
+                );
+                complete = false;
+                break;
+            }
+            Err(e) => {
+                eprintln!(
+                    "advice request {id} of {} in {scope} ({}) failed, given up: {e:#}",
+                    r.by, r.op
+                );
+                crate::advice_loop::request_failed(store, scope, &id, &r.op, r.at, &e).await;
+            }
         }
+        RETRYING.lock().unwrap().remove(&id);
         done.push(id);
     }
     match crate::advice_requests::applied(store, scope, &done).await {
@@ -17723,16 +17964,15 @@ async fn document_text(
 }
 
 /// The `remember_memory` tool, as offered where it writes.
-fn remember_tool(writes: Writes, scope: &Scope) -> Value {
+fn remember_tool(writes: Writes, scope: &Scope, shared_at: usize) -> Value {
     let description = match writes {
         Writes::Scope => format!(
             "Add text to this memory ({scope}) as a source episode: get_episode reads it, and start_session \
              hands the user's own back in later conversations. Call it without being asked when the user states \
              a preference, corrects you, or settles a decision or procedure, in that turn, and when they ask you \
              to remember something. It is theirs alone (`for` \"me\", the default): AmpUp Memory shares it with \
-             everyone in {scope} once at least {SHARED_AT} people have said the same. `for` \"team\" is for a \
+             everyone in {scope} once at least {shared_at} people have said the same. `for` \"team\" is for a \
              document or note that isn't anyone's feedback. Never small talk, secrets or raw tool output.",
-            SHARED_AT = crate::keep::SHARED_AT
         ),
         _ => "Queue text (a decision, a meeting note, a thread) for the team memory; facts are \
               extracted from it at the next scheduled ingest (about 15 minutes). By default it's visible to \
@@ -18072,12 +18312,40 @@ async fn forget_matching(
                 .collect::<Vec<_>>()
                 .join("\n")
         ));
+        // Each note's sentences that hold one of the words: one of them can go on its own, before any fact is
+        // drawn from it.
+        let bodies = store
+            .episode_bodies(scope, found.iter().map(|(id, _)| id.clone()).collect())
+            .await?;
+        let mut lines = vec![];
+        for (id, _) in &found {
+            let Some(text) = bodies
+                .get(id)
+                .map(|b| String::from_utf8_lossy(b).to_string())
+            else {
+                continue;
+            };
+            for s in sentences(&text) {
+                let held = crate::search::terms(s);
+                if words.iter().any(|w| held.contains(w)) && crate::holds_sentence(&text, s) {
+                    lines.push(format!("- episode_id {id}, sentence {s:?}"));
+                }
+            }
+        }
+        if !lines.is_empty() {
+            out.push_str(&format!(
+                "Their sentences holding those words:\n{}\nWhen only that sentence should go, forget it with \
+                 forget_memory, its episode_id and the sentence as listed: no one reads it any more, nor a fact \
+                 drawn from it, and the rest of the note stays. ",
+                lines.into_iter().take(20).collect::<Vec<_>>().join("\n")
+            ));
+        }
     }
     if !parts.is_empty() {
         out.push_str(&format!(
             "What was drawn from what you remembered that holds those words:\n{}\nWhen only that part stopped \
-             being true or should no longer be used, end those facts with close_memory, the user's words as the \
-             reason: the rest of each note stays. ",
+             being true or should no longer be used, forget each with forget_memory by its fact_id: no one reads \
+             it or the sentence it came from any more, and the rest of each note stays. ",
             parts.join("\n")
         ));
     }
@@ -18085,6 +18353,115 @@ async fn forget_matching(
         "Forget a whole note by its episode_id only when the user wants all of it gone; confirm with them first.",
     );
     Ok(out)
+}
+
+/// `text`'s sentences, as a note is written: split after `.`, `!` or `?` followed by a space, and at line breaks.
+fn sentences(text: &str) -> Vec<&str> {
+    let mut out = vec![];
+    for line in text.lines() {
+        let mut start = 0;
+        let b = line.as_bytes();
+        for i in 0..b.len() {
+            if matches!(b[i], b'.' | b'!' | b'?') && b.get(i + 1).is_none_or(|c| *c == b' ') {
+                out.push(line[start..=i].trim());
+                start = i + 1;
+            }
+        }
+        out.push(line[start..].trim());
+    }
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+/// `forget_memory` with an `episode_id` and a `sentence`: forget one sentence of what the caller wrote (a note, a
+/// session's record), before or after facts are drawn from it. Search serves no passage holding it in what they
+/// wrote, and no fact quoting it or stating it drawn only from their words, now or extracted later
+/// ([`Store::forget_fact`], under [`crate::sentence_key`]); the rest of the note stays. The same answer for an
+/// episode that isn't theirs as for one that doesn't exist.
+async fn forget_sentence(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    episode_id: &str,
+    sentence: &str,
+) -> Result<String> {
+    let missing = || {
+        ToolError(format!(
+            "no episode {episode_id} of what you wrote in {scope}"
+        ))
+    };
+    let vis = store.visibility(scope, MAIN).await?;
+    let me = crate::origin::sayer_id(&format!("{REMEMBER_SOURCE}:{}", who.user()));
+    if vis.episode_sayer(episode_id) != Some(me) || !vis.can_see_episode(episode_id, who) {
+        return Err(missing().into());
+    }
+    let bodies = store
+        .episode_bodies(scope, vec![episode_id.to_string()])
+        .await?;
+    let Some(text) = bodies
+        .get(episode_id)
+        .map(|b| String::from_utf8_lossy(b).to_string())
+    else {
+        return Err(missing().into());
+    };
+    let sentence = sentence.trim();
+    if !crate::holds_sentence(&text, sentence) {
+        return Err(ToolError(format!(
+            "episode {episode_id} doesn't hold {sentence:?} as written (a sentence of at least a few words, \
+             copied from it): forget_memory with `matching` lists its sentences"
+        ))
+        .into());
+    }
+    let key = crate::sentence_key(who.user(), sentence);
+    store
+        .forget_fact(scope, who.user(), &key, Some(sentence))
+        .await?;
+    Ok(format!(
+        "forgot {sentence:?} from episode {episode_id}: search serves no one it, or a fact stating it drawn from \
+         what you wrote, any more; the rest of the note stays"
+    ))
+}
+
+/// `forget_memory` with a `fact_id`: forget one fact drawn only from the caller's own words (a note, a session's
+/// record), and the sentence it quotes wherever they wrote it ([`Store::forget_fact`]): what is left of the note
+/// stays. The same answer for a fact that isn't theirs as for one that doesn't exist.
+async fn forget_fact(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    fact_id: &str,
+) -> Result<String> {
+    let missing = || {
+        ToolError(format!(
+            "no fact {fact_id} drawn from what you remembered in {scope}"
+        ))
+    };
+    let Some(fact) = store.fact_seen(scope, who, fact_id).await? else {
+        return Err(missing().into());
+    };
+    let vis = store.visibility(scope, MAIN).await?;
+    let me = crate::origin::sayer_id(&format!("{REMEMBER_SOURCE}:{}", who.user()));
+    // Every word it cites is theirs: a fact someone else's words also support isn't one person's to take away.
+    if fact.source_episodes.is_empty()
+        || !fact
+            .source_episodes
+            .iter()
+            .all(|e| vis.episode_sayer(e) == Some(me))
+    {
+        return Err(missing().into());
+    }
+    store
+        .forget_fact(scope, who.user(), fact_id, fact.quote.as_deref())
+        .await?;
+    Ok(match fact.quote {
+        Some(q) => format!(
+            "forgot fact {fact_id}: search serves no one it, or {q:?} from what you wrote, any more"
+        ),
+        None => format!(
+            "forgot fact {fact_id}: search serves no one it any more (it quotes no sentence, so other facts drawn from the \
+             same words stay)"
+        ),
+    })
 }
 
 /// `forget_memory` and `/forget`: forget an episode the caller remembered. The same answer for an episode

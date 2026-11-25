@@ -1412,6 +1412,19 @@
     width: auto;
     max-width: 280px;
   }
+  /* In a host's own place (its sidebar's foot): the pickers alone, as wide as it, on its background. */
+  &.studio-pickers-host {
+    padding: 0;
+    border: 0;
+    background: transparent;
+  }
+  &.studio-pickers-host:not(:has(select, input)) {
+    display: none;
+  }
+  &.studio-pickers-host .studio-pickers {
+    padding-bottom: 0;
+    border-bottom: 0;
+  }
   .studio-pickers {
     display: flex;
     flex-direction: column;
@@ -2349,4 +2362,9 @@
 .memory.traces-bar {
   background: none;
   margin-bottom: var(--s4);
+}
+
+/* The pickers drawn in a host's own place: a block as wide as that place, not a grid sized to them. */
+.memory-studio.studio-pickers-root {
+  display: block;
 }

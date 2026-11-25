@@ -1,7 +1,8 @@
 //! A recording too large for one request, added in Studio in parts: `/learn` items of kind `part`, each a piece of
 //! the file as base64, kept beside the catalog until the last arrives; then it is transcribed and filed apart from
 //! any request ([`super::learn::file_media`], keyed on the digest of its bytes as a small one is), its pieces
-//! deleted whatever came of it, and `/learn/status {upload_ids}` says how it stands.
+//! deleted whatever came of it, and `/learn/status {upload_ids}` says how it stands (`uploading` until its last part
+//! arrives, then `transcribing`, then `added` or `refused`).
 //!
 //! - The first part (`n` 0) names the file and its `size` in bytes and is answered with an `upload_id`; the rest
 //!   carry it. Every part but the last holds exactly [`PART`] bytes, the last the rest, so the pieces kept add up to
@@ -336,8 +337,8 @@ async fn transcribe(
     }
 }
 
-/// How each of `ids` the caller sent stands: `transcribing`, `added` (its `episode_id`, `new`), `refused`
-/// (`reason`), or `unknown` (not theirs, or long gone).
+/// How each of `ids` the caller sent stands: `uploading` (parts still to come: its last hasn't arrived),
+/// `transcribing`, `added` (its `episode_id`, `new`), `refused` (`reason`), or `unknown` (not theirs, or long gone).
 pub(super) async fn states(
     store: &Store,
     scope: &Scope,
@@ -363,8 +364,16 @@ pub(super) async fn states(
         };
         let mut v = match read {
             Ok(b) => serde_json::from_slice::<Value>(&b.to_vec()).unwrap_or_default(),
+            // Nothing came of it yet: still uploading while its name is kept (the first part arrived, the last
+            // hasn't), else not theirs or long gone.
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                json!({"status": "unknown"})
+                match op.exists(&format!("{mine}{id}/meta.json")).await {
+                    Ok(true) => json!({"status": "uploading"}),
+                    Ok(false) => json!({"status": "unknown"}),
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e).context("read how an upload stands"));
+                    }
+                }
             }
             Err(e) => return Err(anyhow::Error::from(e).context("read how an upload stands")),
         };

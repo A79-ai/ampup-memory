@@ -38,6 +38,7 @@ const USER_ROUTES: &[&str] = &[
     "/search",
     "/query",
     "/episode",
+    "/document",
     "/ingest",
     "/remember",
     "/forget",
@@ -445,7 +446,10 @@ pub(super) async fn enter(
     if let Ok(f) = store.directory().await
         && let Some(o) = f.dir.orgs.get(&org)
     {
-        let write = !matches!(req.path, "/search" | "/query" | "/episode" | "/me");
+        let write = !matches!(
+            req.path,
+            "/search" | "/query" | "/episode" | "/document" | "/me"
+        );
         let person = acting_or(&who, user.is_some());
         state.audit.key_use_as(
             (&org, o.created_at),

@@ -70,7 +70,8 @@ folders. A note their kept notes already say isn't kept again. Callers can't wri
 
 **Shared once three people said it.** A personal note stays the author's until at least three distinct people
 have each said the same thing. Then one sentence, built only from words all their notes share, is written as a
-note everyone in the scope reads, naming no one. The authors are counted by the server, not the model.
+note everyone in the scope reads, naming no one. The authors are counted by the server, not the model. An org's
+admins can set how many people that takes with `share_people` (2 or more; a team's setting overrides the org's).
 
 **Profiles (opt-in).** With `profile: true` on an org or team (or `AMPUP_MEMORY_PROFILE=1`), each person's notes are
 folded into one deduplicated profile (at most 40 lines, 8,000 characters) that `start_session` hands them with

@@ -273,14 +273,20 @@ pub enum OrgCmd {
         #[arg(long)]
         compile_batch: Option<usize>,
         /// What the compile sources are: errors (error reports: each skill's when names the exception and its
-        /// message), or changes (pull requests, tickets, commits: one skill per procedure they repeat, not one
-        /// per change) ("" unsets it)
+        /// message), changes (pull requests, tickets, commits: one skill per procedure they repeat, not one
+        /// per change), or conversations (meetings, chat threads, email: one skill per procedure that recurs in
+        /// them) ("" unsets it)
         #[arg(long)]
         compile_kind: Option<String>,
         /// The compile sources compile_kind is about (sentry:); the others compile with the usual prompt, under
         /// a compiler id of their own ("" unsets it: the kind is about every compile source)
         #[arg(long)]
         compile_kind_sources: Option<String>,
+        /// A kind for each group of compile sources, each under a compiler id of its own:
+        /// changes=github:;conversations=slack:,email: ("" unsets it). Sources it doesn't name compile as
+        /// compile_kind and compile_kind_sources say
+        #[arg(long)]
+        compile_kinds: Option<String>,
         /// Learn advice from rewarded runs and judged sessions on its own (default true; false turns it off)
         #[arg(long)]
         advice: Option<bool>,
@@ -311,6 +317,16 @@ pub enum OrgCmd {
         /// bot's), comma-separated user ids; they still teach their own notes. "" unsets it
         #[arg(long)]
         advice_learn_exclude: Option<String>,
+        /// How many people must each show the same thing in their own memory before everyone reads it: kept notes,
+        /// and with share_facts the facts the schema marks share (default: the server's AMPUP_MEMORY_SHARE_PEOPLE,
+        /// else 3; 2 to 50, 0 unsets it)
+        #[arg(long)]
+        share_people: Option<usize>,
+        /// Write a fact the schema marks share (a repo's commands and conventions) as the org's once share_people
+        /// people each showed it in their own memory, in words they all used, citing none of their sources (an org
+        /// setting; default false)
+        #[arg(long)]
+        share_facts: Option<bool>,
         /// Lead advice asked about an error to similar past errors and the PRs that fixed them, from the sentry: and
         /// github: episodes the caller reads (default false)
         #[arg(long)]
@@ -1222,6 +1238,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             compile_batch,
             compile_kind,
             compile_kind_sources,
+            compile_kinds,
             advice,
             advice_procedures,
             advice_evidence,
@@ -1229,6 +1246,8 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             advice_personal_runs,
             advice_skills,
             advice_learn_exclude,
+            share_people,
+            share_facts,
             error_leads,
             extract,
             extract_model,
@@ -1267,6 +1286,12 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 compile_kind_sources: compile_kind_sources
                     .as_deref()
                     .map(crate::compile::parse_sources),
+                compile_kinds: compile_kinds.as_deref().map(|m| {
+                    m.split(';')
+                        .filter_map(|g| g.split_once('='))
+                        .map(|(k, p)| (k.trim().to_string(), crate::compile::parse_sources(p)))
+                        .collect()
+                }),
                 advice: *advice,
                 advice_procedures: *advice_procedures,
                 advice_evidence: *advice_evidence,
@@ -1280,6 +1305,8 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                         .map(String::from)
                         .collect()
                 }),
+                share_people: *share_people,
+                share_facts: *share_facts,
                 error_leads: *error_leads,
                 extract: *extract,
                 extract_model: extract_model.clone(),

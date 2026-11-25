@@ -262,9 +262,6 @@ export function Home({
     let live = true;
     setFailed(null);
     void (async () => {
-      // The proposals wait for their branches' states to be built, which a first ask doesn't wait for: asked for
-      // beside it, so that the wait starts with the page rather than once the first ask has answered.
-      const beside = browse<HomeSummary>({ op: "home", parts: ["proposals"] }, sel).catch(() => null);
       let h: HomeSummary;
       try {
         h = await browse<HomeSummary>({ op: "home" }, sel);
@@ -273,13 +270,6 @@ export function Home({
         if (unknownOp(e)) setSaid({ key, h: null });
         else setFailed({ key, why: errorText(e) });
         return;
-      }
-      if (live && h.pending?.includes("proposals")) {
-        if (h.pending.length > 1) setSaid({ key, h });
-        const p = await beside;
-        if (p && !p.pending?.includes("proposals")) {
-          h = { ...h, proposals: p.proposals, pending: h.pending.filter((x) => x !== "proposals") };
-        }
       }
       for (let again = 0, fails = 0; live; again++) {
         if (!h.pending?.length || again === ASK_AGAIN) {

@@ -54,6 +54,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::client::{Unreached, sent_error};
+
 /// Longest session body sent, under the server's `/remember` limit: the whole conversation, all but the longest
 /// (one in a hundred ran past 600,000 characters over three days of one person's sessions); past it, its start
 /// (the ask) and its end (where it got to).
@@ -203,6 +205,9 @@ pub struct Client {
     team: Option<String>,
     /// `AMPUP_MEMORY_SCOPE` (`mine`: the caller's own memory), sent as `?scope=`.
     scope: Option<String>,
+    /// `AMPUP_MEMORY_HOOKS` (`sessions`: this client's hooks open and close each session), sent as
+    /// `x-memstore-hooks`. A plugin's MCP entry sets it, so its agent isn't told to open or close sessions itself.
+    hooks: Option<String>,
     /// Where `url` came from, for `status`: AMPUP_MEMORY_URL, or which context in which config directory.
     from: String,
     /// Nothing named a server (no AMPUP_MEMORY_URL, no CLI context): `url` is the local server's default.
@@ -276,6 +281,7 @@ impl Client {
             org,
             team,
             scope: var("AMPUP_MEMORY_SCOPE"),
+            hooks: var("AMPUP_MEMORY_HOOKS"),
             from,
             by_default,
             http: std::sync::OnceLock::new(),
@@ -384,6 +390,9 @@ impl Client {
         }
         if let Some(t) = &self.team {
             req = req.header("x-memstore-team", t);
+        }
+        if let Some(h) = &self.hooks {
+            req = req.header("x-memstore-hooks", h);
         }
         let res = req.send().await.map_err(|e| {
             Unreached(
@@ -592,6 +601,7 @@ impl Client {
             org,
             team: field("team"),
             scope: field("scope"),
+            hooks: None,
             from: "the outbox".into(),
             by_default: false,
             http: std::sync::OnceLock::new(),
@@ -666,34 +676,6 @@ impl std::fmt::Display for Capped {
 }
 
 impl std::error::Error for Capped {}
-
-/// A failure worth sending again: the memory unreachable, slow, down, busy or the sign-in stale, with the seconds it
-/// said to wait first when it said. A refusal (bad arguments, a session that isn't the caller's) never is.
-#[derive(Debug)]
-struct Unreached(String, Option<u64>);
-
-impl std::fmt::Display for Unreached {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Unreached {}
-
-/// Why a request never got its answer, with what reqwest keeps under its own message ("error sending request"):
-/// a timeout and how long it waited, or the connection's, TLS's or DNS's own error.
-fn sent_error(e: &reqwest::Error) -> String {
-    let mut out = e.to_string();
-    if e.is_timeout() {
-        out.push_str(": timed out");
-    }
-    let mut source = std::error::Error::source(e);
-    while let Some(s) = source {
-        out.push_str(&format!(": {s}"));
-        source = s.source();
-    }
-    out
-}
 
 /// The seconds the memory said to wait before `e`'s write is sent again, when it said.
 fn said_wait(e: &anyhow::Error) -> Option<u64> {
@@ -844,9 +826,16 @@ async fn send_outbox(budget: Duration) {
             .ok()
             .and_then(|t| t.elapsed().ok())
             .unwrap_or_default();
-        // One a copy claimed and never finished (killed mid-send) goes back.
-        if let Some((base, _)) = name.split_once(".json.sending.") {
-            if age > Duration::from_secs(600) {
+        // One a copy claimed and never finished (killed mid-send) goes back. How long ago it was claimed is in its
+        // name: the rename that claims it keeps the time it was queued, so an item that waited ten minutes would
+        // read as abandoned the moment it was claimed, and go back to be sent again while its send is under way.
+        // A claim named without the time (an older copy's) goes by when it was written.
+        if let Some((base, claim)) = name.split_once(".json.sending.") {
+            let claimed = claim
+                .split_once('.')
+                .and_then(|(_, at)| at.parse::<u64>().ok())
+                .map_or(age, |at| Duration::from_secs(unix_now().saturating_sub(at)));
+            if claimed > Duration::from_secs(600) {
                 let back = dir.join(format!("{base}.json"));
                 let _ = match back.exists() {
                     true => std::fs::remove_file(&p),
@@ -878,7 +867,7 @@ async fn send_outbox(budget: Duration) {
         {
             continue;
         }
-        let claimed = p.with_extension(format!("json.sending.{pid}"));
+        let claimed = p.with_extension(format!("json.sending.{pid}.{}", unix_now()));
         if std::fs::rename(&p, &claimed).is_err() {
             continue; // another copy has it
         }
@@ -1579,6 +1568,16 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
     {
         return rate_typed(&input, harness, reward, &why).await;
     }
+    // The agent opening a session itself (its server's instructions say to, and the hook's session line hadn't
+    // reached it yet): the call names this conversation, so the server hands back the session the hooks opened
+    // for it, or the one the hooks open next joins it. One conversation is one session.
+    if event == "pre-tool"
+        && !detached
+        && let Some(out) = own_start_in_thread(&input, harness)
+    {
+        println!("{out}");
+        return Ok(());
+    }
     // Said to the person, once a session, after a turn of real work: how to rate it.
     if event == "stop"
         && !detached
@@ -1744,6 +1743,9 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             &[Some(sign_in_hint(&client))],
         ),
         "session-start" => {
+            // The copy says it is still opening the session for as long as it is, so a prompt meanwhile doesn't
+            // take it for one that failed and open a second.
+            let opening = detached.then(|| keep_opening(&input)).flatten();
             if detached {
                 prune_markers();
                 // A server this start (or another session's) is starting: the session opens on it once ready.
@@ -1755,7 +1757,13 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
             let repo = git_repo(&input);
             let about = format!("about {}", repo.as_deref().unwrap_or_default());
             let (opened, recalled, imported) = tokio::join!(
-                continue_or_open(&client, &input, harness),
+                async {
+                    let opened = continue_or_open(&client, &input, harness).await;
+                    if let Some(o) = &opening {
+                        o.abort();
+                    }
+                    opened
+                },
                 async {
                     match &repo {
                         Some(r) => recall(&client, r, &about, START_FACTS).await,
@@ -2771,12 +2779,18 @@ async fn import_starter(client: &Client, input: &Value) -> Result<()> {
     Ok(())
 }
 
-/// The hooks' per-session markers, in a directory of the user's own under the temp directory: owner-only, so on
-/// a shared `/tmp` nobody else can plant a marker (or a link) in it. None when it isn't safe to use.
+/// The hooks' per-session markers, in a directory of the user's own under the temp directory ([`markers_dir`]).
+/// None when it isn't safe to use.
 fn marker(kind: &str, session: &str) -> Option<std::path::PathBuf> {
     if session.is_empty() || session.contains(['/', '\\']) || session.starts_with('.') {
         return None;
     }
+    Some(markers_dir()?.join(format!("{kind}-{session}")))
+}
+
+/// Where the hooks keep their markers, made if missing: owner-only, so on a shared `/tmp` nobody else can plant a
+/// marker (or a link) in it. None when it isn't safe to use.
+fn markers_dir() -> Option<std::path::PathBuf> {
     let dir = std::env::temp_dir().join("memstore-hooks");
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -2792,53 +2806,44 @@ fn marker(kind: &str, session: &str) -> Option<std::path::PathBuf> {
             return None;
         }
     }
-    m.is_dir().then(|| dir.join(format!("{kind}-{session}")))
+    m.is_dir().then_some(dir)
 }
 
-/// Removes per-session markers a week old: those of harness sessions that never reached their end (killed, or a
-/// harness with no end hook), which would otherwise pile up.
+/// How long a marker nothing wrote to is kept ([`prune_markers`]).
+const MARKER_DAYS: u64 = 7;
+
+/// Removes markers a week old: those of harness sessions that never reached their end (killed, or a harness with
+/// no end hook), which would otherwise pile up. Every file in the markers' directory is one: they go by age, not
+/// by a list of kinds, which missed each kind added since. Not those of a session still open, however old: its
+/// `session-` marker is renewed while it is used ([`session_id`]), and its write-once markers (where its trace
+/// starts, how far its note was remembered) would otherwise go from under it.
 fn prune_markers() {
-    const KINDS: [&str; 21] = [
-        "session",
-        "ended",
-        "rated",
-        "ratehint",
-        "advised",
-        "asked",
-        "from",
-        "kept",
-        "opening",
-        "recalled",
-        "remembered",
-        "handed",
-        "inbox",
-        "inboxtmp",
-        "taken",
-        "lined",
-        "recall",
-        "decided",
-        "transcript",
-        "transcriptlock",
-        "transcriptoff",
-    ];
-    let Some(dir) = marker("prune", "x").and_then(|m| m.parent().map(Path::to_path_buf)) else {
+    let Some(dir) = markers_dir() else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let ours = name
-            .to_str()
-            .and_then(|n| n.split_once('-'))
-            .is_some_and(|(kind, _)| KINDS.contains(&kind));
-        let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| {
+    let old = |e: &std::fs::DirEntry| {
+        e.metadata().and_then(|m| m.modified()).is_ok_and(|t| {
             t.elapsed()
-                .is_ok_and(|a| a > Duration::from_secs(7 * 86_400))
-        });
-        if ours && old {
-            let _ = std::fs::remove_file(e.path());
+                .is_ok_and(|a| a > Duration::from_secs(MARKER_DAYS * 86_400))
+        })
+    };
+    let (mut aged, mut open) = (vec![], vec![]);
+    for e in entries.flatten() {
+        let Ok(name) = e.file_name().into_string() else {
+            continue;
+        };
+        match (old(&e), name.strip_prefix("session-")) {
+            (true, _) => aged.push((e.path(), name)),
+            (false, Some(s)) if !s.is_empty() => open.push(s.to_string()),
+            _ => {}
+        }
+    }
+    for (path, name) in aged {
+        if !open.iter().any(|s| name.contains(s.as_str())) {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -2920,6 +2925,38 @@ fn hook_event(harness: Harness, event: &str) -> &'static str {
         "post-tool" => "PostToolUse",
         _ => harness.event(false),
     }
+}
+
+/// For Claude Code's PreToolUse of AmpUp Memory's own `start_session` (an MCP tool of its server) that names no
+/// conversation: the same call naming this one (`thread`, as the hooks' own start does), so the server answers with
+/// the session already open for it rather than a second one.
+fn own_start_in_thread(input: &Value, harness: Harness) -> Option<String> {
+    if harness != Harness::ClaudeCode {
+        return None;
+    }
+    let tool = field(input, &["tool_name", "toolName"])?;
+    let server = tool
+        .strip_prefix("mcp__")?
+        .strip_suffix("__start_session")?;
+    // Only the names AmpUp Memory's server is installed under: the plugin's, and the entry `setup` writes (new and
+    // old). Another server's tool is left as it is.
+    let ours = server == format!("plugin_{0}_{0}", crate::naming::MCP_SERVER)
+        || server == crate::naming::MCP_SERVER
+        || crate::naming::OLD_MCP_SERVERS.contains(&server);
+    if !ours {
+        return None;
+    }
+    let session = session_of(input);
+    let mut args = input["tool_input"].clone();
+    if session.is_empty() || !args.is_object() || args.get("thread").is_some_and(|t| !t.is_null()) {
+        return None;
+    }
+    args["thread"] = json!(session);
+    // The input changes, the permission doesn't: the person's own rules still decide whether it runs.
+    Some(
+        json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": args}})
+            .to_string(),
+    )
 }
 
 /// Whether hook `event` has anything to ask the memory: a session's start and a prompt do; a tool call only in a
@@ -3236,13 +3273,24 @@ fn take_inbox(session: &str, budget: usize) -> Option<String> {
 pub(crate) const ADVICE_LEAD: &str =
     "Advice from the team memory (AmpUp Memory), learned from past sessions like this one";
 
-/// The memstore session this harness session opened (`start_session`), kept in a marker.
+/// The memstore session this harness session opened (`start_session`), kept in a marker. Renewed once a day while
+/// it is used, so a session open for longer than [`MARKER_DAYS`] keeps its markers ([`prune_markers`]).
 fn session_id(input: &Value) -> Option<String> {
     let m = marker("session", session_of(input))?;
-    std::fs::read_to_string(m)
+    let id = std::fs::read_to_string(&m)
         .ok()
         .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
+        .filter(|id| !id.is_empty())?;
+    let day_old = std::fs::metadata(&m)
+        .and_then(|md| md.modified())
+        .is_ok_and(|t| t.elapsed().is_ok_and(|a| a > Duration::from_secs(86_400)));
+    if day_old {
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&m)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    }
+    Some(id)
 }
 
 /// Opens a memstore session for this harness session (`start_session`) with `context`, and keeps its id.
@@ -3259,7 +3307,10 @@ async fn open_session(
     // Where in the harness's transcript this session starts, taken before the start call (seconds, on a remote
     // catalog, while the conversation goes on): a resumed conversation's earlier turns were another session's,
     // and its trace leaves them out.
-    if let Some(f) = marker("from", session_of(input)) {
+    // One kept with no session open yet is an earlier opening's (under way, or failed), and where the session
+    // starts still.
+    let had = session_id(input);
+    if let Some(f) = marker("from", session_of(input)).filter(|f| had.is_some() || !f.exists()) {
         let _ = std::fs::write(f, transcript_entries(input, harness).len().to_string());
     }
     let mut args = json!({"harness": harness.session_name(), "context": redact(context), "max_chars": MAX_ADVICE});
@@ -3281,6 +3332,18 @@ async fn open_session(
     let id = v["session_id"]
         .as_str()
         .context("start_session answered no session_id")?;
+    // Another opening of this harness session finished while this one waited for its answer (a prompt took this
+    // one for failed): the agent may hold that session's id already, so it stays, and this one, opened for
+    // nothing, ends discarded (out of the day's count) rather than open until it goes idle.
+    if let Some(theirs) = session_id(input).filter(|s| had.as_ref() != Some(s) && s != id) {
+        let end = json!({"session_id": id, "harness": harness.session_name(), "discard": true});
+        if let Err(e) = client.tool("end_session", end).await {
+            warn(format!("the session opened twice wasn't ended: {e:#}"));
+        }
+        return Ok(Some(format!(
+            "AmpUp Memory session: {theirs} (pass it as session_id to get_advice when you need help and when a step is finished and you move to the next (moment next); the hooks end it)"
+        )));
+    }
     // What the user asked to be remembered, and what the team shares: the agent never calls start_session under
     // the hooks, so this is the only way it reads them.
     let remembered = remembered_block(&v, NOTES);
@@ -3403,6 +3466,27 @@ fn was_advised(input: &Value) -> bool {
     marker("advised", session_of(input)).is_some_and(|m| m.exists())
 }
 
+/// How long a session's `opening` marker stands for an opening under way: past it unchanged, the opening failed
+/// (or its copy was killed) and the next prompt opens the session.
+const OPENING_STALE: Duration = Duration::from_secs(60);
+
+/// How often an opening under way says so ([`keep_opening`]), well inside [`OPENING_STALE`].
+const OPENING_BEAT: Duration = Duration::from_secs(10);
+
+/// While the copy a session's start hands its opening to is opening it, keeps its `opening` marker fresh, until the
+/// task is aborted. An opening can take well past [`OPENING_STALE`] (a local server starting first, then the start
+/// call, after a sign-in renewed): a prompt that took a marker written once for a failed opening would open a second
+/// session beside it, and the first would never be ended by the hooks.
+fn keep_opening(input: &Value) -> Option<tokio::task::JoinHandle<()>> {
+    let m = marker("opening", session_of(input))?;
+    Some(tokio::spawn(async move {
+        loop {
+            let _ = std::fs::write(&m, "");
+            tokio::time::sleep(OPENING_BEAT).await;
+        }
+    }))
+}
+
 /// How long a session's first prompt waits for its start to finish opening it: in a copy no one waits on, as long
 /// as an opening takes on a cold server; in the hook itself (where it can't be handed to a copy), inside the
 /// prompt hook's own timeout (4 s), with time left for the advice.
@@ -3426,7 +3510,7 @@ async fn advise(
     // little: its first prompt is where what the user asked to be remembered reaches the agent.
     let opening = marker("opening", session_of(input))
         .and_then(|m| std::fs::metadata(m).and_then(|md| md.modified()).ok())
-        .is_some_and(|t| t.elapsed().is_ok_and(|e| e < Duration::from_secs(60)));
+        .is_some_and(|t| t.elapsed().is_ok_and(|e| e < OPENING_STALE));
     let mut found = session_id(input);
     let waited = std::time::Instant::now();
     while found.is_none() && opening && waited.elapsed() < opening_wait() {
@@ -3436,13 +3520,12 @@ async fn advise(
     let Some(id) = found else {
         // Not open yet: its start hook is still opening it, or there was none (memstore installed mid-session),
         // and then a copy opens it now. Either way this prompt goes on without advice rather than wait.
-        // An opening that failed (the memory was down) is tried again a minute on.
+        // An opening that failed (the memory was down) is tried again a minute on; one still under way says so
+        // ([`keep_opening`]) however long it takes.
         let stale = |m: &std::path::PathBuf| {
             std::fs::metadata(m)
                 .and_then(|md| md.modified())
-                .map_or(true, |t| {
-                    t.elapsed().is_ok_and(|e| e > Duration::from_secs(60))
-                })
+                .map_or(true, |t| t.elapsed().is_ok_and(|e| e > OPENING_STALE))
         };
         if let Some(m) = marker("opening", session_of(input)).filter(stale) {
             let _ = std::fs::write(m, "");

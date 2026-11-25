@@ -175,7 +175,7 @@ pub(super) async fn run(
                 reads,
                 who,
                 (Writes::No, via),
-                (None, true),
+                (None, true, false),
                 (false, "memstore-agent", false),
                 body.as_bytes(),
             )

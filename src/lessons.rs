@@ -274,9 +274,10 @@ static FULL: std::sync::LazyLock<crate::kept_answers::Kept<Full>> =
 
 /// [`full`], kept by memory state ([`crate::kept_answers`]) for main as it is now: it reads every person's advice
 /// map and notes, and the sessions log. Kept by the reader, what they read (`space`, `person`, `limit`) and the
-/// sessions log as well as main's state: a session logged since is a newer state, answered as main moving on is
-/// (the last answer while the next is worked out), and a session forgotten or retracted is a loss, never answered
-/// from what was kept before it.
+/// sessions log as well as main's state: a session logged since (in the answer log, or held here for its next
+/// flush) is a newer state, answered as main moving on is (the last answer while the next is worked out), and a
+/// session forgotten or retracted is a loss, never answered from what was kept before it. The sessions are listed
+/// only to work an answer out: a kept one is answered without reading them.
 async fn full_kept(
     store: &Store,
     session: &Session,
@@ -293,24 +294,27 @@ async fn full_kept(
             let now = store
                 .lagging_visibility(session.scope(), crate::MAIN)
                 .await?;
-            std::ptr::eq(session.vis(), &*now).then(|| crate::kept_answers::At::of(mark, &now))
+            match std::ptr::eq(session.vis(), &*now) {
+                true => {
+                    let log = crate::kept_answers::Log::read(store, session.scope()).await?;
+                    let mut at = crate::kept_answers::At::with_log(mark, &now, log);
+                    let (held, newest) = crate::sessions::held_mark(store, session.scope());
+                    at.heads.push(format!("held sessions {held} {newest}"));
+                    Some(at)
+                }
+                false => None,
+            }
         }
         false => None,
     };
     crate::phases::mark("lessons state");
-    let log = std::sync::Arc::new(crate::sessions::list(store, session.scope()).await?);
-    crate::phases::mark("lessons sessions");
-    let Some(mut at) = at else {
+    let Some(at) = at else {
+        let log = crate::sessions::list(store, session.scope()).await?;
+        crate::phases::mark("lessons sessions");
         return Ok(std::sync::Arc::new(
             full(store, session, reader, want, limit, since(), &log).await?,
         ));
     };
-    let newest = log.iter().map(|l| l.updated_at.max(l.asked_at)).max();
-    at.heads.push(format!(
-        "sessions {} {}",
-        log.len(),
-        newest.unwrap_or_default()
-    ));
     let key = format!(
         "{}\n{}\n{}\n{limit}\n{}",
         crate::kept_answers::reader_key(reader.who),
@@ -342,6 +346,8 @@ async fn full_kept(
                 who: &who,
                 every_session: every,
             };
+            let log = crate::sessions::list(&store2, session2.scope()).await?;
+            crate::phases::mark("lessons sessions");
             full(&store2, &session2, reader, &want2, limit, since(), &log).await
         },
     )

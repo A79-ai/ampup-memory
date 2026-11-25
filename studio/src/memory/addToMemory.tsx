@@ -16,11 +16,21 @@ const MAX_BYTES = 64 * 1024;
 const TEXT_TYPES = [
   "txt", "text", "md", "markdown", "csv", "tsv", "json", "jsonl", "ndjson", "yaml", "yml", "log",
 ];
+/** Documents memstore reads the text of (its `doc_text::TYPES`), filed in parts where long. */
+const DOCUMENT_TYPES = ["pdf", "docx"];
+/** The largest document file memstore takes (its `/learn` `MAX_DOCUMENT`). */
+const MAX_DOCUMENT_BYTES = 5 * 1024 * 1024;
+/** The most base64 one `/learn` request carries: under memstore's 8 MB a request (`MAX_INGEST_BODY`), with room. */
+const MAX_REQUEST = 6 * 1024 * 1024;
+/** The most pages one `/learn` request fetches (memstore's `MAX_URLS`). */
+const MAX_PAGES = 5;
+/** Whether an item is a document file, sent in a request of its own. */
+const isDocument = (it: LearnItem) => it.kind === "file" && DOCUMENT_TYPES.includes(extOf(it.name));
 /** Recordings: sent in parts and transcribed where memstore is set to (it says why not where it isn't). */
 const MEDIA_TYPES = [
   "mp4", "mov", "m4v", "webm", "mp3", "wav", "m4a", "aac", "ogg", "oga", "opus", "flac",
 ];
-const ACCEPT = [...TEXT_TYPES, ...MEDIA_TYPES].map((t) => `.${t}`).join(",");
+const ACCEPT = [...TEXT_TYPES, ...DOCUMENT_TYPES, ...MEDIA_TYPES].map((t) => `.${t}`).join(",");
 /** The bytes in each part of a recording but its last, as memstore's `/learn` takes them (`upload::PART`). */
 const PART = 3 * 1024 * 1024;
 
@@ -33,8 +43,8 @@ const isRecording = (name: string) => MEDIA_TYPES.includes(extOf(name));
 /** Why a file isn't sent at all, by its type, before its size: a recording is never "split it". */
 function unreadType(name: string): string | undefined {
   const ext = extOf(name);
-  if (TEXT_TYPES.includes(ext) || MEDIA_TYPES.includes(ext)) return undefined;
-  return `${ext ? `.${ext} files aren't` : "files without an extension aren't"} read: text, Markdown, CSV, JSON, YAML, audio and video are`;
+  if (TEXT_TYPES.includes(ext) || DOCUMENT_TYPES.includes(ext) || MEDIA_TYPES.includes(ext)) return undefined;
+  return `${ext ? `.${ext} files aren't` : "files without an extension aren't"} read: text, Markdown, CSV, JSON, YAML, PDF, Word, audio and video are`;
 }
 /** How often the receipt is read again while extraction runs, and for how long at most; longer while a recording
  * is transcribed. */
@@ -47,6 +57,7 @@ const TRANSCRIBE_FOR_MS = 35 * 60_000;
 export type LearnItem =
   | { kind: "file"; name: string; base64: string }
   | { kind: "paste"; name?: string; text: string }
+  | { kind: "url"; url: string }
   | { kind: "answer"; question: string; answer: string }
   | { kind: "part"; name: string; size: number; n: number; base64: string; upload_id?: string };
 
@@ -56,7 +67,8 @@ type Sent = { name: string; upload_id: string };
 /** How a recording sent in parts stands (`/learn/status` `uploads`). */
 type Upload = {
   upload_id: string;
-  status: "transcribing" | "added" | "refused" | "unknown";
+  /** `uploading`: its last part hasn't arrived yet; shown as transcribing, and asked about again. */
+  status: "uploading" | "transcribing" | "added" | "refused" | "unknown";
   episode_id?: string;
   new?: boolean;
   reason?: string;
@@ -138,7 +150,7 @@ export function useReceipt(sel: Selection, added: Added | null) {
       ];
       const uploadIds = sent
         .map((t) => t.upload_id)
-        .filter((id) => (ups.get(id)?.status ?? "transcribing") === "transcribing");
+        .filter((id) => ["uploading", "transcribing"].includes(ups.get(id)?.status ?? "transcribing"));
       call<Status>(sel, "learn", {
         op: "status",
         ...(episodeIds.length ? { episode_ids: episodeIds } : {}),
@@ -274,7 +286,13 @@ async function sendRecording(
 function readFile(f: File): Promise<LearnItem | { refused: string; name: string }> {
   const unread = unreadType(f.name);
   if (unread) return Promise.resolve({ name: f.name, refused: unread });
-  if (f.size > MAX_BYTES)
+  if (DOCUMENT_TYPES.includes(extOf(f.name))) {
+    if (f.size > MAX_DOCUMENT_BYTES)
+      return Promise.resolve({
+        name: f.name,
+        refused: `it's ${(f.size / (1024 * 1024)).toFixed(1)} MB: a document is at most ${MAX_DOCUMENT_BYTES / (1024 * 1024)} MB`,
+      });
+  } else if (f.size > MAX_BYTES)
     return Promise.resolve({
       name: f.name,
       refused: `it's ${Math.ceil(f.size / 1024)} KB: at most ${MAX_BYTES / 1024} KB is added at a time, so split it`,
@@ -311,7 +329,10 @@ type AddToMemoryDialogProps = AddToMemoryProps & {
 export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: AddToMemoryProps) {
   const [files, setFiles] = useState<File[]>([]);
   const [text, setText] = useState("");
-  const [whose, setWhose] = useState<"me" | "team">("me");
+  // Everyone's by default: an import is usually for the team; "Just me" keeps it to the person.
+  const [whose, setWhose] = useState<"me" | "team">("team");
+  const [urls, setUrls] = useState<string[]>([]);
+  const [url, setUrl] = useState("");
   const [over, setOver] = useState(false);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<string>();
@@ -350,12 +371,57 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
       }
       setProgress(undefined);
       if (text.trim()) items.push({ kind: "paste", text });
-      const answer: Added = items.length
-        ? await learn(sel, items, whose)
-        : { added: [], refused: [], scope: "", readers: "", extraction: "on" };
+      // A URL typed but not staged with Add counts too.
+      const pages = [...urls, ...(url.trim() && !urls.includes(url.trim()) ? [url.trim()] : [])];
+      for (const u of pages) items.push({ kind: "url", url: u });
+      if (pages.length) setProgress(pages.length > 1 ? `Fetching ${pages.length} pages…` : "Fetching the page…");
+      // A request holds at most MAX_REQUEST of base64: each document (up to 5 MB, 6.7 MB as base64) goes in one of
+      // its own, the rest together while they fit. One request too large would refuse everything in it.
+      const batches: LearnItem[][] = [];
+      let size = 0;
+      for (const it of items) {
+        const n = "base64" in it ? it.base64.length : "text" in it ? it.text.length : 1024;
+        if (isDocument(it)) {
+          batches.push([it]);
+          continue;
+        }
+        const last = batches.at(-1);
+        const pages = (b: LearnItem[]) => b.filter((x) => x.kind === "url").length;
+        if (
+          !last ||
+          size + n > MAX_REQUEST ||
+          last.some(isDocument) ||
+          (it.kind === "url" && pages(last) >= MAX_PAGES)
+        ) {
+          batches.push([it]);
+          size = n;
+        } else {
+          last.push(it);
+          size += n;
+        }
+      }
+      const answer: Added = { added: [], refused: [], scope: "", readers: "", extraction: "on" };
+      for (const [i, batch] of batches.entries()) {
+        if (batches.length > 1) setProgress(`Adding ${i + 1} of ${batches.length}…`);
+        try {
+          const a = await learn(sel, batch, whose);
+          answer.added.push(...a.added);
+          answer.refused.push(...a.refused);
+          answer.scope = a.scope;
+          answer.readers = a.readers;
+          answer.extraction = a.extraction;
+        } catch (e) {
+          // That request alone failed: its items say why, the others stand.
+          const reason = errorText(e);
+          for (const it of batch)
+            answer.refused.push({ name: "name" in it && it.name ? it.name : "url" in it ? it.url : "Pasted text", reason });
+        }
+      }
       setAdded({ ...answer, transcribing, refused: [...answer.refused, ...refusedHere] });
       setFiles([]);
       setText("");
+      setUrls([]);
+      setUrl("");
       onAdded?.();
     } catch (e) {
       setError(errorText(e));
@@ -365,7 +431,13 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
     }
   };
 
-  const empty = !files.length && !text.trim();
+  const empty = !files.length && !text.trim() && !urls.length && !url.trim();
+  const stage = () => {
+    const u = url.trim();
+    if (!u) return;
+    setUrls((us) => (us.includes(u) ? us : [...us, u]));
+    setUrl("");
+  };
   return (
     <div className="learn">
       <section className="card card-pad learn-card" aria-label={title}>
@@ -409,8 +481,8 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
             <strong>Drop files here</strong> or click to choose
           </span>
           <span className="muted learn-types">
-            Text, Markdown, CSV, JSON or YAML, up to {MAX_BYTES / 1024} KB each, or an audio or
-            video recording to transcribe
+            Text, Markdown, CSV, JSON or YAML up to {MAX_BYTES / 1024} KB each, PDF or Word up to{" "}
+            {MAX_DOCUMENT_BYTES / (1024 * 1024)} MB, or an audio or video recording to transcribe
           </span>
           <input
             ref={picker}
@@ -447,6 +519,49 @@ export function AddToMemory({ sel, onOpen, onAdded, title = "Add to memory" }: A
             ))}
           </ul>
         )}
+        <div className="learn-web">
+          <label className="muted learn-web-label" htmlFor="learn-url">
+            Add from the web <span className="learn-web-note">(public https pages)</span>
+          </label>
+          <div className="learn-web-row">
+            <input
+              id="learn-url"
+              className="args learn-url"
+              type="url"
+              inputMode="url"
+              placeholder="https://example.com/runbook"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  stage();
+                }
+              }}
+            />
+            <button type="button" className="btn" disabled={!url.trim()} onClick={stage}>
+              <Icon name="plus" size={12} /> Add
+            </button>
+          </div>
+          {urls.length > 0 && (
+            <ul className="learn-files">
+              {urls.map((u) => (
+                <li key={u} className="chip">
+                  <Icon name="search" size={12} />
+                  <span className="learn-url-chip">{u}</span>
+                  <button
+                    type="button"
+                    className="learn-x"
+                    aria-label={`Remove ${u}`}
+                    onClick={() => setUrls((us) => us.filter((x) => x !== u))}
+                  >
+                    <Icon name="close" size={11} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
         <textarea
           className="args learn-paste"
           rows={4}

@@ -8,8 +8,11 @@
 //! The writer looks every [`every`] (`AMPUP_MEMORY_ADVICE_REQUESTS_SECS`, default 30) for commits of that actor in the
 //! ledger, which every server reads anyway, so it reads only the scopes a request was queued in. It applies each
 //! request there, oldest first, and marks it applied by giving it to no one (an applied request is gone from the
-//! scope's documents). One that fails is said in the log and marked too, so a request that can't be applied isn't tried
-//! again every round; one the writer stopped writing during is left for the next holder.
+//! scope's documents). One that fails for a reason that may pass (the model or the store down) stays queued, with
+//! those after it, and is tried again a few times, each a while later; one refused (the model refused it, or it can't
+//! be applied), or still failing after those tries, is given up on: marked too, so it isn't tried again every round,
+//! and listed with why in the scope's advice status (`advice_status`'s `failed_requests`, by the id its queuing
+//! answered). One the writer stopped writing during is left for the next holder.
 
 use std::collections::BTreeSet;
 use std::time::Duration;

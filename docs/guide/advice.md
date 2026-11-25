@@ -145,7 +145,10 @@ Rules that matter:
   passes, once runs recorded while it learned reach `AMPUP_MEMORY_ADVICE_MIN_NEW` (fewer wait for the timer).
 - **Where it stands.** `/admin {"op": "advice_status", "org", "team"?}` (the org's admins): rewarded runs, how many
   are sorted and how many wait, situations and notes, the learn queued or under way (since when, which pass), what
-  the last one did and skipped (too few runs, too few people, waiting for more runs, idle), and the last error.
+  the last one did and skipped (too few runs, too few people, waiting for more runs, idle), and the last error (a
+  learn whose server stopped before it finished is said to be interrupted, once the next server doing the
+  background writing looks). A queued request the writer gave up on (the model refused it, or it kept failing a few
+  tries apart) is under `failed_requests`, by its id, with why.
 - **Audience.** Learning reads every rewarded run in the scope, so only an org's admins start it or turn it on,
   and the notes are written for the audience they name (`--acl`, default `*`).
 
@@ -310,14 +313,30 @@ ampup-memory compile org --sources kb: --local ./store                    # a la
   `AMPUP_MEMORY_COMPILE_MAX_TOKENS` and `AMPUP_MEMORY_COMPILE_PARALLEL`.
 - **Grounded.** Sources go in under handles (`SRC1`, …); a skill that cites none is dropped, and a graph that
   fails validation isn't written.
-- **Audiences.** Sources with different ACLs never share a batch. A skill is readable by exactly its sources' ACL.
+- **Audiences.** Sources with different audiences never share a batch. A source's audience is its ACL less the
+  entries another of its entries already covers: beside `group:<org>.all` (what the org shares with all of it), no
+  other entry adds a reader, since everyone who reads the org holds it. So an email shared with the org and its
+  owner, or with the org and someone who has since left, compiles with the org's other sources. Without it, a
+  `user:` entry and every other group stay. A skill is readable by exactly that audience, which every one of its sources' ACLs allows.
 - `compile_kind: errors` tells the compiler its sources are error reports, so each skill's *When* names the
   exception and message.
 - `compile_kind: changes` tells it its sources are records of single changes (pull requests, tickets, commits): a
   skill is a procedure people repeat (`add-a-database-migration`), which each change is folded into, not one skill
   per change; a one-off change gives none. `AMPUP_MEMORY_COMPILE_KIND` sets a kind for a server whose settings name
   none (`serve --local`), and `ampup-memory compile --kind` for one run.
-- **`changes` rebuilds.** Once a scope compiles as `changes`, skills compiled from those sources under other
+- `compile_kind: conversations` does the same for meetings, chat threads and email: a skill is a procedure people
+  repeat in them (`run-a-discovery-call`, `handle-a-pricing-objection`, `triage-a-customer-reported-bug`), written
+  only once at least two conversations show it, and later conversations fold into it; chatter, status updates and
+  small talk give none. Recurrence is judged within a round (a batch of sources), so a procedure that only ever
+  shows up once per round gets no skill.
+- **A kind per group of sources.** `compile_kinds` names a kind for each group of a scope's sources:
+  `{"changes": ["github:"], "conversations": ["slack:", "email:", "meeting:"]}`. Each kind's sources compile with
+  its prompt under a compiler id of their own, so adding a group compiles no other group again. Sources it doesn't
+  name compile as `compile_kind` (and `compile_kind_sources`) say, as before. A scope that compiles its pull requests
+  as `changes` adds its conversations by adding their prefixes to `compile_sources` and naming them in
+  `compile_kinds` under `conversations`: the pull requests keep their compiler id and nothing of them is read again.
+  With `*` in `compile_sources` the sources can't be split, and `compile_kind` is about all of them.
+- **`changes` and `conversations` rebuild.** Once a scope compiles as `changes` (or `conversations`), skills compiled from those sources under other
   prompts (before the kind was set) aren't shown to the model, so the library is compiled again from the sources rather than from the old skills; those stay served
   until `ampup-memory compile <scope> --retire` lists the ones whose every source the current compile has read, and
   `--retire --apply` retires them on main (every version, kept in the ledger) and writes their indexes again. It

@@ -1512,7 +1512,10 @@ impl Store {
                             // A closure from an episode one person alone reads ends the fact for them alone.
                             let private_end = table == CLOSURES
                                 && value("episode_id").is_some_and(|e| private.contains(&e));
-                            if let Some(fid) = value("fact_id")
+                            // A sentence its sayer forgot before any fact held it names no fact
+                            // (`crate::sentence_key`): no owner's but theirs.
+                            if let Some(fid) =
+                                value("fact_id").filter(|f| crate::sentence_sayer(f).is_none())
                                 && !private_end
                             {
                                 let versions = facts
@@ -1750,18 +1753,217 @@ impl Store {
                 .all(|id| !vis.is_gone(id) && vis.acls.get(id).is_some_and(|acl| who.can_see(acl))),
             "review includes evidence you cannot read"
         );
-        // Fail closed: a fact row that cites no episode is readable by no one on main, so a proposal
-        // carrying one is shown only to those who must act on it (its owners) and who made it.
-        let grounded = p.changes.iter().all(|c| {
-            c["kind"] != "fact" || c["evidence"].as_array().is_some_and(|a| !a.is_empty())
-        });
-        let insider = p.required_owners.contains(&auth::norm_id(who.user()))
-            || auth::norm_id(&p.created_by) == auth::norm_id(who.user());
         anyhow::ensure!(
-            grounded || insider,
+            grounded_or_insider(p, who),
             "review includes a change whose evidence you cannot read"
         );
         Ok(())
+    }
+
+    /// Each proposal's evidence as its branch's visibility state holds it (each episode's ACL there, none where it is
+    /// gone there), worked out from main's state and the episode rows, so that listing proposals builds no branch's
+    /// state: each is a build of the whole memory, and a scope keeps only a few at a time. By proposal id; those
+    /// left out are read from their branch's state ([`Store::governance_readable`]).
+    ///
+    /// A branch's state reads what its commits reach under main's word: main's deletes, ACL changes, forgets,
+    /// withdrawals and retention hold on every branch (see the build in [`Store::visibility`]). So, for an episode:
+    /// - the branch reaches no row of it: gone there;
+    /// - the branch's own commits (what it reaches that main doesn't) wrote no row of it: as main holds it;
+    /// - they did: the newest ACL of its rows on the branch and on main; gone where main deleted it or it aged out.
+    ///
+    /// Left out, as this can't tell them exactly: a branch whose own commits delete, retire or withdraw anything, or
+    /// set the retention; an episode main superseded or released that the branch wrote again (current again there);
+    /// an episode a commit of main wrote that main's state leaves out (an extractor's
+    /// withdrawal took it, but a branch still reads that row's ACL); and every proposal when main's state was built
+    /// from another ledger than `ledger` (the caller's) and the one its tables hold now (a write landed between).
+    async fn evidence_on_main(
+        &self,
+        scope: &Scope,
+        ledger: &Ledger,
+        proposals: &[&Proposal],
+    ) -> Result<HashMap<String, Vec<Option<Vec<String>>>>> {
+        let mut told = HashMap::new();
+        if proposals.is_empty() {
+            return Ok(told);
+        }
+        let ns = scope.namespace();
+        let vis = self.visibility(scope, MAIN).await?;
+        let (_, (ledger_rows, episodes, _, _, _, retractions, retention, _), _) =
+            self.vis_tables(&ns).await?;
+        let read;
+        let ledger = match sorted(ledger.heads(MAIN)) == vis.heads() {
+            true => ledger,
+            false => {
+                read = Ledger::from_batches(&ledger_rows.rows, &ns);
+                &read
+            }
+        };
+        if sorted(ledger.heads(MAIN)) != vis.heads() {
+            return Ok(told);
+        }
+        let main = ledger.visible(MAIN);
+        // Each branch: what it reaches, and of that what main doesn't (its own commits), unless those delete, retire,
+        // withdraw or set the retention.
+        let mut branches: HashMap<&str, (HashSet<String>, HashSet<String>)> = HashMap::new();
+        for p in proposals {
+            if branches.contains_key(p.branch.as_str()) || ledger.base(&p.branch).is_none() {
+                continue;
+            }
+            let reach = ledger.visible(&p.branch);
+            let own: HashSet<String> = reach.difference(&main).cloned().collect();
+            let writes = |rows: &[RecordBatch]| {
+                rows.iter().any(|b| {
+                    let c = b
+                        .column_by_name("commit_id")
+                        .expect("commit_id")
+                        .as_string::<i32>();
+                    (0..c.len()).any(|i| own.contains(c.value(i)))
+                })
+            };
+            if !writes(&retractions) && !writes(&retention) {
+                branches.insert(&p.branch, (reach, own));
+            }
+        }
+        // Every row of each episode cited: its commit, when it was recorded and its ACL.
+        let wanted: HashSet<&str> = proposals
+            .iter()
+            .filter(|p| branches.contains_key(p.branch.as_str()))
+            .flat_map(|p| p.evidence.iter().map(String::as_str))
+            .collect();
+        let mut rows: HashMap<&str, Vec<AclRow>> = HashMap::new();
+        if !wanted.is_empty() {
+            for b in episodes.rows.iter() {
+                let ids = b
+                    .column_by_name("episode_id")
+                    .expect("episode_id")
+                    .as_string::<i32>();
+                let (commit, acl) = (
+                    b.column_by_name("commit_id")
+                        .expect("commit_id")
+                        .as_string::<i32>(),
+                    b.column_by_name("acl").expect("acl").as_string::<i32>(),
+                );
+                let at = b
+                    .column_by_name("recorded_at")
+                    .expect("recorded_at")
+                    .as_primitive::<TimestampMicrosecondType>();
+                for i in 0..b.num_rows() {
+                    if let Some(&e) = wanted.get(ids.value(i)) {
+                        rows.entry(e).or_default().push((
+                            commit.value(i).to_string(),
+                            if at.is_null(i) { i64::MIN } else { at.value(i) },
+                            split_list(acl.value(i)),
+                        ));
+                    }
+                }
+            }
+        }
+        'proposals: for p in proposals {
+            let Some((reach, own)) = branches.get(p.branch.as_str()) else {
+                continue;
+            };
+            let mut evidence = Vec::with_capacity(p.evidence.len());
+            for e in &p.evidence {
+                let of = rows.get(e.as_str()).map(Vec::as_slice).unwrap_or_default();
+                if of
+                    .iter()
+                    .any(|(c, _, _)| main.contains(c) != vis.committed.contains(c))
+                {
+                    continue 'proposals;
+                }
+                if !of.iter().any(|(c, _, _)| reach.contains(c)) {
+                    evidence.push(None);
+                } else if !of.iter().any(|(c, _, _)| own.contains(c)) {
+                    evidence.push(
+                        (!vis.is_gone(e))
+                            .then(|| vis.acls.get(e).cloned())
+                            .flatten(),
+                    );
+                } else if vis.is_retracted(e) {
+                    // Deleted or aged out on main: gone on the branch too. A superseded or released version is
+                    // current again where it is written again, as the branch may have.
+                    if vis.superseded().contains_key(e) || vis.released.contains_key(e) {
+                        continue 'proposals;
+                    }
+                    evidence.push(None);
+                } else {
+                    let acl = latest_acls(
+                        of.iter()
+                            .filter(|(c, _, _)| reach.contains(c) || main.contains(c))
+                            .map(|(_, at, acl)| (e.clone(), *at, acl.clone()))
+                            .collect(),
+                    )
+                    .remove(e);
+                    evidence.push(acl.filter(|acl| !acl.iter().all(|a| a == FORGOTTEN)));
+                }
+            }
+            told.insert(p.id.clone(), evidence);
+        }
+        Ok(told)
+    }
+
+    /// Whether `who` may see each of `proposals` ([`Store::governance_readable`]): from main's state where it tells
+    /// ([`Store::evidence_on_main`]), from their branches' states, built all at once, for the rest. With
+    /// [`proposals_shadow`] on, every one is read from its branch's state too, and a difference is counted
+    /// ([`crate::metrics::PROPOSAL_READ_DIVERGENCE`]) and logged; the branch's answer stands.
+    async fn proposals_readable(
+        &self,
+        scope: &Scope,
+        ledger: &Ledger,
+        proposals: &[&Proposal],
+        who: &Principal,
+    ) -> Vec<bool> {
+        let told = self
+            .evidence_on_main(scope, ledger, proposals)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("proposals in {scope} read from their branches: {e:#}");
+                HashMap::new()
+            });
+        let shadow = proposals_shadow();
+        let on_branch = futures::future::join_all(proposals.iter().map(|p| async {
+            match shadow || !told.contains_key(&p.id) {
+                true => Some(self.governance_readable(scope, p, who).await.is_ok()),
+                false => None,
+            }
+        }))
+        .await;
+        proposals
+            .iter()
+            .zip(on_branch)
+            .map(|(p, on_branch)| {
+                let on_main = told.get(&p.id).map(|evidence| {
+                    evidence
+                        .iter()
+                        .all(|acl| acl.as_ref().is_some_and(|acl| who.can_see(acl)))
+                        && grounded_or_insider(p, who)
+                });
+                metrics::PROPOSAL_READS
+                    .with_label_values(&[match on_main {
+                        Some(_) => "main",
+                        None => "branch",
+                    }])
+                    .inc();
+                match (on_main, on_branch) {
+                    (Some(m), Some(b)) => {
+                        if m != b {
+                            metrics::PROPOSAL_READ_DIVERGENCE.inc();
+                            eprintln!(
+                                "proposals shadow: proposal {} on {} in {scope} is {} to {} by main's state, {} by its branch's",
+                                p.id,
+                                p.branch,
+                                if m { "readable" } else { "not readable" },
+                                who.user(),
+                                if b { "readable" } else { "not readable" },
+                            );
+                        }
+                        b
+                    }
+                    (Some(m), None) => m,
+                    (None, b) => b.unwrap_or(false),
+                }
+            })
+            .collect()
     }
 
     pub async fn propose_branch(
@@ -2157,14 +2359,23 @@ impl Store {
             .collect())
     }
 
-    /// Whether every proposal's branch has its visibility state built already, as [`Store::pin_if_built`] serves
-    /// one: a list of proposals then builds none ([`Store::list_proposals`] reads each branch's state). Those not
-    /// built are built in the background, one after another ([`Store::build_later`]), for a later ask.
+    /// Whether a list of proposals builds no branch's visibility state: every proposal is read from main's
+    /// ([`Store::evidence_on_main`]), or its branch's state is built already, as [`Store::pin_if_built`] serves one.
+    /// Those not built are built in the background, one after another ([`Store::build_later`]), for a later ask.
     pub async fn proposal_branches_built(&self, scope: &Scope) -> Result<bool> {
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
-        let branches: BTreeSet<String> =
-            state.proposals.values().map(|p| p.branch.clone()).collect();
+        let all: Vec<&Proposal> = state.proposals.values().collect();
+        // Not told (main's state failed to build): each branch's state, as a list would read it.
+        let told = self
+            .evidence_on_main(scope, &ledger, &all)
+            .await
+            .unwrap_or_default();
+        let branches: BTreeSet<String> = all
+            .iter()
+            .filter(|p| !told.contains_key(&p.id))
+            .map(|p| p.branch.clone())
+            .collect();
         let mut unbuilt = vec![];
         for b in branches {
             if self.pin_if_built(scope, &b).await?.is_none() {
@@ -2192,17 +2403,11 @@ impl Store {
             .values()
             .filter(|p| entity.is_none_or(|e| entities_of(p).iter().any(|x| x == e)))
             .collect();
-        // A proposal whose evidence the reader can't read is not theirs to know about. Each check builds its
-        // branch's visibility: all at once.
-        let readable = futures::future::join_all(
-            wanted
-                .iter()
-                .map(|p| self.governance_readable(scope, p, who)),
-        )
-        .await;
+        // A proposal whose evidence the reader can't read is not theirs to know about.
+        let readable = self.proposals_readable(scope, &ledger, &wanted, who).await;
         let mut out = Vec::new();
         for (p, readable) in wanted.into_iter().zip(readable) {
-            if readable.is_err() {
+            if !readable {
                 continue;
             }
             let entities = entities_of(p);
@@ -2322,12 +2527,9 @@ impl Store {
                 open.push(p);
             }
         }
-        // Each readability check builds its branch's visibility: all at once.
-        let readable =
-            futures::future::join_all(open.iter().map(|p| self.governance_readable(scope, p, who)))
-                .await;
+        let readable = self.proposals_readable(scope, &ledger, &open, who).await;
         for (p, readable) in open.into_iter().zip(readable) {
-            if readable.is_err() {
+            if !readable {
                 continue;
             }
             for e in entities_of(p) {
@@ -2737,7 +2939,7 @@ impl Store {
             .iter()
             .filter(|(c, f)| {
                 main.contains(c)
-                    && !vis.retracted_facts.contains(&f.fact_id)
+                    && !vis.withheld(f)
                     && !ended.contains(&f.fact_id)
                     && f.valid_to.is_none_or(|t| t > now)
             })
@@ -3712,6 +3914,35 @@ pub fn approved_facts(rows: &[RecordBatch], ledger: &Ledger) -> HashMap<String, 
         }
     }
     out
+}
+
+/// One row of an episode, as [`Store::evidence_on_main`] reads it: its commit, when it was recorded and its ACL.
+type AclRow = (String, i64, Vec<String>);
+
+/// Fail closed: a fact row that cites no episode is readable by no one on main, so a proposal carrying one is shown
+/// only to those who must act on it (its owners) and who made it.
+fn grounded_or_insider(p: &Proposal, who: &Principal) -> bool {
+    let grounded = p
+        .changes
+        .iter()
+        .all(|c| c["kind"] != "fact" || c["evidence"].as_array().is_some_and(|a| !a.is_empty()));
+    grounded
+        || p.required_owners.contains(&auth::norm_id(who.user()))
+        || auth::norm_id(&p.created_by) == auth::norm_id(who.user())
+}
+
+/// Whether a list of proposals also reads each from its branch's state and counts where that differs from what main's
+/// state told ([`Store::proposals_readable`]) (`AMPUP_MEMORY_PROPOSALS_SHADOW`: `1` on, `0` off; on by default in debug
+/// builds, so every test that lists proposals checks it, and off in release).
+fn proposals_shadow() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        match std::env::var("AMPUP_MEMORY_PROPOSALS_SHADOW").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => cfg!(debug_assertions),
+        }
+    });
+    *ON
 }
 
 /// Whether a commit whose publication check found nothing owned (by [`Store::touches_nothing_owned`]) is checked

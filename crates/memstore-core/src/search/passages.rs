@@ -1132,6 +1132,7 @@ pub async fn search(
         vis.can_see_episode(&p.episode_id, who)
             && filter.matches(p)
             && vis.is_current(&p.episode_id, who, filter.occurred_to)
+            && !vis.holds_forgotten(&p.source, &p.text)
     };
     let tail = tail(store, scope, &files, &index.held).await?;
     mark!("tail");
@@ -1807,6 +1808,28 @@ pub async fn read(
 
 /// Forget this process's open passage indexes under `prefix` (their files are being deleted).
 /// Open passage indexes and passage rows held (for the memory log).
+/// The unindexed tail's caches, for the server's memory log: (episodes, chunk bytes) of [`TAIL`],
+/// (chunks, bytes) of [`TAIL_STEMS`] and titles held.
+pub fn tail_held() -> ((usize, usize), (usize, usize), usize) {
+    let tail = {
+        let t = TAIL.lock().unwrap();
+        let bytes = t
+            .iter()
+            .map(|(k, v)| k.len() + v.iter().map(|c| c.len() + 24).sum::<usize>())
+            .sum();
+        (t.len(), bytes)
+    };
+    let stems = {
+        let t = TAIL_STEMS.lock().unwrap();
+        let bytes = t
+            .iter()
+            .map(|(k, v)| k.len() + v.iter().map(|w| w.len() + 32).sum::<usize>())
+            .sum();
+        (t.len(), bytes)
+    };
+    (tail, stems, TITLES.lock().unwrap().len())
+}
+
 pub fn held() -> (usize, usize) {
     (OPEN.lock().unwrap().len(), ROWS.len())
 }

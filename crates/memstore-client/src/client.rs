@@ -621,9 +621,16 @@ impl Credentials {
             if let Some(s) = &self.client_secret {
                 form.push(("client_secret", s.clone()));
             }
+            // Offline, signing in again would not help: the renewal works once the provider answers.
             let t = token_request(&self.token_endpoint, &form)
                 .await
-                .with_context(|| format!("renewing the sign-in failed: run {}", sign_in_hint()))?;
+                .map_err(|e| match e.is::<Unreached>() {
+                    true => e.context("the sign-in couldn't be renewed now"),
+                    false => e.context(format!(
+                        "renewing the sign-in failed: run {}",
+                        sign_in_hint()
+                    )),
+                })?;
             self.take(&t)?;
             self.save()?;
         }
@@ -638,9 +645,48 @@ impl Credentials {
     }
 }
 
+/// A failure worth sending again: the memory unreachable, slow, down, busy or the sign-in stale, or the sign-in's
+/// provider unreachable, down or busy while renewing it. A refusal (bad arguments, a session that isn't the
+/// caller's, a renewal the provider refused) never is. With the seconds it said to wait first, when it said.
+#[derive(Debug)]
+pub(crate) struct Unreached(pub(crate) String, pub(crate) Option<u64>);
+
+impl std::fmt::Display for Unreached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreached {}
+
+/// Why a request never got its answer, with what reqwest keeps under its own message ("error sending request"):
+/// a timeout and how long it waited, or the connection's, TLS's or DNS's own error.
+pub(crate) fn sent_error(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    if e.is_timeout() {
+        out.push_str(": timed out");
+    }
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        out.push_str(&format!(": {s}"));
+        source = s.source();
+    }
+    out
+}
+
+/// A token request's answer. Unanswered, or the provider down or busy, it is [`Unreached`]: offline, a hook's
+/// write (a session's end) waits in the outbox rather than being lost to a renewal that would work later.
 async fn token_request(endpoint: &str, form: &[(&str, String)]) -> Result<Value> {
-    let r = http().post(endpoint).form(form).send().await?;
+    let r = http().post(endpoint).form(form).send().await.map_err(|e| {
+        Unreached(
+            format!("no answer from {endpoint}: {}", sent_error(&e)),
+            None,
+        )
+    })?;
     let status = r.status();
+    if status.is_server_error() || [408, 429].contains(&status.as_u16()) {
+        return Err(Unreached(format!("token request to {endpoint}: HTTP {status}"), None).into());
+    }
     let body: Value = r.json().await.unwrap_or(Value::Null);
     anyhow::ensure!(
         status.is_success(),

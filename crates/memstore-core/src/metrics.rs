@@ -509,6 +509,32 @@ pub static VIS_ORACLE_DIVERGENCE: std::sync::LazyLock<IntCounter> = std::sync::L
     },
 );
 
+/// Proposals whose readability a list worked out, by from what: `main` (main's visibility state and the rows their
+/// branches wrote) or `branch` (their branch's own state, built for it).
+pub static PROPOSAL_READS: std::sync::LazyLock<prometheus::IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounterVec::new(
+            Opts::new(
+                "memstore_proposal_reads_total",
+                "Proposals a list checked a reader may see, by from what: main (main's state) or branch (the branch's state, built)",
+            ),
+            &["from"],
+        )
+        .unwrap()
+    });
+
+/// Proposals whose readability from main's state differed from their branch's (checked when
+/// `AMPUP_MEMORY_PROPOSALS_SHADOW` is on): never more than 0.
+pub static PROPOSAL_READ_DIVERGENCE: std::sync::LazyLock<IntCounter> = std::sync::LazyLock::new(
+    || {
+        IntCounter::new(
+            "memstore_proposal_read_divergence_total",
+            "Proposals a reader may see by main's state but not by their branch's, or the other way (checked when AMPUP_MEMORY_PROPOSALS_SHADOW is on)",
+        )
+        .unwrap()
+    },
+);
+
 /// Bytes of decoded table rows the store's cache holds, the system tables aside: what `AMPUP_MEMORY_CACHE_BYTES`
 /// caps. Set after each cold load of a table.
 pub static CACHE_BYTES: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {

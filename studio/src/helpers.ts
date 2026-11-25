@@ -2,7 +2,14 @@
 // (`ampup-memory-studio/helpers`). Its imports name their `.js`, as the files they import do, so a host whose
 // tests type-check with NodeNext (the console's) can read this file from source as well as the built one.
 export { readSearch, type Found } from "./memory/searchText.js";
-export { adviceQuestion, adviceStarters, type AdviceEntry, type Starter } from "./memory/starters.js";
+export {
+  adviceQuestion,
+  adviceStarters,
+  situationTask,
+  TASK_CHARS,
+  type AdviceEntry,
+  type Starter,
+} from "./memory/starters.js";
 export { capGraph, GRAPH_MAX } from "./memory/graphCap.js";
 export * as graphLayout from "./memory/graphLayout.js";
 export type { Graph, GraphEdge, GraphNode } from "./memory/graphTypes.js";

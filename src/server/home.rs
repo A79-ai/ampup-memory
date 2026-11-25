@@ -22,15 +22,16 @@
 //! - `branches`: the memory's branches with their skills (`branches`), a branch whose state isn't built with none
 //!   known; `schema`: how many types it declares.
 //!
-//! Home builds no branch's visibility state: each is a build of the whole memory, seconds on a large one. The
-//! proposals are listed once every proposal's branch has its state, built meanwhile in the background one at a
-//! time, and wait no longer than the other parts asked for.
+//! Home builds no branch's visibility state: each is a build of the whole memory, seconds on a large one. Which
+//! proposals a reader may see is read from main's state ([`crate::Store::proposal_branches_built`]), so they are
+//! listed at once. The few main's state can't tell wait for their branch's state, built meanwhile in the background
+//! one at a time, and no longer than the other parts asked for.
 //!
 //! The parts that read every fact or record are kept per reader by memory state ([`crate::kept_answers`]): the root
 //! counts, the review lists and the lessons are kept by their own ops; the week's facts, the advice served and the
-//! sources here, for the hour the week is counted back from. The advice served is counted from the answer log as of
-//! the memory's last state: a session logged since counts once the state moves on (it is rebuilt every few seconds
-//! while writes come in).
+//! sources here, for the hour the week is counted back from. The advice served and the activity are counted from the
+//! answer log as kept with them, which may be up to [`crate::kept_answers::STALE`] behind it: a session logged since
+//! counts once they are worked out again.
 //!
 //! A first ask waits [`FIRST`] for its parts, counted from when the request began (signing in and pinning the
 //! memory included): those not worked out by then (a large memory's first read since a restart, or since memory was
@@ -39,13 +40,19 @@
 //! counted in the background, are waited for as they land.
 //!
 //! Worked out ahead: whoever asks for Home is watched for [`WATCHED_FOR`] after, and their whole answer is worked out
-//! again in the background whenever the memory's state moves (and every [`RENEW`] while it doesn't), one reader at a
-//! time per memory and [`AT_ONCE`] memories at a time across the server, at most every [`GAP`] per reader. An ask
+//! again in the background once main's state moved (the answer log growing alone doesn't count: the parts that read
+//! it lag it as their kept answers do), and every [`RENEW`] while it doesn't. A run works out at most [`PER_RUN`]
+//! readers' answers, those worked out longest ago first, and an org has at most one run every
+//! `AMPUP_MEMORY_HOME_AHEAD_SECS` ([`run_every`], 60 s by default), with [`AT_ONCE`] memories worked out at a time across
+//! the server. Its parts are read as an ask reads them: a kept part from an earlier state memory lost nothing since
+//! may answer while that part's next answer is worked out in the background ([`crate::kept_answers`]), so an answer
+//! composed of such parts is worked out once more at the next run, from the parts worked out meanwhile. An ask
 //! answers with the last answer worked out ([`AHEAD`]) when it was worked out at the state the ask finds, or at one
 //! before it that memory lost nothing since ([`crate::kept_answers`]: no forget, delete, retraction, narrowed ACL,
 //! offboarding or rewrite of the facts or answer log between them, and no change here to the review lists) and
 //! that is younger than [`crate::kept_answers::STALE`] (its numbers then miss only what was added since, until the
-//! loop's next answer, normally seconds later), and works its parts out itself (as above) only when there is none. Each answer is one reader's, never another's:
+//! loop's next answers, normally a run or two later), and works its parts out itself (as above) only when there is
+//! none. Each answer is one reader's, never another's:
 //! kept by who they are and every group they read as, how they signed in, and whether the directory lets them read
 //! the admins' parts (an admin of the memory's org, an org that shows its people's activity), as the ask finds
 //! them. Not per memory and shared between readers: every part reads only what its reader may read, so the same
@@ -88,23 +95,27 @@ const FIRST: Duration = Duration::from_secs(1);
 /// usual 30 s for a request.
 const AGAIN: Duration = Duration::from_secs(15);
 /// How often a wait for the root's counts looks again (they are counted in the background, by [`crate::browse`]),
-/// and a wait for the proposals' branches to be built.
+/// and a wait for the branches of the proposals main's state can't tell to be built.
 const COUNTS_EVERY: Duration = Duration::from_millis(250);
 /// How long the proposals are waited for once every other part asked for has answered.
 const BESIDE: Duration = Duration::from_millis(300);
 /// How long a reader is watched (their Home worked out ahead) after they last asked for it.
 const WATCHED_FOR: Duration = Duration::from_secs(1800);
-/// How often a watched memory's state is looked at for a move.
+/// How often a watched memory is looked at: whether a run is due, and whose answer it works out.
 const LOOK_EVERY: Duration = Duration::from_secs(1);
 /// How often a reader's answer is worked out again while the memory's state doesn't move: the activity and the week
-/// are counted back from when they are worked out.
+/// are counted back from when they are worked out, and the parts read from the answer log lag it until then.
 const RENEW: Duration = Duration::from_secs(120);
-/// The least time between two answers worked out for one reader: under steady writes, a memory's state moves every
-/// few seconds.
-const GAP: Duration = Duration::from_secs(3);
-/// How long an answer worked out ahead waits for its parts (the proposals, for their branches' states): one not
-/// [`settled`] by then is worked out again at the next look, so a memory whose branches are still being built doesn't
-/// hold the server's turn ([`AT_ONCE`]).
+/// How many watched readers' answers one run works out. One: each answer reads every part again for its reader
+/// (the root's counts, the dream's records, the answer log, ...), so a run's cost grows with the readers it works
+/// out, while under steady writes main's state moves every few seconds and every answer is always due. Taking the
+/// one worked out longest ago (or never) each run, an org's readers take turns: with the default
+/// [`run_every`] and fewer than ten of them watched, each is worked out again within
+/// [`crate::kept_answers::STALE`], and an ask with none kept young enough works out its own parts.
+const PER_RUN: usize = 1;
+/// How long an answer worked out ahead waits for its parts (the proposals main's state can't tell, for their
+/// branches' states): one not [`settled`] by then is worked out again at the next run, so a memory whose branches
+/// are still being built doesn't hold the server's turn ([`AT_ONCE`]).
 const AHEAD_WAIT: Duration = Duration::from_secs(5);
 /// How many memories' answers are worked out at once, across the server.
 const AT_ONCE: usize = 1;
@@ -120,6 +131,23 @@ static WATCHED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, HashMap<Str
 /// The turns of [`AT_ONCE`].
 static TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(AT_ONCE);
 
+/// When each org's last run began, by org (a person's own memory: by its namespace): a run is due [`run_every`]
+/// after it.
+static RAN: std::sync::LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The least time between two runs of an org's answers worked out ahead (`AMPUP_MEMORY_HOME_AHEAD_SECS`, default 60):
+/// each reads every part for its reader again, from full reads of the memory, on the server that serves the console.
+fn run_every() -> Duration {
+    Duration::from_secs(
+        std::env::var("AMPUP_MEMORY_HOME_AHEAD_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(60),
+    )
+}
+
 /// A reader whose answer is worked out ahead: what their ask had, to ask as they would.
 #[derive(Clone)]
 struct Watched {
@@ -130,7 +158,18 @@ struct Watched {
     superuser: bool,
     every_session: bool,
     asked: std::time::Instant,
-    worked: Option<std::time::Instant>,
+    worked: Option<Worked>,
+}
+
+/// A watched reader's last answer worked out ahead.
+#[derive(Clone)]
+struct Worked {
+    when: std::time::Instant,
+    /// Main's state it was worked out at, the answer log aside ([`state_now`]); none when it failed.
+    main: Option<crate::kept_answers::At>,
+    /// Whether it is worked out once more at the next run, though main's state didn't move: its parts may have
+    /// answered from earlier states while worked out again in the background.
+    again: bool,
 }
 
 /// Whether a request is a Home ask (`/browse {"op": "home"}`), from its path and body, before it is pinned.
@@ -381,8 +420,8 @@ async fn answer(
         }
         Some(v)
     };
-    // Listed once every proposal's branch has its state built (a list reads each one's), built meanwhile in the
-    // background one after another: never on this request, side by side.
+    // Listed once no proposal needs its branch's state built: read from main's, or built already (those main's state
+    // can't tell are built meanwhile in the background, one after another: never on this request, side by side).
     let proposals = async {
         let p = loop {
             let p = admin(json!({"op": "list_proposals", "built": true})).await?;
@@ -418,8 +457,9 @@ async fn answer(
         d["result"]["decisions"] = json!([]);
         Some(d["result"].take())
     };
-    // The proposals wait for their branches' states to be built, which may take long after a restart: they hold no
-    // other part back, and are named pending once the rest has answered, unless they are all that was asked for.
+    // The proposals main's state can't tell wait for their branches' states to be built, which may take long after a
+    // restart: they hold no other part back, and are named pending once the rest has answered, unless they are all
+    // that was asked for.
     let (rest_done, mut rest_heard) = tokio::sync::watch::channel(false);
     let alone = wanted == ["proposals"] || beside.is_none();
     let rest = async {
@@ -548,13 +588,19 @@ fn watch(
 }
 
 /// Main's state as it is now, as an answer worked out ahead is kept by: the loss count and the facts table read
-/// before the state is pinned, and the answer log ([`crate::kept_answers::At::with_log`]).
-async fn state_now(store: &Store, scope: &Scope) -> Result<(crate::kept_answers::At, Session)> {
+/// before the state is pinned, and the answer log ([`crate::kept_answers::At::with_log`]), so an answer is never
+/// answered once the log lost rows. With it, the same state without the log: a move of it is what works an answer
+/// out again, not the log growing.
+async fn state_now(
+    store: &Store,
+    scope: &Scope,
+) -> Result<(crate::kept_answers::At, crate::kept_answers::At, Session)> {
     let mark = crate::kept_answers::Mark::read(store, scope).await?;
     let session = store.pin_lagging(scope, crate::MAIN).await?;
     let log = crate::kept_answers::Log::read(store, scope).await?;
     Ok((
-        crate::kept_answers::At::with_log(mark, session.vis(), log),
+        crate::kept_answers::At::with_log(mark.clone(), session.vis(), log),
+        crate::kept_answers::At::of(mark, session.vis()),
         session,
     ))
 }
@@ -565,7 +611,7 @@ async fn ahead(store: &Store, session: &Session, key: &str, wanted: &[&str]) -> 
     let ns = session.scope().namespace();
     // Read behind this server's own writes, as behind another's: the mark's loss count, compared below, refuses an
     // answer from before any removal.
-    let (at, _) = crate::behind_own_writes(true, state_now(store, session.scope()))
+    let (at, _, _) = crate::behind_own_writes(true, state_now(store, session.scope()))
         .await
         .ok()?;
     let (kept, _, _) = AHEAD.peek(&ns, key, &at)?;
@@ -599,11 +645,12 @@ async fn ahead(store: &Store, session: &Session, key: &str, wanted: &[&str]) -> 
     Some(out)
 }
 
-/// Works out the answers of a memory's watched readers ahead, one reader at a time, while any is watched.
+/// Works out the answers of a memory's watched readers ahead, while any is watched: at most [`PER_RUN`] a run, the one
+/// worked out longest ago (or never) first, and at most one run of its org every [`run_every`].
 async fn ahead_loop(ns: String) {
     loop {
         tokio::time::sleep(LOOK_EVERY).await;
-        let readers: Vec<(String, Watched)> = {
+        let mut readers: Vec<(String, Watched)> = {
             let mut all = WATCHED.lock().unwrap();
             let Some(readers) = all.get_mut(&ns) else {
                 return;
@@ -618,47 +665,97 @@ async fn ahead_loop(ns: String) {
                 .map(|(k, w)| (k.clone(), w.clone()))
                 .collect()
         };
+        // Never worked out first, then the longest ago: every reader has their turn however many are watched.
+        readers.sort_by_key(|(_, w)| w.worked.as_ref().map(|d| d.when));
+        let org = readers[0]
+            .1
+            .scope
+            .org_name()
+            .map_or_else(|| ns.clone(), String::from);
+        let Some(before) = run_due(&org) else {
+            continue;
+        };
+        let mut ran = 0;
         for (key, w) in readers {
-            if w.worked.is_some_and(|t| t.elapsed() < GAP) {
-                continue;
+            if ran == PER_RUN {
+                break;
             }
             let Ok(_turn) = TURNS.acquire().await else {
                 return;
             };
-            match work_ahead(&ns, &key, &w).await {
-                Ok(false) => {}
-                Ok(true) => {
-                    if let Some(w) = WATCHED
-                        .lock()
-                        .unwrap()
-                        .get_mut(&ns)
-                        .and_then(|r| r.get_mut(&key))
-                    {
-                        w.worked = Some(std::time::Instant::now());
+            let worked = match work_ahead(&ns, &key, &w).await {
+                Ok(None) => continue,
+                Ok(Some(worked)) => worked,
+                // A failure is a run too (it is tried again at the next, not at the next look).
+                Err(e) => {
+                    eprintln!(
+                        "home: {}'s answer in {ns} not worked out ahead: {e:#}",
+                        w.who.user()
+                    );
+                    Worked {
+                        when: std::time::Instant::now(),
+                        main: None,
+                        again: false,
                     }
                 }
-                Err(e) => eprintln!(
-                    "home: {}'s answer in {ns} not worked out ahead: {e:#}",
-                    w.who.user()
-                ),
+            };
+            ran += 1;
+            if let Some(w) = WATCHED
+                .lock()
+                .unwrap()
+                .get_mut(&ns)
+                .and_then(|r| r.get_mut(&key))
+            {
+                w.worked = Some(worked);
             }
+        }
+        if ran == 0 {
+            run_not_made(&org, before);
         }
     }
 }
 
-/// Works out `w`'s answer at main's state now, unless the one kept was worked out at it, and less than [`RENEW`] ago,
-/// in this hour: whether it did.
-async fn work_ahead(ns: &str, key: &str, w: &Watched) -> Result<bool> {
+/// Whether a run of `org`'s answers is due ([`run_every`] since its last began): if so it begins now, and with it
+/// when the last began, for [`run_not_made`].
+fn run_due(org: &str) -> Option<Option<std::time::Instant>> {
+    let mut ran = RAN.lock().unwrap();
+    let last = ran.get(org).copied();
+    if last.is_some_and(|t| t.elapsed() < run_every()) {
+        return None;
+    }
+    ran.insert(org.to_string(), std::time::Instant::now());
+    Some(last)
+}
+
+/// A run begun by [`run_due`] that had no answer to work out: the next look may run.
+fn run_not_made(org: &str, last: Option<std::time::Instant>) {
+    let mut ran = RAN.lock().unwrap();
+    match last {
+        Some(t) => ran.insert(org.to_string(), t),
+        None => ran.remove(org),
+    };
+}
+
+/// Works out `w`'s answer at main's state now, unless the one kept may still be answered and was worked out at main's
+/// state as it is now (the answer log aside), less than [`RENEW`] ago, in this hour, with every part, and needn't be
+/// worked out once more: what it worked out, if it did.
+async fn work_ahead(ns: &str, key: &str, w: &Watched) -> Result<Option<Worked>> {
     let store = w.state.store.read().unwrap().clone();
-    let (at, session) = state_now(&store, &w.scope).await?;
+    let (at, main, session) = state_now(&store, &w.scope).await?;
     let since = week_since();
-    if let Some((kept, true, age)) = AHEAD.peek(ns, key, &at)
+    let last = w.worked.as_ref();
+    let moved = last.is_none_or(|l| l.main.as_ref() != Some(&main));
+    if !moved
+        && last.is_some_and(|l| !l.again)
+        && let Some((kept, _, age)) = AHEAD.peek(ns, key, &at)
         && age < RENEW
         && kept["since"] == since
         && settled(&kept)
     {
-        return Ok(false);
+        return Ok(None);
     }
+    // Once more after this at the next run, unless this is that once more.
+    let again = moved || last.is_none_or(|l| !l.again);
     let w = w.clone();
     AHEAD
         .renew(ns, key, at, move || async move {
@@ -667,7 +764,7 @@ async fn work_ahead(ns: &str, key: &str, w: &Watched) -> Result<bool> {
                 every_session: w.every_session,
             };
             let until = tokio::time::Instant::now() + AHEAD_WAIT;
-            crate::kept_answers::exact(answer(
+            answer(
                 &w.state,
                 &store,
                 &session,
@@ -676,16 +773,20 @@ async fn work_ahead(ns: &str, key: &str, w: &Watched) -> Result<bool> {
                 &PARTS,
                 until,
                 None,
-            ))
+            )
             .await
         })
         .await?;
-    Ok(true)
+    Ok(Some(Worked {
+        when: std::time::Instant::now(),
+        main: Some(main),
+        again,
+    }))
 }
 
 /// Whether an answer worked out ahead has every part: none pending, and every branch's skills known (a branch's
 /// state is built in the background, and its skills read once it is, at the same memory state). One that hasn't is
-/// worked out again at the next look, not only once the state moves or [`RENEW`] is up.
+/// worked out again at the next run, not only once the state moves or [`RENEW`] is up.
 fn settled(kept: &Value) -> bool {
     kept["pending"].as_array().is_none_or(|p| p.is_empty())
         && kept["branches"]

@@ -21,7 +21,7 @@ pub(super) async fn asks(store: &Store, scope: &Scope) -> bool {
 
 /// What memory is for, where sessions are kept (the purpose-only [`super::lifecycle_instructions`]). `advised`:
 /// whether `get_advice` is offered.
-pub(super) fn lifecycle(advised: bool) -> String {
+pub(super) fn lifecycle(advised: bool, shared_at: usize) -> String {
     format!(
         "This memory carries what should outlast a conversation: what this user and their team want kept (their \
          preferences, corrections, decisions and ways of working){}. Use it when it would help; when that is, is \
@@ -47,7 +47,7 @@ pub(super) fn lifecycle(advised: bool) -> String {
         } else {
             ""
         },
-        crate::keep::SHARED_AT
+        shared_at
     )
 }
 
@@ -76,7 +76,7 @@ pub(super) fn reading(advice: bool, sessions: bool) -> String {
 /// The purpose-only descriptions of the session tools and `remember_memory`, over those `tools/list` built:
 /// nothing else of a tool changes. `remember_memory` only where it writes into `scope` (`writes_scope`); a queued
 /// write's description says nothing of when to call it.
-pub(super) fn describe(tools: &mut [Value], scope: &Scope, writes_scope: bool) {
+pub(super) fn describe(tools: &mut [Value], scope: &Scope, writes_scope: bool, shared_at: usize) {
     for t in tools.iter_mut() {
         let description = match t["name"].as_str() {
             Some("start_session") => START_SESSION.to_string(),
@@ -89,7 +89,7 @@ pub(super) fn describe(tools: &mut [Value], scope: &Scope, writes_scope: bool) {
                  conversation. It is theirs alone (`for` \"me\", the default): AmpUp Memory shares it with everyone in \
                  {scope} once at least {} people have said the same. `for` \"team\" is for a document or note that \
                  isn't anyone's feedback. Never small talk, secrets or raw tool output.",
-                crate::keep::SHARED_AT
+                shared_at
             ),
             _ => continue,
         };

@@ -15,7 +15,9 @@
 //! - **Exactly once.** A person's digest of a week is recorded in their org's answer log ([`KIND`], under their
 //!   name, so forgetting them takes it) as `sending` before the provider is called and `sent` after. A recorded
 //!   send is never made again; one left `sending` (the server stopped mid-send) or `failed` is retried with the same
-//!   idempotency key, which the provider keeps a day, and given up after that.
+//!   idempotency key, which the provider keeps a day, until the earlier of 22 hours after its first try and the
+//!   close of the day it is sent in (the server sends nothing after it), then given up. The server writes off what
+//!   is left once that day is over (and when it starts outside it), so every send ends `sent` or `given_up`.
 //! - **Off unless asked for.** A server sends digests only with `AMPUP_MEMORY_DIGEST=on`, besides a mail transport
 //!   ([`crate::mail`]), `AMPUP_MEMORY_PUBLIC_URL` and `AMPUP_MEMORY_SECRET_KEY` (the unsubscribe link is sealed with
 //!   it): a server already set up to mail invites doesn't start mailing every org's members when it is upgraded.
@@ -43,7 +45,7 @@ pub const KIND: &str = "digest";
 pub const UNSUBSCRIBE_PATH: &str = "/digest/unsubscribe";
 const TOKEN_CONTEXT: &str = "digest-unsubscribe";
 const WEEK: i64 = 7 * 86_400_000_000;
-/// A send left `sending` or `failed` is retried with its idempotency key for this long, then given up.
+/// A send left `sending` or `failed` is retried with its idempotency key for this long at most, then given up.
 const RETRY_FOR: i64 = 22 * 3_600_000_000;
 /// The most lessons, served sessions and team lessons a digest lists.
 const MAX_LEARNED: usize = 5;
@@ -1025,19 +1027,128 @@ pub async fn subscribe(store: &Store, scope: &Scope, person: &str, on: bool) -> 
         .await
 }
 
-/// A send as recorded: `sending`, `sent`, `failed` or `given_up`, and when the first attempt began.
+/// Where a person's send of a week stands, as its mark records it (the strings are the stored ones).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SendStatus {
+    /// The provider is being called (or the server stopped while it was): retried.
+    Sending,
+    /// The provider took it: never sent again.
+    Sent,
+    /// The provider refused or couldn't be reached: retried.
+    Failed,
+    /// Past its retries ([`Mark::retry_until`]): never sent.
+    GivenUp,
+}
+
+impl SendStatus {
+    fn name(self) -> &'static str {
+        match self {
+            SendStatus::Sending => "sending",
+            SendStatus::Sent => "sent",
+            SendStatus::Failed => "failed",
+            SendStatus::GivenUp => "given_up",
+        }
+    }
+}
+
+/// A send as recorded: where it stands, and when the first attempt began.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Mark {
-    status: String,
+    status: SendStatus,
     first: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+impl Mark {
+    /// Whether it is over: sent, or given up.
+    fn over(&self) -> bool {
+        matches!(self.status, SendStatus::Sent | SendStatus::GivenUp)
+    }
+
+    /// Until when a send of `week` first tried at `first` is retried (µs): [`RETRY_FOR`] after, while the provider
+    /// still keeps its idempotency key, and never past the close of the day its digests go out in ([`due`]), after
+    /// which the server sends none of `week`'s. One first tried after that day (`ampup-memory digest send`) has its
+    /// [`RETRY_FOR`].
+    fn retry_until(&self, week: Week) -> i64 {
+        let closes = window(week).1;
+        let until = self.first + RETRY_FOR;
+        if self.first < closes {
+            until.min(closes)
+        } else {
+            until
+        }
+    }
+
+    /// As it stands at `now`: given up once past its retries, whatever was last written.
+    fn at(&self, week: Week, now: i64) -> SendStatus {
+        match self.status {
+            SendStatus::Sending | SendStatus::Failed if now >= self.retry_until(week) => {
+                SendStatus::GivenUp
+            }
+            s => s,
+        }
+    }
 }
 
 fn mark_of(log: &[Logged], person: &str, week: Week) -> Option<Mark> {
     row(log, &sent_id(person, week))
         .and_then(|l| l.answer.as_deref())
         .and_then(|a| serde_json::from_str(a).ok())
+}
+
+/// Gives up every send recorded in `home` that is past its retries ([`Mark::retry_until`]) at `now` and still says
+/// `sending` or `failed`, of any week: the server sends a week's digests only in the day after it, so what is left of
+/// them once that day is over would otherwise stay unsent and unsettled. How many it gave up.
+pub async fn give_up_overdue(store: &Store, home: &Scope, now: i64) -> Result<usize> {
+    let log = crate::qa_log::list(store, home, None).await?;
+    let mut n = 0;
+    for l in &log {
+        if l.kind.as_deref() != Some(KIND) {
+            continue;
+        }
+        // `digest:<week>:<person>` (a subscription is `digest:subscription:<person>`).
+        let Some((label, _)) = l
+            .answer_id
+            .strip_prefix(&format!("{KIND}:"))
+            .and_then(|r| r.split_once(':'))
+        else {
+            continue;
+        };
+        let Some(week) = Week::parse(label, now).ok().filter(|w| w.label() == label) else {
+            continue;
+        };
+        let Some(m) = l
+            .answer
+            .as_deref()
+            .and_then(|a| serde_json::from_str::<Mark>(a).ok())
+        else {
+            continue;
+        };
+        if m.over() || m.at(week, now) != SendStatus::GivenUp {
+            continue;
+        }
+        mark(
+            store,
+            home,
+            &l.asker,
+            week,
+            &Mark {
+                status: SendStatus::GivenUp,
+                ..m.clone()
+            },
+        )
+        .await?;
+        eprintln!(
+            "digest {home}: {}'s send of {} given up, unconfirmed since {}",
+            l.asker,
+            week.label(),
+            m.first
+        );
+        n += 1;
+    }
+    Ok(n)
 }
 
 async fn mark(store: &Store, scope: &Scope, person: &str, week: Week, m: &Mark) -> Result<()> {
@@ -1129,11 +1240,28 @@ pub fn hour() -> i64 {
 /// send's idempotency key, so a retry within it is never a second mail.
 const SEND_WINDOW_US: i64 = 24 * 3_600_000_000;
 
+/// When `week`'s digests go out (µs): the day from the next Monday at [`hour`], start and end.
+fn window(week: Week) -> (i64, i64) {
+    let from = week.end() + hour() * 3_600_000_000;
+    (from, from + SEND_WINDOW_US)
+}
+
 /// The week whose digests are due at `now` (µs): last week's, in the day from Monday at [`hour`]; none at other times.
 pub fn due(now: i64) -> Option<Week> {
-    let this = Week::containing(now);
-    let from = this.start + hour() * 3_600_000_000;
-    (now >= from && now < from + SEND_WINDOW_US).then(|| this.previous())
+    let last = Week::containing(now).previous();
+    let (from, to) = window(last);
+    (now >= from && now < to).then_some(last)
+}
+
+/// The newest week whose day of sending ([`due`]) is over at `now` (µs): what is left of it can be given up
+/// ([`give_up_overdue`]).
+pub fn last_closed(now: i64) -> Week {
+    let last = Week::containing(now).previous();
+    if now >= window(last).1 {
+        last
+    } else {
+        last.previous()
+    }
 }
 
 /// Everything a send needs: the mail transport, the key sealing unsubscribe links and the public URL they open.
@@ -1227,19 +1355,20 @@ pub async fn send_org(
         }
         let was = mark_of(&home, person, week);
         match &was {
-            Some(m) if m.status == "sent" || m.status == "given_up" => {
+            Some(m) if m.over() => {
                 round.already += 1;
                 continue;
             }
-            Some(m) if now - m.first > RETRY_FOR => {
-                // Past the provider's memory of the key: a retry could send it twice. It stays unsent.
+            Some(m) if m.at(week, now) == SendStatus::GivenUp => {
+                // Past the provider's memory of the key, or the day's end: a retry could send it twice, or late. It
+                // stays unsent.
                 mark(
                     store,
                     &org.home,
                     person,
                     week,
                     &Mark {
-                        status: "given_up".into(),
+                        status: SendStatus::GivenUp,
                         ..m.clone()
                     },
                 )
@@ -1272,7 +1401,7 @@ pub async fn send_org(
             person,
             week,
             &Mark {
-                status: "sending".into(),
+                status: SendStatus::Sending,
                 first,
                 error: None,
             },
@@ -1300,8 +1429,8 @@ pub async fn send_org(
             .send_with(person, &r.subject, &r.text, &r.html, &extra)
             .await;
         let (status, error) = match &sent {
-            Ok(()) => ("sent", None),
-            Err(e) => ("failed", Some(format!("{e:#}"))),
+            Ok(()) => (SendStatus::Sent, None),
+            Err(e) => (SendStatus::Failed, Some(format!("{e:#}"))),
         };
         mark(
             store,
@@ -1309,7 +1438,7 @@ pub async fn send_org(
             person,
             week,
             &Mark {
-                status: status.into(),
+                status,
                 first,
                 error: error.clone(),
             },
@@ -1554,7 +1683,8 @@ pub async fn preview_in(
         rendered: render(&d, &links),
         digest: d,
         unsubscribed: unsubscribed(&log, who.user()),
-        sent: mark_of(&log, who.user(), week).map(|m| m.status),
+        sent: mark_of(&log, who.user(), week)
+            .map(|m| m.at(week, crate::now_micros()).name().to_string()),
     })
 }
 

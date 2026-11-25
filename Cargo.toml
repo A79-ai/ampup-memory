@@ -68,7 +68,10 @@ quick_cache = "0.6"
 # statvfs, for the disk_usage alert (src/alerts.rs).
 libc = "0.2"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
-tikv-jemallocator = "0.6"
+# profiling: compiled in, sampling only when _RJEM_MALLOC_CONF=prof:true (src/heap_profile.rs).
+tikv-jemallocator = { version = "0.6", features = ["profiling"] }
+# Names the heap profile's allocation sites (src/heap_profile.rs): the version sentry already builds.
+backtrace = "0.3.76"
 prometheus = { version = "0.14", default-features = false }
 schemars = { version = "1", features = ["chrono04"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
@@ -76,6 +79,12 @@ ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 p256 = { version = "0.13", features = ["jwk", "pem"] }
 rsa = { version = "0.9", features = ["pem"] }
 tempfile = "3.27.0"
+# Text out of the PDFs and Word files added in Studio (src/doc_text.rs).
+pdf-extract = "0.12"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+# A web page added in Studio, as Markdown (src/doc_text.rs).
+htmd = "0.6"
 
 [package]
 name = "memstore"
@@ -156,10 +165,15 @@ parking_lot.workspace = true
 libc.workspace = true
 tikv-jemalloc-ctl.workspace = true
 tikv-jemallocator.workspace = true
+backtrace.workspace = true
 prometheus.workspace = true
 schemars.workspace = true
 ed25519-dalek.workspace = true
 p256.workspace = true
+pdf-extract.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+htmd.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

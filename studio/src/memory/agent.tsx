@@ -463,18 +463,18 @@ export function Agent({
                         key={s.question}
                         type="button"
                         className="pg-chip"
-                        title={s.when ? adviceTitle(s) : undefined}
-                        onClick={() => ask(s.question)}
+                        title={s.situation ? adviceTitle(s) : s.question}
+                        onClick={() => ask(s.asks ?? s.question)}
                       >
                         <Icon
                           name={
-                            s.when
+                            s.situation
                               ? "skill"
                               : (SUGGESTIONS.find(([, q]) => q === s.question)?.[0] ?? "chat")
                           }
                           size={13}
-                        />{" "}
-                        {s.question}
+                        />
+                        <span className="pg-chip-text">{s.question}</span>
                       </button>
                     ))}
                   </div>
@@ -720,7 +720,7 @@ function useStarters(sel: Selection): Starter[] | undefined {
 
 /** What a starter from advice says on hover: the situation, and how often its advice helped. */
 const adviceTitle = (s: Starter) =>
-  `Advice learned for: ${s.when}` +
+  `Advice learned for: ${s.situation}` +
   (s.served ? ` · helped ${s.helped ?? 0} of ${s.served} ${s.served === 1 ? "run" : "runs"}` : "");
 
 /** The playground on a memory with nothing in it: nothing to ask yet, and the three ways to put something in. */

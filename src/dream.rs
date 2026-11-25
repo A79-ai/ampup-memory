@@ -581,7 +581,7 @@ async fn view(store: &Store, scope: &Scope) -> Result<View> {
         .rows
         .iter()
         .flat_map(|b| decode_facts(b, "source_episodes"))
-        .filter(|(c, f)| vis.committed.contains(c) && !vis.retracted_facts.contains(&f.fact_id))
+        .filter(|(c, f)| vis.committed.contains(c) && !vis.withheld(f))
         .collect();
     Ok(View {
         vis,

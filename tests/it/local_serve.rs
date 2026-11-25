@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use memstore::{Episode, Fact, Scope};
 use serde_json::{Value, json};
 
-fn free_port() -> u16 {
+pub(crate) fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -16,7 +16,7 @@ fn free_port() -> u16 {
 }
 
 /// The real binary, serving `dir` on `port`.
-struct Server(Child);
+pub(crate) struct Server(Child);
 
 impl Drop for Server {
     fn drop(&mut self) {
@@ -27,11 +27,11 @@ impl Drop for Server {
 
 /// A home directory of its own, so nothing the server writes can land in the real `~/.cache`; the
 /// embedding model is still read from the real cache rather than downloaded again.
-fn home_of(dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn home_of(dir: &std::path::Path) -> std::path::PathBuf {
     dir.with_extension("home")
 }
 
-async fn serve_local(dir: &std::path::Path, port: u16, env: &[(&str, &str)]) -> Server {
+pub(crate) async fn serve_local(dir: &std::path::Path, port: u16, env: &[(&str, &str)]) -> Server {
     let models = format!("{}/.cache/memstore/models", std::env::var("HOME").unwrap());
     let child = Command::new(env!("CARGO_BIN_EXE_ampup-memory"))
         .env("HOME", home_of(dir))

@@ -117,7 +117,7 @@ pub struct SessionPart {
     pub verdicts: Option<String>,
     #[serde(skip)]
     pub acl: Vec<String>,
-    /// `agent` (end_session) or `idle` (ended by the server).
+    /// How it ended, once it has ([`Ended`]; read it with [`SessionPart::ended`]).
     pub ended_by: Option<String>,
     /// The advice ops fired mid-run (`crate::sessions::fire`), each `<kind>:<tool>:<situation>:<op>`.
     #[serde(default)]
@@ -146,6 +146,71 @@ pub struct SessionPart {
     /// gives, or `test`, which reads advice and teaches nothing ([`crate::sessions::split`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split: Option<String>,
+}
+
+impl SessionPart {
+    /// How the session ended: None while it is open, or when its row names an ending this engine doesn't know.
+    pub fn ended(&self) -> Option<Ended> {
+        self.ended_by.as_deref().and_then(Ended::parse)
+    }
+
+    /// Ends it `how`, as its row says from now on.
+    pub fn end_as(&mut self, how: Ended) {
+        self.ended_by = Some(how.as_str().into());
+    }
+}
+
+/// How a session ended: its row's `ended_by`, spelled as [`Ended::as_str`] says. A value no variant names (a row
+/// from a newer engine) is kept as it is and read as no ending ([`SessionPart::ended`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ended {
+    /// Its agent ended it (`end_session`, or its hook).
+    Agent,
+    /// The server ended it once it went idle: its owner may still come back to it.
+    Idle,
+    /// Its run kept no transcript (`end_session` with `discard`).
+    Discarded,
+    /// Nothing was asked in it and nothing kept, whoever ended it.
+    Empty,
+}
+
+impl Ended {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Ended::Agent => "agent",
+            Ended::Idle => "idle",
+            Ended::Discarded => "discarded",
+            Ended::Empty => "empty",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "agent" => Some(Ended::Agent),
+            "idle" => Some(Ended::Idle),
+            "discarded" => Some(Ended::Discarded),
+            "empty" => Some(Ended::Empty),
+            _ => None,
+        }
+    }
+
+    /// Whether the end is final: an idle end is the only one its owner can resume, and the log ranks a final end
+    /// over any later row of the session.
+    pub fn is_final(self) -> bool {
+        match self {
+            Ended::Idle => false,
+            Ended::Agent | Ended::Discarded | Ended::Empty => true,
+        }
+    }
+
+    /// Whether the session is one of its person's day's, the activity's and the judge's: not one that kept nothing
+    /// (discarded) or had nothing asked in it (empty).
+    pub fn counts(self) -> bool {
+        match self {
+            Ended::Agent | Ended::Idle => true,
+            Ended::Discarded | Ended::Empty => false,
+        }
+    }
 }
 
 /// Records an answer, or (with `answer_id`) rates one `who` logged before. Returns its id.
@@ -1015,6 +1080,66 @@ type Decoded = (Arc<Vec<arrow_array::RecordBatch>>, Chunks);
 static DECODED: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, Decoded>>> =
     std::sync::LazyLock::new(Default::default);
 
+/// Roughly how many bytes `l` holds: its text, its lists and its session part (serialized length).
+pub fn logged_bytes(l: &Logged) -> usize {
+    let opt = |o: &Option<String>| o.as_ref().map_or(0, |s| s.len());
+    std::mem::size_of::<Logged>()
+        + l.answer_id.len()
+        + l.asker.len()
+        + opt(&l.goal)
+        + l.question.len()
+        + opt(&l.answer)
+        + opt(&l.rating)
+        + l.cited
+            .iter()
+            .chain(&l.episodes)
+            .map(|s| s.len() + 24)
+            .sum::<usize>()
+        + opt(&l.kind)
+        + opt(&l.reward_reason)
+        + l.session
+            .as_ref()
+            .map_or(0, |p| serde_json::to_vec(p).map_or(0, |v| v.len()))
+}
+
+/// What the decoded log holds, for the server's memory log: scopes, rows, the snapshots' Arrow bytes (kept
+/// alive here even once the table cache drops them) and the decoded rows' bytes (every 20th row sized).
+pub fn memory_report() -> String {
+    let all: Vec<(String, Decoded)> = DECODED
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let (mut rows, mut batches, mut decoded, mut largest) = (0, 0, 0, (0, String::new()));
+    for (name, (b, d)) in &all {
+        let n: usize = d.iter().map(|c| c.len()).sum();
+        let arrow: usize = b.iter().map(|b| b.get_array_memory_size()).sum();
+        let mut sampled = (0, 0);
+        for r in d.iter().flat_map(|c| c.iter()).step_by(20) {
+            sampled = (
+                sampled.0 + 1,
+                sampled.1 + logged_bytes(&r.logged) + r.commit.len(),
+            );
+        }
+        let bytes = (sampled.1 * n).checked_div(sampled.0).unwrap_or(0);
+        rows += n;
+        batches += arrow;
+        decoded += bytes;
+        if arrow + bytes > largest.0 {
+            largest = (arrow + bytes, name.clone());
+        }
+    }
+    format!(
+        "qa_log {} scopes {rows} rows, arrow {} MB, decoded ~{} MB (largest {} {} MB)",
+        all.len(),
+        batches >> 20,
+        decoded >> 20,
+        largest.1,
+        largest.0 >> 20
+    )
+}
+
 /// A batch's identity: its first column, shared by every read of the same data file.
 fn batch_id(b: &arrow_array::RecordBatch) -> usize {
     Arc::as_ptr(b.column(0)) as *const () as usize
@@ -1092,10 +1217,10 @@ fn decode(rows: &[arrow_array::RecordBatch]) -> Vec<Row> {
                 commit: commit[i].clone(),
                 final_end: kind[i].as_deref() == Some("session")
                     && ended[i].is_some()
-                    && matches!(
-                        ended_by[i].as_deref(),
-                        Some("agent" | "discarded" | "empty")
-                    ),
+                    && ended_by[i]
+                        .as_deref()
+                        .and_then(Ended::parse)
+                        .is_some_and(Ended::is_final),
                 prs: prs[i]
                     .as_deref()
                     .and_then(|v| serde_json::from_str::<Vec<crate::session_prs::Pr>>(v).ok())
@@ -1261,7 +1386,9 @@ impl StoreQaLog for Store {
                 if end.is_some() && h.as_deref().is_some_and(crate::sessions::is_backfill) {
                     continue;
                 }
-                if e.as_deref() == Some("empty") && ended_empty.insert(id) {
+                if e.as_deref().and_then(Ended::parse) == Some(Ended::Empty)
+                    && ended_empty.insert(id)
+                {
                     continue;
                 }
                 n.extend(t);
@@ -1387,7 +1514,7 @@ impl StoreQaLog for Store {
         if rows.iter().any(|l| {
             l.session
                 .as_ref()
-                .is_some_and(|s| s.ended_by.as_deref() == Some("empty"))
+                .is_some_and(|s| s.ended() == Some(Ended::Empty))
         }) {
             forget_counts(scope);
         }

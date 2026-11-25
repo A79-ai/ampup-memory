@@ -1441,9 +1441,17 @@ fn new_caches() {
 pub fn memory_report() -> String {
     let (passage_open, passage_rows) = passages::held();
     let (flat_parts, flat_bytes) = rows::flat_held();
+    let ((tail_eps, tail_bytes), (stems, stem_bytes), titles) = passages::tail_held();
+    let (tail_vecs, tail_vec_bytes) = {
+        let t = TAIL_CACHE.lock().unwrap();
+        let bytes: usize = t.iter().map(|(k, v)| k.len() + v.len() * 4).sum();
+        (t.len(), bytes)
+    };
     format!(
         "lance caches {} MB, open indexes {} fact + {passage_open} passage, index rows {} fact + {} keyed + \
-         {passage_rows} passage, held whole {} fact rows {} MB, flat vectors {flat_parts} parts {} MB, query vectors {}",
+         {passage_rows} passage, held whole {} fact rows {} MB, flat vectors {flat_parts} parts {} MB, tail vectors \
+         {tail_vecs} ({} MB), tail chunks {tail_eps} episodes ({} MB), tail stems {stems} ({} MB), titles {titles}, \
+         query vectors {}",
         session().size_bytes() >> 20,
         OPEN.lock().unwrap().len(),
         FACT_VECS.len(),
@@ -1451,7 +1459,10 @@ pub fn memory_report() -> String {
         KEYED_ROWS.resident().0,
         KEYED_ROWS.resident().1 >> 20,
         flat_bytes >> 20,
-        TAIL_CACHE.lock().unwrap().len(),
+        tail_vec_bytes >> 20,
+        tail_bytes >> 20,
+        stem_bytes >> 20,
+        QUERY_CACHE.lock().unwrap().len(),
     )
 }
 

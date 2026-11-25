@@ -82,39 +82,138 @@ async fn trusted_get<T: serde::de::DeserializeOwned>(url: &str) -> Result<T> {
 }
 
 async fn vetted_get<T: serde::de::DeserializeOwned>(url: &str, allow_loopback: bool) -> Result<T> {
-    let mut url = Url::parse(url).context("not a URL")?;
-    for _ in 0..=MAX_REDIRECTS {
-        let addr = vet(&url, allow_loopback).await?;
-        let client = reqwest::Client::builder()
+    let url = Url::parse(url).context("not a URL")?;
+    let got = vetted_fetch(url, allow_loopback, MAX_BODY, MAX_REDIRECTS, None)
+        .await
+        .map_err(|e| match e {
+            Failed::Refused(e) | Failed::Other(e) => e,
+        })?;
+    Ok(serde_json::from_slice(&got.body)?)
+}
+
+/// What a vetted fetch read: where it ended up (after redirects), what the server called it, and its bytes.
+pub struct Fetched {
+    pub url: Url,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+/// Why a vetted fetch failed: the URL (or a redirect) named a place it may not go, or anything else.
+enum Failed {
+    Refused(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+/// Fetch `url` and each redirect, every hop vetted ([`vet`]) and its connection pinned to the vetted address:
+/// at most `max_body` bytes and `max_redirects` redirects.
+async fn vetted_fetch(
+    mut url: Url,
+    allow_loopback: bool,
+    max_body: usize,
+    max_redirects: usize,
+    agent: Option<&str>,
+) -> std::result::Result<Fetched, Failed> {
+    for _ in 0..=max_redirects {
+        let addr = vet(&url, allow_loopback).await.map_err(Failed::Refused)?;
+        let mut client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(TIMEOUT)
             // A proxy would resolve the name itself, after the check.
             .no_proxy()
-            .dns_resolver(Arc::new(Pinned(addr)))
-            .build()?;
-        let mut r = client.get(url.clone()).send().await?;
+            .dns_resolver(Arc::new(Pinned(addr)));
+        if let Some(a) = agent {
+            client = client.user_agent(a);
+        }
+        let other = |e: reqwest::Error| Failed::Other(e.into());
+        let mut r = client
+            .build()
+            .map_err(other)?
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(other)?;
         if r.status().is_redirection() {
             let to = r
                 .headers()
                 .get(LOCATION)
                 .and_then(|l| l.to_str().ok())
-                .context("a redirect without a Location")?;
-            url = url.join(to).context("a redirect to a bad URL")?;
+                .ok_or_else(|| Failed::Other(anyhow::anyhow!("a redirect without a Location")))?;
+            url = url
+                .join(to)
+                .map_err(|_| Failed::Other(anyhow::anyhow!("a redirect to a bad URL")))?;
             continue;
         }
         let status = r.status();
-        anyhow::ensure!(status.is_success(), "HTTP {status}");
-        let mut body = Vec::new();
-        while let Some(chunk) = r.chunk().await? {
-            body.extend_from_slice(&chunk);
-            anyhow::ensure!(
-                body.len() <= MAX_BODY,
-                "the answer is over {MAX_BODY} bytes"
-            );
+        if !status.is_success() {
+            return Err(Failed::Other(anyhow::anyhow!("HTTP {status}")));
         }
-        return Ok(serde_json::from_slice(&body)?);
+        let content_type = r
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut body = Vec::new();
+        while let Some(chunk) = r.chunk().await.map_err(other)? {
+            body.extend_from_slice(&chunk);
+            if body.len() > max_body {
+                return Err(Failed::Other(anyhow::anyhow!(
+                    "the answer is over {max_body} bytes"
+                )));
+            }
+        }
+        return Ok(Fetched {
+            url,
+            content_type,
+            body,
+        });
     }
-    anyhow::bail!("more than {MAX_REDIRECTS} redirects")
+    Err(Failed::Other(anyhow::anyhow!(
+        "more than {max_redirects} redirects"
+    )))
+}
+
+/// All a person learns when a page they named is somewhere the server may not fetch from (this machine, the
+/// private network, the cloud's metadata service) or its name doesn't resolve: the same words whatever the host
+/// and whether or not it is up, so the server maps no network. The server's log says why.
+pub const NOT_PUBLIC: &str = "it couldn't be fetched: only public https pages are read";
+
+/// Redirects a public page may take.
+const PAGE_REDIRECTS: usize = 5;
+
+/// A public web page a person named (Studio's Import, `/learn`'s `url` item): vetted as an org's provider is
+/// ([`vet`]: https, no credentials, every address public, every redirect vetted, the connection pinned), at most
+/// `max_body` bytes. Err is what the person is told: [`NOT_PUBLIC`] for anywhere the server may not go, else the
+/// public host's own answer (its status, too large, too many redirects, unreachable).
+pub async fn fetch_public(
+    url: &str,
+    max_body: usize,
+    agent: &str,
+) -> std::result::Result<Fetched, String> {
+    let Ok(parsed) = Url::parse(url.trim()) else {
+        return Err("it isn't a URL (https://...)".into());
+    };
+    if parsed.scheme() == "http" {
+        return Err("only https links are read".into());
+    }
+    match vetted_fetch(parsed, false, max_body, PAGE_REDIRECTS, Some(agent)).await {
+        Ok(f) => Ok(f),
+        Err(Failed::Refused(e)) => {
+            eprintln!("web import: {url}: {e:#}");
+            Err(NOT_PUBLIC.into())
+        }
+        Err(Failed::Other(e)) => {
+            let e = format!("{e:#}");
+            Err(
+                if e.starts_with("HTTP ") || e.contains("bytes") || e.contains("redirect") {
+                    format!("the page couldn't be read ({e})")
+                } else {
+                    eprintln!("web import: {url}: {e}");
+                    "the page couldn't be reached".into()
+                },
+            )
+        }
+    }
 }
 
 /// The one address `url` may be fetched from, or why it may not be fetched at all.

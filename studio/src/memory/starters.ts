@@ -13,22 +13,47 @@ export type AdviceEntry = {
   merged_into?: unknown;
 };
 
-/** A question to start from, and the advice it comes from (none for the fallback questions). */
-export type Starter = { question: string; when?: string; served?: number; helped?: number };
+/** A question to start from, and the situation whose advice it comes from (none for the fixed questions). */
+export type Starter = {
+  question: string;
+  /** What is asked when it's picked, where the question shown is cut short. */
+  asks?: string;
+  situation?: string;
+  served?: number;
+  helped?: number;
+};
+
+/** The longest a starter's task runs, in characters: a question on one line of the composer's width. */
+export const TASK_CHARS = 60;
 
 /**
- * The question to ask about a situation the memory learned advice for: what to know before doing it ("deploy the
- * billing service"), or when it happens ("an alert fires…").
+ * The task a situation is about, short: its title ("Review a pull request"), or one written as a key
+ * ("mine:code-and-file-changes/merge-a-finished-change") read as words; a description of when it applies
+ * stands in only where it is that short. Cut at a word, with an ellipsis, past `max`; none without either.
  */
-export function adviceQuestion(when: string): string {
-  let w = when
-    .trim()
-    .replace(/^when\s+/i, "")
-    .replace(/[\s.?!:;,]+$/, "");
-  if (!/^[A-Z]{2}/.test(w)) w = w.charAt(0).toLowerCase() + w.slice(1);
-  const happens = /^(a|an|the|someone|somebody|you|we|it|they|there)\b/i.test(w);
-  return happens ? `What should I know when ${w}?` : `What should I know before I ${w}?`;
+export function situationTask(
+  e: { situation?: string; when?: string },
+  max = TASK_CHARS,
+): string | undefined {
+  const keyed = (k: string) => k.replace(/^.*[/:]/, "").replace(/[-_]+/g, " ");
+  const title = e.situation?.trim();
+  let t =
+    title && (/\s/.test(title) || !/[-_/:]/.test(title))
+      ? title
+      : title
+        ? keyed(title)
+        : (e.when?.trim() ?? "");
+  t = t.replace(/^when\s+/i, "").replace(/[\s.?!:;,]+$/, "");
+  if (!t || (!title && t.length > TASK_CHARS)) return undefined;
+  if (t.length > max) {
+    const cut = t.slice(0, max);
+    t = `${cut.slice(0, Math.max(cut.lastIndexOf(" "), max / 2)).replace(/[\s,;:]+$/, "")}…`;
+  }
+  return /^[A-Z]{2}/.test(t) ? t : t.charAt(0).toLowerCase() + t.slice(1);
 }
+
+/** The question a starter asks about a task: how to do it ("How do I review a pull request?"). */
+export const adviceQuestion = (task: string) => `How do I ${task}${task.endsWith("…") ? "" : "?"}`;
 
 /**
  * The starter questions from the advice learned so far: the situations whose advice is served (not withheld, held,
@@ -37,8 +62,7 @@ export function adviceQuestion(when: string): string {
  */
 export function adviceStarters(entries: AdviceEntry[], n = 3): Starter[] {
   const live = entries.filter(
-    (e) =>
-      !!e.when?.trim() && e.withheld == null && !e.held && !e.conversation && e.merged_into == null,
+    (e) => e.withheld == null && !e.held && !e.conversation && e.merged_into == null,
   );
   const score = (e: AdviceEntry) => [
     e.evidence?.helped ?? 0,
@@ -54,9 +78,18 @@ export function adviceStarters(entries: AdviceEntry[], n = 3): Starter[] {
   });
   const out: Starter[] = [];
   for (const e of live) {
-    const question = adviceQuestion(e.when!);
+    const task = situationTask(e);
+    if (!task) continue;
+    const question = adviceQuestion(task);
     if (out.some((s) => s.question === question)) continue;
-    out.push({ question, when: e.when, served: e.evidence?.served, helped: e.evidence?.helped });
+    const whole = adviceQuestion(situationTask(e, Infinity)!);
+    out.push({
+      question,
+      ...(whole !== question ? { asks: whole } : {}),
+      situation: e.situation,
+      served: e.evidence?.served,
+      helped: e.evidence?.helped,
+    });
     if (out.length === n) break;
   }
   return out;
