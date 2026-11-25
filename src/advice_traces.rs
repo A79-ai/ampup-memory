@@ -35,7 +35,7 @@ use crate::{Episode, Principal, Scope, Store};
 
 /// What a source holds after its signature: `advice-trace:<session>`, every part of the session's trace
 /// (`:<file>` after it from clients before parts).
-const SOURCE: &str = "advice-trace:";
+pub const SOURCE: &str = "advice-trace:";
 /// Most transcripts (the session's and its subagents') one part holds.
 const MAX_FILES: usize = 200;
 /// Most lines one part holds.

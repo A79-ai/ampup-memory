@@ -187,12 +187,16 @@ pub fn document(author: &str) -> String {
 }
 
 /// Who wrote a `remember_memory` episode, and the rest of its source after them: a service key's `key:<org>/<name>`,
-/// else everything up to the next `:`.
+/// an import source's `import:<label>` (an imported run's trace, `crate::runs::import`), else everything up to the
+/// next `:`.
 pub(crate) fn author_of(source: &str) -> Option<(&str, &str)> {
     let rest = source
         .strip_prefix(crate::REMEMBER_SOURCE)?
         .strip_prefix(':')?;
-    let skip = if rest.starts_with("key:") { 4 } else { 0 };
+    let skip = ["key:", crate::runs::IMPORT]
+        .iter()
+        .find(|p| rest.starts_with(*p))
+        .map_or(0, |p| p.len());
     let end = skip + rest[skip..].find(':')?;
     Some((&rest[..end], &rest[end + 1..]))
 }

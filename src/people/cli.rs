@@ -28,6 +28,8 @@ use crate::Store;
 use crate::people::client::{self, Config, Context, Credentials};
 use crate::people::directory::{self, Actor, Change, Directory, Profile, Role, SyncMember};
 
+// A command line, parsed once a run: a big variant (the settings flags) costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum PeopleCmd {
     /// Create an org and switch to it (catalog owner or a platform admin key)
@@ -173,6 +175,8 @@ pub struct InviteArgs {
     role: String,
 }
 
+// A command line, parsed once a run: a big variant (the settings flags) costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum OrgCmd {
     /// Set up an org's memory: a few questions about what matters, then teams and next steps
@@ -269,7 +273,8 @@ pub enum OrgCmd {
         #[arg(long)]
         compile_batch: Option<usize>,
         /// What the compile sources are: errors (error reports: each skill's when names the exception and its
-        /// message) ("" unsets it)
+        /// message), or changes (pull requests, tickets, commits: one skill per procedure they repeat, not one
+        /// per change) ("" unsets it)
         #[arg(long)]
         compile_kind: Option<String>,
         /// The compile sources compile_kind is about (sentry:); the others compile with the usual prompt, under
@@ -376,6 +381,11 @@ pub enum OrgCmd {
         /// people's notes off it and hands the ones that share a word with the task (default true)
         #[arg(long)]
         notes_decide: Option<bool>,
+        /// Flag a fact served in a session that the conversation shows wrong, as its person's negative feedback;
+        /// false checks nothing and stops counting the flags it gave (default: the server's
+        /// AMPUP_MEMORY_SERVED_FACT_CHECKS, on)
+        #[arg(long)]
+        fact_checks: Option<bool>,
         /// Other scopes of the org its readers also search, comma-separated (team:<org>/<team>; "" unsets them;
         /// the operator only)
         #[arg(long)]
@@ -396,6 +406,11 @@ pub enum OrgCmd {
         /// recorded for the owners to review, who may still approve what it rejected (default true)
         #[arg(long)]
         auto_review: Option<bool>,
+        /// Whether the schema grows with what extraction meets: where several episodes hold things of a kind it has
+        /// no type or predicate for, a model drafts an additive change for the entity owners to review (default
+        /// false)
+        #[arg(long)]
+        schema_growth: Option<bool>,
         /// Replace payment card numbers, US social security numbers, IBANs and international phone numbers in text
         /// written from now on with [card], [ssn], [iban] and [phone] before it is stored (default false)
         #[arg(long)]
@@ -1232,11 +1247,13 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             instructions,
             notes_dream,
             notes_decide,
+            fact_checks,
             reads,
             purge,
             activity,
             session_branches,
             auto_review,
+            schema_growth,
             pii,
             digest,
         }) => {
@@ -1281,6 +1298,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 instructions: instructions.clone(),
                 notes_dream: *notes_dream,
                 notes_decide: *notes_decide,
+                fact_checks: *fact_checks,
                 reads: reads.as_deref().map(|r| {
                     r.split(',')
                         .map(str::trim)
@@ -1292,6 +1310,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 activity: *activity,
                 session_branches: *session_branches,
                 auto_review: *auto_review,
+                schema_growth: *schema_growth,
                 pii: *pii,
                 digest: *digest,
                 // Which sign-ins the org takes: the control plane's to set, with its own (`/admin set_settings`).

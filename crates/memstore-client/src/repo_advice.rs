@@ -5,9 +5,9 @@
 //!
 //! **When.** In the copy a session's start hands its work to (never in the hook the person waits on), at most once
 //! a day per repository and memory (server, org, team and scope), with a lock so sessions starting at once send it
-//! once. The first time it is said in the session (the agent tells the user once); later days send it again
-//! quietly, and the memory keeps (and writes notes from) only what changed: a file's new text, a newly merged pull
-//! request. A memory that can't write advice (no model) is asked again a day later, and nothing is read or sent
+//! once. The first repository a memory reads is said in the session (the agent tells the user once, and that each
+//! repository opened is read so); other repositories and later days send it quietly, and the memory keeps (and
+//! writes notes from) only what changed: a file's new text, a newly merged pull request. A memory that can't write advice (no model) is asked again a day later, and nothing is read or sent
 //! meanwhile.
 //!
 //! **What.** Only what a person expects a coding agent to read, from files git tracks (so `.gitignore` holds), never
@@ -209,6 +209,20 @@ pub(super) async fn seed(client: &Client, input: &Value) -> Result<Option<String
     if !first || all.is_empty() {
         return Ok(None);
     }
+    // Said once per memory, not per repository: a person opens many, and the first time says each is read so.
+    let told = dir.join(format!(
+        "told-{}",
+        hex(&[
+            client.url.as_str(),
+            client.org.as_deref().unwrap_or(""),
+            client.team.as_deref().unwrap_or(""),
+            client.scope.as_deref().unwrap_or(""),
+        ])
+    ));
+    if told.exists() {
+        return Ok(None);
+    }
+    std::fs::write(&told, b"")?;
     let named: Vec<&str> = docs.iter().map(|s| s.name.as_str()).collect();
     let mut read = vec![];
     if !named.is_empty() {
@@ -243,7 +257,8 @@ pub(super) async fn seed(client: &Client, input: &Value) -> Result<Option<String
     Ok(Some(format!(
         "AmpUp Memory read this repository once so its advice works from the first session: {}. It is kept in the \
          user's own memory (no teammate reads it) and the memory {writing}; what changes is sent again at most once \
-         a day. {OFF_VAR}=off turns this off. Tell the user once, in one sentence, then carry on with their request.",
+         a day. Each other repository opened is read the same way, without saying so again. {OFF_VAR}=off turns this \
+         off. Tell the user once, in one sentence, then carry on with their request.",
         read.join("; ")
     )))
 }

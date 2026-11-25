@@ -168,10 +168,30 @@
   border-top: 1px solid var(--line);
   min-height: 520px;
 }
-/* The list is as long as it is: the page scrolls it, never a box of its own. */
+/* The notes, one row each across the page; the page scrolls them, never a box of its own. Picking one opens it
+   in their place (.ap-one), with a link back. */
 .ap-list {
-  border-right: 1px solid var(--line);
   min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.ap-one {
+  min-width: 0;
+}
+.ap-back {
+  border: 0;
+  background: none;
+  padding: 4px 0;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+.ap-back:hover {
+  color: var(--ink);
 }
 .ap-filter {
   padding: 10px 12px;
@@ -266,15 +286,11 @@
   background: var(--error);
 }
 
-/* The note picked stays in view beside the list as the page scrolls; a long one scrolls on its own. */
+/* The note picked, on a page of its own: the page scrolls it. */
 .ap-detail {
-  padding: 16px 22px;
+  padding: 4px 0 16px;
   min-width: 0;
   overflow-wrap: anywhere;
-  position: sticky;
-  top: 16px;
-  max-height: calc(100vh - 32px);
-  overflow-y: auto;
 }
 /* A host's page may say `nowrap` of every button: a row's text wraps here whatever it says. */
 .ap-item,
@@ -405,27 +421,11 @@
   .ap-split {
     grid-template-columns: 1fr;
   }
-  .ap-list {
-    border-right: 0;
-    border-bottom: 1px solid var(--line);
-    max-height: 40vh;
-    overflow-y: auto;
-  }
-  .ap-detail {
-    position: static;
-    max-height: none;
-    overflow: visible;
-  }
   .ap-seg {
     margin-left: 0;
   }
 }
 
-/* Under a host's bar (the console's, 52px), the note picked sticks below it. */
-.memory-studio[data-navigation="host"] .ap-detail {
-  top: 68px;
-  max-height: calc(100vh - 84px);
-}
 /* With the host drawing the sections, Advice opens as its other pages do: the title at page size, the line
    saying what it is under it, the window on the right, no bar, no inset. */
 .memory-studio[data-navigation="host"] .ap {
@@ -445,4 +445,16 @@
     order: 0;
     flex: 1 1 auto;
   }
+}
+
+/* What every total in Advice is counted over (adviceScope.tsx): a line under the header, and for the org's admins
+   whose own notes are counted beside the team's, above both tabs. */
+.ap-scope {
+  margin: 0;
+  padding: 8px 20px 0;
+}
+.ap-person {
+  align-items: center;
+  margin: 0;
+  padding: 10px 20px 0;
 }

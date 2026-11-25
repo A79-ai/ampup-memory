@@ -16,7 +16,7 @@ Examples below run against `ampup-memory serve --local` on `localhost:8080`.
 | `POST /sessions` | `{context?, harness?, max_chars?}` | `{session_id, situation, advice, evidence, skills}` |
 | `POST /advice` | `{question, session_id?, moment?, conversation_so_far?, format?, max_chars?, procedures?, notes?}` | `{situation, advice, skills}`; 503 with no routing model |
 | `POST /sessions/end` | `{session_id, transcript?, outcome?, reward?, reason?}` | `{ended, served, session_id}` |
-| `POST /runs` | `{task, trace, used?, outcome?, advice?}` or `{runs: [...]}` | `{run_id}` or `{run_ids}` |
+| `POST /runs` | `{task, trace, used?, outcome?, advice?}` or `{runs: [...]}`; an org admin's `{import: <label>, runs: [...], acl?}` | `{run_id}` or `{run_ids}` (an import: `{run_ids, recorded, already, import}`) |
 | `POST /runs/reward` | `{run_id, reward, reason?}` or `{rewards: [...]}` | `{run_id}` or `{run_ids}` |
 | `POST /sessions/prs` | `{repo, number, branch?, event, at?, by?}` | how many sessions it reached |
 | `POST /advice/seed` | `{repo, sources: [{name, text}]}` or `{check: true}` | `{advises, sent, written, retired, writing_notes}`, or `{advises: false, why}` with no model |
@@ -57,10 +57,10 @@ Details of advice, runs and sessions: [advice.md](advice.md).
 | `POST /browse` | `{op, path?, …}` | Memory as file trees: `sources/`, `entities/`, `skills/` |
 | `POST /facts/list` | `{entity?, entity_type?, predicate?, source?, tags?, status?, text?, limit?, cursor?}` | Facts the caller may read, newest first |
 | `POST /advice/list` | `{space?, category?, situation?, text?, …}` | Situations whose advice the caller may read, with evidence tallies |
-| `POST /lessons` | `{space?, person?, key?, since?, limit?}` | What it learned: each lesson with the runs it came from and the sessions it was served in, and how each went |
+| `POST /lessons` | `{space?, person?, key?, since?, limit?, days?, as_usage?}` | What it learned: each lesson with the runs it came from and the sessions it was served in, and how each went |
 | `POST /brief` | `{subject, refresh?}` | Where a subject stands (needs `extract.aggregates`) |
 | `POST /pin` | `{ttl_secs?}`, `{renew}`, `{release}` | A leased pin; read through it with `x-memstore-at: pin_…` or `?at=` |
-| `GET /me` | | The caller, their groups, selected scope, memberships, the org's memory profile |
+| `GET /me` | | The caller, their groups, selected scope and its `org`, memberships, the org's memory profile, and `capabilities`: for each org they belong to, `{admin, activity, review, lessons}`, what the `/admin` reads of its admins, owner review and `/lessons` would answer them (from the directory, so an org whose cell is down still says) |
 | `GET /doctor` | | What the memory runs for this caller: extraction, compiling, advice and its evidence bar |
 | `GET /ready` | | 503 until warm-up is done, then 200 |
 
@@ -132,6 +132,12 @@ curl -s localhost:8080/lessons -d '{"since": "2026-11-06"}'
   entry in full; `person` narrows to one person's own (a member may name only themselves, else 400).
 - `since` (µs, an RFC 3339 time or a date) keeps the lessons written at or after it; `key` reads one (404 if the
   caller may read no such lesson).
+- Counted as the Advice page counts (`/browse {"op": "advice_usage"}`, which takes the same `days`, and a `person`
+  under the same rule): `days` (1 to 3650; all when absent) counts only the runs and sessions asked in the last that
+  many days, in the totals, the trails and `groups` alike; `as_usage: true` reads the notes `advice_usage` lists, the
+  team's and the caller's own, or `person`'s own in their place, leaving out conversation situations' and merged
+  situations' notes. The answer echoes `days` and `as_usage` as it applied them, so a caption never claims a window
+  an older server ignored.
 
 Every read is filtered by what the caller may see. A path or id that holds nothing the caller may see answers 404,
 as if it didn't exist.
@@ -168,7 +174,7 @@ as if it didn't exist.
 
 | Route | What it does |
 |---|---|
-| `POST /admin` | Directory and settings ops as JSON: `create_team`, `invite`, `set_settings`, `get_schema`, `set_schema`, `learn_advice`, `audit`, `retention`, `forget_user`, `export_org`, `snapshot`, `check_directory`, …; `"dry_run": true` where it applies |
+| `POST /admin` | Directory and settings ops as JSON: `create_team`, `invite`, `set_settings`, `get_schema`, `set_schema`, `learn_advice`, `audit`, `retention`, `forget_user`, `export_org`, `snapshot`, `check_directory`, `orgs` (the operator's: every org with its member count, admins and Auth0 org, in one call answered from the directory, `{orgs: [{org, members, admins, auth0_org}]}`), `show {org, fields}` (only those fields of the org's view, as `show` gives them to the caller, from the directory: no usage, and answered by the server asked, never the org's cell), `standing {org}` (what `show`'s limits say, from the directory: `{org, limits: {monthly_model_tokens, max_episodes, expires_at}, expired}`, to whoever `show` gives them), …; `"dry_run": true` where it applies |
 | `POST /closure` | Push a user's group changes or disable them (admin key) |
 | `POST /team`, `DELETE /team` | Replace or clear a team csv on every server (admin key) |
 | `POST /installations` | Register which org owns a connector installation (admin key) |

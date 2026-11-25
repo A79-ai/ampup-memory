@@ -170,6 +170,8 @@ Callers are the ones in the review's threat model. In the table, ✓ means allow
   In an org it selects it reads every episode some reader may (`Principal::reading_all`, `auth::READS_ALL`), never
   one whose ACL holds only entries no reader holds (`auth::no_reader`: a forgotten episode); its sign-ins and reads
   are audited under no org (the operator's view), not the org's.
+  The operator's admin key, in an org it selects on the routes that only read (the server's `operator_key_reads`),
+  reads as the org's admins do, not every episode, the org's scope only; its reads are audited the same way.
   A person signed in through Auth0 for an org's Organization is a Member or Admin of that org only.
 - **Catalog write** is anyone with write access to `memory_system`. It bypasses every check, because it
   appends rows itself.
@@ -191,7 +193,9 @@ Callers are the ones in the review's threat model. In the table, ✓ means allow
 | `ImportKeys` (`key.create` with `imported_user`) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ (the rows are the server's own keys file's, by id, or the owner's with `--direct`); the server holding the writer lease, for its own keys file's rows, as `server:keys-file` (§1) | ✗ | ✓ | `plan` (the import gate); `directory_change` (the fill by id); `file_keys::fate` |
 | `forget_user` (`member.remove`, `member.forget`) | ✗ | ✗ | own, as a person, not themselves | own | ✗ | ✗ | ✗ | its own tenants (`POST /tenants/{id}/users/{user}/forget`), also deleting the episodes it ingested that only that member reads | ✓ (every org) | ✗ | ✓ | `offboard.rs:may_manage`, `forget_user`: checked again inside the `member.remove` CAS, against the directory read fresh before each scope's memory is deleted, and inside the `member.forget` CAS. A caller who loses the right partway is refused there: the person is out of the org, no scope is half-forgotten, and someone who may can run it again to finish. |
 | `set_schema` (a ledger commit, not a directory event) | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | the template's built-in schema on a tenant of its own that has none (`if_unset`): as it is made, or on its next request on each server | ✓ | ✗ | ✓ | `directory_change` |
-| Read `show` | ✗ | own: themselves only | own | own (as whoever it signs in) | ✗ | own | ✗ | the tenant it names | all | all | — | `directory_change` |
+| Read `show` (with `fields`, the same view, those fields only) | ✗ | own: themselves only | own | own (as whoever it signs in) | ✗ | own | ✗ | the tenant it names | all | all | — | `directory_change` |
+| Read `standing` (an org's limits, from the directory) | ✗ | ✗ | own | own (as whoever it signs in) | ✗ | own | ✗ | where `show` gives it the org's limits | all | all | — | `directory_change`: whoever `show` gives the org's whole view (with its limits) to |
+| Read `orgs` (every org: its name, member count, admins and Auth0 org) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | — | `directory_change` |
 | Read the org's audit; `export_org` | ✗ | ✗ | own | own | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | — | `directory_change`; `offboard.rs:may_manage` |
 | Read the operator's audit; `snapshot`; `check_directory` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | admin file key only for the operator's audit | ✗ | — | `directory_change` |
 | `/ingest`, `/acl`, `/closure`, `/team`, `/metrics` (public port) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | `/ingest` into the tenant it names, ACLs translated | admin file key | ✗ | — | `server/mod.rs:require_admin` |
@@ -258,7 +262,7 @@ There is no key rotation: to rotate, change the key everywhere, then run `auth s
 | Bearer to caller (`request_principal`) | The keys file, `directory_auth` (5 s), and OIDC or JWT signatures, from the headers alone: `handle` runs it before reading the body, and refuses a caller it doesn't know with the body unread (BigQuery's service agent, which names its caller in the body, has its body read once its token is shown to be the agent's) | The catalog for keys and providers; the IdPs for identity, bound to their org; the app JWT issuer and gateways completely |
 | Scope selection (`select_scope` → `Directory::resolve`) | The 1 s fold | The catalog. A caller with no selection and no directory route gets the served scope. |
 | Memory reads (`/search`, `/query`, `/episode`, MCP) | The scope, then episode ACLs (`acl.rs`), then `may_read` | The catalog grants on namespaces. Facts are visible only if every cited episode is. |
-| `/me`, `show` | The fold, plus `key_usage` for `show` | The catalog. `/me` is reduced for ingest keys, and refused to directory keys. |
+| `/me`, `show`, `orgs`, `standing` | The fold, plus `key_usage` for `show` (with `fields`, only when `keys` is asked); the fold alone for `orgs`, `standing` and `show` with `fields` (on the server asked, never an org's cell) | The catalog. `/me` is reduced for ingest keys, and refused to directory keys. |
 | Audit (`audit::collect`) | The audit table, the fold (the incarnation, `Org::created_at`), the log's changes since that incarnation, and this server's buffer | The catalog, and the incarnation stamps |
 | `protected_resource` (anonymous) | The fold; it resolves the secret of a client that isn't confidential. The `resource` it names, and every 401's `WWW-Authenticate`, come from `AMPUP_MEMORY_PUBLIC_URL` (`public_url`, at start) | Nothing about the caller, its `Host` header included |
 | A server's first load | The newest snapshot plus the log after it, if this server's key sealed it; else the whole log, with the snapshot checked against it | The log; a snapshot only under its seal |

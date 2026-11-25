@@ -1,3 +1,6 @@
+// The CLI's async commands nest deep (a digest awaits the whole store), past the default 128.
+#![recursion_limit = "256"]
+
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -130,6 +133,14 @@ enum Cmd {
         /// A `serve --local` directory, instead of the catalog the environment names (stop the server first)
         #[arg(long)]
         local: Option<PathBuf>,
+    },
+    /// How sure the served-fact checks' model is that each case's conversation shows each of its facts wrong
+    /// (`served_checks::judge`, the decisions model the environment names): one JSON line a case
+    #[command(hide = true)]
+    FactChecksEval {
+        /// JSON lines, each `{id, facts: [{about, attribute, value}], conversation: [{person|agent: text}] |
+        /// transcript: "User: ...\nClaude: ..."}`; other fields are passed through
+        cases: PathBuf,
     },
     /// Answer a corpus's gold questions through the fact-key API
     Eval {
@@ -391,6 +402,20 @@ enum Cmd {
         /// At most this many sources this time
         #[arg(long, default_value_t = 100_000)]
         limit: usize,
+        /// What the sources are, over the scope's compile_kind setting (else AMPUP_MEMORY_COMPILE_KIND): errors
+        /// (error reports), or changes (pull requests, tickets, commits: one skill per procedure they repeat, not
+        /// one per change). Switching a library to changes compiles it again from the sources
+        #[arg(long)]
+        kind: Option<String>,
+        /// Compile nothing: list the skills an older prompt compiled whose sources the current compile has
+        /// read since (folded into the current skills, or no procedure at all), and the documents compiled
+        /// under goals/ before skills were per scope. With --apply, retire them on main (every version,
+        /// kept in the ledger, gone for readers) and write their audiences' indexes again
+        #[arg(long)]
+        retire: bool,
+        /// With --retire: retire what it lists
+        #[arg(long, requires = "retire")]
+        apply: bool,
         /// A `serve --local` directory, instead of the catalog the environment names (stop the server first)
         #[arg(long)]
         local: Option<PathBuf>,
@@ -1111,6 +1136,14 @@ enum RunsCmd {
         /// With --local and no --as: the groups `serve --local` was given (default `local`)
         #[arg(long, value_delimiter = ',')]
         groups: Vec<String>,
+        /// Import the runs as the org's, graded elsewhere, under this label (`import:<label>`) instead of as a
+        /// person: each line comes with its reward, and loading the file again records nothing new
+        #[arg(long, value_name = "LABEL", conflicts_with = "as_user")]
+        import: Option<String>,
+        /// With --import: who reads the imported traces (`user:<id>`, `group:<group>`; never `*`). Needed unless
+        /// --local, whose imports are kept to its groups
+        #[arg(long, value_delimiter = ',', requires = "import")]
+        acl: Vec<String>,
         /// A `serve --local` directory, instead of the catalog the environment names (stop the server first)
         #[arg(long)]
         local: Option<PathBuf>,
@@ -1291,6 +1324,14 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// jemalloc's counters for the memory log: what is allocated, what its pages hold resident, and the
 /// difference, the freed memory it hasn't returned yet.
+/// jemalloc's bytes allocated now, for the memory log's jumps.
+#[cfg(not(feature = "dylib"))]
+fn jemalloc_allocated() -> Option<usize> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().ok()?;
+    stats::allocated::read().ok()
+}
+
 #[cfg(not(feature = "dylib"))]
 fn jemalloc_stats() -> String {
     use tikv_jemalloc_ctl::{epoch, stats};
@@ -1331,6 +1372,8 @@ fn main() -> Result<()> {
     }
     #[cfg(not(feature = "dylib"))]
     let _ = memstore::metrics::ALLOCATOR_STATS.set(jemalloc_stats);
+    #[cfg(not(feature = "dylib"))]
+    let _ = memstore::metrics::ALLOCATED.set(jemalloc_allocated);
     let cli = Cli::parse();
     if let Some(c) = &cli.context {
         memstore::people::client::override_context(c);
@@ -1521,6 +1564,15 @@ async fn schema_set(
     Ok(())
 }
 
+/// How `memstore compile` runs beyond its scope, sources, branch and limit.
+struct CompileHow<'a> {
+    /// `--kind`: what the sources are, over the scope's setting.
+    kind: Option<&'a str>,
+    /// `--retire`: list (with `apply`, retire) what the current compile no longer stands behind, compiling nothing.
+    retire: bool,
+    apply: bool,
+}
+
 /// `memstore compile`: the scope's skill library from `sources` (else the scope's own compile sources) on `branch`.
 async fn compile(
     store: &Store,
@@ -1528,6 +1580,7 @@ async fn compile(
     sources: Option<&str>,
     branch: &str,
     limit: usize,
+    how: CompileHow<'_>,
 ) -> Result<()> {
     let cx = memstore::extract::Extractor::compile_from_env()?.ok_or_else(|| {
         anyhow::anyhow!(
@@ -1543,6 +1596,8 @@ async fn compile(
     let dir = memstore::people::directory::Directory::load(store)
         .await
         .ok();
+    // The models its org (or team) names, as `serve` compiles it: the same compiler ids.
+    let cx = memstore::compile::scoped_models(&cx, dir.as_ref(), &scope_);
     let sources = match sources {
         Some(s) => memstore::compile::parse_sources(s),
         None => memstore::compile::sources_for(dir.as_ref(), &scope_),
@@ -1553,9 +1608,62 @@ async fn compile(
          compile_sources"
     );
     // The scope's batch size and what its sources are, as its settings say, as `serve` compiles it: a group of
-    // sources per prompt.
+    // sources per prompt. `--kind` names what they are for this run.
+    let kind = match how.kind {
+        Some(k) => Some(
+            memstore::compile::Kind::parse(k)
+                .ok_or_else(|| anyhow::anyhow!("--kind is errors or changes, not {k:?}"))?,
+        ),
+        None => None,
+    };
+    let mut groups = memstore::compile::plan(dir.as_ref(), &scope_, &sources);
+    if kind.is_some() {
+        for (_, opts) in &mut groups {
+            opts.kind = kind;
+        }
+    }
+    if how.retire {
+        anyhow::ensure!(
+            branch == memstore::MAIN,
+            "--retire retires on main, for every branch: drop --branch"
+        );
+        // Only a `changes` group rebuilds, so only its old skills are retired.
+        let ids: Vec<(Vec<String>, String)> = groups
+            .iter()
+            .filter(|(_, o)| o.kind == Some(memstore::compile::Kind::Changes))
+            .map(|(s, o)| (s.clone(), memstore::compile::compiler_id_with(s, &cx, o)))
+            .collect();
+        let r = memstore::compile::retire(store, &scope_, &ids, how.apply).await?;
+        for (slug, into) in &r.skills {
+            if into.is_empty() {
+                println!("  {slug}: no current skill cites its sources");
+            } else {
+                println!("  {slug}: folded into {}", into.join(", "));
+            }
+        }
+        let verb = if how.apply { "retired" } else { "would retire" };
+        println!(
+            "{scope}: {verb} {} skills an older prompt compiled ({} more wait for the current compile to read their sources) and {} versions of documents compiled under goals/",
+            r.skills.len(),
+            r.waiting,
+            r.goal_versions
+        );
+        if r.held_for_owners {
+            println!(
+                "nothing retired: facts on owned entities cite these versions, so their owners must approve"
+            );
+        } else if how.apply {
+            println!(
+                "{} episodes retired (kept in the ledger), {} audience indexes written again",
+                r.retired, r.indexes
+            );
+        } else if !r.skills.is_empty() || r.goal_versions > 0 {
+            println!("run again with --apply to retire them");
+        }
+        return Ok(());
+    }
     let mut down = 0;
-    for (sources, opts) in memstore::compile::plan(dir.as_ref(), &scope_, &sources) {
+    for (sources, opts) in groups {
         let r = memstore::compile::run_with(store, &scope_, branch, &sources, &cx, &opts, limit)
             .await?;
         println!(
@@ -1606,19 +1714,31 @@ async fn runs(store: &Store, cmd: RunsCmd) -> Result<()> {
         file,
         as_user,
         groups,
+        import,
+        acl,
         local,
     } = cmd;
-    let person = match (&as_user, &local) {
-        (Some(u), _) => Some(principal(u)),
-        (None, Some(_)) => None,
-        (None, None) => anyhow::bail!(
-            "runs are a person's: name whose with --as <user> (only a --local store has a caller of its own)"
+    let person = match (&as_user, &local, &import) {
+        (Some(u), _, _) => Some(principal(u)),
+        (None, Some(_), _) | (None, None, Some(_)) => None,
+        (None, None, None) => anyhow::bail!(
+            "runs are a person's: name whose with --as <user>, or import them as the org's with --import <label> \
+             (only a --local store has a caller of its own)"
         ),
     };
     let groups = if groups.is_empty() {
         vec!["local".to_string()]
     } else {
         groups
+    };
+    // An import's traces: kept to the ACL named, else on a --local store to its groups, as its runs are.
+    let acl = match (&import, acl.is_empty(), &local) {
+        (None, _, _) => vec![],
+        (Some(_), false, _) => acl,
+        (Some(_), true, Some(_)) => groups.iter().map(|g| format!("group:{g}")).collect(),
+        (Some(_), true, None) => anyhow::bail!(
+            "an import's traces are kept to who --acl names (the org's admins, `user:<id>,...`): name them"
+        ),
     };
     let text =
         std::fs::read_to_string(&file).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
@@ -1641,15 +1761,24 @@ async fn runs(store: &Store, cmd: RunsCmd) -> Result<()> {
     anyhow::ensure!(!items.is_empty(), "{}: no runs", file.display());
     let t = std::time::Instant::now();
     let rewarded = items.iter().filter(|v| !v["reward"].is_null()).count();
-    let ids = memstore::runs::load(
-        store,
-        &Scope::parse(&scope)?,
-        person.as_ref(),
-        &groups,
-        &items,
-    )
-    .await
-    .map_err(|e| match e.downcast_ref::<memstore::runs::Refused>() {
+    let loaded = match &import {
+        Some(label) => {
+            memstore::runs::load_import(store, &Scope::parse(&scope)?, label, &acl, &items).await
+        }
+        None => memstore::runs::load(
+            store,
+            &Scope::parse(&scope)?,
+            person.as_ref(),
+            &groups,
+            &items,
+        )
+        .await
+        .map(|ids| memstore::runs::Imported {
+            recorded: ids.len(),
+            ids,
+        }),
+    };
+    let done = loaded.map_err(|e| match e.downcast_ref::<memstore::runs::Refused>() {
         Some(r) => {
             let at =
                 r.0.strip_prefix("runs[")
@@ -1663,14 +1792,23 @@ async fn runs(store: &Store, cmd: RunsCmd) -> Result<()> {
         }
         None => e,
     })?;
-    for id in &ids {
+    for id in &done.ids {
         println!("{id}");
     }
-    eprintln!(
-        "recorded {} runs ({rewarded} with rewards) in {scope} in {:.1}s",
-        ids.len(),
-        t.elapsed().as_secs_f64()
-    );
+    match &import {
+        Some(label) => eprintln!(
+            "imported {} new of {} runs as import:{label} in {scope} in {:.1}s ({} imported before)",
+            done.recorded,
+            done.ids.len(),
+            t.elapsed().as_secs_f64(),
+            done.ids.len() - done.recorded
+        ),
+        None => eprintln!(
+            "recorded {} runs ({rewarded} with rewards) in {scope} in {:.1}s",
+            done.ids.len(),
+            t.elapsed().as_secs_f64()
+        ),
+    }
     Ok(())
 }
 
@@ -2291,10 +2429,18 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             sources,
             branch,
             limit,
+            kind,
+            retire,
+            apply,
             local: Some(dir),
         } => {
             let store = local_store(dir).await?;
-            return compile(&store, scope, sources.as_deref(), branch, *limit).await;
+            let how = CompileHow {
+                kind: kind.as_deref(),
+                retire: *retire,
+                apply: *apply,
+            };
+            return compile(&store, scope, sources.as_deref(), branch, *limit, how).await;
         }
         Cmd::Advice {
             scope,
@@ -2407,6 +2553,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
         }
         Cmd::Mcp => return memstore::hook::bridge().await,
         Cmd::Doctor => return memstore::hook::doctor().await,
+        Cmd::FactChecksEval { cases } => return fact_checks_eval(cases).await,
         Cmd::SupportBundle {
             engine,
             admin_key_file,
@@ -2968,8 +3115,18 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             sources,
             branch,
             limit,
+            kind,
+            retire,
+            apply,
             ..
-        } => compile(&store, &scope, sources.as_deref(), &branch, limit).await?,
+        } => {
+            let how = CompileHow {
+                kind: kind.as_deref(),
+                retire,
+                apply,
+            };
+            compile(&store, &scope, sources.as_deref(), &branch, limit, how).await?
+        }
         Cmd::Backfill {
             scope,
             dry_run,
@@ -3176,6 +3333,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
         Cmd::Check(c) => println!("{}", check(c, catalog, &store).await?),
         Cmd::People(p) => memstore::people::cli::run(&p, Some(&store)).await?,
         Cmd::VerifyCorpus { .. }
+        | Cmd::FactChecksEval { .. }
         | Cmd::Hook { .. }
         | Cmd::Mcp
         | Cmd::Doctor
@@ -3801,4 +3959,28 @@ async fn serve_local(dir: &str, port: u16, scope: Scope, groups: Vec<String>) ->
         },
     )
     .await
+}
+
+/// `fact-checks-eval`: each case's facts put to the decisions model as the served-fact checks put them.
+async fn fact_checks_eval(cases: &std::path::Path) -> anyhow::Result<()> {
+    use memstore::served_checks::{Shown, conversation, judge};
+    let d = memstore::decide::Decider::from_env()?.ok_or_else(|| {
+        anyhow::anyhow!("no decisions model: set AMPUP_MEMORY_DECIDE and its key")
+    })?;
+    let text = std::fs::read_to_string(cases)?;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut case: serde_json::Value = serde_json::from_str(line)?;
+        let facts: Vec<Shown> = serde_json::from_value(case["facts"].clone())?;
+        let said = match case["conversation"].as_array() {
+            Some(c) => c.clone(),
+            None => conversation(case["transcript"].as_str().unwrap_or_default()),
+        };
+        case["likely"] = match judge(&d, &facts, &said).await {
+            Ok(p) => serde_json::json!(p),
+            Err(e) => serde_json::json!(format!("{e:#}")),
+        };
+        case["shown"] = serde_json::json!(said);
+        println!("{case}");
+    }
+    Ok(())
 }

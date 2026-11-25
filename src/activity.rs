@@ -86,7 +86,34 @@ pub fn view(entries: &[Logged], user: Option<&str>, since: i64, limit: usize) ->
     for g in mine.iter().filter_map(|l| gap(l)) {
         gaps[g] = json!(gaps[g].as_u64().unwrap_or(0) + 1);
     }
-    json!({"people": summary, "entries": shown, "more": mine.len() > limit, "serving": serving, "gaps": gaps})
+    json!({"people": summary, "entries": shown, "more": mine.len() > limit, "serving": serving, "gaps": gaps,
+           "by_day": by_day(entries)})
+}
+
+/// The days [`by_day`] counts back over.
+pub const BY_DAY_DAYS: i64 = 30;
+const DAY_MICROS: i64 = 86_400_000_000;
+
+/// Sessions, runs and answers begun on each of the last [`BY_DAY_DAYS`] days (UTC), oldest first, a day with none
+/// included: Home's chart of the month. Counted as the window above counts them (no internal or discarded entry).
+fn by_day(entries: &[Logged]) -> Vec<Value> {
+    let today = chrono::Utc::now().timestamp_micros().div_euclid(DAY_MICROS) * DAY_MICROS;
+    let first = today - (BY_DAY_DAYS - 1) * DAY_MICROS;
+    let mut n = vec![0u64; BY_DAY_DAYS as usize];
+    for l in entries
+        .iter()
+        .filter(|l| !crate::qa_log::internal(l) && !crate::sessions::discarded(l))
+        .filter(|l| l.asked_at >= first)
+    {
+        let i = ((l.asked_at - first) / DAY_MICROS) as usize;
+        if let Some(c) = n.get_mut(i) {
+            *c += 1;
+        }
+    }
+    n.iter()
+        .enumerate()
+        .map(|(i, c)| json!([first + i as i64 * DAY_MICROS, c]))
+        .collect()
 }
 
 /// Why an entry wasn't answered well, if it wasn't: its asker rated it unhelpful, a session or run went wrong (its

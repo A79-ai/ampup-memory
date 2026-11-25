@@ -589,6 +589,10 @@ pub fn process_memory() -> String {
 /// sets it for jemalloc). Unset, the log reads glibc's counters.
 pub static ALLOCATOR_STATS: std::sync::OnceLock<fn() -> String> = std::sync::OnceLock::new();
 
+/// The bytes the binary's global allocator has handed out now, when it can say (the server sets it for jemalloc):
+/// what [`crate::running::watch_jumps`] watches.
+pub static ALLOCATED: std::sync::OnceLock<fn() -> Option<usize>> = std::sync::OnceLock::new();
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn malloc_held() -> String {
     // SAFETY: mallinfo2 only reads the allocator's own counters.

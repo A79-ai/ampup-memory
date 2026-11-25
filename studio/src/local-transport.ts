@@ -7,8 +7,8 @@ import { ApiError, failedWithout, type Area, type Capabilities, type Transport }
  * and refuses a request naming an org (`?org=`, `x-memstore-org`): none is ever sent, and the selection's org is
  * only the pages' name for it. The branch read goes as `?branch=`.
  *
- * Admin reads (People, Branches, traces) and owner review are probed once: they appear when the server lets its
- * caller administer its own memory.
+ * Admin reads (People, Branches, traces) and owner review are probed once (the server's `/me` says): they appear
+ * when the server lets its caller administer its own memory.
  */
 export class LocalTransport implements Transport {
   readonly capabilities: Capabilities = {

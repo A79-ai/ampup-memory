@@ -40,7 +40,7 @@
 //! - a provisioner key (a sign-up service's) creates an org, binds it to its Auth0 Organization once, mints it an
 //!   ingest key, sets any org's limits and reads back the orgs it created, and does nothing else: no deleting,
 //!   no other org, no existing name, no other key role, no members, settings or schema, and no route but
-//!   `/admin`; an org's own admin can't set its limits.
+//!   `/admin`, not even one that only reads; an org's own admin can't set its limits.
 
 use std::time::{Duration, Instant};
 
@@ -457,6 +457,18 @@ async fn a_provisioner_key_sets_up_only_the_orgs_it_creates() {
         "{shown}"
     );
     assert_eq!(shown["usage"]["model_tokens"], 0, "{shown}");
+    // The same from the directory alone: its limits (`standing`), and only the fields asked for.
+    let (status, standing) = admin(json!({"op": "standing", "org": "trial"})).await;
+    assert_eq!(status, 200, "{standing}");
+    assert_eq!(standing["limits"], shown["limits"], "{standing}");
+    let (status, some) =
+        admin(json!({"op": "show", "org": "trial", "fields": ["created_by", "members"]})).await;
+    assert_eq!(status, 200, "{some}");
+    assert_eq!(
+        some,
+        json!({"view": {"created_by": "provisioner:signup", "members": {"pat@example.com": "admin"}}}),
+        "{some}"
+    );
     // An omitted limit is unchanged, a null one removed.
     let (status, body) =
         admin(json!({"op": "set_limits", "org": "trial", "expires_at": null})).await;
@@ -524,6 +536,8 @@ async fn a_provisioner_key_sets_up_only_the_orgs_it_creates() {
                "client_ids": ["evil-cli"], "required": true}}),
         json!({"op": "show", "org": "acme"}),
         json!({"op": "show"}),
+        json!({"op": "show", "org": "acme", "fields": ["members"]}),
+        json!({"op": "standing", "org": "acme"}),
     ] {
         let (status, body) = admin(change.clone()).await;
         assert_eq!(status, 403, "{change}: {body}");
@@ -537,6 +551,8 @@ async fn a_provisioner_key_sets_up_only_the_orgs_it_creates() {
         json!({"op": "create_key", "org": "trial", "name": "theirs", "role": "ingest", "key": other}),
         json!({"op": "set_schema", "org": "trial2", "schema": "sales"}),
         json!({"op": "show", "org": "trial"}),
+        json!({"op": "show", "org": "trial", "fields": ["members"]}),
+        json!({"op": "standing", "org": "trial"}),
     ] {
         let (status, body) = post(&s, "/admin", OTHER_PROVISIONER_KEY, &change).await;
         assert_eq!(status, 403, "{change}: {body}");
@@ -576,8 +592,22 @@ async fn a_provisioner_key_sets_up_only_the_orgs_it_creates() {
     // An org's admin must be a person's plain email.
     let (status, body) = admin(json!({"op": "create_org", "org": "trial3"})).await;
     assert_eq!(status, 400, "{body}");
-    // No route but /admin.
-    for path in ["/me", "/search", "/ingest?org=trial", "/mcp"] {
+    // No route but /admin: not even the routes that only read, on which the operator's admin key reads an org it
+    // selects, in an org it created or any other.
+    for path in [
+        "/me",
+        "/search",
+        "/ingest?org=trial",
+        "/mcp",
+        "/search?org=acme",
+        "/query?org=acme",
+        "/lessons?org=acme",
+        "/facts/list?org=acme",
+        "/advice/list?org=trial",
+        "/episode?org=trial",
+        "/browse?org=trial",
+        "/mcp?org=trial",
+    ] {
         let (status, body) = post(&s, path, PROVISIONER_KEY, &json!({})).await;
         assert_eq!(status, 403, "{path}: {body}");
     }

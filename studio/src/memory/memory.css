@@ -1469,6 +1469,36 @@
   .app-page {
     grid-template-rows: auto minmax(0, 1fr);
   }
+  /* The Explorer's tabs (Context tree, Graph), in its bar and above the graph. */
+  .explorer-tabs {
+    display: inline-flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: var(--r);
+    background: var(--sunken);
+  }
+  .explorer-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--s1);
+    padding: 4px var(--s3);
+    border: 0;
+    border-radius: calc(var(--r) - 2px);
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--t-sm);
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .explorer-tab:hover {
+    color: var(--ink);
+  }
+  .explorer-tab.on {
+    background: var(--surface);
+    color: var(--ink);
+    box-shadow: var(--shadow-sm);
+  }
   .bar-title {
     display: flex;
     align-items: center;
@@ -1958,273 +1988,6 @@
     box-shadow: var(--shadow-sm);
   }
 
-  /* Agent: a question on one or more arms (agent.tsx). */
-  .agent-quiet {
-    background: transparent;
-    border-color: transparent;
-  }
-  .agent-quiet:hover {
-    background: var(--sunken);
-  }
-  .agent-small {
-    height: 28px;
-    padding: 0 var(--s2);
-    font-size: var(--t-xs);
-  }
-  .agent-danger {
-    color: var(--error);
-    border-color: color-mix(in srgb, var(--error) 35%, transparent);
-  }
-  .agent-label {
-    font-size: var(--t-sm);
-    font-weight: 650;
-    color: var(--ink-2);
-  }
-  .agent-hint {
-    font-size: var(--t-sm);
-  }
-  .agent-arms {
-    display: grid;
-    gap: var(--s3);
-    margin-bottom: var(--s5);
-  }
-  .agent-arms-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--s3);
-  }
-  .agent-arm-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--s2);
-  }
-  .agent-arm {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--s1);
-    padding: 2px 2px 2px var(--s3);
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    background: var(--surface);
-  }
-  .agent-arm.on {
-    background: var(--accent-soft);
-    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  }
-  .agent-arm-pick {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--s2);
-    min-height: 32px;
-    font-size: var(--t-sm);
-    cursor: pointer;
-  }
-  .agent-arm-pick input {
-    accent-color: var(--accent);
-  }
-  .agent-arm-name {
-    font-weight: 600;
-  }
-  .agent-arm-meta {
-    font-size: var(--t-xs);
-  }
-  .agent-editor {
-    display: grid;
-    gap: var(--s3);
-    padding: var(--s4);
-    border: 1px solid var(--line);
-    border-radius: var(--r);
-    background: var(--surface-2);
-  }
-  .agent-editor-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--s3);
-  }
-  .agent-field {
-    display: grid;
-    gap: 4px;
-    flex: 1 1 200px;
-    font-size: var(--t-xs);
-    color: var(--muted);
-  }
-  .agent-field-sm {
-    flex: 0 1 120px;
-  }
-  .agent-tools {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: var(--s1) var(--s4);
-    margin: 0;
-    padding: 0;
-    border: 0;
-  }
-  .agent-tools legend {
-    margin-bottom: var(--s2);
-  }
-  .agent-tool {
-    display: grid;
-    grid-template-columns: auto 1fr;
-    column-gap: var(--s2);
-    align-items: baseline;
-    padding: 6px 0;
-    font-size: var(--t-sm);
-    cursor: pointer;
-  }
-  .agent-tool input {
-    accent-color: var(--accent);
-  }
-  .agent-tool .muted {
-    grid-column: 2;
-    font-size: var(--t-xs);
-  }
-  .agent-turn {
-    display: grid;
-    gap: var(--s3);
-    margin-bottom: var(--s6);
-  }
-  .agent-question {
-    justify-self: end;
-    max-width: 80%;
-    padding: var(--s2) var(--s4);
-    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-    border-radius: 12px;
-    background: var(--accent-soft);
-    white-space: pre-wrap;
-  }
-  .agent-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
-    gap: var(--s4);
-    align-items: start;
-  }
-  .agent-result {
-    min-width: 0;
-    overflow: hidden;
-  }
-  .agent-result-head {
-    display: grid;
-    gap: var(--s2);
-    padding: var(--s3) var(--s4);
-    border-bottom: 1px solid var(--line);
-    background: var(--surface-2);
-  }
-  .agent-result-title {
-    display: flex;
-    align-items: baseline;
-    gap: var(--s2);
-  }
-  .agent-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .agent-stats {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    margin: 0;
-    border-bottom: 1px solid var(--line);
-  }
-  .agent-stats > div {
-    min-width: 0;
-    padding: var(--s2) var(--s3);
-  }
-  .agent-stats > div + div {
-    border-left: 1px solid var(--line);
-  }
-  .agent-stats dt {
-    font-size: var(--t-xs);
-    color: var(--muted);
-    white-space: nowrap;
-  }
-  .agent-stats dd {
-    margin: 0;
-    font-size: var(--t-md);
-    font-weight: 650;
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .agent-trace {
-    padding: var(--s2) var(--s4);
-    border-bottom: 1px solid var(--line);
-    font-size: var(--t-sm);
-  }
-  .agent-trace > summary {
-    cursor: pointer;
-    font-weight: 600;
-    min-height: 28px;
-    display: flex;
-    align-items: center;
-    gap: var(--s2);
-  }
-  .agent-trace ol {
-    margin: var(--s2) 0 0;
-    padding-left: var(--s5);
-    display: grid;
-    gap: 4px;
-  }
-  .agent-trace li {
-    min-width: 0;
-  }
-  .agent-trace li summary {
-    min-width: 0;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: var(--s2);
-    cursor: pointer;
-  }
-  .agent-trace li.refused .agent-step-tool {
-    text-decoration: line-through;
-    color: var(--muted);
-  }
-  .agent-trace li.err .agent-step-tool {
-    color: var(--error);
-  }
-  .agent-step-args {
-    flex: 1 1 160px;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: var(--t-xs);
-  }
-  .agent-step-meta {
-    font-size: var(--t-xs);
-  }
-  .agent-step-text {
-    max-height: 260px;
-    overflow: auto;
-    margin: var(--s2) 0;
-    padding: var(--s2) var(--s3);
-    border-radius: var(--r-sm);
-    background: var(--code-bg);
-    font: var(--t-xs) / 1.5 var(--mono);
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-  }
-  .agent-stopped {
-    margin-bottom: var(--s2);
-    font-size: var(--t-xs);
-    font-weight: 600;
-    color: var(--warn);
-  }
-  .agent-composer {
-    position: sticky;
-    bottom: var(--s3);
-    box-shadow: var(--shadow);
-  }
-  /* With a conversation, the composer stays pinned over it as it scrolls. The turns end with room for it (its
-     measured height, --agent-composer-h, and a gap) and it sits in that room at the end, so the last answer, a long
-     "Why this answer" included, scrolls fully clear above it. */
-  .agent-convo-on > .agent-turns {
-    padding-bottom: calc(var(--agent-composer-h, 0px) + var(--s5));
-  }
-  .agent-convo-on > .agent-composer {
-    margin-top: calc(-1 * var(--agent-composer-h, 0px));
-  }
-
   /* Responsive: below 900px the sidebar is a drawer and the header keeps only what fits. */
   @media (max-width: 1100px) {
     .who-name {
@@ -2421,10 +2184,35 @@
   }
   .menu-label {
     font-size: var(--t-sm);
-    font-weight: 600;
+    font-weight: 500;
+  }
+  .menu-btn {
+    color: var(--muted);
+    border-color: transparent;
+    background: none;
+  }
+  .menu-btn:hover {
+    color: var(--ink);
+    background: var(--sunken);
   }
   .search-open[hidden] {
     display: none;
+  }
+  /* The bar: the tabs, and the folders' toggle on its own line under them; no rule beneath. */
+  .bar {
+    flex-wrap: wrap;
+    height: auto;
+    row-gap: var(--s2);
+    padding-top: var(--s1);
+    padding-bottom: var(--s2);
+    border-bottom: 0;
+  }
+  .bar-title {
+    flex: 0 0 100%;
+  }
+  .menu-btn {
+    margin-left: -10px;
+    height: 30px;
   }
   /* Below 900px the tree is already a drawer over the page (above); wider, a column beside it. */
   @media (min-width: 901px) {
@@ -2548,4 +2336,17 @@
   .learned-summary > .banner {
     margin-bottom: var(--s4);
   }
+}
+
+/* Above the graph: the Explorer's tabs, on a line of their own. */
+.memory.rv-shell > .explorer-tabs {
+  display: flex;
+  width: max-content;
+  margin-bottom: var(--s4);
+}
+
+/* Traces' tabs (Yours, Team), on a line of their own above the page. */
+.memory.traces-bar {
+  background: none;
+  margin-bottom: var(--s4);
 }

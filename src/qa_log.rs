@@ -617,6 +617,41 @@ pub async fn runs_cap(store: &Store, scope: &Scope, who: &Principal, adding: usi
     Ok(())
 }
 
+/// Refused when `adding` more imported runs would pass the most a scope imports in a day
+/// ([`crate::runs::max_imported_per_day`]), from every import source together. Counted as [`runs_cap`] counts a
+/// person's, from every row ever written.
+pub async fn imports_cap(store: &Store, scope: &Scope, adding: usize) -> Result<()> {
+    let since = now_micros() - DAY_MICROS;
+    let rows = store.side_rows(&scope.namespace(), QA_LOG).await?;
+    let mut ids = BTreeSet::new();
+    for b in rows.iter() {
+        let (id, asker, kind, asked) = (
+            strings(b, "answer_id"),
+            strings(b, "asker"),
+            optional_strings(b, "kind"),
+            timestamps(b, "asked_at"),
+        );
+        for i in 0..b.num_rows() {
+            if crate::runs::is_import(&asker[i])
+                && kind[i].as_deref() == Some("run")
+                && asked[i].is_some_and(|t| t >= since)
+            {
+                ids.insert(id[i].clone());
+            }
+        }
+    }
+    let max = crate::runs::max_imported_per_day();
+    if ids.len() + adding > max {
+        return Err(Refused(format!(
+            "{} runs were imported into {scope} today: {adding} more would pass the most a day, {max}; import the \
+             rest tomorrow",
+            ids.len()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Most runs one person may record in a scope in a day: `AMPUP_MEMORY_RUNS_PER_DAY`, default 100. An agent that
 /// records every run it makes, for advice to learn from (`crate::advice`), needs more.
 fn max_runs_per_day() -> usize {
@@ -641,18 +676,25 @@ pub struct RunEntry<'a> {
 /// (checked like an answer's) and its trace episode last among its episodes, so forgetting the trace drops the
 /// entry too; then, for each run given with a reward, the reward's row, as [`reward`] would add it later (the
 /// newest row is the entry). Runs are asked a microsecond apart in their order, so the log, and advice reading
-/// runs oldest first, keep it. A refusal names its run ([`of_item`]); nothing is written then.
+/// runs oldest first, keep it. A refusal names its run ([`of_item`]); nothing is written then. `by` wrote them:
+/// `who`, or for an import (`who` an import source, [`crate::runs::IMPORT`]) the admin or operator who sent it, whose
+/// runs count toward the scope's day's imports rather than a person's caps.
 pub async fn log_runs(
     store: &Store,
     scope: &Scope,
     who: &Principal,
+    by: &str,
     runs: &[RunEntry<'_>],
     label: Option<&str>,
 ) -> Result<()> {
-    runs_cap(store, scope, who, runs.len()).await?;
     let rewards = runs.iter().filter(|r| r.reward.is_some()).count();
-    if rewards > 0 {
-        entries_cap(store, scope, who, runs.len() + rewards).await?;
+    if crate::runs::is_import(who.user()) {
+        imports_cap(store, scope, runs.len()).await?;
+    } else {
+        runs_cap(store, scope, who, runs.len()).await?;
+        if rewards > 0 {
+            entries_cap(store, scope, who, runs.len() + rewards).await?;
+        }
     }
     let entries: Vec<&Value> = runs.iter().map(|r| r.entry).collect();
     let checked = checked_all(store, scope, who, &entries, label).await?;
@@ -675,7 +717,7 @@ pub async fn log_runs(
         rows.push(l);
     }
     rows.extend(rewarded);
-    store.write_qa_rows(scope, who.user(), &rows).await
+    store.write_qa_rows(scope, by, &rows).await
 }
 
 /// Attaches a reward (-1 to 1) and its reason to an answer or run `who` logged; the newest row is the entry.
@@ -922,13 +964,25 @@ pub async fn judged(store: &Store, scope: &Scope, judgements: &[Judgement]) -> R
 /// (committed, not retracted, not erased or forgotten) is applied to them on every call, from main's visibility
 /// as it is now. Never cached by time.
 pub async fn list(store: &Store, scope: &Scope, goal: Option<&str>) -> Result<Vec<Logged>> {
+    list_where(store, scope, goal, |_| true).await
+}
+
+/// [`list`], only the entries `keep` keeps: each answer's newest row is chosen as `list` chooses it, then kept or
+/// not, and only those kept are copied. A caller after one session or one person's reads only theirs: a listing
+/// copies every entry of the log, which in a large org is a GB, and a session's end read it three times.
+pub async fn list_where(
+    store: &Store,
+    scope: &Scope,
+    goal: Option<&str>,
+    keep: impl Fn(&Logged) -> bool,
+) -> Result<Vec<Logged>> {
     // Main's last state may serve while the next is built: what was recorded since comes with it, so an entry
     // logged a moment ago is listed, and nothing taken away is.
     let view = store.lagging_view(scope, MAIN).await?;
     crate::phases::mark("qa_log view");
     let rows = store.side_rows(&scope.namespace(), QA_LOG).await?;
     let decoded = decoded(scope, rows);
-    let out = newest(&view, &decoded, goal);
+    let out = newest(&view, &decoded, goal, keep);
     crate::phases::mark("qa_log newest");
     Ok(out)
 }
@@ -1102,7 +1156,12 @@ fn decode(rows: &[arrow_array::RecordBatch]) -> Vec<Row> {
 }
 
 /// The answers `vis` lets be read, each as its newest row; only `goal`'s with one; newest first.
-fn newest(view: &View, chunks: &[Arc<Vec<Row>>], goal: Option<&str>) -> Vec<Logged> {
+fn newest(
+    view: &View,
+    chunks: &[Arc<Vec<Row>>],
+    goal: Option<&str>,
+    keep: impl Fn(&Logged) -> bool,
+) -> Vec<Logged> {
     let rows: Vec<&Row> = chunks.iter().flat_map(|c| c.iter()).collect();
     // Each answer's newest row, except that a session its agent ended is final: no row without that end (a
     // conversation kept, or the sweep's idle end, from a read taken before the end landed) supersedes it.
@@ -1142,7 +1201,7 @@ fn newest(view: &View, chunks: &[Arc<Vec<Row>>], goal: Option<&str>) -> Vec<Logg
     let mut out: Vec<Logged> = newest
         .into_values()
         .map(|(_, i)| &rows[i].logged)
-        .filter(|l| goal.is_none_or(|g| l.goal.as_deref() == Some(g)))
+        .filter(|l| goal.is_none_or(|g| l.goal.as_deref() == Some(g)) && keep(l))
         .map(|l| {
             let mut l = l.clone();
             if let (Some(s), Some(p)) = (l.session.as_mut(), prs_of.remove(l.answer_id.as_str())) {

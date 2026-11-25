@@ -284,6 +284,7 @@ impl<T: Send + Sync + 'static> RowCache<T> {
         let ds = ds.clone();
         tokio::spawn(async move {
             let t0 = std::time::Instant::now();
+            let _running = crate::running::running(format!("index rows held: {uri} v{version}"));
             match self.hold(&ds, columns, decode, size, budget).await {
                 Ok(h) => {
                     if h.read > 0 || h.dropped > 0 || h.pruned > 0 {

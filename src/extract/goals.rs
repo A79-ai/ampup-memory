@@ -1686,6 +1686,28 @@ fn missed_quote(units: &[Unit], quote: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// What the rows `ep` dropped say its schema has no room for ([`crate::schema_growth`]): a row under a type the
+/// schema doesn't declare (`unknown_type`: the type its subject names), or with a predicate the subject's declared
+/// type doesn't (`schema`, where the check says so). Names only, made identifiers; never a value or a quote.
+pub(super) fn misses(ep: &Episode, dropped: &[Value]) -> Vec<crate::schema_growth::Miss> {
+    let mut out: Vec<crate::schema_growth::Miss> = dropped
+        .iter()
+        .filter(|d| d.get("engine_fact").is_none())
+        .filter_map(|d| {
+            let predicate = d["row"]["predicate"].as_str()?;
+            let ty = match d["code"].as_str()? {
+                "unknown_type" => d["row"]["subject"].as_str()?.split_once(':')?.0,
+                "schema" => d["why"].as_str()?.split_once(" has no predicate ")?.0,
+                _ => return None,
+            };
+            crate::schema_growth::Miss::new(&ep.episode_id, ty, predicate)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// A dropped row as a log names it ([`super::refusal_note`]): why in a word, the predicate, and the subject and
 /// value as the model wrote them, never the quote (the full reason stays in a dry run's report).
 pub(super) fn drop_note(d: &Value) -> String {
@@ -1865,6 +1887,9 @@ pub(super) async fn run(
                                     ep.episode_id,
                                     drop_note(d)
                                 );
+                            }
+                            if report.is_none() {
+                                done.misses.extend(misses(&ep, &found.dropped));
                             }
                             if let (Some(d), None) = (found.dropped.first(), &report) {
                                 super::record_refused(

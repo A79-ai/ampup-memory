@@ -33,10 +33,15 @@ const READS: [&str; 8] = [
 ];
 
 /// The models a run may ask for, by name, and the OpenRouter model each is.
-const MODELS: [(&str, &str); 3] = [
+const MODELS: [(&str, &str); 8] = [
     ("haiku", "anthropic/claude-haiku-5.5"),
     ("sonnet", "anthropic/claude-sonnet-5.5"),
     ("opus", "anthropic/claude-opus-5.5"),
+    ("fable", "anthropic/claude-fable-5.2"),
+    ("gpt-sol", "openai/gpt-6.2-sol"),
+    ("gpt-terra", "openai/gpt-6.1-terra"),
+    ("deepseek", "deepseek/deepseek-v4-pro-0813"),
+    ("qwen", "qwen/qwen4-max"),
 ];
 
 /// The most tool calls one run makes, whatever it asks.
@@ -75,7 +80,7 @@ pub(super) struct Ask {
 }
 
 impl Ask {
-    /// Reads a request body: `{question, tools: [name], model?: haiku|sonnet|opus, max_tool_calls?, history?:
+    /// Reads a request body: `{question, tools: [name], model?: a name in [`MODELS`], max_tool_calls?, history?:
     /// [{question, answer}]}`. An error is the caller's to fix (a 400).
     pub fn parse(v: &Value) -> Result<Ask, String> {
         let question = v["question"]
@@ -110,7 +115,10 @@ impl Ask {
             .iter()
             .find(|(n, id)| *n == name || *id == name)
             .map(|(_, id)| *id)
-            .ok_or_else(|| format!("model is haiku, sonnet or opus, not {name}"))?;
+            .ok_or_else(|| {
+                let names: Vec<&str> = MODELS.iter().map(|(n, _)| *n).collect();
+                format!("model is one of {}, not {name}", names.join(", "))
+            })?;
         let max_calls = match &v["max_tool_calls"] {
             Value::Null => 8,
             n => n
@@ -318,6 +326,10 @@ pub(super) async fn run(
         "tokens": {"in": tokens_in, "out": tokens_out},
         "cost": cost,
         "ms": started.elapsed().as_millis() as u64,
+        // What the model was given, for a playground's "Raw context": the conversation as it last saw it (system
+        // prompt, earlier turns, the question, its tool calls and what each returned, cut as it got them) and the
+        // tools it was offered with their schemas.
+        "context": {"messages": messages, "tools": offered},
     }))
 }
 

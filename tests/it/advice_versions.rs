@@ -215,6 +215,27 @@ async fn trail_until(admin_url: &str, done: impl Fn(&Value) -> bool) -> Value {
     }
 }
 
+/// Waits until acme's learn has finished (`advice_status`): it holds the scope until it has said so, and an op that
+/// changes the map meanwhile is refused as the scope being learned.
+async fn learned(admin_url: &str) {
+    let up = Instant::now();
+    loop {
+        let (status, body) = post(
+            admin_url,
+            ADMIN_KEY,
+            &json!({"op": "advice_status", "org": "acme"}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        if v["learning"].is_null() && !v["last_learn"].is_null() {
+            return;
+        }
+        assert!(up.elapsed() < Duration::from_secs(60), "{v}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
 /// The item of `note` whose text holds `word`.
 fn item<'a>(note: &'a Value, word: &str) -> &'a Value {
     note["items"]
@@ -374,6 +395,7 @@ async fn a_notes_lessons_are_traced_item_by_item_across_its_versions() {
     let step_id = item(&n, "KEEP-STEP")["id"].as_str().unwrap().to_string();
     let fact_id = item(&n, "OLD-FACT")["id"].as_str().unwrap().to_string();
     let pitfall_id = item(&n, "OLD-PITFALL")["id"].as_str().unwrap().to_string();
+    learned(&admin_url).await;
     let (status, body) = post(
         &admin_url,
         ADMIN_KEY,

@@ -8,11 +8,13 @@
 //! - `week`: the facts that took effect in the last seven days: how many, and of the newest of them how many were
 //!   read (`sample`), the entities they are about and where they came from (`by_source`, by a source's first
 //!   segment);
+//! - `month` (with `week`): the facts that took effect on each of the last 30 days (UTC), for Home's chart;
 //! - `lessons`: how many lessons were learned in the week (`lessons {count: true}`);
 //! - `advice`: the team's notes served in the week (`advice_usage`): how often, how many notes, and how many of
 //!   those served wait for ratifying;
 //! - `activity` (an org's admins, where it shows its people's activity): who asked or ran something in the week,
-//!   how many sessions, and how many of them were given advice;
+//!   how many sessions, how many of them were given advice, and the sessions, runs and answers begun on each of the
+//!   last 30 days (`by_day`);
 //! - `proposals`: those that wait on the caller, and all that wait for review; `conflicts`: those on what the
 //!   caller owns;
 //! - `dream` (an org's admins): its last pass, what waits and what it applied (as `dream_decisions` answers, with
@@ -55,6 +57,8 @@ use super::*;
 
 /// The days Home counts back over.
 const WEEK_DAYS: i64 = 7;
+/// The days Home's chart shows, one bar each (the activity's `by_day` counts as many).
+const MONTH_DAYS: i64 = crate::activity::BY_DAY_DAYS;
 const DAY_MICROS: i64 = 86_400_000_000;
 /// The newest of the week's facts read to say where they came from (`count` is the whole week's).
 const FACT_SAMPLE: usize = 200;
@@ -365,6 +369,10 @@ async fn answer(
             "people": people.len(),
             "sessions": people.iter().map(|p| n(&p["sessions"]) + n(&p["runs"]) + n(&p["answers"])).sum::<u64>(),
         });
+        // Sessions, runs and answers begun on each of the last 30 days, for the chart of the month.
+        if a["by_day"].is_array() {
+            v["by_day"] = a["by_day"].clone();
+        }
         // How many sessions were given advice, of how many, where the log says.
         for (k, from) in [("served", "sessions_served"), ("of", "sessions")] {
             if !a["serving"][from].is_null() {
@@ -461,7 +469,7 @@ async fn answer(
             Some(Err(_)) => pending.push(name),
             Some(Ok(v)) if name == "week" => {
                 let v = v.unwrap_or_default();
-                for k in ["week", "sources", "advice"] {
+                for k in ["week", "sources", "advice", "month"] {
                     out[k] = v[k].clone();
                 }
             }
@@ -579,7 +587,7 @@ async fn ahead(store: &Store, session: &Session, key: &str, wanted: &[&str]) -> 
     let mut out = json!({"since": kept["since"], "pending": []});
     for p in wanted {
         let fields: &[&str] = match *p {
-            "week" => &["week", "sources", "advice"],
+            "week" => &["week", "sources", "advice", "month"],
             p => &[p],
         };
         for f in fields {
@@ -735,17 +743,26 @@ async fn week(
     reader: crate::browse::Reader<'_>,
     since: i64,
 ) -> Result<Value> {
-    let (facts, advice, sources) = (
+    // The month's facts start at the first of its 30 days (UTC), as the activity's days do.
+    let month_from = (since + WEEK_DAYS * DAY_MICROS).div_euclid(DAY_MICROS) * DAY_MICROS
+        - (MONTH_DAYS - 1) * DAY_MICROS;
+    let (facts, advice, sources, month) = (
         // The facts as `entities/` counts them: a note's own fact is a note, counted under notes.
         json!({"op": "facts", "valid_from": {"gte": since}, "limit": FACT_SAMPLE, "order": "newest", "notes": false}),
         json!({"op": "advice_usage", "days": WEEK_DAYS}),
         json!({"op": "ls", "path": ["sources"], "limit": 1000}),
+        json!({"op": "facts", "valid_from": {"gte": month_from}, "limit": 1, "notes": false, "by_day": true}),
     );
     let facts = crate::browse::run(store, session, reader, &facts);
     let advice = crate::browse::run(store, session, reader, &advice);
     let sources = crate::browse::run(store, session, reader, &sources);
-    let (facts, advice, sources) =
-        tokio::join!(Box::pin(facts), Box::pin(advice), Box::pin(sources));
+    let month = crate::browse::run(store, session, reader, &month);
+    let (facts, advice, sources, month) = tokio::join!(
+        Box::pin(facts),
+        Box::pin(advice),
+        Box::pin(sources),
+        Box::pin(month)
+    );
     let week = facts.ok().map(|f| {
         let sample = f["facts"].as_array().cloned().unwrap_or_default();
         let entities: HashSet<&str> = sample.iter().filter_map(|f| f["entity"].as_str()).collect();
@@ -785,5 +802,21 @@ async fn week(
         children.truncate(SOURCES_SHOWN);
         children
     });
-    Ok(json!({"week": week, "advice": advice, "sources": sources}))
+    // The facts that took effect on each of the month's days, oldest first, a day with none included.
+    let month = month.ok().map(|m| {
+        let got: BTreeMap<i64, u64> = m["by_day"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| Some((d[0].as_i64()?, d[1].as_u64()?)))
+            .collect();
+        let days: Vec<Value> = (0..MONTH_DAYS)
+            .map(|i| {
+                let d = month_from + i * DAY_MICROS;
+                json!([d, got.get(&d).copied().unwrap_or(0)])
+            })
+            .collect();
+        json!({"facts": days})
+    });
+    Ok(json!({"week": week, "advice": advice, "sources": sources, "month": month}))
 }

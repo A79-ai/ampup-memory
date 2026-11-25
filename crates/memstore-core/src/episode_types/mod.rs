@@ -266,17 +266,22 @@ pub fn name_of_source(source: &str) -> Option<&'static str> {
 
 /// Sources the engine writes itself, never a caller: goals from before they were retired (`goal:`), compiled
 /// skills (`compile:`), advice learned from runs (`advice:`) and a dream's record of each decision it made
-/// (`dream:`), a merge's record of the conflicts it resolved (`merge:`), and reconcile's record of two facts that
-/// disagree (`reconcile:`, [`crate::conflicts`]). They are the engine's documents about the memory, of no episode
+/// (`dream:`), a merge's record of the conflicts it resolved (`merge:`), reconcile's record of two facts that
+/// disagree (`reconcile:`, [`crate::conflicts`]), and what extraction met that the schema has no type for
+/// (`schema-growth:`, `memstore::schema_growth`). They are the engine's documents about the memory, of no episode
 /// type, and nothing extracts facts from them.
-pub const ENGINE_SOURCES: [&str; 6] = [
+pub const ENGINE_SOURCES: [&str; 7] = [
     "goal:",
     "compile:",
     "advice:",
     "dream:",
     "merge:",
     crate::conflicts::SOURCE,
+    SCHEMA_GROWTH_SOURCE,
 ];
+
+/// The source of the engine's record of what extraction met that the schema has no type for.
+pub const SCHEMA_GROWTH_SOURCE: &str = "schema-growth:";
 
 /// Whether `source` is one the engine writes itself ([`ENGINE_SOURCES`]).
 pub fn engine_source(source: &str) -> bool {

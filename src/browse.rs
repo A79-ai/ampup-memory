@@ -1,6 +1,9 @@
 //! `/browse`: a scope's memory as a file tree, for a UI to walk. Up to three trees hang off the root:
 //!
-//! - `sources/…`: episodes by their source split at `:` (`slack:C09:1712.3` is `sources/slack/C09/1712.3`).
+//! - `sources/…`: episodes by their source split at `:` (`slack:C09:1712.3` is `sources/slack/C09/1712.3`), but for
+//!   the engine's own documents (advice, compiled skills, dreams: [`crate::episode_types::ENGINE_SOURCES`]). Those are
+//!   what the memory wrote about itself, not what it was told: each version shows on its own page instead (a note's
+//!   under `advice/`, a skill's under `skills/`), and an episode op names that page as its path.
 //! - `entities/<type>/<key>`: facts by the entity they are about (`deal:42` is `entities/deal/42`).
 //! - `skills/<slug>`: the skills compiled from the scope's documents (`crate::compile`), there only when the
 //!   caller may read one on the branch read. The folder lists the routing index and each skill with when it
@@ -120,7 +123,19 @@ pub async fn run(
                         .ok_or_else(|| bad("days is a whole number of days, 1 to 3650"))?,
                 ),
             };
-            usage_kept(store, session.scope(), reader, days).await
+            // One person's own notes instead of the reader's: an admin's view of someone (as `/lessons` reads
+            // them), or the reader naming themselves.
+            let person = match req["person"].as_str().filter(|p| !p.is_empty()) {
+                Some(p)
+                    if !reader.every_session
+                        && crate::auth::acl::norm_id(p)
+                            != crate::auth::acl::norm_id(who.user()) =>
+                {
+                    return Err(bad("you read only your own advice and the team's"));
+                }
+                p => p.map(crate::auth::acl::norm_id),
+            };
+            usage_kept(store, session.scope(), reader, days, person).await
         }
         // What it learned, lesson by lesson, with where each came from and where it was served (`/lessons`).
         "lessons" => crate::lessons::run(store, session, reader, req).await,
@@ -315,15 +330,17 @@ async fn usage_kept(
     scope: &crate::Scope,
     reader: Reader<'_>,
     days: Option<u64>,
+    person: Option<String>,
 ) -> Result<Value> {
     let mark = crate::kept_answers::Mark::read(store, scope).await?;
     let now = store.lagging_visibility(scope, crate::MAIN).await?;
     let log = crate::kept_answers::Log::read(store, scope).await?;
     let at = crate::kept_answers::At::with_log(mark, &now, log);
     let key = format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}",
         crate::kept_answers::reader_key(reader.who),
         reader.every_session,
+        person.as_deref().unwrap_or_default(),
         days.map_or_else(
             || "all".to_string(),
             |d| format!("{d} in {}", crate::kept_answers::span())
@@ -338,7 +355,7 @@ async fn usage_kept(
     let usage = USAGE
         .get(&scope.namespace(), &key, at, true, || async move {
             let since = days.map_or(0, |d| crate::now_micros() - d as i64 * 86_400_000_000);
-            crate::advice::usage(&store2, &scope2, &who, every, since).await
+            crate::advice::usage(&store2, &scope2, &who, every, since, person.as_deref()).await
         })
         .await?;
     Ok((*usage).clone())
@@ -510,10 +527,19 @@ async fn ls(
                 let found = leaves
                     .into_iter()
                     .find(|(p, _)| p == &[space.clone(), category.clone(), situation.clone()]);
-                return match found {
-                    Some((_, a)) => Ok(json!({"path": path, "advice": a})),
-                    None => Err(NotFound.into()),
+                let Some((_, a)) = found else {
+                    return Err(NotFound.into());
                 };
+                // Every version of its note the caller may read, newest first.
+                let doc = a["note_id"]
+                    .as_str()
+                    .and_then(|id| session.vis().document_of(id))
+                    .map(str::to_string);
+                let history = match doc {
+                    Some(k) => history(store, session, who, &k).await?,
+                    None => vec![],
+                };
+                return Ok(json!({"path": path, "advice": a, "history": history}));
             }
             let mut folders: BTreeMap<&str, (usize, Option<&Value>)> = BTreeMap::new();
             for (p, a) in &leaves {
@@ -545,7 +571,7 @@ async fn ls(
             let eps = episodes(store, session, who).await?;
             let under: Vec<&Ep> = eps
                 .iter()
-                .filter(|e| e.segments().starts_with(&at))
+                .filter(|e| listed_source(&e.source) && e.segments().starts_with(&at))
                 .collect();
             if under.is_empty() && !at.is_empty() {
                 return Err(NotFound.into());
@@ -683,12 +709,15 @@ async fn episode(store: &Store, session: &Session, who: &Principal, id: &str) ->
     let truncated = body.len() > BODY_BYTES;
     let text = String::from_utf8_lossy(&body[..body.len().min(BODY_BYTES)]).into_owned();
     // Where the Explorer lists it: a note (one its fact cites) under `notes`, anything else under `sources/`.
-    let path = match crate::note_facts::is_note(&e.source) {
-        true => vec!["notes".to_string()],
-        false => std::iter::once("sources")
+    let path = if crate::note_facts::is_note(&e.source) {
+        vec!["notes".to_string()]
+    } else if !listed_source(&e.source) {
+        engine_path(store, session, who, &e.id).await?
+    } else {
+        std::iter::once("sources")
             .chain(e.segments())
             .map(String::from)
-            .collect::<Vec<_>>(),
+            .collect::<Vec<_>>()
     };
     let cites: Vec<Value> = facts
         .iter()
@@ -846,7 +875,8 @@ async fn skills(
             };
             let mut v = json!({"path": path, "name": name,
                                "kind": if index { "skill_index" } else { "skill" },
-                               "markdown": markdown, "episode_id": id, "occurred_at": at});
+                               "markdown": markdown, "episode_id": id, "occurred_at": at,
+                               "history": history(store, session, who, &key).await?});
             // The episodes it was compiled from that the caller may read, each with its name; the rest
             // are only counted.
             if let Some((meta, _)) = crate::compile::parse_skill(&body) {
@@ -1042,6 +1072,83 @@ fn keep_root(
     );
 }
 
+/// Whether `sources/` lists an episode from `source`: anything but the engine's own documents
+/// ([`crate::episode_types::engine_source`]), whose versions show on their own pages.
+fn listed_source(source: &str) -> bool {
+    !crate::episode_types::engine_source(source)
+}
+
+/// Versions of a document's history shown, at most.
+const HISTORY: usize = 50;
+
+/// Every version of document `key` the caller may read, newest first, each with when it was written and its first
+/// line: a note's or a skill's history, each version readable with the `episode` op.
+async fn history(
+    store: &Store,
+    session: &Session,
+    who: &Principal,
+    key: &str,
+) -> Result<Vec<Value>> {
+    let versions = session.versions(store, who, key).await?;
+    Ok(versions
+        .iter()
+        .take(HISTORY)
+        .map(|(id, at, body)| {
+            let text = String::from_utf8_lossy(body);
+            // A skill's first line is the compiler's record of it, not its title.
+            let shown = match text.split_once('\n') {
+                Some((first, rest)) if first.starts_with("<!-- memstore skill ") => rest,
+                _ => text.as_ref(),
+            };
+            json!({"episode_id": id, "occurred_at": at, "title": title(shown)})
+        })
+        .collect())
+}
+
+/// Where the Explorer shows a version of one of the engine's own documents: the piece of advice or the skill it is a
+/// version of, else the folder of its kind (`advice` for the advice index and map, `skills` for a skills index).
+/// Anything else the engine wrote (a dream's, a merge's or reconcile's record) has no page and is named by its source
+/// alone, under no folder.
+async fn engine_path(
+    store: &Store,
+    session: &Session,
+    who: &Principal,
+    id: &str,
+) -> Result<Vec<String>> {
+    let Some(doc) = session.vis().document_of(id).map(str::to_string) else {
+        return Ok(vec![]);
+    };
+    let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    if let Some(slug) = doc
+        .strip_prefix(crate::compile::SKILLS)
+        .or_else(|| doc.strip_prefix(crate::compile::AIP))
+    {
+        return Ok(match crate::compile::is_index(&doc) {
+            true => strings(&["skills"]),
+            false => strings(&["skills", slug]),
+        });
+    }
+    if doc.starts_with(crate::advice::PREFIX) || doc.starts_with(crate::advice::MINE) {
+        let vis = session.vis();
+        let found = advice(store, session, who)
+            .await?
+            .into_iter()
+            .find(|a| a["note_id"].as_str().and_then(|n| vis.document_of(n)) == Some(doc.as_str()));
+        return Ok(match found {
+            Some(a) => {
+                ["space", "category", "situation"]
+                    .iter()
+                    .fold(strings(&["advice"]), |mut p, k| {
+                        p.push(a[*k].as_str().unwrap_or_default().to_string());
+                        p
+                    })
+            }
+            None => strings(&["advice"]),
+        });
+    }
+    Ok(vec![])
+}
+
 /// Counts the root's folders: the episodes (and from them the notes), the facts and the advice read side by side.
 async fn count_root(store: &Store, session: &Session, who: &Principal) -> Result<Counts> {
     let read_eps = async {
@@ -1067,7 +1174,10 @@ async fn count_root(store: &Store, session: &Session, who: &Principal) -> Result
         ("notes", notes),
         ("sessions", filed(&eps, who).len()),
         ("skills", skill_keys(session, who).len()),
-        ("sources", eps.len()),
+        (
+            "sources",
+            eps.iter().filter(|e| listed_source(&e.source)).count(),
+        ),
     ])
 }
 

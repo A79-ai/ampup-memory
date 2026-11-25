@@ -31,6 +31,19 @@
 //! advice learned from them the same prompts, which the model-call cache answers (`crate::extract::cache`); and
 //! loading the same file twice records each run once. A batch item may name its own `id` (a UUID) instead: one
 //! another person recorded is refused.
+//!
+//! **Imported runs.** Runs already graded elsewhere (exported from another system, a CI, a benchmark, an earlier
+//! agent's logs) are the organization's, not a person's: `POST /runs {import: "<label>", runs: [...], acl?: [...]}`
+//! ([`import`]), or `memstore runs load --import <label>`, records them as the import source `import:<label>`
+//! ([`IMPORT`]), never as whoever sent them. Only an org's admin or the operator imports (the server checks who);
+//! a member or a service key is refused. Each run comes with its reward, the outside grader's, and names no facts
+//! it used (another system's ids aren't this memory's). Their traces are kept to the org's admins as the directory
+//! has them at the import, or to the `acl` the import names: people of the org, or the whole org, never `*`. The
+//! org's admins also read any of them as they read every person's runs. A day's imports into a scope have one
+//! allowance of their own ([`max_imported_per_day`]), apart from every person's day's caps, which they never count
+//! toward; ids are made as a batch's are, from the import source rather than the sender, so the same file imported
+//! again, by anyone, records nothing new, and those runs count toward nothing. Advice weighs an imported run an
+//! outcome rewarded as evidence of what happened, not as one person's habit (`crate::advice`).
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -48,6 +61,133 @@ const MAX_ADVICE_KEYS: usize = 10;
 /// Most runs one `POST /runs` records, and rewards one `POST /runs/reward` attaches: a batch is checked whole in
 /// memory before it's written. `memstore runs load` isn't a request, and loads a whole file as one batch.
 pub const MAX_BATCH: usize = 1_000;
+
+/// What an imported run's log entry names as its asker, before its label: `import:<label>`. No person's id is one
+/// (a person is an email, and an ACL can't name an id with a `:`), and only [`import`] writes it.
+pub const IMPORT: &str = "import:";
+
+/// Longest import label, in characters.
+const MAX_LABEL: usize = 64;
+
+/// Whether `asker` is an import source ([`IMPORT`]) rather than a person.
+pub fn is_import(asker: &str) -> bool {
+    asker
+        .trim()
+        .strip_prefix(IMPORT)
+        .is_some_and(|l| !l.is_empty() && !l.contains('@'))
+}
+
+/// The import source `label` names (`import:<label>`): 1 to [`MAX_LABEL`] lowercase letters, digits, `.`, `_` and
+/// `-`, so it can never be a person's id, and a source signed with it reads as its author ([`crate::profile`]).
+pub fn import_source(label: &str) -> Result<String> {
+    let l = label.trim();
+    if l.is_empty()
+        || l.chars().count() > MAX_LABEL
+        || !l
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+    {
+        return Err(refuse(format!(
+            "import is a label of 1 to {MAX_LABEL} lowercase letters, digits, `.`, `_` and `-`, naming where the \
+             runs come from (`ci-nightly`), not {label:?}"
+        )));
+    }
+    Ok(format!("{IMPORT}{l}"))
+}
+
+/// Most imported runs a scope records in a day, from every import source together ([`import`]):
+/// `AMPUP_MEMORY_IMPORT_RUNS_PER_DAY`, default 5000. Apart from the per-person caps, which imports never count
+/// toward.
+pub fn max_imported_per_day() -> usize {
+    std::env::var("AMPUP_MEMORY_IMPORT_RUNS_PER_DAY")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(5_000)
+}
+
+/// What [`import`] did: every run's id, in order, and how many of them were new (the rest were imported before).
+#[derive(Debug)]
+pub struct Imported {
+    pub ids: Vec<String>,
+    pub recorded: usize,
+}
+
+/// Imports a batch of graded runs as the import source `label` names ([`IMPORT`]), sent by `by` (an org's admin, or
+/// the operator: the caller has checked who may), their traces readable by `acl` (the caller has checked it is
+/// within the scope's org). Each is checked as [`record_many`] checks one, and must come with its reward and name
+/// no facts it used. Runs imported before (the same id) are left as they are and counted toward nothing; the rest
+/// count toward the scope's day's imports ([`max_imported_per_day`]).
+pub async fn import(
+    store: &Store,
+    scope: &Scope,
+    by: &str,
+    label: &str,
+    acl: &[String],
+    runs: &[Value],
+) -> Result<Imported> {
+    if runs.is_empty() {
+        return Err(refuse("runs is a list of at least one run".into()));
+    }
+    if acl.is_empty() || acl.iter().any(|a| a.trim() == "*") {
+        return Err(refuse(
+            "acl names who reads the imported traces: at least one, and not *".into(),
+        ));
+    }
+    let source = import_source(label)?;
+    let who = Principal::new(&source, &[]);
+    let signed = format!("{}:{source}:", crate::REMEMBER_SOURCE);
+    let rec = Recorder {
+        who: &who,
+        person: true,
+        acl,
+        signed: &signed,
+        by,
+        import: true,
+    };
+    let ids = rec.ids(store, scope, runs, Some("runs")).await?;
+    // Those imported before: kept as they are, and none of the day's allowance.
+    let had: std::collections::HashSet<String> = crate::qa_log::list(store, scope, None)
+        .await?
+        .into_iter()
+        .filter(|l| l.asker == source)
+        .map(|l| l.answer_id)
+        .collect();
+    let (mut new, mut new_ids) = (vec![], vec![]);
+    for (i, (run, id)) in runs.iter().zip(&ids).enumerate() {
+        if !had.contains(id) {
+            new.push((i, run, id.clone()));
+            new_ids.push(id.clone());
+        }
+    }
+    // Every run checked, the old ones too: a file with a bad line is refused whole, as a batch is.
+    for (i, (run, id)) in runs.iter().zip(&ids).enumerate() {
+        rec.checked(run, true, id.clone())
+            .map_err(|e| of_item(Some("runs"), i, e))?;
+    }
+    let recorded = new.len();
+    if recorded > 0 {
+        let items: Vec<Value> = new.iter().map(|(_, r, _)| (*r).clone()).collect();
+        rec.write_as(store, scope, &items, &new_ids, Some("runs"))
+            .await
+            .map_err(|e| renumber(e, &new))?;
+    }
+    Ok(Imported { ids, recorded })
+}
+
+/// A refusal about the `j`th of the new runs an import wrote, said of its place in the batch as sent.
+fn renumber(e: anyhow::Error, new: &[(usize, &Value, String)]) -> anyhow::Error {
+    let Some(r) = e.downcast_ref::<Refused>() else {
+        return e;
+    };
+    let at =
+        r.0.strip_prefix("runs[")
+            .and_then(|rest| rest.split_once("]: "))
+            .and_then(|(j, rest)| Some((new.get(j.parse::<usize>().ok()?)?.0, rest)));
+    match at {
+        Some((i, rest)) => refuse(format!("runs[{i}]: {rest}")),
+        None => e,
+    }
+}
 
 /// A caller's mistake, said back to them as is.
 #[derive(Debug)]
@@ -111,6 +251,8 @@ pub async fn record(
         person,
         acl,
         signed,
+        by: who.user(),
+        import: false,
     };
     Ok(rec
         .write(store, scope, std::slice::from_ref(args), None)
@@ -138,6 +280,8 @@ pub async fn record_many(
         person,
         acl,
         signed,
+        by: who.user(),
+        import: false,
     };
     rec.write(store, scope, runs, Some("runs")).await
 }
@@ -181,6 +325,19 @@ pub async fn load(
     record_many(store, scope, who, true, &acl, &signed, runs).await
 }
 
+/// Imports a batch of graded runs from outside a request (`memstore runs load --import`), as [`import`] does, their
+/// traces readable by `acl`.
+pub async fn load_import(
+    store: &Store,
+    scope: &Scope,
+    label: &str,
+    acl: &[String],
+    runs: &[Value],
+) -> Result<Imported> {
+    store.ensure_scope(scope).await?;
+    import(store, scope, "memstore runs load", label, acl, runs).await
+}
+
 /// Who records: the caller, whether they are a person, the ACL keeping their traces to them, and how the traces
 /// are signed.
 struct Recorder<'a> {
@@ -188,6 +345,12 @@ struct Recorder<'a> {
     person: bool,
     acl: &'a [String],
     signed: &'a str,
+    /// Who sent them, as the commits name their author: the caller, or for an import the admin or operator who
+    /// sent it (`who` is then the import source).
+    by: &'a str,
+    /// An import ([`import`]): each run comes with its reward and names no facts, and the day's imports are counted
+    /// in place of a person's caps.
+    import: bool,
 }
 
 /// A run checked and ready to write.
@@ -208,14 +371,27 @@ impl Recorder<'_> {
         runs: &[Value],
         label: Option<&str>,
     ) -> Result<Vec<String>> {
-        let who = self.who;
         if !self.person {
             return Err(refuse(format!(
                 "a run is a person's: {} is a key",
-                who.user()
+                self.who.user()
             )));
         }
         let ids = self.ids(store, scope, runs, label).await?;
+        self.write_as(store, scope, runs, &ids, label).await
+    }
+
+    /// [`Self::write`], under the ids given, one a run.
+    async fn write_as(
+        &self,
+        store: &Store,
+        scope: &Scope,
+        runs: &[Value],
+        ids: &[String],
+        label: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let who = self.who;
+        let ids = ids.to_vec();
         let runs: Vec<Checked> = runs
             .iter()
             .zip(ids)
@@ -231,20 +407,27 @@ impl Recorder<'_> {
             .await
             .map_err(relay)?;
         // The day's caps before anything is written: a refused batch leaves no trace behind. Rewards given with
-        // runs count as `reward_run`'s do, after the runs' own entries.
-        crate::qa_log::runs_cap(store, scope, who, runs.len())
-            .await
-            .map_err(relay)?;
-        let rewards = runs.iter().filter(|r| r.reward.is_some()).count();
-        if rewards > 0 {
-            crate::qa_log::entries_cap(store, scope, who, runs.len() + rewards)
+        // runs count as `reward_run`'s do, after the runs' own entries. An import counts toward the scope's day's
+        // imports instead.
+        if self.import {
+            crate::qa_log::imports_cap(store, scope, runs.len())
                 .await
                 .map_err(relay)?;
+        } else {
+            crate::qa_log::runs_cap(store, scope, who, runs.len())
+                .await
+                .map_err(relay)?;
+            let rewards = runs.iter().filter(|r| r.reward.is_some()).count();
+            if rewards > 0 {
+                crate::qa_log::entries_cap(store, scope, who, runs.len() + rewards)
+                    .await
+                    .map_err(relay)?;
+            }
         }
         // The traces first, then the log entries naming them: a trace forgotten takes its entry with it, and
         // traces that couldn't be written (a cap) leave no entry behind.
         let episodes: Vec<Episode> = runs.iter().map(|r| r.episode.clone()).collect();
-        store.commit_record(scope, who.user(), &episodes).await?;
+        store.commit_record(scope, self.by, &episodes).await?;
         let logged: Vec<crate::qa_log::RunEntry> = runs
             .iter()
             .map(|r| crate::qa_log::RunEntry {
@@ -257,7 +440,7 @@ impl Recorder<'_> {
                     .map(|(reward, reason)| (*reward, reason.as_deref())),
             })
             .collect();
-        crate::qa_log::log_runs(store, scope, who, &logged, label)
+        crate::qa_log::log_runs(store, scope, who, self.by, &logged, label)
             .await
             .map_err(relay)?;
         Ok(runs.into_iter().map(|r| r.id).collect())
@@ -343,6 +526,18 @@ impl Recorder<'_> {
             .map(str::trim)
             .filter(|o| !o.is_empty());
         let advice = advice_key(&args["advice"])?;
+        if self.import && args["used"].as_array().is_some_and(|u| !u.is_empty()) {
+            return Err(refuse(
+                "an imported run names no facts it used: another system's ids aren't this memory's"
+                    .into(),
+            ));
+        }
+        if self.import && args["reward"].is_null() {
+            return Err(refuse(
+                "an imported run comes with its reward, from -1 to 1: what its grader said is what it teaches"
+                    .into(),
+            ));
+        }
         let reward = if rewarded {
             match (&args["reward"], &args["reason"]) {
                 (Value::Null, Value::Null) => None,

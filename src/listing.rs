@@ -23,7 +23,8 @@
 //! lt}` on when the note was written). With `include: "text"` each entry carries its note. A person's own
 //! entries show no evidence: a tally is the team's, and counts other people's sessions. Where the scope curates
 //! advice (`crate::advice_curate`), a note withheld by reward says so (`withheld`: its served runs against the rest),
-//! and a situation merged into another is listed with its note's history and `merged_into`.
+//! and a situation merged into another is listed with its note's history and `merged_into`. A note an org admin wrote
+//! rather than one learned from runs carries `written_by` (`crate::advice::write_admin`): the label they gave.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -124,6 +125,9 @@ fn cursor(req: &Value) -> Result<Option<(i64, String)>> {
         _ => Err(bad("cursor is one a previous page returned")),
     }
 }
+
+/// A day, in µs: `facts {by_day: true}` counts by UTC day.
+const DAY_MICROS: i64 = 86_400_000_000;
 
 /// `facts`: see the module's description.
 pub async fn facts(
@@ -227,6 +231,19 @@ pub async fn facts(
         })
         .collect();
     let total = facts.len();
+    // `by_day: true`: how many of them took effect on each day (UTC), oldest first, before the page is cut: Home's
+    // chart of the month, without the facts themselves.
+    let by_day = (req["by_day"].as_bool() == Some(true)).then(|| {
+        let mut days: BTreeMap<i64, u64> = BTreeMap::new();
+        for f in &facts {
+            *days
+                .entry(f.valid_from.div_euclid(DAY_MICROS) * DAY_MICROS)
+                .or_default() += 1;
+        }
+        days.into_iter()
+            .map(|(d, n)| json!([d, n]))
+            .collect::<Vec<_>>()
+    });
     // A total order: newest first (or oldest), ties by id.
     let order = |a: &Fact, b: &Fact| {
         let by_time = if oldest {
@@ -283,7 +300,11 @@ pub async fn facts(
             v
         })
         .collect();
-    Ok(json!({"facts": page, "count": total, "cursor": next}))
+    let mut out = json!({"facts": page, "count": total, "cursor": next});
+    if let Some(d) = by_day {
+        out["by_day"] = json!(d);
+    }
+    Ok(out)
 }
 
 /// `advice`: see the module's description.
@@ -370,6 +391,10 @@ pub async fn advice(
         }
         if let Some(m) = &l.merged_into {
             v["merged_into"] = json!(m);
+        }
+        // An org admin wrote it rather than learning from runs: where they said it came from.
+        if let Some((label, at)) = &l.admin {
+            v["written_by"] = json!({"admin": true, "label": label, "at": at});
         }
         if with_text {
             v["text"] = json!(note);

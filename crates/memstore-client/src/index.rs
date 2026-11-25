@@ -743,7 +743,27 @@ struct Indexed {
     skipped: Option<String>,
 }
 
-/// Ends each session the hooks didn't keep into the memory, as the hooks would have at its end.
+/// Sessions [`send`] has in flight at once: two, so the next commits while one waits for its own (the server writes
+/// ends that arrive together in one group commit). Each commit makes the server build its memory's state again, so
+/// more at once is a burst a busy server pays for in memory.
+const SENDING: usize = 2;
+/// How long one session's end may take to answer: it waits for its commit, which a busy server can take a minute
+/// or more over.
+const SEND_WAIT: Duration = Duration::from_secs(180);
+/// Tries for each session's end that went unanswered. One that timed out may have landed all the same: sent again,
+/// the server finds it ended, and it counts as there already.
+const SEND_TRIES: u32 = 3;
+/// How long [`send`] waits once the server stopped answering (restarting, say) before it sends again.
+const SEND_PAUSE: Duration = Duration::from_secs(30);
+/// How long the server may go on answering nothing before [`send`] stops: longer than a server takes to restart.
+const SEND_DOWN_FOR: Duration = Duration::from_secs(15 * 60);
+/// Sessions in a row the server refused before [`send`] stops: it refuses them all.
+const SEND_GIVE_UP: usize = 20;
+
+/// Ends each session the hooks didn't keep into the memory, as the hooks would have at its end, [`SENDING`] at a
+/// time. A slow or lost answer is tried again; while the server answers nothing, its sessions wait their turn again
+/// and the sending pauses. Only the day's most, the server answering nothing for [`SEND_DOWN_FOR`], or
+/// [`SEND_GIVE_UP`] refusals in a row stop it.
 async fn send(client: &Client, sessions: &[Session]) -> Indexed {
     let mut done = Indexed {
         server: client.url.clone(),
@@ -758,33 +778,95 @@ async fn send(client: &Client, sessions: &[Session]) -> Indexed {
     }
     // The session this runs in is the hooks' to end.
     let here = std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_default();
-    let todo: Vec<&Session> = sessions
+    let mut todo: std::collections::VecDeque<Value> = sessions
         .iter()
         .filter(|s| !s.kept && s.id != here && !s.short)
+        .filter_map(|s| s.end.clone())
         .collect();
     done.short = sessions.iter().filter(|s| !s.kept && s.short).count();
     done.already = sessions.len() - todo.len() - done.short;
-    for (n, s) in todo.iter().enumerate() {
-        let Some(args) = s.end.clone() else { continue };
-        eprint!("\rSending sessions to the memory: {}/{}", n + 1, todo.len());
-        match client.tool("end_session", args).await {
-            Ok(_) => done.sent += 1,
-            // Sent by an earlier index: the server found it by its id, ended.
+    let (total, before) = (todo.len(), done.already);
+    let client = std::sync::Arc::new(Client::from_env(SEND_WAIT));
+    let mut flying = tokio::task::JoinSet::new();
+    let (mut refused, mut stopped) = (0, false);
+    // Since when the server has answered nothing, and until when nothing more is sent.
+    let (mut down_since, mut paused_until) =
+        (None::<std::time::Instant>, std::time::Instant::now());
+    loop {
+        if !stopped && flying.is_empty() && !todo.is_empty() {
+            tokio::time::sleep_until(paused_until.into()).await;
+        }
+        while !stopped && flying.len() < SENDING && std::time::Instant::now() >= paused_until {
+            let Some(args) = todo.pop_front() else { break };
+            let client = client.clone();
+            flying.spawn(async move {
+                let mut tries = 0;
+                loop {
+                    tries += 1;
+                    match client.tool("end_session", args.clone()).await {
+                        Err(e) if super::worth_retrying(&e) && tries < SEND_TRIES => {
+                            tokio::time::sleep(Duration::from_secs(5 * tries as u64)).await
+                        }
+                        r => break (args, r),
+                    }
+                }
+            });
+        }
+        let Some(r) = flying.join_next().await else {
+            if stopped || todo.is_empty() {
+                break;
+            }
+            continue;
+        };
+        let (args, r) = match r {
+            Ok(r) => r,
+            Err(e) => {
+                done.failed += 1;
+                done.error = Some(format!("{e:#}"));
+                continue;
+            }
+        };
+        match r {
+            Ok(_) => {
+                done.sent += 1;
+                (refused, down_since) = (0, None);
+            }
+            // Sent by an earlier index, or by a try of this one whose answer was lost: the server found it ended.
             Err(e) if super::session_gone(&e) || format!("{e:#}").contains("has ended") => {
-                done.already += 1
+                done.already += 1;
+                (refused, down_since) = (0, None);
+            }
+            // At the day's most: the rest would fare the same.
+            Err(e) if e.downcast_ref::<Capped>().is_some() => {
+                done.failed += 1;
+                done.error = Some(format!("{e:#}"));
+                stopped = true;
+            }
+            // Answering nothing (restarting, say): it waits its turn again, and nothing is sent for a while.
+            Err(e) if super::worth_retrying(&e) => {
+                let since = *down_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= SEND_DOWN_FOR {
+                    done.failed += 1;
+                    done.error = Some(format!("{e:#}"));
+                    stopped = true;
+                } else {
+                    todo.push_back(args);
+                    paused_until = std::time::Instant::now() + SEND_PAUSE;
+                }
             }
             Err(e) => {
                 done.failed += 1;
-                let capped = e.downcast_ref::<Capped>().is_some();
                 done.error = Some(format!("{e:#}"));
-                // At the day's most, or unreachable: the rest would fare the same.
-                if capped || super::worth_retrying(&e) {
-                    done.failed += todo.len() - n - 1;
-                    break;
-                }
+                refused += 1;
+                stopped |= refused >= SEND_GIVE_UP;
             }
         }
+        eprint!(
+            "\rSending sessions to the memory: {}/{total}",
+            done.sent + done.failed + done.already - before
+        );
     }
+    done.failed += todo.len();
     eprintln!();
     done
 }

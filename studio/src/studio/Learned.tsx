@@ -6,12 +6,15 @@ import { call } from "../memory/api";
 import { ago, when } from "../memory/format";
 import { useOption } from "../memory/hashOptions";
 import type { Selection } from "../memory/types";
+import { RangeSeg, scopeText, useAdviceScope } from "./adviceScope";
 
 // Studio's Learned page: each lesson AmpUp Memory learned from how runs went (memstore's `/lessons`, through
 // `Transport.call(sel, "lessons")`), its text first, then the runs it was learned from and the sessions it was
 // handed in since, with how each went and who said so. A person reads their own lessons and the team's; an org's
 // admin, everyone's (memstore decides). The Advice page is the other side of the team's lessons: how often each is
-// served, to whom, and ratifying it; a team lesson links there, and Advice links back here.
+// served, to whom, and ratifying it; a team lesson links there, and Advice links back here. Both count the same
+// notes over the same window (adviceScope.tsx): the team's and the reader's own (an admin may pick a person's own in
+// their place), and the runs and sessions asked in the window the link names.
 
 /** How a run or a session went (`/lessons`). */
 type Outcome = "right" | "wrong" | "good" | "bad" | "unclear" | "open";
@@ -74,6 +77,8 @@ interface Lesson {
   needs_backing?: string;
   /** A team lesson's: ratified by an admin, or backed and past the evidence bar. */
   ratified?: boolean;
+  /** A note an org admin wrote rather than one learned from runs, with the label they gave where it came from. */
+  written_by?: { admin: boolean; label: string; at: number };
   learned_from: {
     runs: number;
     right: number;
@@ -119,6 +124,16 @@ interface Lessons {
   groups?: Group[];
   /** Where the next page starts; null on the last (an engine that pages lessons says it). */
   next?: string | null;
+  /** The window the runs and sessions were counted over, in days; null, all of them (an engine that counts by
+   * window echoes it). */
+  days?: number | null;
+  /** Read as the Advice page reads its notes (an engine that can echoes it). */
+  as_usage?: boolean;
+}
+
+/** What Learned asks `/lessons` for, beside its page: the notes and window Served counts. */
+function scoped(days: number | null, person: string): Record<string, unknown> {
+  return { as_usage: true, ...(days ? { days } : {}), ...(person ? { person } : {}) };
 }
 
 /** Lessons a page asks for at a time. */
@@ -473,13 +488,17 @@ function LessonCard({
   onLesson,
   onTrace,
   onAdvice,
+  days,
 }: {
   l: Lesson;
   me: string;
   focused: boolean;
+  /** The window its runs and sessions were counted over, as the server applied it (null: all of them). */
+  days?: number | null;
   onLesson: (id: string) => void;
   onTrace: (id: string) => void;
-  onAdvice: (key: string) => void;
+  /** Opens the lesson on Advice's Served tab; absent where it is shown there already. */
+  onAdvice?: (key: string) => void;
 }) {
   const f = l.learned_from;
   const s = l.served_in;
@@ -508,8 +527,13 @@ function LessonCard({
               Not ratified
             </span>
           ))}
+        {l.written_by && (
+          <span className="ap-badge" title={`Written by an admin: ${l.written_by.label}`}>
+            Written by an admin
+          </span>
+        )}
         <span className="ap-muted ap-small lr-date" title={when(l.learned_at)}>
-          learned {ago(l.learned_at)}
+          {l.written_by ? "written" : "learned"} {ago(l.learned_at)}
         </span>
       </div>
       <h2 className="lr-title">
@@ -519,8 +543,13 @@ function LessonCard({
       </h2>
       {whenText && <p className="lr-when">{inline(whenText)}</p>}
       {!mine && l.needs_backing && <p className="ap-muted ap-small">{l.needs_backing}</p>}
+      {l.written_by && (
+        <p className="ap-muted ap-small">
+          Written by an admin, not learned from runs: {l.written_by.label}
+        </p>
+      )}
       <NoteBody note={l.lesson} />
-      {!mine && (
+      {!mine && onAdvice && (
         <p className="ap-small lr-advice">
           <button className="ap-link" onClick={() => onAdvice(l.key)}>
             How often it is served, and ratifying it: Advice →
@@ -529,7 +558,7 @@ function LessonCard({
       )}
       <div className="lr-flow">
         <Trail
-          title="Learned from"
+          title={l.written_by ? "Runs of this kind of task" : "Learned from"}
           summary={
             <>
               {plural(f.runs, "run")}
@@ -541,7 +570,7 @@ function LessonCard({
           rows={f.trail}
           hidden={others(f.hidden, "run")}
           more={f.more}
-          empty="No runs left in the log."
+          empty={days ? `No runs in the last ${days} days.` : "No runs left in the log."}
           render={(e) => <FromRow key={e.id} e={e} me={me} onTrace={onTrace} />}
         />
         <div className="lr-arrow" aria-hidden>
@@ -566,7 +595,7 @@ function LessonCard({
                 {s.good + s.bad ? ` · ${s.good} went well, ${s.bad} didn't` : ""}
               </>
             ) : (
-              "not yet"
+              days ? `none in the last ${days} days` : "not yet"
             )
           }
           dots={{ ok: s.good, bad: s.bad, other: s.sessions - s.good - s.bad }}
@@ -574,7 +603,9 @@ function LessonCard({
           hidden={others(s.hidden, "session")}
           more={s.more}
           empty={
-            mine
+            days
+              ? `Not handed in the last ${days} days.`
+              : mine
               ? "Not handed yet: it will be the next time this kind of task starts."
               : "Not handed yet: agents get it the next time someone starts this kind of task."
           }
@@ -582,6 +613,75 @@ function LessonCard({
         />
       </div>
     </article>
+  );
+}
+
+/**
+ * The lessons behind one piece of advice (its key): the runs it was learned from and the sessions it was served in,
+ * for Advice's "Learned from" tab. `mine`: the reader's own note, else the team's.
+ */
+export function LessonsFor({
+  sel,
+  adviceKey,
+  mine,
+  owner,
+  days,
+  onLesson,
+  onTrace,
+}: {
+  sel: Selection;
+  adviceKey: string;
+  mine: boolean;
+  /** Whose own note it is, where not the reader's (an admin's view of a person). */
+  owner?: string;
+  /** The window the note's page counts (null: all), so its trails count what its tiles do. */
+  days: number | null;
+  onLesson: (id: string) => void;
+  onTrace: (id: string) => void;
+}) {
+  const [got, setGot] = useState<{ key: string; data?: Lessons; error?: unknown } | null>(null);
+  const key = JSON.stringify([sel.org, sel.team, sel.branch, adviceKey, owner, days]);
+  useEffect(() => {
+    let live = true;
+    call<Lessons>(sel, "lessons", { key: adviceKey, ...scoped(days, owner ?? "") }).then(
+      (data) => live && setGot({ key, data }),
+      (error: unknown) => live && setGot({ key, error }),
+    );
+    return () => {
+      live = false;
+    };
+  }, [key]);
+  const cur = got?.key === key ? got : null;
+  if (!cur) return <p className="ap-muted ap-pad-y">Reading where it was learned…</p>;
+  if (cur.error) return <p className="ap-error ap-pad-y">{errorText(cur.error)}</p>;
+  const me = cur.data?.reader.user ?? "";
+  const all = (cur.data?.lessons ?? []).filter((l) => l.key === adviceKey);
+  // The reader's own note is their lesson; the team's, the team's (an admin also reads other people's own).
+  const these = all.filter((l) =>
+    mine ? l.space === "mine" && same(l.owner, owner ?? me) : l.owner === null,
+  );
+  const shown = these.length ? these : all;
+  if (!shown.length) {
+    return (
+      <p className="ap-muted ap-pad-y">
+        No lesson behind it is left to read: the runs it was learned from may have aged out of the log.
+      </p>
+    );
+  }
+  return (
+    <div className="lr lr-for">
+      {shown.map((l) => (
+        <LessonCard
+          key={lessonId(l)}
+          l={l}
+          me={me}
+          focused={false}
+          days={cur.data?.days ?? null}
+          onLesson={onLesson}
+          onTrace={onTrace}
+        />
+      ))}
+    </div>
   );
 }
 
@@ -621,12 +721,15 @@ function Empty({ filtered }: { filtered: boolean }) {
  */
 export function Learned({
   sel,
+  admin,
   lesson,
   onLesson,
   onTrace,
   onAdvice,
 }: {
   sel: Selection;
+  /** The org's admin: may pick a person whose own lessons stand in for theirs (`person` in the link). */
+  admin: boolean;
   /** The lesson the link names. */
   lesson?: string;
   onLesson: (id: string) => void;
@@ -636,15 +739,22 @@ export function Learned({
   onAdvice: (key: string) => void;
 }) {
   const [n, setN] = useState(0);
+  const { range, setRange, days, person } = useAdviceScope(admin);
   const [show, setShow] = useOption("show");
+  // What `show` asks for: "mine" is the reader's own, or the person's picked in their place.
+  const showAs = show === "mine" && person ? person : show;
   const [got, setGot] = useState<{ key: string; data?: Lessons; error?: unknown } | null>(null);
   const [more, setMore] = useState<{ key: string; busy: boolean; error?: unknown } | null>(null);
   // A page of the view (`show`) at a time: memstore keeps every lesson the reader reads and answers each page from
   // them, with how many of each whose there are for the tiles and tabs.
-  const key = JSON.stringify([sel.org, sel.team, sel.branch, show, n]);
+  const key = JSON.stringify([sel.org, sel.team, sel.branch, show, days, person, n]);
   useEffect(() => {
     let live = true;
-    call<Lessons>(sel, "lessons", { page: PAGE, ...(show ? { show } : {}) }).then(
+    call<Lessons>(sel, "lessons", {
+      page: PAGE,
+      ...scoped(days, person),
+      ...(showAs ? { show: showAs } : {}),
+    }).then(
       (data) => live && setGot({ key, data }),
       (error: unknown) => live && setGot({ key, error }),
     );
@@ -660,7 +770,12 @@ export function Learned({
   const loadMore = () => {
     if (!v || !next || (more?.key === key && more.busy)) return;
     setMore({ key, busy: true });
-    call<Lessons>(sel, "lessons", { page: PAGE, after: next, ...(show ? { show } : {}) }).then(
+    call<Lessons>(sel, "lessons", {
+      page: PAGE,
+      after: next,
+      ...scoped(days, person),
+      ...(showAs ? { show: showAs } : {}),
+    }).then(
       (page) => {
         setGot((g) =>
           g?.key === key && g.data
@@ -675,11 +790,12 @@ export function Learned({
 
   const all = useMemo(() => v?.lessons ?? [], [v]);
   const whose = (owner: string | null, s: string) =>
-    !s || (s === "team" ? owner === null : owner !== null && same(owner, s === "mine" ? me : s));
+    !s ||
+    (s === "team" ? owner === null : owner !== null && same(owner, s === "mine" ? person || me : s));
   // An engine that pages answers the view asked for; an older one, every lesson, filtered here.
   const shown = useMemo(
     () => (paged ? all : all.filter((l) => whose(l.owner, show))),
-    [all, paged, show, me],
+    [all, paged, show, me, person],
   );
   const groups: Group[] = useMemo(
     () =>
@@ -728,12 +844,12 @@ export function Learned({
     }),
     { lessons: 0, runs: 0, sessions: 0, helped: 0 },
   );
-  const people = (v?.people ?? []).filter((p) => !same(p, me));
+  // Whose own lessons are counted beside the team's is picked above both tabs (PersonPicker): here only which of
+  // the two to list.
   const tabs: { id: string; label: string }[] = [
     { id: "", label: "All" },
     { id: "team", label: "Team" },
-    { id: "mine", label: "Yours" },
-    ...(v?.reader.everyone ? people.map((p) => ({ id: p, label: p })) : []),
+    { id: "mine", label: person ? `${person}'s` : "Yours" },
   ];
   const picked = lesson && !found && !next ? lesson : null;
   const anyLessons = groups.some((g) => g.lessons > 0);
@@ -745,9 +861,18 @@ export function Learned({
         <span className="ap-muted">
           What separated the runs that went right from those that didn&apos;t, handed to agents the
           next time the same kind of task comes up
-          {v?.reader.everyone ? " · as an admin you see everyone's" : ""}
         </span>
+        <RangeSeg range={range} setRange={setRange} />
       </header>
+      {v && (
+        <p className="ap-scope ap-muted ap-small">
+          {/* As the server says it counted: an engine that predates counting as Advice does counts every lesson
+              the reader may read, over all time. */}
+          {v.as_usage
+            ? scopeText(person, v.days ?? null, "runs and sessions")
+            : `Counting every lesson you may read${v.reader.everyone ? " (as an admin, everyone's)" : ""}, over all time`}
+        </p>
+      )}
 
       {cur?.error ? (
         <p className="ap-pad ap-error" role="alert">
@@ -772,8 +897,8 @@ export function Learned({
               <dd>{totals.runs.toLocaleString()}</dd>
             </div>
             <div>
-              <dt>Sessions served</dt>
-              <dd>{totals.sessions.toLocaleString()}</dd>
+              <dt>Advice used</dt>
+              <dd>{totals.sessions.toLocaleString()} times</dd>
             </div>
             <div>
               <dt>Helped</dt>
@@ -811,6 +936,7 @@ export function Learned({
                   l={l}
                   me={me}
                   focused={lessonId(l) === lesson}
+                  days={v?.days ?? null}
                   onLesson={onLesson}
                   onTrace={onTrace}
                   onAdvice={onAdvice}

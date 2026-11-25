@@ -15,6 +15,7 @@ import { Home, type HomeSummary } from "./home";
 import { AddToMemoryDialog } from "./addToMemory";
 import { Advice, AdviceServing, Branches, NotAnswered, Owners, People } from "../studio/Admin";
 import { AdvicePage } from "../studio/AdvicePage";
+import { PersonPicker, SCOPE_OPTIONS } from "../studio/adviceScope";
 import { Learned } from "../studio/Learned";
 import { Trace } from "../studio/Trace";
 import { NAVIGATE, optionsOf, setOptions, subscribe, viewOf } from "./hashOptions";
@@ -290,7 +291,8 @@ function sectionOf(f: Focus | null, start: Section): Section {
       return "explorer";
   }
 }
-type Item = { id: Section; label: string; icon: string; to: Focus; reads: boolean };
+/** `hide`: a page that still answers at its link but isn't listed (the Graph is a tab of the Explorer). */
+type Item = { id: Section; label: string; icon: string; to: Focus; reads: boolean; hide?: boolean };
 // The sidebar follows a builder's journey: feed the memory and see what it learned (Memory), fix it (Review),
 // see it used (Answers), know it pays off (Impact), and shape what it learns (Build). Home sums them up.
 const SECTIONS: { group: string; items: Item[] }[] = [
@@ -308,7 +310,8 @@ const SECTIONS: { group: string; items: Item[] }[] = [
         to: { kind: "folder", path: [] },
         reads: true,
       },
-      { id: "graph", label: "Graph", icon: "entity", to: { kind: "graph" }, reads: true },
+      // The Graph is the Explorer's second tab: lit as the Explorer.
+      { id: "graph", label: "Graph", icon: "entity", to: { kind: "graph" }, reads: true, hide: true },
       // Facts (a search) and Look up (a question through the agent tools): one page, two modes.
       {
         id: "search",
@@ -318,6 +321,15 @@ const SECTIONS: { group: string; items: Item[] }[] = [
         reads: true,
       },
       { id: "ask", label: "Ask", icon: "chat", to: { kind: "agent" }, reads: true },
+      // What the memory answered: the reader's own sessions, and (the org's admins) the team's, a tab of the same
+      // section with each conversation's trace.
+      {
+        id: "sessions",
+        label: "Traces",
+        icon: "notes",
+        to: { kind: "folder", path: ["sessions"] },
+        reads: true,
+      },
     ],
   },
   // Who decides what reaches main: the proposals and conflicts waiting, and who owns what.
@@ -328,26 +340,21 @@ const SECTIONS: { group: string; items: Item[] }[] = [
       { id: "owners", label: "Owners", icon: "lock", to: { kind: "owners" }, reads: true },
     ],
   },
-  // What the memory answered: the reader's sessions, and (for the org's admins) each conversation's trace.
-  {
-    group: "Answers",
-    items: [
-      {
-        id: "sessions",
-        label: "Sessions",
-        icon: "notes",
-        to: { kind: "folder", path: ["sessions"] },
-        reads: true,
-      },
-    ],
-  },
   // Whether it pays off: the advice served and how it went, what it learned, what it couldn't answer, who uses it.
   {
     group: "Impact",
     items: [
       { id: "advice", label: "Advice", icon: "skill", to: { kind: "advice" }, reads: true },
-      // What it learned: every lesson the person may read (their own and the team's; an admin's, everyone's).
-      { id: "learned", label: "Learned", icon: "history", to: { kind: "learned" }, reads: true },
+      // What it learned: every lesson the person may read (their own and the team's; an admin's, everyone's). The
+      // second tab of Advice, lit as it.
+      {
+        id: "learned",
+        label: "Learned",
+        icon: "history",
+        to: { kind: "learned" },
+        reads: true,
+        hide: true,
+      },
       { id: "gaps", label: "Not answered", icon: "quote", to: { kind: "gaps" }, reads: true },
       {
         id: "handover",
@@ -356,7 +363,8 @@ const SECTIONS: { group: string; items: Item[] }[] = [
         to: { kind: "handover" },
         reads: false,
       },
-      { id: "people", label: "People", icon: "user", to: { kind: "people" }, reads: true },
+      // The team's traces: the second tab of Traces, lit as it.
+      { id: "people", label: "Team traces", icon: "user", to: { kind: "people" }, reads: true, hide: true },
     ],
   },
   // What shapes what it learns: the types, the goals, the compiled skills, the branches, the tools agents call.
@@ -379,7 +387,8 @@ const SECTIONS: { group: string; items: Item[] }[] = [
         to: { kind: "branches" },
         reads: true,
       },
-      { id: "tools", label: "Tools", icon: "tools", to: { kind: "tools" }, reads: true },
+      // The memory's tools, called one at a time: not listed, as the Playground runs them for a question.
+      { id: "tools", label: "Tools", icon: "tools", to: { kind: "tools" }, reads: true, hide: true },
     ],
   },
 ];
@@ -502,6 +511,18 @@ export function MemoryStudio({
   const section = visible.some((g) => g.items.some((i) => i.id === wanted))
     ? wanted
     : (visible[0]?.items[0]?.id ?? "schema");
+  // The sections the sidebar lists (and the host is told of); `lit`: the one shown as open.
+  const listed = visible
+    .map((g) => ({ ...g, items: g.items.filter((i) => !i.hide) }))
+    .filter((g) => g.items.length);
+  const lit =
+    section === "graph"
+      ? "explorer"
+      : section === "people"
+        ? "sessions"
+        : section === "learned"
+          ? "advice"
+          : section;
   const sel = useMemo<Selection>(() => {
     const q = new URLSearchParams(search);
     return { org, team: q.get("team") ?? undefined, branch: q.get("branch") ?? undefined };
@@ -695,20 +716,20 @@ export function MemoryStudio({
   // For a host that draws the sections: tell it what they are whenever that changes.
   const typeCount = schema?.types?.size ?? (onHome && said ? said.schema?.types : undefined);
   const navigationKey = JSON.stringify([
-    visible.map((g) => [g.group, g.items.map((i) => i.id)]),
-    section,
+    listed.map((g) => [g.group, g.items.map((i) => i.id)]),
+    lit,
     typeCount,
   ]);
   useEffect(() => {
     if (!onNavigation) return;
     onNavigation({
-      groups: visible.map((g) => ({
+      groups: listed.map((g) => ({
         group: g.group,
         items: g.items.map((i) => ({
           id: i.id,
           label: i.label,
           hash: toHash(i.to),
-          current: section === i.id,
+          current: lit === i.id,
           count: i.id === "schema" && typeCount ? typeCount : undefined,
         })),
       })),
@@ -725,14 +746,14 @@ export function MemoryStudio({
   ) : (
     <aside className="memory studio-nav" aria-label="Memory sections">
       {pickers}
-      {visible.map((g) => (
+      {listed.map((g) => (
         <div key={g.group} className="studio-group">
           {g.group && <div className="side-section">{g.group}</div>}
           {g.items.map((i) => (
             <button
               key={i.id}
-              className={`studio-item ${section === i.id ? "on" : ""}`}
-              aria-current={section === i.id ? "page" : undefined}
+              className={`studio-item ${lit === i.id ? "on" : ""}`}
+              aria-current={lit === i.id ? "page" : undefined}
               onClick={() => go(i.to)}
             >
               <Icon name={i.icon} size={16} />
@@ -773,6 +794,8 @@ export function MemoryStudio({
               onFocus={go}
             />
           ) : (
+            <>
+            <ExplorerTabs on="graph" go={go} />
             <GraphSection
               key={memoryKey}
               sel={sel}
@@ -780,6 +803,7 @@ export function MemoryStudio({
               focus={focus?.kind === "graph" ? focus.entity : undefined}
               onFocus={go}
             />
+            </>
           )}
         </section>
       </div>
@@ -802,6 +826,14 @@ export function MemoryStudio({
       go({ kind: "people", user });
       if (days) setOptions({ days });
     };
+    // Within Advice, a move to another tab or note keeps what every total is counted over: the window and whose
+    // own notes (adviceScope.tsx), plus any of `keep`.
+    const inAdvice = (f: Focus, keep: Record<string, string | null> = {}) => {
+      const now = optionsOf(location.hash);
+      const scope = Object.fromEntries(SCOPE_OPTIONS.map((k) => [k, now.get(k)]));
+      go(f);
+      setOptions({ ...scope, ...keep });
+    };
     return (
       <div {...root}>
         {nav}
@@ -815,6 +847,8 @@ export function MemoryStudio({
               onOpen={(id) => go({ kind: "conversation", id })}
             />
           ) : section === "people" ? (
+            <>
+            <TracesTabs on="team" go={go} team />
             <People
               sel={sel}
               user={focus?.kind === "people" ? focus.user : undefined}
@@ -822,37 +856,47 @@ export function MemoryStudio({
               onEpisode={(id) => go({ kind: "episode", id })}
               onTrace={(id) => go({ kind: "conversation", id })}
             />
+            </>
           ) : section === "learned" ? (
+            <>
+            <AdviceTabs on="learned" go={inAdvice} admin={admin} />
+            <PersonPicker sel={sel} admin={admin} />
             <Learned
               key={memoryKey}
               sel={sel}
+              admin={admin}
               lesson={focus?.kind === "learned" ? focus.lesson : undefined}
               onLesson={(lesson) => {
                 // Picking a lesson keeps whose lessons are shown.
                 const show = optionsOf(location.hash).get("show");
-                go({ kind: "learned", lesson });
-                if (show) setOptions({ show });
+                inAdvice({ kind: "learned", lesson }, { show });
               }}
               onTrace={(id) => go({ kind: "conversation", id })}
-              onAdvice={(note) => {
-                go({ kind: "advice" });
-                setOptions({ note });
-              }}
+              onAdvice={(note) => inAdvice({ kind: "advice" }, { note })}
             />
+            </>
           ) : section === "advice" || section === "serving" ? (
-            // Serving's lookup tables now sit under the Advice page's diagnostics, with the evidence.
-            <AdvicePage
-              sel={sel}
-              admin={admin}
-              onTrace={(id) => go({ kind: "conversation", id })}
-              onLearned={(lesson) => go({ kind: "learned", lesson })}
-              diagnostics={
-                <>
-                  <Advice sel={sel} onUser={toPerson} />
-                  <AdviceServing sel={sel} onUser={toPerson} />
-                </>
-              }
-            />
+            // Advice's tabs: Served (each note), and for the org's admins Impact (`#/serving`): whether advice
+            // helps, and when it is given.
+            focus?.kind === "serving" && admin ? (
+              <>
+                <AdviceTabs on="impact" go={inAdvice} admin />
+                <ImpactScope />
+                <Advice sel={sel} onUser={toPerson} />
+                <AdviceServing sel={sel} onUser={toPerson} />
+              </>
+            ) : (
+              <>
+                <AdviceTabs on="served" go={inAdvice} admin={admin} />
+                <PersonPicker sel={sel} admin={admin} />
+                <AdvicePage
+                  sel={sel}
+                  admin={admin}
+                  onTrace={(id) => go({ kind: "conversation", id })}
+                  onLearned={(lesson) => inAdvice({ kind: "learned", lesson })}
+                />
+              </>
+            )
           ) : section === "gaps" ? (
             <NotAnswered
               sel={sel}
@@ -937,16 +981,8 @@ export function MemoryStudio({
     body = (
       <div className={`app ${hostNav ? "hosted" : ""} ${drawer ? "drawer-open" : ""}`}>
         <header className="bar">
-          <button
-            className="icon-btn menu-btn"
-            aria-label={drawer ? "Close the tree" : "Open the tree"}
-            onClick={() => setDrawer((d) => !d)}
-          >
-            <Icon name={drawer ? "close" : "menu"} />
-            {hostNav && <span className="menu-label">Folders</span>}
-          </button>
           <div className="bar-title">
-            <Icon name="explorer" size={16} /> Context tree
+            <ExplorerTabs on="tree" go={go} />
           </div>
           <button
             className="search-box search-open"
@@ -959,6 +995,16 @@ export function MemoryStudio({
             <Icon name="search" size={15} />
             <span>Search facts</span>
             <span className="kbd">⌘K</span>
+          </button>
+          {/* The folders' drawer, after the tabs: a quiet toggle at the bar's end. */}
+          <button
+            className="icon-btn menu-btn"
+            aria-label={drawer ? "Hide the folders" : "Show the folders"}
+            aria-expanded={drawer}
+            onClick={() => setDrawer((d) => !d)}
+          >
+            <Icon name={drawer ? "close" : "menu"} size={16} />
+            {hostNav && <span className="menu-label">{drawer ? "Hide folders" : "Folders"}</span>}
           </button>
         </header>
         {banners}
@@ -1012,7 +1058,8 @@ export function MemoryStudio({
       <div className="app app-page">
         {banners}
         <section className="pane">
-          <div className="pane-inner">
+          {/* The playground fills the pane: its conversation scrolls inside, under a composer that stays. */}
+          <div className={`pane-inner ${section === "ask" ? "pane-fill" : ""}`}>
             {section === "home" ? (
               <Home
                 key={selKey}
@@ -1032,7 +1079,12 @@ export function MemoryStudio({
                 addToMemory={transport.capabilities.learn ? <AddToMemoryDialog sel={sel} /> : undefined}
               />
             ) : section === "ask" ? (
-              <Agent sel={sel} />
+              <Agent
+                sel={sel}
+                onFocus={go}
+                connect={connect}
+                addToMemory={transport.capabilities.learn ? <AddToMemoryDialog sel={sel} /> : undefined}
+              />
             ) : section === "search" ? (
               <>
                 <div className="ask-modes" role="tablist" aria-label="Search">
@@ -1086,14 +1138,6 @@ export function MemoryStudio({
                       <button className="btn btn-primary" type="submit" disabled={!query.trim()}>
                         Search
                       </button>
-                      <button
-                        type="button"
-                        className="btn"
-                        title="Call search_memory as an agent would"
-                        onClick={() => go({ kind: "tools", tool: "search_memory" })}
-                      >
-                        <Icon name="tools" size={14} /> As an agent
-                      </button>
                     </form>
                     {focus?.kind === "search" && focus.query ? (
                       <Inspector
@@ -1143,29 +1187,7 @@ export function MemoryStudio({
             ) : (
               // Skills and Sessions: the Explorer's own folder, on a page of its own.
               <>
-                {section === "sessions" && (
-                  <div className="banner banner-note">
-                    <Icon name="notes" size={14} />
-                    <span>
-                      Your sessions, as the memory kept them.
-                      {admin ? (
-                        <>
-                          {" "}
-                          Everyone&rsquo;s, with each conversation&rsquo;s trace:{" "}
-                          <button className="link" onClick={() => go({ kind: "people" })}>
-                            People
-                          </button>
-                          .
-                        </>
-                      ) : null}{" "}
-                      The advice served in them:{" "}
-                      <button className="link" onClick={() => go({ kind: "advice" })}>
-                        Advice
-                      </button>
-                      .
-                    </span>
-                  </div>
-                )}
+                {section === "sessions" && <TracesTabs on="yours" go={go} team={admin} />}
                 {crumbs}
                 <Inspector
                   focus={
@@ -1238,5 +1260,118 @@ function useMedia(query: string): boolean {
       return () => m.removeEventListener("change", on);
     },
     () => typeof matchMedia !== "function" || matchMedia(query).matches,
+  );
+}
+
+/** The Explorer's two views: the context tree and the graph of the same memory. */
+function ExplorerTabs({ on, go }: { on: "tree" | "graph"; go: (f: Focus) => void }) {
+  const tab = (id: "tree" | "graph", label: string, icon: string, to: Focus) => (
+    <button
+      role="tab"
+      aria-selected={on === id}
+      className={`explorer-tab ${on === id ? "on" : ""}`}
+      onClick={() => on !== id && go(to)}
+    >
+      <Icon name={icon} size={14} /> {label}
+    </button>
+  );
+  return (
+    <div className="explorer-tabs" role="tablist" aria-label="Explorer">
+      {tab("tree", "Context tree", "explorer", { kind: "folder", path: [] })}
+      {tab("graph", "Graph", "entity", { kind: "graph" })}
+    </div>
+  );
+}
+
+/** A section's views, as tabs above its page (Traces: yours and the team's; Advice: served and learned). */
+function PageTabs({
+  label,
+  on,
+  tabs,
+  go,
+}: {
+  label: string;
+  on: string;
+  tabs: { id: string; label: string; icon: string; to: Focus }[];
+  go: (f: Focus) => void;
+}) {
+  return (
+    // In Studio's styles wherever it is drawn: some of these pages are drawn outside them.
+    <div className="memory traces-bar">
+      <div className="explorer-tabs" role="tablist" aria-label={label}>
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={on === t.id}
+            className={`explorer-tab ${on === t.id ? "on" : ""}`}
+            onClick={() => on !== t.id && go(t.to)}
+          >
+            <Icon name={t.icon} size={14} /> {t.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Traces' two views: the reader's own sessions, and (the org's admins) the team's, person by person. */
+function TracesTabs({ on, go, team }: { on: "yours" | "team"; go: (f: Focus) => void; team: boolean }) {
+  if (!team) return null;
+  return (
+    <PageTabs
+      label="Traces"
+      on={on}
+      go={go}
+      tabs={[
+        { id: "yours", label: "Yours", icon: "notes", to: { kind: "folder", path: ["sessions"] } },
+        { id: "team", label: "Team", icon: "user", to: { kind: "people" } },
+      ]}
+    />
+  );
+}
+
+/**
+ * What Impact counts, which isn't what Served and Learned count: whether advice helps reads every judged session of
+ * the team's notes, and when advice is given reads every lookup in its own window (7, 30 or 90 days; 30 for a link
+ * that names all of them).
+ */
+function ImpactScope() {
+  const days = optionsOf(useSyncExternalStore(subscribe, () => location.hash)).get("days");
+  const span = days === "7" || days === "90" ? days : "30";
+  return (
+    <p className="ap-scope ap-muted ap-small">
+      Counted apart from Served and Learned: &ldquo;Does advice help&rdquo; reads the team&apos;s notes and every
+      judged session; &ldquo;When advice is given&rdquo; reads every lookup in the last {span} days.
+    </p>
+  );
+}
+
+/**
+ * Advice's views: each note and how it was served, every lesson with the runs it was learned from, and for the org's
+ * admins its impact (whether advice helps, and when it is given).
+ */
+function AdviceTabs({
+  on,
+  go,
+  admin,
+}: {
+  on: "served" | "learned" | "impact";
+  go: (f: Focus) => void;
+  admin: boolean;
+}) {
+  return (
+    <PageTabs
+      label="Advice"
+      on={on}
+      go={go}
+      tabs={[
+        { id: "served", label: "Served", icon: "skill", to: { kind: "advice" } },
+        { id: "learned", label: "Learned", icon: "history", to: { kind: "learned" } },
+        ...(admin
+          ? [{ id: "impact", label: "Impact", icon: "goal", to: { kind: "serving" } as Focus }]
+          : []),
+      ]}
+    />
   );
 }

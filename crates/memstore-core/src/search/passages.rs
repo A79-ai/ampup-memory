@@ -927,7 +927,9 @@ pub async fn warm(
     text: &str,
     q: Option<&arrow_array::Float32Array>,
 ) -> Result<()> {
+    let running = crate::running::running(format!("warm {scope}: passage index"));
     let index = open_cached(store, scope).await?;
+    running.step(format!("warm {scope}: episode files"));
     // The unindexed tail's embeddings, as `search::warm` does the facts': a search otherwise embeds them while its
     // caller waits. A search embeds the tail its reader sees when that is at most TAIL_EMBED_MAX passages; all of
     // it is warmed, up to a few times that. Not past TAIL_EMBED_MAX unindexed episodes (each one passage at least):
@@ -944,6 +946,9 @@ pub async fn warm(
         .map(|(_, bs)| bs.iter().map(RecordBatch::num_rows).sum::<usize>())
         .sum();
     if unindexed > 0 && unindexed <= search::TAIL_EMBED_MAX {
+        running.step(format!(
+            "warm {scope}: {unindexed} unindexed episodes' passages"
+        ));
         let texts: Vec<String> = tail(store, scope, &files, &index.held)
             .await?
             .into_iter()

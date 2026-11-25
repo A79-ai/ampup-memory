@@ -551,7 +551,7 @@ export function People({
 
   if (off) {
     return (
-      <Sheet title="People">
+      <Sheet title="Traces">
         <div className="st-empty">
           <h2>Activity is off for {sel.org}</h2>
           <p className="st-quiet">
@@ -648,7 +648,7 @@ export function People({
 
   return (
     <Sheet
-      title={user ? user : "People"}
+      title={user ? user : "Traces"}
       facts={
         data && !user
           ? [
@@ -678,9 +678,6 @@ export function People({
           <p className="st-quiet st-pad">No one used the memory in the last {days} days.</p>
         ) : (
           <div className="st-table-wrap st-pad-x">
-            <p className="st-quiet st-small">
-              Each person's activity in the last {days} days, counted from the answer log.
-            </p>
             <table className="st-table">
               <thead>
                 <tr>
@@ -1073,7 +1070,7 @@ export function AdviceServing({ sel, onUser }: { sel: Selection; onUser: (u: str
   const moments = s ? Object.entries(s.by_moment).sort((a, b) => b[1].lookups - a[1].lookups) : [];
   return (
     <Sheet
-      title="Serving"
+      title="When advice is given"
       facts={
         s
           ? [
@@ -1334,11 +1331,6 @@ export function NotAnswered({
   const noFacts = counted ? counted.no_facts : gaps.length - unhelpful;
   const inAll = unhelpful + noFacts;
   const entriesInWindow = sessions + answers;
-  const note = sampled
-    ? `The last two counts and this list come from the newest ${fig(read)} of the ${fig(entriesInWindow)} sessions, runs and answers in the last ${days} days.`
-    : data?.more && gaps.length < inAll
-      ? `Listed: the ${fig(gaps.length)} among the newest ${fig(read)} of the ${fig(entriesInWindow)} sessions, runs and answers in the last ${days} days.`
-      : null;
   const off = error instanceof ApiError && error.status === 403 && /activity/i.test(error.message);
   return (
     <Sheet
@@ -1412,7 +1404,6 @@ export function NotAnswered({
         </p>
       ) : (
         <div className="st-table-wrap st-pad-x">
-          {note && <p className="st-quiet st-small">{note}</p>}
           {gaps.length > 0 && (
             <table className="st-table">
               <thead>
@@ -1768,7 +1759,7 @@ export function Advice({ sel, onUser }: { sel: Selection; onUser: (u: string) =>
   );
   return (
     <Sheet
-      title="Advice"
+      title="Does advice help"
       facts={
         !data?.map
           ? undefined

@@ -47,6 +47,10 @@ pub struct Lookup {
     /// How likely it found one of the note's `Withhold when` cases to describe the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withhold: Option<f64>,
+    /// Of the served note's items (its Steps, Pitfalls and Verification), how many the decisions model found help with
+    /// this very request and were served, of how many it had ([`crate::advice_route::useful_items`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<(usize, usize)>,
     /// What the person's own advice came to first, when they have some and it served nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub own: Option<String>,
@@ -132,6 +136,7 @@ struct Step {
     score: Option<f64>,
     fit: Option<f64>,
     when: Option<(f64, Option<f64>)>,
+    items: Option<(usize, usize)>,
 }
 
 struct Trace {
@@ -144,6 +149,8 @@ struct Trace {
     score: Option<f64>,
     fit: Option<f64>,
     when: Option<(f64, Option<f64>)>,
+    /// The served note's items kept, of how many ([`items_kept`]).
+    items: Option<(usize, usize)>,
     /// What went wrong on the way ([`trouble`]).
     trouble: Option<String>,
 }
@@ -172,6 +179,7 @@ fn fresh(moment: String, started: Instant, at: i64) -> RefCell<Trace> {
         score: None,
         fit: None,
         when: None,
+        items: None,
         trouble: None,
     })
 }
@@ -233,6 +241,11 @@ pub fn fitted(p: f64) {
     let _ = TRACE.try_with(|t| t.borrow_mut().fit = Some(p));
 }
 
+/// Of the routed note's items, how many were kept for the request, of how many ([`crate::advice_route::useful_items`]).
+pub fn items_kept(kept: usize, of: usize) {
+    let _ = TRACE.try_with(|t| t.borrow_mut().items = Some((kept, of)));
+}
+
 /// How likely the request is in the routed note's `When`, and one of its `Withhold when` cases (when it has some).
 pub fn when_fitted(when: f64, withhold: Option<f64>) {
     let _ = TRACE.try_with(|t| t.borrow_mut().when = Some((when, withhold)));
@@ -263,7 +276,8 @@ pub fn trouble(what: &str) {
 pub fn step(own: bool, outcome: &'static str, key: Option<String>) {
     let _ = TRACE.try_with(|t| {
         let mut t = t.borrow_mut();
-        let (score, fit, when) = (t.score.take(), t.fit.take(), t.when.take());
+        let (score, fit, when, items) =
+            (t.score.take(), t.fit.take(), t.when.take(), t.items.take());
         t.steps.push(Step {
             own,
             outcome,
@@ -271,6 +285,7 @@ pub fn step(own: bool, outcome: &'static str, key: Option<String>) {
             score,
             fit,
             when,
+            items,
         });
     });
 }
@@ -325,6 +340,7 @@ pub fn finish(outcome: &str, key: Option<&str>) -> Option<Lookup> {
                 fit: step.and_then(|s| s.fit).or(t.fit),
                 when: step.and_then(|s| s.when).or(t.when).map(|(w, _)| w),
                 withhold: step.and_then(|s| s.when).or(t.when).and_then(|(_, h)| h),
+                items: step.and_then(|s| s.items).or(t.items),
                 own: own.filter(|o| o != ROUTED),
                 beside: None,
                 error: t.trouble.clone(),

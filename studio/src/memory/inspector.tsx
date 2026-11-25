@@ -20,6 +20,7 @@ import type {
   Selection,
   SkillView,
   AdviceView,
+  DocVersion,
 } from "./types";
 import { CopyId, EmptyState, ErrorState, Icon, Skeleton } from "./ui";
 import { EntityOwnership } from "./review";
@@ -142,9 +143,8 @@ export function Inspector({
         />
       );
     case "skill":
-      // A skill is `skills/<goal>/<slug>`: a shorter path (`#/skill/skills`, `#/skill/skills/<goal>`) is a folder, opened as
-      // one, not read as a skill.
-      if (focus.path[0] === "skills" && focus.path.length < 3)
+      // A skill is `skills/<slug>`: `#/skill/skills` alone is the folder, opened as one, not read as a skill.
+      if (focus.path[0] === "skills" && focus.path.length < 2)
         return (
           <FolderView
             key={JSON.stringify(focus.path)}
@@ -317,13 +317,6 @@ function Overview({ sel, onFocus }: { sel: Selection; onFocus: (f: Focus) => voi
           title="Read what was said"
           sub="Calls, threads, notes and records, by the source they came from"
           onClick={() => onFocus({ kind: "folder", path: ["sources"] })}
-        />
-        <StartRow
-          icon="tools"
-          cls="k-code"
-          title="Ask it as an agent would"
-          sub="Call the memory's tools and see exactly what an agent gets back"
-          onClick={() => onFocus({ kind: "tools" })}
         />
       </div>
     </section>
@@ -1026,7 +1019,7 @@ function AdvicePane({
   );
   return (
     <Loading s={s} retry={retry} rows={6}>
-      {({ advice: a }) =>
+      {({ advice: a, history }) =>
         // A folder of advice (`#/skill/advice`), or anything else that isn't one piece: say so rather than read it.
         !a ? (
           <EmptyState icon="skill" title="No advice here">
@@ -1084,6 +1077,7 @@ function AdvicePane({
               </EmptyState>
             )}
           </div>
+          <Versions versions={history} what="note" onFocus={onFocus} />
         </section>
         )
       }
@@ -1126,18 +1120,12 @@ function SkillPane({
             <div className="head-text">
               <div className="eyebrow">{k.kind === "skill_index" ? "Routing index" : "Skill"}</div>
               <h1 className="title">
-                {k.kind === "skill_index" ? `Skills for ${humanize(k.goal)}` : humanize(k.name)}
+                {k.kind === "skill_index" ? "Skills index" : humanize(k.name)}
               </h1>
               <div className="subtitle">
-                <span>
-                  Goal{" "}
-                  <button
-                    className="link"
-                    onClick={() => onFocus({ kind: "folder", path: ["skills", k.goal] })}
-                  >
-                    {k.goal}
-                  </button>
-                </span>
+                <button className="link" onClick={() => onFocus({ kind: "folder", path: ["skills"] })}>
+                  All skills
+                </button>
                 {k.occurred_at != null && (
                   <span title={when(k.occurred_at)}>compiled {ago(k.occurred_at)}</span>
                 )}
@@ -1156,12 +1144,12 @@ function SkillPane({
           <div className="card card-pad">
             <Markdown
               text={k.markdown}
-              // A skill named in `code` in its goal's index links to it.
+              // A skill named in `code` in the index links to it.
               code={(c) =>
-                /^[a-z0-9][a-z0-9~-]*$/.test(c) && c !== k.goal ? (
+                /^[a-z0-9][a-z0-9~-]*$/.test(c) && c !== k.name ? (
                   <button
                     className="link mono"
-                    onClick={() => onFocus({ kind: "skill", path: ["skills", k.goal, c] })}
+                    onClick={() => onFocus({ kind: "skill", path: ["skills", c] })}
                   >
                     {c}
                   </button>
@@ -1213,6 +1201,7 @@ function SkillPane({
               )}
             </>
           )}
+          {k.kind === "skill" && <Versions versions={k.history} what="skill" onFocus={onFocus} />}
         </section>
         )
       }
@@ -1669,6 +1658,49 @@ function SearchSummary({
 }
 
 /** An entity's ended facts, drawn only once the reader opens them. */
+/** An engine document's versions, newest first, each opening as its episode: where a note's or a skill's history
+ * lives, now that `sources/` no longer lists the engine's own writes. */
+function Versions({
+  versions,
+  what,
+  onFocus,
+}: {
+  versions?: DocVersion[];
+  what: string;
+  onFocus: (f: Focus) => void;
+}) {
+  if (!versions || versions.length < 2) return null;
+  return (
+    <details className="history en-more">
+      <summary className="h-section">
+        <Icon name="chevron" size={14} /> Versions{" "}
+        <span className="count">
+          {versions.length} of this {what}
+        </span>
+      </summary>
+      <div className="card card-pad">
+        <ol className="versions">
+          {versions.map((v, i) => (
+            <li key={v.episode_id}>
+              <button
+                className="link"
+                title={v.episode_id}
+                onClick={() => onFocus({ kind: "episode", id: v.episode_id })}
+              >
+                {v.title || short(v.episode_id, 10)}
+              </button>{" "}
+              <span className="muted" title={when(v.occurred_at)}>
+                {ago(v.occurred_at)}
+              </span>
+              {i === 0 && <span className="chip">current</span>}
+            </li>
+          ))}
+        </ol>
+      </div>
+    </details>
+  );
+}
+
 function History({
   count,
   open,

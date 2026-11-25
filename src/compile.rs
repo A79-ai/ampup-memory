@@ -31,17 +31,25 @@
 //! **Per scope.** A scope's org (or team) may set two more ([`options_for`]), each only where it is set: its
 //! batch size (`compile_batch`, sources per round, over `AMPUP_MEMORY_COMPILE_BATCH`; a round writes at most 8
 //! skills, so sources that are each a situation of their own want 8 or fewer), and what its sources are
-//! (`compile_kind`: `errors` has each skill's `when` name the exception and its message as reported). A kind
+//! (`compile_kind`: `errors` has each skill's `when` name the exception and its message as reported; `changes` has a
+//! skill be a procedure people repeat, which each change record is folded into, not one skill per change). A kind
 //! changes the prompt and so the compiler's id; the batch size doesn't, and a scope that sets neither compiles
 //! with the same prompt, under the same id, as before either existed. A scope whose sources are of more than one
 //! kind names those its kind is about (`compile_kind_sources`, [`plan`]): they compile with the kind's prompt, the
 //! others with the one prompt, each group under a compiler id of its own, so adding sources of another kind
 //! compiles none of the kind's again.
 //!
+//! **Rebuilding.** In a `changes` group, skills written under other prompts (before the kind was set, a changed
+//! prompt) from the group's sources aren't shown to the model ([`rebuilt`]): the library is compiled again from the sources, not from what the old
+//! prompts made of them. The old skills are served until `memstore compile --retire` retires each one whose every
+//! source the current compiler has read ([`retire`]), on main, every version, kept in the ledger.
+//!
 //! **Audiences.** Sources whose ACLs differ never share a batch. A skill, its graph and its index are
 //! readable by exactly the ACL of the sources they were compiled from, so a skill never shows a reader what
 //! a source they can't read said. A skill whose audience isn't everyone carries its audience in its slug
-//! (`<slug>~<hash>`), so two audiences' skills for one situation stay apart.
+//! (`<slug>~<hash>`), so two audiences' skills for one situation stay apart. A skill many changes are folded into
+//! is no exception: every source it rests on has its audience's ACL, so whoever reads it may read all of them, and
+//! a change only another audience may read goes into that audience's own skill.
 //!
 //! **Grounding.** The model sees each new source under a handle (`SRC1`, `SRC2`, …) and must cite the handles a
 //! skill rests on. A skill that cites none of them, or only handles it wasn't given, is dropped, as an
@@ -84,6 +92,26 @@ pub fn sources_for(
         })
 }
 
+/// The compiler for `scope`: `cx` with the skill-library and AIP-graph models its org (or team) names
+/// (`set_settings {compile_model, aip_model}`), on `cx`'s backend; as it is where neither names one.
+pub fn scoped_models(
+    cx: &Extractor,
+    dir: Option<&crate::people::directory::Directory>,
+    scope: &Scope,
+) -> Extractor {
+    let Some(dir) = dir else {
+        return cx.clone();
+    };
+    let cx = match dir.model(scope, |s| s.compile_model.as_ref()) {
+        Some(m) => cx.with_model(&m),
+        None => cx.clone(),
+    };
+    match dir.model(scope, |s| s.aip_model.as_ref()) {
+        Some(m) => cx.with_aip_model(&m),
+        None => cx,
+    }
+}
+
 /// How a scope compiles beyond its sources and models, as its org's (or team's) settings say ([`options_for`]).
 /// The default is how every scope compiled before these settings: the server's batch size and the one prompt,
 /// under the same compiler id.
@@ -104,27 +132,46 @@ pub enum Kind {
     /// which is how an agent asks about the error (on 30 later Sentry questions, skills whose `when` described
     /// the fix instead were routed to by topic words alone).
     Errors,
+    /// Records of single changes (pull requests, tickets, commits): a skill is a procedure people repeat, which
+    /// several changes are instances of, not one change. Compiled with the one prompt, a library of change records
+    /// read like a changelog, one skill per change, and lookups routed to those skills were mostly off-task.
+    Changes,
 }
 
 impl Kind {
-    /// The kind a `compile_kind` setting names (`errors`); none for any other.
+    /// The kind a `compile_kind` setting names (`errors`, `changes`); none for any other.
     pub fn parse(name: &str) -> Option<Kind> {
         match name {
             "errors" => Some(Kind::Errors),
+            "changes" => Some(Kind::Changes),
             _ => None,
         }
     }
 }
 
+/// The kind `AMPUP_MEMORY_COMPILE_KIND` names, for a scope whose settings name none (a `serve --local` store has no
+/// settings).
+fn env_kind() -> Option<Kind> {
+    Kind::parse(std::env::var("AMPUP_MEMORY_COMPILE_KIND").ok()?.trim())
+}
+
 /// The compile options `scope` has: its team's `compile_batch` and `compile_kind`, else its org's; the default
-/// (the server's batch, the one prompt) where neither sets them, or with no directory.
+/// (the server's batch, the one prompt) where neither sets them, or with no directory. A kind no setting names is
+/// the server's `AMPUP_MEMORY_COMPILE_KIND`, if set.
 pub fn options_for(dir: Option<&crate::people::directory::Directory>, scope: &Scope) -> Options {
     let Some(d) = dir else {
-        return Options::default();
+        return Options {
+            kind: env_kind(),
+            ..Options::default()
+        };
     };
     Options {
         batch: d.compile_batch(scope),
-        kind: d.compile_kind(scope).as_deref().and_then(Kind::parse),
+        kind: d
+            .compile_kind(scope)
+            .as_deref()
+            .and_then(Kind::parse)
+            .or_else(env_kind),
     }
 }
 
@@ -253,17 +300,24 @@ const WHEN_LINE: &str = "- `when`: the situation, as an agent would recognize it
 const ERRORS_LINE: &str = "- the sources are error reports: a skill's `when` names the exception type and its message \
 as reported, and where it was raised, as an agent asking about that error would put it;\n";
 
+/// What [`Kind::Changes`] adds to the C2S prompt, after its `when` line.
+const CHANGES_LINE: &str = "- the sources are records of single changes (a pull request, a ticket, a commit). A skill is \
+a procedure people here repeat, never one change: fold each change into the skill for the procedure it is an instance \
+of, reusing that skill's slug and adding or correcting the steps, values and checks the change shows; create a skill \
+only when no skill in the library is that procedure, named for the procedure (`deploy-a-service-to-staging`, \
+`add-a-database-migration`), never for the change (`add-dark-mode-to-settings-page`), with a `when` that names the \
+task as someone starting it would put it. Changes that are instances of one procedure give one skill citing all of \
+them. A change that is no instance of a procedure anyone will repeat gives no skill;\n";
+
 /// The C2S prompt for sources of `kind`: [`C2S_PROMPT`] itself where none is set, so a scope that sets no kind
 /// keeps its compiler id.
 fn c2s_prompt(kind: Option<Kind>) -> std::borrow::Cow<'static, str> {
-    match kind {
-        None => std::borrow::Cow::Borrowed(C2S_PROMPT),
-        Some(Kind::Errors) => std::borrow::Cow::Owned(C2S_PROMPT.replacen(
-            WHEN_LINE,
-            &format!("{WHEN_LINE}{ERRORS_LINE}"),
-            1,
-        )),
-    }
+    let line = match kind {
+        None => return std::borrow::Cow::Borrowed(C2S_PROMPT),
+        Some(Kind::Errors) => ERRORS_LINE,
+        Some(Kind::Changes) => CHANGES_LINE,
+    };
+    std::borrow::Cow::Owned(C2S_PROMPT.replacen(WHEN_LINE, &format!("{WHEN_LINE}{line}"), 1))
 }
 
 const AIP_PROMPT: &str = "Compile this skill into an AIP step graph (the portable prose subset of AIP v0.3): \
@@ -713,6 +767,8 @@ pub async fn run_with(
     let id = compiler_id_with(sources, cx, opts);
     let size = opts.batch.unwrap_or_else(batch);
     let template = c2s_prompt(opts.kind);
+    // A `changes` group rebuilds what other prompts compiled from its sources ([`rebuilt`]).
+    let rebuilds = (opts.kind == Some(Kind::Changes)).then_some(sources);
     let actor = SOURCE;
     let mut tried = std::collections::HashSet::new();
     while done.episodes + done.failed < limit {
@@ -780,7 +836,7 @@ pub async fn run_with(
                 let round = match library(store, scope, branch, &acl).await {
                     Ok(lib) => match ahead.take() {
                         Some((guess, r)) if guess == lib => r,
-                        _ => c2s_round(&template, &acl, batch, lib, cx, &id).await,
+                        _ => c2s_round(&template, &acl, batch, lib, cx, &id, rebuilds).await,
                     },
                     Err(e) => Err(e),
                 };
@@ -813,7 +869,7 @@ pub async fn run_with(
                         let (b, guess) = next?;
                         Some((
                             guess.clone(),
-                            c2s_round(&template, &acl, b, guess, cx, &id).await,
+                            c2s_round(&template, &acl, b, guess, cx, &id, rebuilds).await,
                         ))
                     }
                 );
@@ -884,7 +940,14 @@ async fn c2s_round(
     lib: Library,
     cx: &Extractor,
     compiler: &str,
+    rebuilds: Option<&[String]>,
 ) -> Result<Round> {
+    // What the model sees of the library, and what an update builds on: not the skills this compiler rebuilds.
+    let seen: Library = lib
+        .iter()
+        .filter(|(_, (m, _))| !rebuilds.is_some_and(|srcs| rebuilt(m, compiler, srcs)))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let handles: Vec<(String, &Episode)> = batch
         .iter()
         .enumerate()
@@ -904,7 +967,7 @@ async fn c2s_round(
         })
         .collect();
     let batch_words: BTreeSet<String> = sources.iter().flat_map(|(_, t)| words(t)).collect();
-    let mut ranked: Vec<(&String, usize)> = lib
+    let mut ranked: Vec<(&String, usize)> = seen
         .iter()
         .map(|(slug, (_, text))| (slug, words(text).intersection(&batch_words).count()))
         .collect();
@@ -913,10 +976,10 @@ async fn c2s_round(
         .iter()
         .take(CONTEXT_SKILLS)
         .filter(|(_, n)| *n > 0)
-        .map(|(slug, _)| lib[*slug].1.clone())
+        .map(|(slug, _)| seen[*slug].1.clone())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let index: String = lib
+    let index: String = seen
         .iter()
         .map(|(slug, (_, text))| {
             format!(
@@ -966,7 +1029,7 @@ async fn c2s_round(
             continue;
         }
         let slug = format!("{base}{suffix}");
-        let (mut all, mut all_names) = match lib.get(&slug) {
+        let (mut all, mut all_names) = match seen.get(&slug) {
             Some((m, _)) if m.names.len() == m.sources.len() => {
                 (m.sources.clone(), m.names.clone())
             }
@@ -1049,18 +1112,208 @@ async fn finish_round(
         for (slug, text, _) in &written {
             lines.insert(slug.clone(), text.clone());
         }
-        let mut index =
-            "# Skills compiled from documents\n\nOne line per skill: when to use it, then its \
-                         AIP graph.\n\n"
-                .to_string();
-        for (slug, text) in lines {
-            let when = text
-                .lines()
-                .find_map(|l| l.strip_prefix("**When:** "))
-                .unwrap_or("");
-            index += &format!("- `{slug}`: {when} (`{}`)\n", aip_key(&slug));
-        }
-        docs.push(Episode::sourced(SOURCE, index.as_bytes(), &entries).version_of(&index_key(acl)));
+        docs.push(index_doc(acl, &lines));
     }
     Ok((docs, written.len(), aip_n, dropped))
+}
+
+/// An audience's routing index over its skills (slug -> text), one line per skill: when to use it, its graph.
+fn index_doc(acl: &[String], lines: &BTreeMap<String, String>) -> Episode {
+    let entries: Vec<&str> = acl.iter().map(String::as_str).collect();
+    let mut index =
+        "# Skills compiled from documents\n\nOne line per skill: when to use it, then its \
+                     AIP graph.\n\n"
+            .to_string();
+    for (slug, text) in lines {
+        let when = text
+            .lines()
+            .find_map(|l| l.strip_prefix("**When:** "))
+            .unwrap_or("");
+        index += &format!("- `{slug}`: {when} (`{}`)\n", aip_key(slug));
+    }
+    Episode::sourced(SOURCE, index.as_bytes(), &entries).version_of(&index_key(acl))
+}
+
+/// The prompt part of a compiler id (`compile:<sources>:<model>@<prompts>`).
+fn prompt_of(compiler: &str) -> &str {
+    compiler.rsplit_once('@').map_or("", |(_, p)| p)
+}
+
+/// Whether the compiler `compiler` of a `changes` group, compiling `sources`, rebuilds the skill `meta` rather than
+/// updating it: it was written under other prompts (before the scope's kind was `changes`, or a prompt since changed)
+/// from sources every one of which `sources` select. The model isn't shown such a skill, so the library is compiled
+/// again from the sources rather than from the skills the old prompt wrote (one per change, where `changes` wants one
+/// per procedure); the old skill is served until `compile --retire` retires it ([`retire`]). A skill written under
+/// the same prompts by another model is updated as before, and other kinds never rebuild: their skills are updated
+/// whatever prompt wrote them, as they always were.
+fn rebuilt(meta: &Meta, compiler: &str, sources: &[String]) -> bool {
+    prompt_of(&meta.compiler) != prompt_of(compiler)
+        && !meta.names.is_empty()
+        && meta.names.len() == meta.sources.len()
+        && meta.names.iter().all(|n| selects(sources, n, None))
+}
+
+/// What [`retire`] found, or retired.
+#[derive(Debug, Default)]
+pub struct Retired {
+    /// Skills compiled under other prompts whose every source the current compiler has read, each with the current
+    /// skills that cite one of its sources (none: the current compiler found no procedure in them).
+    pub skills: Vec<(String, Vec<String>)>,
+    /// Skills compiled under other prompts with sources the current compiler hasn't read yet: kept for now.
+    pub waiting: usize,
+    /// Versions of the documents a compile wrote under `goals/` before skills were compiled per scope: nothing reads
+    /// them since.
+    pub goal_versions: usize,
+    /// The episodes retired (every version of each skill and its graph, the goal-era versions), when applied.
+    pub retired: usize,
+    /// Audiences whose routing index was written again without the retired skills.
+    pub indexes: usize,
+    /// Set when the retirement needs the approval of the owners of entities whose facts cite these versions.
+    pub held_for_owners: bool,
+}
+
+/// Retire, on main, the skills `scope`'s compile no longer stands behind, or (`apply` false) only say which:
+/// - each skill [`rebuilt`] by one of `groups`, the scope's groups that compile as `changes` (their sources and
+///   compiler ids, as [`plan`] gives them; the others rebuild nothing), once that compiler has read every source the
+///   skill rests on: what those sources hold is in the current library by then,
+///   folded into the procedure skills that cite them, or judged no procedure at all;
+/// - every version of the documents a compile wrote under `goals/` (a `compile:<goal>` source), from when skills
+///   were compiled per goal.
+///
+/// Retiring is `Store::supersede`: every version of the skill and of its AIP graph is gone for readers on every
+/// branch, as a delete would make it, but nothing is deleted, the ledger keeps them, and a skill compiled again
+/// under the same slug is current again. Each audience whose skills were retired gets its routing index written
+/// again without them. Nothing calls a model. A retirement that facts on owned entities would lose needs their
+/// owners' approval and is refused whole ([`Retired::held_for_owners`]).
+pub async fn retire(
+    store: &Store,
+    scope: &Scope,
+    groups: &[(Vec<String>, String)],
+    apply: bool,
+) -> Result<Retired> {
+    let mut out = Retired::default();
+    let session = store.pin(scope, crate::MAIN).await?;
+    let mut skills: Vec<(String, Meta)> = vec![];
+    for key in session.engine_documents(SKILLS) {
+        if is_index(&key) {
+            continue;
+        }
+        if let Some(body) = session.engine_document(store, &key).await?
+            && let Some((meta, _)) = parse_skill(&body)
+        {
+            skills.push((key, meta));
+        }
+    }
+    // Which source each current skill cites, by group: where a retired skill's sources went.
+    let mut cited: HashMap<&str, Vec<String>> = HashMap::new();
+    for (_, m) in &skills {
+        if groups.iter().any(|(_, id)| *id == m.compiler) {
+            for src in &m.sources {
+                cited.entry(src.as_str()).or_default().push(m.slug.clone());
+            }
+        }
+    }
+    let mut read: HashMap<&str, std::collections::HashSet<String>> = HashMap::new();
+    let mut targets: Vec<crate::AclTarget> = vec![];
+    let mut audiences: BTreeSet<Vec<String>> = BTreeSet::new();
+    for (_, m) in &skills {
+        let Some((_, id)) = groups.iter().find(|(srcs, id)| rebuilt(m, id, srcs)) else {
+            continue;
+        };
+        if !read.contains_key(id.as_str()) {
+            let r = store.extracted_on(scope, crate::MAIN, id).await?;
+            read.insert(id.as_str(), r);
+        }
+        let done = &read[id.as_str()];
+        if !m
+            .sources
+            .iter()
+            .all(|e| done.contains(e) || session.vis().is_gone(e))
+        {
+            out.waiting += 1;
+            continue;
+        }
+        let mut into: Vec<String> = m
+            .sources
+            .iter()
+            .flat_map(|e| cited.get(e.as_str()).into_iter().flatten().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        into.retain(|s| *s != m.slug);
+        out.skills.push((m.slug.clone(), into));
+        audiences.insert(m.acl.clone());
+        for key in [skill_key(&m.slug), aip_key(&m.slug)] {
+            targets.extend(versions_of(session.vis(), &key));
+        }
+    }
+    // The goal-era documents: versions under `goals/` a `compile:` source wrote.
+    let goal_ids: Vec<String> = session
+        .vis()
+        .document_versions("goals/")
+        .into_iter()
+        .flat_map(|(_, ids)| ids.into_iter().map(String::from))
+        .filter(|id| !session.vis().is_gone(id))
+        .collect();
+    if !goal_ids.is_empty() {
+        let current = store.current_episodes(scope).await?;
+        for id in goal_ids {
+            if current
+                .get(&id)
+                .is_some_and(|e| e.source.starts_with("compile:") && e.source != SOURCE)
+            {
+                out.goal_versions += 1;
+                targets.push(crate::AclTarget::Episode(id));
+            }
+        }
+    }
+    if !apply || targets.is_empty() {
+        return Ok(out);
+    }
+    match store.supersede(scope, SOURCE, &targets).await {
+        Ok(ids) => out.retired = ids.len(),
+        Err(e) if crate::governance::OwnerApprovalRequired::refused(&e) => {
+            out.held_for_owners = true;
+            return Ok(out);
+        }
+        Err(e) => return Err(e),
+    }
+    // Each audience's index, over the skills it has left.
+    let mut docs = vec![];
+    let mut gone: Vec<crate::AclTarget> = vec![];
+    for acl in &audiences {
+        let lib = library(store, scope, crate::MAIN, acl).await?;
+        if lib.is_empty() {
+            gone.extend(versions_of(
+                store.pin(scope, crate::MAIN).await?.vis(),
+                &index_key(acl),
+            ));
+        } else {
+            let lines = lib
+                .into_iter()
+                .map(|(slug, (_, text))| (slug, text))
+                .collect();
+            docs.push(index_doc(acl, &lines));
+        }
+        out.indexes += 1;
+    }
+    if !docs.is_empty() {
+        store.commit(scope, SOURCE, &docs, &[]).await?;
+    }
+    if !gone.is_empty() {
+        store.supersede(scope, SOURCE, &gone).await?;
+    }
+    Ok(out)
+}
+
+/// Every version of document `key` (exactly that key), as targets.
+fn versions_of(vis: &crate::Vis, key: &str) -> Vec<crate::AclTarget> {
+    vis.document_versions(key)
+        .into_iter()
+        .filter(|(k, _)| *k == key)
+        .flat_map(|(_, ids)| {
+            ids.into_iter()
+                .map(|id| crate::AclTarget::Episode(id.to_string()))
+        })
+        .collect()
 }

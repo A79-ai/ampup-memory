@@ -3588,7 +3588,9 @@ pub async fn search(
 /// (the visibility state), the embedding model, and the fact and passage indexes with their index files: one
 /// query of each, for row ids only, so no row is read for anyone.
 pub async fn warm(store: &Store, scope: &Scope) -> Result<()> {
+    let running = crate::running::running(format!("warm {scope}: main's state"));
     store.pin(scope, crate::MAIN).await?;
+    running.step(format!("warm {scope}: fact index and tail"));
     let query = "warm up";
     // Without the embedding model (not fetched, and offline), the rest still warms: searches rank by keyword.
     // A remote embedding is the scope's org's to count.
@@ -3625,6 +3627,7 @@ pub async fn warm(store: &Store, scope: &Scope) -> Result<()> {
             rows::ids(scan).await?;
         }
     }
+    running.step(format!("warm {scope}: passages"));
     passages::warm(store, scope, query, q.as_ref()).await?;
     // The parts' rows, held in memory in the background once the index files the first searches need are in, so
     // reading them doesn't hold those up.
@@ -4697,6 +4700,45 @@ async fn ranked(
     // name variants), not what it holds: never a hit, nor a group's member (below), where they would push out what
     // the thing's facts say.
     out.retain(|h| !crate::dream_name(&h.fact));
+    // What only an agent wrote, where a fact a person stated or a system observed says it too: the same thing in
+    // other words under another name (a session's record restating what the person's kept note holds). Shown once,
+    // as theirs; the agent's copy, labelled "an agent concluded", would only cast doubt on it. Covered when nearly
+    // all its words (stemmed, `COVER`) are in the other's; a value of few words never is, so a bare "2" or "yes"
+    // isn't cut by any fact that happens to hold it.
+    let cover = knob("COVER", 0.8);
+    if !rank.classic && cover > 0.0 {
+        use crate::origin::Origin;
+        let words = |f: &Fact| stems(&format!("{} {}", f.predicate, f.value));
+        let firm: Vec<(String, HashSet<String>)> = out
+            .iter()
+            .filter(|h| h.origin.is_some_and(|o| o > Origin::Agent))
+            .map(|h| (h.fact.fact_id.clone(), words(&h.fact)))
+            .collect();
+        if !firm.is_empty() {
+            out.retain(|h| {
+                if h.origin != Some(Origin::Agent) {
+                    return true;
+                }
+                let mine = stems(&h.fact.value);
+                if mine.len() < 4 {
+                    return true;
+                }
+                let by = firm.iter().find(|(_, theirs)| {
+                    mine.iter().filter(|w| theirs.contains(*w)).count() as f32
+                        >= cover * mine.len() as f32
+                });
+                match by {
+                    Some((id, _)) => {
+                        if explain {
+                            cut.insert(h.fact.fact_id.clone(), Cut::Duplicate(id.clone()));
+                        }
+                        false
+                    }
+                    None => true,
+                }
+            });
+        }
+    }
     // Near-duplicates: facts about the same entity that say the same thing (the same value but for case,
     // spacing and punctuation) show once, the best ranked; the others come with it in a group, or not at all.
     let same = |s: &str| -> String {

@@ -386,11 +386,10 @@ impl Client {
             req = req.header("x-memstore-team", t);
         }
         let res = req.send().await.map_err(|e| {
-            Unreached(format!(
-                "no AmpUp Memory server at {}: {}",
-                self.url,
-                sent_error(&e)
-            ))
+            Unreached(
+                format!("no AmpUp Memory server at {}: {}", self.url, sent_error(&e)),
+                None,
+            )
         })?;
         let status = res.status();
         let retry_after = res
@@ -398,10 +397,12 @@ impl Client {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok());
-        let text = res
-            .text()
-            .await
-            .map_err(|e| Unreached(format!("{}{path}: the answer broke off: {e:#}", self.url)))?;
+        let text = res.text().await.map_err(|e| {
+            Unreached(
+                format!("{}{path}: the answer broke off: {e:#}", self.url),
+                None,
+            )
+        })?;
         // Past the day's most entries: no session's start or advice is sent again until the memory said one more fits
         // (`Retry-After`). Not worth sending again sooner, so not kept in the outbox either.
         if status.as_u16() == 429
@@ -415,13 +416,20 @@ impl Client {
             ))
             .into());
         }
-        // Down, busy, or signed out for now: worth sending again later.
+        // Down, busy, or signed out for now: worth sending again later, not before the memory said (`Retry-After`,
+        // or the body's `retry_after_secs`).
         if status.is_server_error() || [401, 408, 429].contains(&status.as_u16()) {
-            return Err(Unreached(format!(
-                "{}{path}: {status}: {}",
-                self.url,
-                text.chars().take(300).collect::<String>()
-            ))
+            let said = retry_after.or_else(|| {
+                serde_json::from_str::<Value>(&text).ok()?["retry_after_secs"].as_u64()
+            });
+            return Err(Unreached(
+                format!(
+                    "{}{path}: {status}: {}",
+                    self.url,
+                    text.chars().take(300).collect::<String>()
+                ),
+                said,
+            )
             .into());
         }
         if !status.is_success() {
@@ -593,17 +601,32 @@ impl Client {
 
     /// Keeps a write the memory couldn't take now in the outbox, as `kind` of harness session `session`, with
     /// where it was going: the newest of a kind and session replaces the last (each carries the whole
-    /// conversation so far). Read and written by its owner alone.
-    fn queue(&self, kind: &str, session: &str, path: &str, body: Value, tool: Option<&str>) {
+    /// conversation so far). It isn't sent again before its back-off is out ([`outbox_wait`], at least `said`
+    /// seconds when the memory said): the memory may still be taking the copy that timed out. A newer one that
+    /// replaces a waiting one counts on from its failures and waits at least as long. Read and written by its
+    /// owner alone.
+    fn queue(
+        &self,
+        kind: &str,
+        session: &str,
+        path: &str,
+        body: Value,
+        tool: Option<&str>,
+        said: Option<u64>,
+    ) {
         let dir = outbox_dir();
-        let item = json!({"kind": kind, "session": session, "url": self.url, "org": self.org,
-                          "team": self.team, "scope": self.scope, "path": path, "body": body,
-                          "tool": tool, "at": unix_now()});
         let key: String = session
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
             .collect();
         let file = dir.join(format!("{kind}-{key}.json"));
+        let waiting = read_item(&file).unwrap_or_default();
+        let attempts = waiting["attempts"].as_u64().unwrap_or(0) + 1;
+        let next_at = (unix_now() + outbox_wait(attempts, said))
+            .max(waiting["next_at"].as_u64().unwrap_or(0));
+        let item = json!({"kind": kind, "session": session, "url": self.url, "org": self.org,
+                          "team": self.team, "scope": self.scope, "path": path, "body": body,
+                          "tool": tool, "at": unix_now(), "attempts": attempts, "next_at": next_at});
         if let Err(e) = write_private(&dir, &file, &item.to_string()) {
             warn(format!("{kind} wasn't kept to send again: {e:#}"));
         }
@@ -644,10 +667,10 @@ impl std::fmt::Display for Capped {
 
 impl std::error::Error for Capped {}
 
-/// A failure worth sending again: the memory unreachable, slow, down, busy or the sign-in stale. A refusal
-/// (bad arguments, a session that isn't the caller's) never is.
+/// A failure worth sending again: the memory unreachable, slow, down, busy or the sign-in stale, with the seconds it
+/// said to wait first when it said. A refusal (bad arguments, a session that isn't the caller's) never is.
 #[derive(Debug)]
-struct Unreached(String);
+struct Unreached(String, Option<u64>);
 
 impl std::fmt::Display for Unreached {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -672,6 +695,12 @@ fn sent_error(e: &reqwest::Error) -> String {
     out
 }
 
+/// The seconds the memory said to wait before `e`'s write is sent again, when it said.
+fn said_wait(e: &anyhow::Error) -> Option<u64> {
+    e.chain()
+        .find_map(|c| c.downcast_ref::<Unreached>().and_then(|u| u.1))
+}
+
 fn worth_retrying(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.downcast_ref::<Unreached>().is_some())
         // The server's session buffer full for now.
@@ -683,9 +712,19 @@ fn tool_call(name: &str, args: &Value) -> Value {
            "params": {"name": name, "arguments": args}})
 }
 
-/// An MCP tool call's text answer, or its error.
+/// An MCP tool call's text answer, or its error. An error saying when to ask again (`retry_after_secs` in a
+/// JSON-RPC error's data or the tool answer's `_meta`: the memory busy) is worth sending again then, unless it is
+/// the day's most entries.
 fn tool_answer(name: &str, v: &Value) -> Result<String> {
+    let busy = |said: &Value| {
+        (said["daily_cap"] != true)
+            .then(|| said["retry_after_secs"].as_u64())
+            .flatten()
+    };
     if let Some(e) = v.get("error") {
+        if let Some(secs) = busy(&e["data"]) {
+            return Err(Unreached(format!("{name}: {e}"), Some(secs)).into());
+        }
         bail!("{name}: {e}");
     }
     let text = v["result"]["content"][0]["text"]
@@ -693,6 +732,9 @@ fn tool_answer(name: &str, v: &Value) -> Result<String> {
         .unwrap_or_default()
         .to_string();
     if v["result"]["isError"].as_bool() == Some(true) {
+        if let Some(secs) = busy(&v["result"]["_meta"]) {
+            return Err(Unreached(format!("{name}: {text}"), Some(secs)).into());
+        }
         bail!("{name}: {text}");
     }
     Ok(text)
@@ -706,6 +748,36 @@ fn unix_now() -> u64 {
 
 /// How long an outbox item waits for the memory before it is dropped.
 const OUTBOX_DAYS: u64 = 7;
+
+/// How long an outbox item waits after its first failure before it is sent again. Each failure after doubles it.
+const OUTBOX_FIRST_WAIT_SECS: u64 = 60;
+
+/// The longest an outbox item waits between sends, whatever its failures: half an hour.
+const OUTBOX_MOST_WAIT_SECS: u64 = 1_800;
+
+/// How long a session's end waits for the memory where nobody waits on it (a detached copy, the outbox): past the
+/// longest a busy memory takes to commit one, so an end isn't given up on mid-commit and sent again on top of it.
+const END_WAIT: Duration = Duration::from_secs(120);
+
+/// The seconds an outbox item waits before it is sent again after its `attempts`-th failure in a row: a minute,
+/// doubling with each failure up to half an hour, and up to a quarter more at random, so copies that failed together
+/// don't send again together. Never sooner than the memory `said` (at most an hour of it): a busy memory says to wait
+/// a second, and every hook sending again that soon is what keeps it busy.
+fn outbox_wait(attempts: u64, said: Option<u64>) -> u64 {
+    let base =
+        (OUTBOX_FIRST_WAIT_SECS << attempts.saturating_sub(1).min(5)).min(OUTBOX_MOST_WAIT_SECS);
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()))
+        ^ u64::from(std::process::id()).wrapping_mul(2_654_435_761);
+    let wait = base + seed % (base / 4 + 1);
+    wait.max(said.unwrap_or(0).min(CAPPED_MOST_SECS))
+}
+
+/// The outbox item in `file`, if it is there and reads.
+fn read_item(file: &Path) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()
+}
 
 /// Where writes the memory couldn't take wait: the config directory's `outbox/`.
 fn outbox_dir() -> std::path::PathBuf {
@@ -744,7 +816,7 @@ fn queue_if_unreached<T>(
 ) -> Result<T> {
     match r {
         Err(e) if worth_retrying(&e) => {
-            client.queue(kind, session_of(input), path, body, tool);
+            client.queue(kind, session_of(input), path, body, tool, said_wait(&e));
             Err(e.context("kept in the outbox to send again"))
         }
         r => r,
@@ -752,8 +824,9 @@ fn queue_if_unreached<T>(
 }
 
 /// Sends what the outbox holds, oldest first, each to where it was going: until the memory fails to take one
-/// (it is down, and the rest would wait out the same timeout) or `budget` is spent. What the memory refuses is
-/// dropped, as is what waited past [`OUTBOX_DAYS`]; a session's waiting keep goes once its end waits too.
+/// (it is down, and the rest would wait out the same timeout) or `budget` is spent. An item whose back-off isn't
+/// out (`next_at`) is left alone, and one that fails again waits longer ([`outbox_wait`]). What the memory refuses
+/// is dropped, as is what waited past [`OUTBOX_DAYS`]; a session's waiting keep goes once its end waits too.
 async fn send_outbox(budget: Duration) {
     let dir = outbox_dir();
     let Ok(listed) = std::fs::read_dir(&dir) else {
@@ -798,14 +871,18 @@ async fn send_outbox(budget: Duration) {
         if started.elapsed() > budget {
             break;
         }
+        // Not yet due: the memory may still be taking the copy that failed (a timed-out end's commit runs on).
+        if read_item(&p)
+            .and_then(|v| v["next_at"].as_u64())
+            .is_some_and(|at| at > unix_now())
+        {
+            continue;
+        }
         let claimed = p.with_extension(format!("json.sending.{pid}"));
         if std::fs::rename(&p, &claimed).is_err() {
             continue; // another copy has it
         }
-        let Some(item) = std::fs::read_to_string(&claimed)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        else {
+        let Some(mut item) = read_item(&claimed) else {
             let _ = std::fs::remove_file(&claimed);
             continue;
         };
@@ -819,7 +896,18 @@ async fn send_outbox(budget: Duration) {
             let _ = std::fs::remove_file(&claimed);
             continue;
         }
-        let client = Client::pinned(&item, Duration::from_secs(20));
+        // Counted as failed until it is taken, written before it is sent: a copy killed mid-send leaves it backed
+        // off, and the claim reads as fresh, so no other copy takes it back while this one waits on the memory.
+        let attempts = item["attempts"].as_u64().unwrap_or(0) + 1;
+        item["attempts"] = json!(attempts);
+        item["next_at"] = json!(unix_now() + outbox_wait(attempts, None));
+        let _ = write_private(&dir, &claimed, &item.to_string());
+        // An end can take the memory a while to commit, and nobody waits on this copy.
+        let timeout = match item["kind"] == "end" {
+            true => END_WAIT,
+            false => Duration::from_secs(20),
+        };
+        let client = Client::pinned(&item, timeout);
         let path = item["path"].as_str().unwrap_or("/mcp");
         // A server from before `/mcp/hook` answers it 404 (or 405): asked on `/mcp`, as `Client::hook_advice` does.
         let posted = match client.post(path, &item["body"]).await {
@@ -845,12 +933,29 @@ async fn send_outbox(budget: Duration) {
                 let _ = std::fs::remove_file(&claimed);
             }
             Err(e) if worth_retrying(&e) => {
-                // A newer one of the same kind and session waits already: it carries more.
-                let _ = match p.exists() {
-                    true => std::fs::remove_file(&claimed),
-                    false => std::fs::rename(&claimed, &p),
-                };
-                warn(format!("outbox: {what} waits: {e:#}"));
+                // Waits from now, the failure seen, at least as long as the memory said.
+                let next_at = unix_now() + outbox_wait(attempts, said_wait(&e));
+                item["next_at"] = json!(next_at);
+                // A newer one of the same kind and session waits already: it carries more, and waits at least as
+                // long as this one would have.
+                match read_item(&p) {
+                    Some(mut newer) => {
+                        let most = |k: &str, v: u64| json!(newer[k].as_u64().unwrap_or(0).max(v));
+                        let (a, n) = (most("attempts", attempts), most("next_at", next_at));
+                        newer["attempts"] = a;
+                        newer["next_at"] = n;
+                        let _ = write_private(&dir, &p, &newer.to_string());
+                        let _ = std::fs::remove_file(&claimed);
+                    }
+                    None => {
+                        let _ = write_private(&dir, &claimed, &item.to_string());
+                        let _ = std::fs::rename(&claimed, &p);
+                    }
+                }
+                warn(format!(
+                    "outbox: {what} waits {} s: {e:#}",
+                    next_at.saturating_sub(unix_now())
+                ));
                 break;
             }
             Err(e) => {
@@ -1546,6 +1651,8 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
     // What the person waits on is cut short: a slow memory adds nothing to the context rather than holding it up.
     let timeout = match (ending || event == "end", detached) {
         _ if tries => first_prompt_try(harness),
+        // A session's end in a copy: nobody waits on it, and one given up on mid-commit is sent again on top of it.
+        (true, true) => END_WAIT,
         (_, true) => Duration::from_secs(30),
         (true, false) => Duration::from_millis(900),
         (false, false) => match event {
@@ -2430,6 +2537,32 @@ fn git_repo(input: &Value) -> Option<String> {
         false => common,
     };
     last(&main.to_string_lossy())
+}
+
+/// `owner/name` of the checkout's GitHub origin (https, `git@github.com:` or `ssh://`), as the code host's connector
+/// names the repository (`repo:owner/name`), so a session's facts land on the entity its pull requests' do. None for
+/// another host or no origin. Nothing else of the URL (which can carry a token) is kept.
+fn github_slug(input: &Value) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", cwd_of(input), "config", "--get", "remote.origin.url"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let at = url.find("github.com")?;
+    if at > 0 && !url[..at].ends_with(['@', '/']) {
+        return None;
+    }
+    let rest = url[at + "github.com".len()..].strip_prefix([':', '/'])?;
+    let rest = rest.trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (owner, name) = rest.split_once('/')?;
+    let ok = |p: &str| {
+        !p.is_empty()
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    (ok(owner) && ok(name)).then(|| format!("{owner}/{name}"))
 }
 
 /// The repository the session works in: the top level of its directory's checkout, else the directory.
@@ -3544,6 +3677,10 @@ async fn end_session(client: &Client, input: &Value, harness: Harness) -> Result
     let capture = std::env::var("AMPUP_MEMORY_CAPTURE").unwrap_or_default() != "off";
     let seg = capture.then(|| trace_since(input, harness));
     let mut args = json!({"session_id": id, "harness": harness.session_name()});
+    // The repository it ran in, so what is learned from it lands on that repository's entity.
+    if let Some(repo) = github_slug(input) {
+        args["repo"] = json!(repo);
+    }
     if let Some(seg) = seg {
         if !seg.trace.trim().is_empty() {
             args["transcript"] = json!(seg.trace);
@@ -3824,7 +3961,15 @@ async fn rate_session(
     let kept = match client.post("/runs/reward", &body).await {
         Ok(_) => false,
         Err(e) if worth_retrying(&e) => {
-            client.queue("rate", session.unwrap_or(id), "/runs/reward", body, None);
+            let said = said_wait(&e);
+            client.queue(
+                "rate",
+                session.unwrap_or(id),
+                "/runs/reward",
+                body,
+                None,
+                said,
+            );
             true
         }
         Err(e) => return Err(e),

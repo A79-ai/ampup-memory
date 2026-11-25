@@ -32,7 +32,10 @@
 //! recorder's own reward: a PR's fate, a verifier), then the person (their rating, or their next message, which
 //! accepted the work or corrected it), then a model's reading of the transcript (the judge's). A situation gets a
 //! team note once its runs come from the people bar's worth of people, whatever rewarded them, and the note is
-//! served; each lesson must cite runs of that many people, and a pitfall a run that went wrong ([`gated`]). Outcomes
+//! served; each lesson must cite runs of that many people, and a pitfall a run that went wrong ([`gated`]). An
+//! imported run an outcome rewarded (graded elsewhere and imported by an admin: [`crate::runs::import`]) stands in
+//! for those people on its own: it is evidence of what happened, not one person's habit, so an import alone can
+//! teach the team, while one person's own runs never do ([`enough_people`]). Outcomes
 //! and people decide only whether the note is **ratified** ([`backing`]): a failure they showed, against a success
 //! they showed, or successes they showed from two people, from the people bar's worth of people, and a step of the
 //! note resting on such runs. Until then it is listed as not ratified, with why ([`Map::needs_backing`]), and
@@ -755,6 +758,23 @@ struct Map {
     /// the sessions the candidate isn't, until the runs served each settle which one is kept.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     trials: BTreeMap<String, Trial>,
+    /// Team notes an org admin wrote ([`write_admin`]): a note's key → who wrote it and the label they gave where it
+    /// came from. Served as written, ratified by the admin's word, and pinned: no learn writes it again, trims it,
+    /// withholds it, merges its situation away or takes it out of the map, whatever runs come in, until an admin
+    /// replaces or removes it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    admin: BTreeMap<String, Pinned>,
+}
+
+/// Who wrote a team note an admin wrote ([`Map::admin`]), and where they said it came from.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Pinned {
+    /// Where the note came from, as the admin labelled it: a team's runbook, a note learned elsewhere.
+    label: String,
+    /// The admin who wrote it, as an ACL entry names them (`norm_id`).
+    by: String,
+    /// When (µs).
+    at: i64,
 }
 
 /// What a document key's end marks as a note's candidate rather than the note ([`Space::trial_note`]).
@@ -975,7 +995,7 @@ fn backing(rs: &[&Run], min_people: usize) -> Option<String> {
             },
         ));
     }
-    (people.len() < min_people).then(|| {
+    (!enough_people(backed.iter().map(|r| **r), min_people)).then(|| {
         format!(
             "its backed runs come from {} {}, fewer than the {min_people} a team note needs{only}",
             people.len(),
@@ -1167,6 +1187,9 @@ pub struct Learned {
     pub waiting: usize,
     /// Notes the advisor model refused or answered without the sections.
     pub dropped: usize,
+    /// Situations whose note an admin wrote ([`write_admin`]), left as it is whatever runs came in.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pinned: usize,
     /// Situations whose task is the conversation itself ([`Situation::conversation`]): the team writes them no note.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub conversation: usize,
@@ -1265,7 +1288,7 @@ pub struct Skill {
     pub written_at: String,
 }
 
-/// Where a [`Skill`] came from: `"from": "runs"` or `"from": "documents"`.
+/// Where a [`Skill`] came from: `"from": "runs"`, `"from": "documents"` or `"from": "admin"`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "from", rename_all = "lowercase")]
 pub enum Origin {
@@ -1281,6 +1304,8 @@ pub enum Origin {
     },
     /// Compiled from the scope's documents.
     Documents,
+    /// Written by an org admin as it is ([`write_admin`]), with the label they gave where it came from.
+    Admin { label: String },
 }
 
 impl Skill {
@@ -1307,6 +1332,7 @@ impl Skill {
             ),
             Origin::Runs { .. } => "learned from runs of this kind of task".to_string(),
             Origin::Documents => "compiled from the organization's documents".to_string(),
+            Origin::Admin { label } => format!("written by an admin ({label})"),
         }
     }
 }
@@ -1834,7 +1860,7 @@ pub async fn hold(
             map.ratified.remove(k);
         }
     }
-    write_admin_map(store, scope, &mut map, "advice:hold").await?;
+    write_admin_map(store, scope, &mut map, "advice:hold", vec![]).await?;
     // What the advice page kept shows each note held or ratified as it was: worked out again on its next read here.
     crate::kept_answers::changed(&scope.namespace());
     Ok(map.held)
@@ -1862,25 +1888,32 @@ pub async fn ratify(
             map.ratified.remove(k);
         }
     }
-    write_admin_map(store, scope, &mut map, "advice:ratify").await?;
+    write_admin_map(store, scope, &mut map, "advice:ratify", vec![]).await?;
     // What the advice page kept shows each note held or ratified as it was: worked out again on its next read here.
     crate::kept_answers::changed(&scope.namespace());
     Ok(map.ratified.into_keys().collect())
 }
 
-/// Writes the team map an admin changed ([`hold`], [`ratify`]) and its index of the notes served now.
-async fn write_admin_map(store: &Store, scope: &Scope, map: &mut Map, actor: &str) -> Result<()> {
+/// Writes the team map an admin changed ([`hold`], [`ratify`], [`write_admin`]) and its index of the notes served
+/// now, in one commit with `docs` (a note the admin wrote).
+async fn write_admin_map(
+    store: &Store,
+    scope: &Scope,
+    map: &mut Map,
+    actor: &str,
+    mut docs: Vec<Episode>,
+) -> Result<()> {
     map.changed_at = Some(crate::now_micros());
     let map = &*map;
     let space = Space::team();
     let entries: Vec<&str> = map.acl.iter().map(String::as_str).collect();
     let served = map.served_notes();
-    let docs = vec![
+    docs.extend([
         Episode::sourced(&space.source, index(map, &served).as_bytes(), &entries)
             .version_of(&space.index()),
         Episode::sourced(&space.source, &serde_json::to_vec_pretty(map)?, &entries)
             .version_of(&space.map()),
-    ];
+    ]);
     store.commit(scope, actor, &docs, &[]).await?;
     Ok(())
 }
@@ -1949,6 +1982,8 @@ pub(crate) struct Listed {
     /// The situation it was merged into as the same task, when it was ([`crate::advice_curate`]): listed for its
     /// note's history, which is served no more.
     pub merged_into: Option<String>,
+    /// Where an org admin wrote its note ([`write_admin`]): the label they gave where it came from, and when (µs).
+    pub admin: Option<(String, i64)>,
 }
 
 /// What the session judge found of one item of a note ([`crate::sessions`]'s verdicts), across the judged sessions
@@ -2237,7 +2272,8 @@ fn session_outcome(l: &crate::qa_log::Logged) -> (Option<bool>, Option<&'static 
 /// at a session's start, `recalled`), how many people's sessions since `since` (µs) it was used in across the scope, how many of them went well or wrong
 /// ([`session_outcome`]), whether it is ratified (by its evidence, or by an admin: [`ratify`]), and the sessions
 /// themselves: everyone's where `every` (the org's admins, where the org shows people's activity), else only
-/// `who`'s own. Counts are the scope's for everyone; no one else's session, question or name is in them. Programs'
+/// `who`'s own. With `person`, that person's own notes stand in for `who`'s (an admin's view of someone, as
+/// `/lessons` reads them; the caller checks `every`), each with its `owner`. Counts are the scope's for everyone; no one else's session, question or name is in them. Programs'
 /// sessions ([`crate::sessions::automated`]) are left out.
 pub async fn usage(
     store: &Store,
@@ -2245,28 +2281,37 @@ pub async fn usage(
     who: &Principal,
     every: bool,
     since: i64,
+    person: Option<&str>,
 ) -> Result<Value> {
     // A page of how advice is used: the last visibility state serves (see [`trail`]).
     let session = store.pin_lagging(scope, crate::MAIN).await?;
     let bar = crate::sessions::evidence_bar(store, scope).await?;
     let tallies = crate::sessions::evidence(store, scope).await?;
     let log = crate::qa_log::list(store, scope, None).await?;
-    let me = crate::auth::acl::norm_id(who.user());
+    let owner = person.unwrap_or(who.user());
+    let me = crate::auth::acl::norm_id(owner);
     let mut out = vec![];
     // The team's notes, then the reader's own (`mine:`): written for them alone and served to them at once, so
     // never ratified, and used where a session was served one or was handed its preferences ([`recalled`]).
-    for space in [Space::team(), Space::mine(who.user())] {
-        let Some(m) = read_map(&session, store, who, &space).await? else {
+    // Someone else's own notes are written for them alone: read as them (as `/lessons` reads them for an admin).
+    let as_owner = crate::Principal::from_parts(me.clone(), vec![]);
+    for space in [Space::team(), Space::mine(owner)] {
+        let mine = space.owner.is_some();
+        let reading = if mine && me != crate::auth::acl::norm_id(who.user()) {
+            &as_owner
+        } else {
+            who
+        };
+        let Some(m) = read_map(&session, store, reading, &space).await? else {
             continue;
         };
-        let mine = space.owner.is_some();
         let conversation = m.conversation();
         let wanted = m
             .notes
             .keys()
             .filter(|k| !conversation.contains(*k))
             .cloned();
-        let mut notes = notes_of(&session, store, who, &space, wanted).await?;
+        let mut notes = notes_of(&session, store, reading, &space, wanted).await?;
         for (c, cat) in &m.categories {
             for (s, sit) in &cat.situations {
                 let bare = key(c, s);
@@ -2338,6 +2383,7 @@ pub async fn usage(
                     "approved": approved, "sessions": sessions});
                 if mine {
                     v["mine"] = json!(true);
+                    v["owner"] = json!(owner);
                 }
                 if m.held.contains(&bare) {
                     v["held"] = json!(true);
@@ -2355,7 +2401,7 @@ pub async fn usage(
             .cmp(&a["used"].as_u64())
             .then_with(|| a["key"].as_str().cmp(&b["key"].as_str()))
     });
-    Ok(json!({"advice": out, "every": every, "since": since}))
+    Ok(json!({"advice": out, "every": every, "since": since, "person": person}))
 }
 
 /// How many advice notes are read from the object store at once: one at a time, a map of a few hundred notes
@@ -2484,6 +2530,7 @@ async fn listed_of(
                 approved: map.ratified.contains_key(&k),
                 conversation: sit.conversation == Some(true),
                 merged_into: None,
+                admin: map.admin.get(&k).map(|p| (p.label.clone(), p.at)),
             });
         }
     }
@@ -2509,6 +2556,7 @@ async fn listed_of(
             approved: false,
             conversation: false,
             merged_into: Some(format!("{}{}", space.tag(), m.into)),
+            admin: None,
         });
     }
     times.merged = started.elapsed();
@@ -3023,6 +3071,27 @@ fn judged(r: &Run) -> bool {
     r.source == Source::Judge
 }
 
+/// Whether `r` is an imported run ([`crate::runs::import`]) an outcome rewarded: graded elsewhere, by what happened,
+/// and recorded by no one of the team. It is evidence of an outcome, not one person's habit, so it carries a lesson
+/// on its own where a team note otherwise needs runs of several people ([`enough_people`]).
+fn imported(r: &Run) -> bool {
+    !judged(r) && crate::runs::is_import(&r.asker)
+}
+
+/// Whether `runs` rest on enough people for a team's note or lesson: runs of at least `min_people` people, or an
+/// imported run an outcome rewarded ([`imported`]). One person's own runs, however many, never do (`min_people`
+/// is at least 2 for a team: [`crate::sessions::min_learn_people`]); nor does an import's runs read only by a model.
+fn enough_people<'a>(runs: impl IntoIterator<Item = &'a Run>, min_people: usize) -> bool {
+    let mut people: BTreeSet<&str> = BTreeSet::new();
+    for r in runs {
+        if imported(r) {
+            return true;
+        }
+        people.insert(r.asker.as_str());
+    }
+    people.len() >= min_people
+}
+
 /// Accounts of the runs of `shown` whose trace is longer than an advisor sees ([`NOTE_TRACE`]), by run id: each
 /// read whole (up to [`REFLECT_TRACE`]) by `reflector`, a chat model, so a note is written from what each run did
 /// from its start, not only how it ended. A run whose reflection fails is shown as before, by the end of its trace;
@@ -3175,7 +3244,7 @@ fn runs_text_as(
     // team's, without their names.
     let mut people: Vec<&str> = vec![];
     for r in shown {
-        if !people.contains(&r.asker.as_str()) {
+        if !crate::runs::is_import(&r.asker) && !people.contains(&r.asker.as_str()) {
             people.push(&r.asker);
         }
     }
@@ -3184,7 +3253,14 @@ fn runs_text_as(
         .enumerate()
         .map(|(i, r)| {
             let new = seen.is_some_and(|s| !s.is_empty()) && !seen_before(r, seen);
-            let person = people.iter().position(|p| *p == r.asker).unwrap_or(0) + 1;
+            // An imported run was asked by none of the team's people ([`imported`]): said so, never numbered as one.
+            let asked = match crate::runs::is_import(&r.asker) {
+                true => "imported, graded elsewhere".to_string(),
+                false => format!(
+                    "asked by P{}",
+                    people.iter().position(|p| *p == r.asker).unwrap_or(0) + 1
+                ),
+            };
             // An outcome or the person says how a run went; a model's reading is shown as unverified. A lesson may rest
             // on either ([`gated`]); only the first back it.
             let went = match (r.source, r.right) {
@@ -3199,7 +3275,7 @@ fn runs_text_as(
                 Source::Judge => "",
             };
             let mut t = format!(
-                "### R{} (asked by P{person}, {went}, reward {}{by}{})\nTask: {}\n",
+                "### R{} ({asked}, {went}, reward {}{by}{})\nTask: {}\n",
                 i + 1,
                 r.reward,
                 if new { ", new" } else { "" },
@@ -3382,7 +3458,8 @@ fn cited(item: &str) -> (String, Option<(Vec<usize>, bool)>) {
 }
 
 /// `note`'s items of [`GATED`] sections, each without what it cites ([`cited`]), kept only where it rests on runs
-/// of at least `min_people` people of `shown` (its runs, as [`runs_text`] numbered them), whatever rewarded them,
+/// of at least `min_people` people of `shown` (its runs, as [`runs_text`] numbered them), whatever rewarded them, or
+/// on an imported run an outcome rewarded ([`enough_people`]),
 /// or, where the writer was shown some (`procedures`), on the procedures: so a team note holds no lesson only one
 /// person's runs show, and none that cites nothing. A pitfall rests on a run that went wrong. With 1 (a person's own
 /// note), every item is kept. The note, how many items were dropped, and how many steps it kept that rest on runs
@@ -3426,17 +3503,12 @@ fn gated(
             return None;
         }
         let procedures = procedures && had_procedures;
-        let people: BTreeSet<&str> = from.iter().map(|r| r.asker.as_str()).collect();
-        if !procedures && people.len() < min_people {
+        if !procedures && !enough_people(from.iter().copied(), min_people) {
             return None;
         }
         // Whether runs an outcome or a person rewarded back it: a model's reading of a run backs nothing.
-        let backed: BTreeSet<&str> = from
-            .iter()
-            .filter(|r| !judged(r))
-            .map(|r| r.asker.as_str())
-            .collect();
-        if section == "Steps" && (procedures || backed.len() >= min_people) {
+        let backed = enough_people(from.iter().copied().filter(|r| !judged(r)), min_people);
+        if section == "Steps" && (procedures || backed) {
             backed_steps.set(backed_steps.get() + 1);
         }
         Some(text)
@@ -4359,6 +4431,269 @@ pub async fn seed(
     Ok(now.len())
 }
 
+/// The longest note an admin may write ([`write_admin`]), in characters.
+const ADMIN_NOTE_MAX: usize = 32_000;
+/// The longest label of where it came from.
+const ADMIN_LABEL_MAX: usize = 200;
+
+/// A team note an org admin writes as it is (`/admin {"op": "write_advice"}`), or takes out (no `note`): a team's
+/// runbook for a kind of task, or a note learned elsewhere (another organization, an earlier build), that they want
+/// served as it is.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AdminNote {
+    pub category: String,
+    /// The category's description, where the map has none for it yet.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub about: String,
+    pub situation: String,
+    /// When the situation applies: the line routing reads for it. Needed for a situation the map doesn't hold yet;
+    /// given for one it holds, it replaces the map's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub when: String,
+    /// The note, markdown in a learned note's sections (`## When`, `## Steps`, `## Pitfalls`, …); none takes the
+    /// note an admin wrote out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Where it came from, as the admin says: shown with it wherever it is listed or served.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+}
+
+/// What a [`write_admin`] did, or would do on a dry run.
+#[derive(Debug, Serialize)]
+pub struct AdminWrote {
+    /// The situation's key, `<category>/<situation>`.
+    pub key: String,
+    /// `written` (a situation with no note before), `replaced` or `removed`.
+    pub action: &'static str,
+    /// What the note replaced: one `learned` from runs, one a `repository` seeded, or one an `admin` wrote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<&'static str>,
+    /// Whether the situation stays in the map after a removal: runs are sorted into it, or procedures linked to it,
+    /// so learning may write it a note from them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub situation_kept: Option<bool>,
+    /// The audience the note is written for: the map's.
+    pub acl: Vec<String>,
+    /// On a dry run, the note as an agent would be served it (without its Evidence and Freshness, and any line of its
+    /// Steps, Pitfalls or Verification that is no part of an item).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served: Option<String>,
+}
+
+/// Writes `w`'s note as it is into `scope`'s team advice for situation `w.category`/`w.situation`, or takes the note
+/// an admin wrote there out (no note), as org admin `by` asked; `dry_run` says what it would do and writes nothing.
+///
+/// The note goes into the map as any situation's does, so routing offers it ([`get`]), and is marked as the admin's
+/// ([`Map::admin`], [`Origin::Admin`]) with `w.label`: listed and served as written by an admin, never as learned from
+/// runs. It is stamped with item ids (which no one is served) and nothing else: no budget trims it. It replaces the
+/// note the situation had (learned, a repository's, an admin's; a rewrite on trial is dropped, a hold or a
+/// withholding lifted), is ratified by the admin's word ([`ratify`]), and is pinned: learning leaves it as it is,
+/// whatever runs come in, until an admin writes it again or takes it out. Taken out, its situation stays in the map
+/// only where runs are sorted into it or procedures linked to it, and learning may then write it a note from them; the
+/// note's document stays as its history, as a learned note's does. Served, it loses what every note does: its
+/// Evidence and Freshness, and its dated `[state]` items once they are older than [`state_days`].
+///
+/// Written for the map's audience: `acl` (default the map's, or everyone, `*`, for a scope with no advice yet) must
+/// be it, as one map serves all its notes. The caller holds the scope's learn claim, as for [`hold`].
+pub async fn write_admin(
+    store: &Store,
+    scope: &Scope,
+    by: &str,
+    acl: Option<&[String]>,
+    w: &AdminNote,
+    dry_run: bool,
+) -> Result<AdminWrote> {
+    let k = key(&w.category, &w.situation);
+    if slug(&w.category).is_empty() || slug(&w.situation).is_empty() {
+        return Err(Refused("category and situation each need a word".into()).into());
+    }
+    let space = Space::team();
+    let session = store.pin(scope, crate::MAIN).await?;
+    // The map as it is, whoever it was written for: read as one audience, a map kept for another would look absent,
+    // and writing an empty one over it would lose every note.
+    let mut map: Map = match session.engine_document(store, &space.map()).await? {
+        Some(b) => serde_json::from_slice(&b)
+            .map_err(|e| anyhow::anyhow!("{scope}'s advice map isn't readable: {e}"))?,
+        None => Map::default(),
+    };
+    let mut asked: Vec<String> = acl.map(<[String]>::to_vec).unwrap_or_default();
+    asked.sort();
+    asked.dedup();
+    if map.acl.is_empty() {
+        map.acl = match asked.is_empty() {
+            true => vec!["*".to_string()],
+            false => asked,
+        };
+    } else if !asked.is_empty() && asked != map.acl {
+        return Err(Refused(format!(
+            "{scope}'s advice is kept for {:?}: write the note for that audience (leave acl out)",
+            map.acl
+        ))
+        .into());
+    }
+    // The category and situation as the map names them, where it holds them under another spelling of the same key.
+    let category = map
+        .categories
+        .keys()
+        .find(|c| slug(c) == slug(&w.category))
+        .cloned()
+        .unwrap_or_else(|| w.category.trim().to_string());
+    let situation = map
+        .categories
+        .get(&category)
+        .and_then(|cat| {
+            cat.situations
+                .keys()
+                .find(|s| slug(s) == slug(&w.situation))
+        })
+        .cloned()
+        .unwrap_or_else(|| w.situation.trim().to_string());
+    let replaced = if map.admin.contains_key(&k) {
+        Some("admin")
+    } else if !map.notes.contains_key(&k) {
+        None
+    } else if map.seeded.contains_key(&k) {
+        Some("repository")
+    } else {
+        Some("learned")
+    };
+    let mut docs = vec![];
+    let mut served = None;
+    let mut situation_kept = None;
+    let action = match &w.note {
+        None => {
+            if !map.admin.contains_key(&k) {
+                return Err(Refused(format!(
+                    "{scope} has no note an admin wrote for {k} (hold_advice holds a learned one)"
+                ))
+                .into());
+            }
+            map.admin.remove(&k);
+            map.notes.remove(&k);
+            map.ratified.remove(&k);
+            map.written.remove(&k);
+            // Its situation stays where runs are sorted into it or procedures linked to it: learning may write it a
+            // note from them.
+            let runs = map.assign.values().any(|(c, s)| key(c, s) == k);
+            let linked = map
+                .categories
+                .get(&category)
+                .and_then(|cat| cat.situations.get(&situation))
+                .is_some_and(|sit| !sit.skills.is_empty());
+            if !runs
+                && !linked
+                && let Some(cat) = map.categories.get_mut(&category)
+            {
+                cat.situations.remove(&situation);
+                if cat.situations.is_empty() {
+                    map.categories.remove(&category);
+                }
+            }
+            situation_kept = Some(runs || linked);
+            "removed"
+        }
+        Some(note) => {
+            let note = note.trim();
+            let label = w.label.trim();
+            if label.is_empty() {
+                return Err(Refused(
+                    "label says where the note came from (a team's runbook, a note learned elsewhere): it is shown \
+                     with the note"
+                        .into(),
+                )
+                .into());
+            }
+            if label.chars().count() > ADMIN_LABEL_MAX {
+                return Err(
+                    Refused(format!("label is at most {ADMIN_LABEL_MAX} characters")).into(),
+                );
+            }
+            if note.chars().count() > ADMIN_NOTE_MAX {
+                return Err(
+                    Refused(format!("the note is at most {ADMIN_NOTE_MAX} characters")).into(),
+                );
+            }
+            if let Some(why) = malformed(note) {
+                return Err(Refused(format!(
+                    "the note can't be served as it is: {why}. A note is markdown in a learned note's sections: \
+                     `## When`, `## Steps` (each step a `- ` or `1. ` item, its detail indented under it), \
+                     `## Pitfalls`"
+                ))
+                .into());
+            }
+            let new_situation = !map
+                .categories
+                .get(&category)
+                .is_some_and(|cat| cat.situations.contains_key(&situation));
+            if new_situation && w.when.trim().is_empty() {
+                return Err(Refused(format!(
+                    "when is needed for a new situation ({k}): the line routing reads for it"
+                ))
+                .into());
+            }
+            let cat = map.categories.entry(category.clone()).or_default();
+            if cat.description.trim().is_empty() {
+                cat.description = w.about.trim().to_string();
+            }
+            let sit = cat.situations.entry(situation.clone()).or_default();
+            if !w.when.trim().is_empty() {
+                sit.when = w.when.trim().to_string();
+            }
+            // A kind of task, never the conversation itself, which is served nothing ([`converse`]).
+            sit.conversation = Some(false);
+            let text = stamp_ids(note, &k);
+            let hash = short_hash(&[&text]);
+            map.notes.insert(k.clone(), hash.clone());
+            map.ratified.insert(k.clone(), hash);
+            map.admin.insert(
+                k.clone(),
+                Pinned {
+                    label: label.to_string(),
+                    by: crate::auth::acl::norm_id(by.trim()),
+                    at: crate::now_micros(),
+                },
+            );
+            // What learning or another admin decided of the note it replaces no longer holds.
+            map.written.remove(&k);
+            map.trials.remove(&k);
+            map.withheld.remove(&k);
+            map.needs_backing.remove(&k);
+            map.held.remove(&k);
+            map.seeded.remove(&k);
+            // A situation curation merged into another is one of its own again: its tasks sort here.
+            map.merged.remove(&k);
+            if dry_run {
+                served = Some(served_text(&text, chrono::Utc::now().date_naive()));
+            }
+            let entries: Vec<&str> = map.acl.iter().map(String::as_str).collect();
+            docs.push(
+                Episode::sourced(&space.source, text.as_bytes(), &entries)
+                    .version_of(&space.note(&k)),
+            );
+            if replaced.is_some() {
+                "replaced"
+            } else {
+                "written"
+            }
+        }
+    };
+    let acl = map.acl.clone();
+    if !dry_run {
+        write_admin_map(store, scope, &mut map, "advice:admin", docs).await?;
+        // What the advice page kept shows each note as it was: worked out again on its next read here.
+        crate::kept_answers::changed(&scope.namespace());
+    }
+    Ok(AdminWrote {
+        key: k,
+        action,
+        replaced: replaced.filter(|_| action != "removed"),
+        situation_kept,
+        acl,
+        served,
+    })
+}
+
 /// Learns the scope's advice from its rewarded runs, for the audience `acl`; a situation gets a note once at
 /// least `min_wrong` of its runs went wrong, or [`min_right`] went right.
 pub async fn learn(
@@ -4397,6 +4732,10 @@ pub struct Pass {
     pub rewrite: BTreeSet<String>,
     /// Every note whose runs changed is updated, served lately or not (`AMPUP_MEMORY_ADVICE_EDIT_IDLE_DAYS`).
     pub force: bool,
+    /// Notes, by key, an earlier pass of the same learn wrote ([`crate::advice_loop::learn_all`]): updated once their
+    /// runs changed, however few did, served lately or not, and never put on trial against themselves, as nobody was
+    /// served them yet.
+    pub written_now: BTreeSet<String>,
 }
 
 /// [`learn`] of the team's advice as `pass` asks.
@@ -4457,11 +4796,12 @@ async fn learn_space(
     if pass.resort {
         // What curation decided stays: a note withheld for scoring worse isn't served again for being re-sorted, and
         // a situation merged into another still lands there.
-        // So do the notes a repository seeded, with their situations: no run sorts them back.
+        // So do the notes a repository seeded or an admin wrote, with their situations: no run sorts them back.
         let mut categories: BTreeMap<String, Category> = BTreeMap::new();
         for (c, cat) in &map.categories {
             for (s, sit) in &cat.situations {
-                if map.seeded.contains_key(&key(c, s)) {
+                let k = key(c, s);
+                if map.seeded.contains_key(&k) || map.admin.contains_key(&k) {
                     let to = categories.entry(c.clone()).or_default();
                     to.description = cat.description.clone();
                     to.situations.insert(s.clone(), sit.clone());
@@ -4471,7 +4811,7 @@ async fn learn_space(
         let notes = map
             .notes
             .iter()
-            .filter(|(k, _)| map.seeded.contains_key(*k))
+            .filter(|(k, _)| map.seeded.contains_key(*k) || map.admin.contains_key(*k))
             .map(|(k, h)| (k.clone(), h.clone()))
             .collect();
         map = Map {
@@ -4483,14 +4823,17 @@ async fn learn_space(
             categories,
             notes,
             seeded: map.seeded,
+            admin: map.admin,
             ..Map::default()
         };
     }
     let mut audience = acl.to_vec();
     audience.sort();
     if map.acl != audience {
-        // Notes kept for another audience are written again for this one, so none stays readable by the old.
-        map.notes.clear();
+        // Notes kept for another audience are written again for this one, so none stays readable by the old. A note an
+        // admin wrote stays as they wrote it, readable by the audience they wrote it for, until they write it again.
+        let admin = &map.admin;
+        map.notes.retain(|k, _| admin.contains_key(k));
         map.written.clear();
         map.withheld.clear();
         map.linked.clear();
@@ -4603,12 +4946,22 @@ async fn learn_space(
             done.too_few += 1;
             continue;
         }
-        let people: BTreeSet<&str> = rs.iter().map(|r| r.asker.as_str()).collect();
-        if people.len() < min_people {
+        if !enough_people(rs.iter().copied(), min_people) {
             done.few_people += 1;
             continue;
         }
         let k = key(c, s);
+        // A note an admin wrote is theirs ([`write_admin`]): no learn writes it again, whatever runs come in, until
+        // an admin replaces or removes it.
+        if map.admin.contains_key(&k) {
+            if pass.rewrite.contains(&k) {
+                eprintln!(
+                    "advice {k}: an admin wrote this note, so it isn't written again from runs"
+                );
+            }
+            done.pinned += 1;
+            continue;
+        }
         // Whether outcomes or people back the team's runs here ([`backing`]): the note is learned and served from runs
         // of enough people whatever rewarded them, and ratified only once they do.
         let unbacked = match space.owner {
@@ -4673,6 +5026,8 @@ async fn learn_space(
         let h = note_hash(rs, &[NOTE_FORMAT, &procedures]);
         // A note an admin asked to be written again whole (`learn_advice {rewrite: [...]}`) is, whatever changed.
         let rewriting = pass.rewrite.contains(&k);
+        // A note this learn wrote in an earlier pass takes the runs recorded since in full ([`Pass::written_now`]).
+        let just_written = pass.written_now.contains(&k);
         // A note whose rewrite is on trial: once each version has enough rewarded runs since the trial began, the
         // rewrite replaces the note if its runs went better, and is dropped if not; until then the note isn't written
         // again (unless an admin asks for it whole, which ends the trial).
@@ -4791,6 +5146,7 @@ async fn learn_space(
         if let Some(was) = map.written.get(&k)
             && !due(was)
             && !rewriting
+            && !just_written
         {
             done.waiting += 1;
             continue;
@@ -4798,7 +5154,8 @@ async fn learn_space(
         // A note nobody was served or routed to lately isn't updated: an edit costs a strong model's read of its
         // runs (most of what learning spends), and what it would change reaches no one. Its new runs stay new to it,
         // so the update it gets once it is used again takes them in. `force` updates every note.
-        if map.notes.contains_key(&k) && !rewriting && !pass.force && idle_days > 0 {
+        if map.notes.contains_key(&k) && !rewriting && !just_written && !pass.force && idle_days > 0
+        {
             if used.is_none() {
                 let since = crate::now_micros() - idle_days * 86_400_000_000;
                 let mut u = used_since(store, scope, since).await?;
@@ -4890,10 +5247,15 @@ async fn learn_space(
     }
     // A note kept only while its situation may hold one: a situation that lost its runs or its people
     // (forgotten, retracted), or has none left, is taken out of the map, so no note outlives what it was written from.
-    // A note a repository seeded stays while no runs back its situation ([`seed`]).
+    // A note a repository seeded stays while no runs back its situation ([`seed`]); one an admin wrote, until an
+    // admin removes it ([`write_admin`]).
     let seeded = map.seeded.clone();
+    let admin = map.admin.clone();
     let keep = |k: &String| {
-        eligible.contains(k) || needs_backing.contains_key(k) || seeded.contains_key(k)
+        eligible.contains(k)
+            || needs_backing.contains_key(k)
+            || seeded.contains_key(k)
+            || admin.contains_key(k)
     };
     map.notes.retain(|k, _| keep(k));
     map.written.retain(|k, _| keep(k));
@@ -5035,7 +5397,10 @@ async fn learn_space(
             // A rewrite of a note there is goes on trial against it ([`trials`]): kept as a candidate, served to
             // part of the sessions, while the note stays as it was.
             Ok(Some((text, _, _)))
-                if trials() && map.notes.contains_key(&k) && !pass.rewrite.contains(&k) =>
+                if trials()
+                    && map.notes.contains_key(&k)
+                    && !pass.rewrite.contains(&k)
+                    && !pass.written_now.contains(&k) =>
             {
                 let text = stamp_ids(&text, &k);
                 let (text, _) = curb(&text, &format!("{}{k}", space.tag()), &tally, today, true);
@@ -5141,7 +5506,7 @@ async fn learn_space(
     }
     // A note not written again here is kept as every note is written, with no model call: one written before items
     // had ids gets them, and one holding items agents kept doing anyway loses them ([`curb`]; the budget is the
-    // writer's to keep). A note an admin held stays as they held it.
+    // writer's to keep). A note an admin held stays as they held it, and one an admin wrote as they wrote it.
     for k in map.notes.keys().filter(|k| !stamped.contains(*k)) {
         let Some((_, _, b)) = session.document(store, &who, &space.note(k), None).await? else {
             continue;
@@ -5152,7 +5517,7 @@ async fn learn_space(
             text = stamp_ids(&text, k);
             done.stamped += 1;
         }
-        if !map.held.contains(k) {
+        if !map.held.contains(k) && !map.admin.contains_key(k) {
             let (curbed, cut) = curb(&text, &format!("{}{k}", space.tag()), &tally, today, false);
             if cut.redundant + cut.over_budget > 0 {
                 eprintln!(
@@ -5211,7 +5576,8 @@ fn retire(
     let mut decided: Vec<(String, Option<curate::Utility>)> = vec![];
     for ((c, s), rs) in groups {
         let k = key(c, s);
-        if !map.notes.contains_key(&k) {
+        // A note an admin wrote is served as they wrote it, however its served runs score ([`write_admin`]).
+        if !map.notes.contains_key(&k) || map.admin.contains_key(&k) {
             continue;
         }
         // As a session or a run names what it was served: `mine:`-tagged in a person's own space.
@@ -5376,10 +5742,12 @@ async fn dedupe(
                 .filter(|(id, cs)| by_id.contains_key(id.as_str()) && key(&cs.0, &cs.1) == k)
                 .count()
         };
+        // A situation whose note an admin wrote ([`write_admin`]) is never merged away: others may go into it.
         let into = keys
             .iter()
             .max_by_key(|k| {
                 (
+                    map.admin.contains_key(*k),
                     map.notes.contains_key(*k) && !map.withheld.contains_key(*k),
                     map.notes.contains_key(*k),
                     runs_of(k),
@@ -5389,7 +5757,11 @@ async fn dedupe(
             .cloned()
             .expect("two keys");
         let target = names[&into].clone();
-        for from in keys.into_iter().filter(|k| *k != into) {
+        let from: Vec<String> = keys
+            .into_iter()
+            .filter(|k| *k != into && !map.admin.contains_key(k))
+            .collect();
+        for from in from {
             let (fc, fs) = names[&from].clone();
             for cs in map.assign.values_mut() {
                 if cs.0 == fc && cs.1 == fs {
@@ -6165,16 +6537,49 @@ async fn route(
     let noted = note.is_some();
     // What the note says of when it applies, read from the note whole: the text served may leave its Withhold when out.
     let when = note.as_deref().and_then(crate::advice_route::When::of);
-    let (text, dropped) = fit(note, procedures, more, format, max_chars, mine);
-    let fit = match check_fit {
+    // A note an admin wrote is said to be theirs, not lessons learned from runs.
+    let admin = served.iter().find_map(|s| match &s.origin {
+        Origin::Admin { label } => Some(label.clone()),
+        _ => None,
+    });
+    // Kept to write the text again from the note's helpful items alone, once it is found to fit ([`helpful_items`]).
+    let again = (note.clone(), procedures.clone(), more.clone());
+    let (text, dropped) = fit(
+        note,
+        procedures,
+        more,
+        format,
+        max_chars,
+        mine,
+        admin.as_deref(),
+    );
+    let fitted = match check_fit {
         Some(d) => crate::advice_route::fits(d, question, when.as_ref(), &text).await,
         None => crate::advice_route::fits_chat(router, question, when.as_ref(), &text).await,
     };
     let key = format!("{}{}", space.tag(), lines[i].0);
-    if let Some(withheld) = fit.withheld() {
+    if let Some(withheld) = fitted.withheld() {
         crate::advice_lookups::step(mine, withheld, Some(key));
         return Ok(None);
     }
+    // A note fit whole is served its items that help with this very request: the decisions model weighs each.
+    let (text, dropped) = match (check_fit, again) {
+        (Some(d), (Some(note), procedures, more)) => {
+            match helpful_items(d, question, &note).await {
+                Some(kept) => fit(
+                    Some(kept),
+                    procedures,
+                    more,
+                    format,
+                    max_chars,
+                    mine,
+                    admin.as_deref(),
+                ),
+                None => (text, dropped),
+            }
+        }
+        _ => (text, dropped),
+    };
     crate::advice_lookups::step(mine, crate::advice_lookups::ROUTED, Some(key.clone()));
     // A procedure left out to fit is named in the text, not served.
     served.truncate(served.len().saturating_sub(dropped));
@@ -6191,6 +6596,53 @@ async fn route(
         unbacked,
         approved,
     }))
+}
+
+/// `note` (as it is served) with only its Steps, Pitfalls and Verification items the decisions model finds help with
+/// `question` ([`crate::advice_route::useful_items`], at [`crate::advice_route::item_min`]), steps numbered again and
+/// sections left with no item taken out. Where none reaches the bar, the one found most helpful: the note was found to
+/// fit whole. None where every item is kept, the note has fewer than two, the filter is off, or the items weren't
+/// weighed: the note is served as it is.
+async fn helpful_items(d: &crate::decide::Decider, question: &str, note: &str) -> Option<String> {
+    let min = crate::advice_route::item_min()?;
+    let items = std::cell::RefCell::new(vec![]);
+    map_items(note, |_, item| {
+        items.borrow_mut().push(item.to_string());
+        Some(item.to_string())
+    });
+    let items = items.into_inner();
+    if items.len() < 2 {
+        return None;
+    }
+    let ps = crate::advice_route::useful_items(d, question, note, &items).await?;
+    let mut keep: Vec<bool> = ps.iter().map(|p| *p >= min).collect();
+    if !keep.contains(&true) {
+        let best = (0..ps.len()).max_by(|&a, &b| ps[a].total_cmp(&ps[b]))?;
+        keep[best] = true;
+    }
+    let kept = keep.iter().filter(|k| **k).count();
+    crate::advice_lookups::items_kept(kept, items.len());
+    eprintln!(
+        "advice: {kept} of the note's {} items help with the request (bar {min}): {}",
+        items.len(),
+        ps.iter()
+            .map(|p| format!("{p:.2}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    if kept == items.len() {
+        return None;
+    }
+    let at = std::cell::Cell::new(0);
+    let (kept_text, _) = map_items(note, |_, item| {
+        let i = at.get();
+        at.set(i + 1);
+        keep.get(i)
+            .copied()
+            .unwrap_or(true)
+            .then(|| item.to_string())
+    });
+    Some(without_empty_sections(&kept_text))
 }
 
 /// The chat router's pick of one of `lines` among `among` (their indices), the ones that rank best for the question
@@ -6312,10 +6764,14 @@ fn learned_skill(
     let w = map.written.get(key);
     Some(Skill {
         key: key.to_string(),
-        // A note a repository seeded ([`seed`]) was written from its documents, not from runs.
-        origin: match map.seeded.contains_key(key) {
-            true => Origin::Documents,
-            false => Origin::Runs {
+        // A note a repository seeded ([`seed`]) was written from its documents, not from runs; one an admin wrote
+        // ([`write_admin`]), by them.
+        origin: match (map.admin.get(key), map.seeded.contains_key(key)) {
+            (Some(p), _) => Origin::Admin {
+                label: p.label.clone(),
+            },
+            (None, true) => Origin::Documents,
+            (None, false) => Origin::Runs {
                 runs: w.map(|w| w.runs),
                 right: w.map(|w| w.runs.saturating_sub(w.wrong)),
                 wrong: w.map(|w| w.wrong),
@@ -6419,8 +6875,9 @@ fn fit(
     format: Format,
     max_chars: Option<usize>,
     mine: bool,
+    admin: Option<&str>,
 ) -> (String, usize) {
-    let text = compose(note.clone(), &procedures, &more, format, mine);
+    let text = compose(note.clone(), &procedures, &more, format, mine, admin);
     let Some(max) = max_chars else {
         return (text, 0);
     };
@@ -6443,7 +6900,7 @@ fn fit(
             .to_string()
     };
     loop {
-        let text = compose(note.clone(), &procedures, &more, format, mine);
+        let text = compose(note.clone(), &procedures, &more, format, mine, admin);
         if fits(&text) || procedures.is_empty() {
             let dropped = given - procedures.len();
             if fits(&text) {
@@ -6586,18 +7043,30 @@ fn without_empty_sections(md: &str) -> String {
 }
 
 /// The answer's text: a line on what follows, the note, then the procedures. `mine`: the note is the caller's own,
-/// learned from their sessions alone, and its line says so (a personal space serves no procedures).
+/// learned from their sessions alone, and its line says so (a personal space serves no procedures). `admin`: an org
+/// admin wrote the note ([`write_admin`]), with this label of where it came from, and its line says so.
 fn compose(
     note: Option<String>,
     procedures: &[String],
     more: &[String],
     format: Format,
     mine: bool,
+    admin: Option<&str>,
 ) -> String {
     let mut out = match (&note, procedures.is_empty()) {
         (Some(_), _) if mine => "Below is your own advice for this kind of task, learned from your past sessions; \
                                  only you see it. Follow it unless the data contradicts it."
             .to_string(),
+        (Some(_), empty) if admin.is_some() => format!(
+            "Below is the advice an admin of this organization wrote for this kind of task ({}){}. Follow it unless \
+             the data contradicts it.",
+            admin.unwrap_or_default(),
+            if empty {
+                ""
+            } else {
+                ", then the procedure compiled from its documents"
+            }
+        ),
         (Some(_), false) => "Below are the lessons learned from this organization's past runs of this kind of task, \
                              then the procedure compiled from its documents. Follow them unless the data \
                              contradicts them."

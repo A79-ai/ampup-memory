@@ -651,6 +651,81 @@ pub async fn fits(
     if fit { Fit::Fits } else { Fit::OffTask }
 }
 
+/// What the decisions model is asked of each item of a note it found fits the request ([`useful_items`]). The item is
+/// named in the question; the request, where it was asked, the whole note and every item are in the state.
+const ITEM_ASK: &str = "An AI agent is about to do the request, and the advice was found for it. Does the item named \
+below (one of the advice's items, in items) tell the agent something it needs for this very request: a step to take, \
+a pitfall to avoid or a check to run that applies to what the request asks? It doesn't when it is about another part \
+of the work, another case or a situation the request isn't in, or only says what any capable agent would do anyway. \
+The item:";
+
+/// The bar an item of a served note must reach to be served ([`useful_items`]): `AMPUP_MEMORY_ADVICE_ITEM_MIN`,
+/// default 0.3. None, every item served as before, where `AMPUP_MEMORY_ADVICE_ITEM_FILTER=off`.
+pub fn item_min() -> Option<f64> {
+    if std::env::var("AMPUP_MEMORY_ADVICE_ITEM_FILTER").is_ok_and(|v| v.trim() == "off") {
+        return None;
+    }
+    Some(
+        std::env::var("AMPUP_MEMORY_ADVICE_ITEM_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.3),
+    )
+}
+
+/// How likely each of `items` (a served note's Steps, Pitfalls and Verification items, in order) is to help with
+/// `question`, by the decisions model: the request, where it was asked and the whole note are its state, so each item
+/// is read in its note; one question an item, in as few requests as [`crate::decide`] batches them. A note found to
+/// fit the request whole still carries items for other cases of its situation, and an agent served them follows them
+/// too. None when it isn't answered in time or fails: the note is served whole, as before items were weighed.
+pub async fn useful_items(
+    d: &crate::decide::Decider,
+    question: &str,
+    note: &str,
+    items: &[String],
+) -> Option<Vec<f64>> {
+    let mut state = serde_json::json!({"request": question});
+    if let Some(a) = asked() {
+        state["asked"] = serde_json::json!(a.place);
+        if let Some(c) = a.conversation {
+            state["conversation_end"] = serde_json::json!(c);
+        }
+    }
+    state["advice"] = serde_json::json!(note.chars().take(3_000).collect::<String>());
+    state["items"] = serde_json::json!(items);
+    let questions = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let item: String = item.chars().take(600).collect();
+            (
+                format!("item_{}", i + 1),
+                crate::decide::Question::Likely(format!("{ITEM_ASK} {item}")),
+            )
+        })
+        .collect();
+    let wait = decide_wait();
+    match tokio::time::timeout(wait, d.decide(&state, questions)).await {
+        Ok(Ok(a)) => Some(
+            (1..=items.len())
+                .map(|i| a.get(&format!("item_{i}")).map_or(1.0, |a| a.likely()))
+                .collect(),
+        ),
+        Ok(Err(e)) => {
+            eprintln!("advice: the note's items weren't weighed, served whole: {e:#}");
+            crate::advice_lookups::trouble(&format!("the note's items weren't weighed: {e:#}"));
+            None
+        }
+        Err(_) => {
+            eprintln!("advice: the note's items weren't weighed within {wait:?}, served whole");
+            crate::advice_lookups::trouble(&format!(
+                "the note's items weren't weighed within {wait:?}"
+            ));
+            None
+        }
+    }
+}
+
 /// How long the chat router has to say whether routed advice fits ([`fits_chat`]): `AMPUP_MEMORY_ADVICE_FIT_WAIT_SECS`,
 /// default 8. A router reached through a slower transport than an API (a CLI, a queue shared with learning calls)
 /// needs longer, or every fit check times out and nothing is served.

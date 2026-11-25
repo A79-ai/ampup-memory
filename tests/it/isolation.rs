@@ -11,7 +11,11 @@
 //! gets nothing there. A person who selects nothing gets their one org. A service key reads only its own
 //! scope (a team key never its org's), and an ingest key reads nothing. A member's personal key reads what
 //! they do (their teams and their own notes too), and manages nothing even when they are an admin. A key or a person never falls back
-//! to the served scope; the operator's key, which is in no org, reads only the served scope.
+//! to the served scope. The operator's key, which is in no org, reads the served scope when it selects nothing. An org it
+//! selects (by name or alias, never a team) it reads as that org's admins do, on the routes that only read (search,
+//! queries, episodes, the browse and its lists, lessons): what the org shares with everyone, never what a member keeps
+//! to themselves (their notes, sessions, profile or own advice). Anywhere else (`/document`, `/mcp`, a team) it is
+//! refused there, as every other key outside its own scope is.
 //!
 //! Not covered: `ask_memory` needs an answer model (`AMPUP_MEMORY_ANSWER_MODEL`, Gemini on Vertex AI) and isn't
 //! offered without one; `/whoami` exists only behind Google sign-in; the internal port's service functions
@@ -35,6 +39,9 @@ const PRIVATE: &str = "xmineprivate";
 
 /// The tag of a session's transcript (`start_session` … `end_session`): its owner's alone.
 const SESSION: &str = "xsessionprivate";
+
+/// The tag of a run imported as an org's (`POST /runs {import}`): its trace is the org's admins' alone.
+const IMPORTED: &str = "ximportedrun";
 
 pub(crate) const CLIENT_ID: &str = "memstore-cli";
 pub(crate) const ADMIN_KEY: &str = "msk_platform_admin_for_isolation";
@@ -277,13 +284,58 @@ enum Kind {
     },
     /// A member's personal key: reads as the person does in their orgs and teams, and manages nothing.
     Personal(Vec<(&'static str, Vec<&'static str>)>),
-    /// The platform operator's `AMPUP_MEMORY_API_KEYS` key: in no org.
+    /// The platform operator's `AMPUP_MEMORY_API_KEYS` key: in no org, reading one it selects on the routes that only
+    /// read ([`operator_key_reads`]).
     Operator,
+}
+
+/// The routes on which the operator's key reads an org it selects (the server's own list of them).
+const OPERATOR_KEY_READS: [&str; 7] = [
+    "/search",
+    "/query",
+    "/episode",
+    "/browse",
+    "/facts/list",
+    "/advice/list",
+    "/lessons",
+];
+
+/// What the operator's key reads on `path` where that isn't what [`entitled`] says: an org it selects, by name or
+/// alias and with no team, read on a route that only reads as the org's admins read it. None for every other caller,
+/// route and selection.
+fn operator_key_reads(
+    kind: &Kind,
+    org: Option<&str>,
+    team: Option<&str>,
+    path: &str,
+) -> Option<Scope> {
+    match (kind, org, team) {
+        (Kind::Operator, Some(o), None) if OPERATOR_KEY_READS.contains(&path) => {
+            Scope::org(if o == ACME_ALIAS { "acme" } else { o }).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Which of a caller's reads a read path answers with.
+#[derive(Clone, Copy)]
+enum Want {
+    /// The facts (and their entities) of the memory the caller reads.
+    Facts,
+    /// Its episodes and passages.
+    Memory,
+    /// Nothing: there is none of it here.
+    Nothing,
 }
 
 /// Carol, signed in or through her personal key: the one caller who reads her own note and session.
 fn is_carol(c: &Caller) -> bool {
     c.name.starts_with("a1 member")
+}
+
+/// Alice, acme's admin, signed in or through her personal key: the one caller who reads the run imported into acme.
+fn is_acme_admin(c: &Caller) -> bool {
+    c.name.starts_with("acme admin")
 }
 
 struct Caller {
@@ -737,6 +789,139 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    // Runs graded elsewhere, imported as the org's (`POST /runs {import}`): only the org's admin imports, never a
+    // member, a key or another org's admin; the traces are the org's admins' alone, or members the import names,
+    // never anyone outside the org or everyone.
+    let imported_run = json!({"task": format!("{IMPORTED} reconcile the ledger"),
+                              "trace": format!("{IMPORTED} matched every entry"), "reward": 1});
+    let import = json!({"import": "ledger-export", "runs": [imported_run]});
+    for (bearer, sel, who) in [
+        (person("bob@acme.com"), "?org=acme", "a member"),
+        (carol.clone(), "?org=acme&team=a1", "a team member"),
+        (a_reader.clone(), "", "a reader key"),
+        (a_ingest.clone(), "", "an ingest key"),
+        (b_writer.clone(), "", "another org's writer key"),
+        (
+            person("gary@globex.com"),
+            "?org=acme",
+            "another org's admin",
+        ),
+        (
+            person("gary@globex.com"),
+            "?org=globex",
+            "an admin naming a member of another org",
+        ),
+    ] {
+        let mut body = import.clone();
+        if who.starts_with("an admin naming") {
+            body["acl"] = json!(["user:alice@acme.com"]);
+        }
+        let (status, raw) = post(&format!("{s}/runs{sel}"), &bearer, &body).await;
+        let want = if who.starts_with("an admin naming") {
+            400
+        } else {
+            403
+        };
+        assert_eq!(status, want, "{who} imported runs: {raw}");
+    }
+    let alice = person("alice@acme.com");
+    for acl in [
+        json!(["*"]),
+        json!(["user:erin@globex.com"]),
+        json!(["group:globex.all"]),
+    ] {
+        let mut body = import.clone();
+        body["acl"] = acl.clone();
+        let (status, raw) = post(&format!("{s}/runs?org=acme"), &alice, &body).await;
+        assert_eq!(status, 400, "an import readable by {acl}: {raw}");
+    }
+    let (status, raw) = post(&format!("{s}/runs?org=acme"), &alice, &import).await;
+    assert_eq!(status, 200, "alice's import: {raw}");
+    let done: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(done["recorded"], 1, "{raw}");
+    // The same file again records nothing new.
+    let (status, raw) = post(&format!("{s}/runs?org=acme"), &alice, &import).await;
+    let again: Value = serde_json::from_str(&raw).unwrap();
+    assert!(
+        status == 200 && again["recorded"] == 0 && again["run_ids"] == done["run_ids"],
+        "alice's import again: {raw}"
+    );
+    // The operator's admin key imports into the org it selects; the ids are the import source's, not the sender's.
+    let (status, raw) = post(&format!("{s}/runs?org=acme"), ADMIN_KEY, &import).await;
+    let by_operator: Value = serde_json::from_str(&raw).unwrap();
+    assert!(
+        status == 200 && by_operator["recorded"] == 0 && by_operator["run_ids"] == done["run_ids"],
+        "the operator's import of the same runs: {raw}"
+    );
+    let imported_id = done["run_ids"][0].as_str().unwrap().to_string();
+    let start = Instant::now();
+    let imported_episode = loop {
+        let logged = memstore::qa_log::list(&store, &Scope::org("acme").unwrap(), None)
+            .await
+            .unwrap();
+        // Only alice's import is in the log: every refused one left nothing.
+        let imports: Vec<_> = logged
+            .iter()
+            .filter(|l| memstore::runs::is_import(&l.asker))
+            .collect();
+        if let Some(l) = imports.first() {
+            assert!(
+                imports.len() == 1
+                    && l.answer_id == imported_id
+                    && l.asker == "import:ledger-export",
+                "the imported runs: {imports:?}"
+            );
+            break l
+                .episodes
+                .last()
+                .cloned()
+                .expect("the imported run's trace");
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the import never reached the log"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let start = Instant::now();
+    loop {
+        let (_, raw) = mcp_call(
+            s,
+            "?org=acme",
+            &alice,
+            "get_episode",
+            json!({"episode_id": imported_episode}),
+        )
+        .await;
+        if raw.contains(IMPORTED) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "alice never read the imported trace: {raw}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // Its admin reads it as an entry of the org's log too, even where the org keeps each person's activity to
+    // themselves (an import is no person's); a member reads neither.
+    let read = json!({"op": "conversation", "org": "acme", "id": imported_id});
+    for activity in [false, true] {
+        admin(
+            s,
+            json!({"op": "set_settings", "org": "acme", "settings": {"activity": activity}}),
+        )
+        .await;
+        let (status, raw) = post(&format!("{s}/admin"), &alice, &read).await;
+        assert!(
+            status == 200 && raw.contains(IMPORTED),
+            "alice's conversation (activity {activity}): {raw}"
+        );
+        let (status, raw) = post(&format!("{s}/admin"), &person("bob@acme.com"), &read).await;
+        assert!(
+            status == 403 && !raw.contains(IMPORTED),
+            "bob's conversation (activity {activity}): {raw}"
+        );
+    }
     // Members' personal keys, each made by the member signed in as themselves: carol's (in team a1), and the
     // admin alice's, which reads as a member and manages nothing.
     let in_30_days = std::time::SystemTime::now()
@@ -820,6 +1005,24 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
         raw.contains("carol_cli") && !raw.contains("alice_cli"),
         "carol's view of her keys: {raw}"
     );
+    // The same view's fields alone (a directory read on any cell): hers still, nothing of the org's.
+    let (_, raw) = post(
+        &format!("{s}/admin"),
+        &carol,
+        &json!({"op": "show", "org": "acme", "fields": ["members", "keys", "pending", "limits"]}),
+    )
+    .await;
+    assert!(
+        raw.contains("carol_cli") && !raw.contains("alice_cli") && !raw.contains("bob@acme.com"),
+        "carol's directory fields: {raw}"
+    );
+    let (status, raw) = post(
+        &format!("{s}/admin"),
+        &carol,
+        &json!({"op": "standing", "org": "acme"}),
+    )
+    .await;
+    assert_eq!(status, 403, "a member read the org's standing: {raw}");
     let callers = [
         Caller {
             name: "a1 member's personal key",
@@ -954,6 +1157,7 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
         .flat_map(|c| selections.iter().map(move |&sel| (c, sel)));
     let (tags, entity_ids, all_ids) = (&tags, &entity_ids, &all_ids);
     let session_episode = session_episode.as_str();
+    let imported_episode = imported_episode.as_str();
     let mut checked: usize = futures::stream::iter(runs)
         .map(|(c, (org, team))| async move {
             let mut checked = 0;
@@ -972,128 +1176,145 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
             };
             let scope = entitled(&c.kind, org, team).ok();
             let reads = scope.as_ref().filter(|_| !ingest);
-            let mut foreign = tags.foreign(reads);
-            if !is_carol(c) {
-                foreign.push(PRIVATE.to_string());
-                foreign.push(SESSION.to_string());
-            }
-            let mine: Vec<String> = reads.map(|s| tags.of(s)).unwrap_or_default();
-            let mine_facts: Vec<String> = mine
-                .iter()
-                .filter(|t| !t.starts_with("xprof") && !tags.episode_only.contains(t))
-                .cloned()
-                .collect();
-            let mine_memory: Vec<String> = mine
-                .iter()
-                .filter(|t| !t.starts_with("xprof"))
-                .cloned()
-                .collect();
-            // The selected org's profile, shown to those who read its memory.
-            let mine_profile: Vec<String> = mine
-                .iter()
-                .filter(|t| t.starts_with("xprof"))
-                .cloned()
-                .collect();
+            // What a caller reading `reads` may not see, and the facts, memory and org profile it must.
+            let view = |reads: Option<&Scope>| {
+                let mut foreign = tags.foreign(reads);
+                if !is_carol(c) {
+                    foreign.push(PRIVATE.to_string());
+                    foreign.push(SESSION.to_string());
+                }
+                if !is_acme_admin(c) {
+                    foreign.push(IMPORTED.to_string());
+                }
+                let mine: Vec<String> = reads.map(|s| tags.of(s)).unwrap_or_default();
+                let facts: Vec<String> = mine
+                    .iter()
+                    .filter(|t| !t.starts_with("xprof") && !tags.episode_only.contains(t))
+                    .cloned()
+                    .collect();
+                let memory: Vec<String> = mine
+                    .iter()
+                    .filter(|t| !t.starts_with("xprof"))
+                    .cloned()
+                    .collect();
+                // The selected org's profile, shown to those who read its memory.
+                let profile: Vec<String> = mine
+                    .iter()
+                    .filter(|t| t.starts_with("xprof"))
+                    .cloned()
+                    .collect();
+                (foreign, facts, memory, profile)
+            };
+            let (foreign, mine_facts, mine_memory, mine_profile) = view(reads);
+            // Where the operator's key selects an org, a route that only reads answers from it ([`operator_key_reads`]).
+            let reads_on = |path: &str| operator_key_reads(&c.kind, org, team, path);
             let what = |path: &str| format!("{} {path}{sel}", c.name);
-            // A refused selection, or an ingest key's read: the HTTP read paths answer 403.
-            let want_status = if reads.is_some() { 200 } else { 403 };
 
             // HTTP: /search, /query (facts, entities with evidence, passages), /episode (every episode id),
             // /document (the list of documents).
-            let no_documents: Vec<String> = vec![];
             let http = [
                 (
                     "/search",
                     json!({"calls": [["owner", 50, -1, 400]]}),
-                    &mine_facts,
+                    Want::Facts,
                 ),
                 (
                     "/query",
                     json!({"calls": [[{"find": "facts", "time": "all", "limit": 500}]]}),
-                    &mine_facts,
+                    Want::Facts,
                 ),
                 (
                     "/query",
                     json!({"calls": [[{"find": "entities", "type": "deal", "include": ["evidence"], "limit": 500}]]}),
-                    &mine_facts,
+                    Want::Facts,
                 ),
                 (
                     "/query",
                     json!({"calls": [[{"id": entity_ids, "include": ["evidence"]}]]}),
-                    &mine_facts,
+                    Want::Facts,
                 ),
                 // A count's citations: each group's members and the facts that put them there.
                 (
                     "/query",
                     json!({"calls": [[{"find": "count", "type": "deal", "group_by": "owner", "include": ["evidence"], "limit": 500}]]}),
-                    &mine_facts,
+                    Want::Facts,
                 ),
                 // The named metrics, a SQL one among them: its rows and the facts they cite.
                 (
                     "/query",
                     json!({"calls": [[{"find": "metrics", "include": ["evidence"], "limit": 500}]]}),
-                    &mine_facts,
+                    Want::Facts,
                 ),
                 (
                     "/query",
                     json!({"calls": [[{"find": "passages", "text": "owner", "limit": 100}]]}),
-                    &mine_memory,
+                    Want::Memory,
                 ),
-                ("/episode", json!({"calls": all_ids}), &mine_memory),
+                ("/episode", json!({"calls": all_ids}), Want::Memory),
                 // The browse tree: every scope's facts are on entities `deal:<tag>`.
                 (
                     "/browse",
                     json!({"op": "ls", "path": ["entities", "deal"]}),
-                    &mine_facts,
+                    Want::Facts,
                 ),
                 // Again, answered from what was kept for this caller: never another's.
                 (
                     "/browse",
                     json!({"op": "ls", "path": ["entities", "deal"]}),
-                    &mine_facts,
+                    Want::Facts,
                 ),
                 // Narrowed to what a source taught, and what each source taught: counted and named only from
                 // what the caller may read.
                 (
                     "/browse",
                     json!({"op": "ls", "path": ["entities", "deal"], "from": "note:"}),
-                    &mine_facts,
+                    Want::Facts,
                 ),
                 (
                     "/browse",
                     json!({"op": "sources", "top": 20}),
-                    &mine_facts,
+                    Want::Facts,
                 ),
                 // The sessions folder and the advice page, each twice: the second answered from what was
                 // kept for this caller, never another's.
                 (
                     "/browse",
                     json!({"op": "ls", "path": ["sessions"], "limit": 500}),
-                    &no_documents,
+                    Want::Nothing,
                 ),
                 (
                     "/browse",
                     json!({"op": "ls", "path": ["sessions"], "limit": 500}),
-                    &no_documents,
+                    Want::Nothing,
                 ),
                 (
                     "/browse",
                     json!({"op": "advice_usage", "days": 30}),
-                    &no_documents,
+                    Want::Nothing,
                 ),
                 (
                     "/browse",
                     json!({"op": "advice_usage", "days": 30}),
-                    &no_documents,
+                    Want::Nothing,
                 ),
                 // The filterable lists: every fact the caller may read (each with the sources of the episodes
                 // it cites, which are the caller's to see too), and the advice (none is learned here).
-                ("/facts/list", json!({"limit": 500}), &mine_facts),
-                ("/advice/list", json!({}), &no_documents),
+                ("/facts/list", json!({"limit": 500}), Want::Facts),
+                ("/advice/list", json!({}), Want::Nothing),
                 // Documents kept in versions: there are none here, so a reader lists nothing.
-                ("/document", json!({"calls": [[""]]}), &no_documents),
+                ("/document", json!({"calls": [[""]]}), Want::Nothing),
             ];
             for (path, body, want) in http {
+                let key = reads_on(path);
+                let reads = key.as_ref().or(reads);
+                let (foreign, facts, memory, _) = view(reads);
+                let want = match want {
+                    Want::Facts => facts,
+                    Want::Memory => memory,
+                    Want::Nothing => vec![],
+                };
+                // A refused selection, or an ingest key's read: the HTTP read paths answer 403.
+                let want_status = if reads.is_some() { 200 } else { 403 };
                 let (status, answer) = post(&format!("{s}{path}{sel}"), &c.bearer, &body).await;
                 let asked = if body.to_string().contains("deal:") {
                     entity_ids.clone()
@@ -1102,16 +1323,20 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
                 };
                 assert_clean(&what(path), &answer, &foreign, &asked);
                 assert_eq!(status, want_status, "{}: {answer}", what(path));
-                assert_sees(&what(path), &answer, want);
+                assert_sees(&what(path), &answer, &want);
                 checked += 1;
             }
             // `/browse` reads each episode by id: its own scope's, and 404 for every other (403 when refused).
+            let key = reads_on("/browse");
+            let reads_browse = key.as_ref().or(reads);
+            let (foreign_browse, ..) = view(reads_browse);
             for (id, home, tag) in &tags.episodes {
+                let (reads, foreign) = (reads_browse, &foreign_browse);
                 let own = reads.is_some_and(|s| &s.to_string() == home);
                 let req = json!({"op": "episode", "id": id});
                 let (status, answer) = post(&format!("{s}/browse{sel}"), &c.bearer, &req).await;
                 let w = what("/browse episode");
-                assert_clean(&w, &answer, &foreign, &[]);
+                assert_clean(&w, &answer, foreign, &[]);
                 let want = match (reads.is_some(), own) {
                     (false, _) => 403,
                     (true, true) => 200,
@@ -1238,6 +1463,10 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
             let own = is_carol(c) && reads.is_some_and(|s| s.to_string() == "org:acme");
             let want = if own { vec![SESSION.to_string()] } else { vec![] };
             tools.push(("get_episode", json!({"episode_id": session_episode}), want));
+            // The imported run's trace: acme's admin reads it in acme's memory, no one else anywhere.
+            let own = is_acme_admin(c) && reads.is_some_and(|s| s.to_string() == "org:acme");
+            let want = if own { vec![IMPORTED.to_string()] } else { vec![] };
+            tools.push(("get_episode", json!({"episode_id": imported_episode}), want));
             for (tool, args, want) in tools {
                 let (status, raw) = mcp_call(s, &sel, &c.bearer, tool, args.clone()).await;
                 let w = what(&format!("/mcp {tool}"));
@@ -1365,6 +1594,7 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
 
     checked += pinned_reads(s, &callers, &selections, tags).await;
     checked += cross_scope_reads(s, &store, &callers, &selections, tags, &person).await;
+    checked += feedback_reaches_only_readers(s, &carol, &person).await;
 
     // Taken out of the org, carol's personal key goes with her: refused on every read, at once.
     admin(
@@ -1395,6 +1625,161 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     eprintln!("checked {checked} responses");
+}
+
+/// Feedback (`POST /feedback`, `feedback_memory`) goes only on a fact its giver may read. Everyone else is refused:
+/// outside the scope as on any write there, and in it (another org's or team's fact, or another person's own note)
+/// with the answer a fact that doesn't exist gets, and their vote counts nowhere. A fact's tally reaches only
+/// those who read the fact. Carol votes on her team's fact and on her own note in acme.
+async fn feedback_reaches_only_readers(
+    s: &str,
+    carol: &str,
+    person: &impl Fn(&str) -> String,
+) -> usize {
+    let mut checked = 0;
+    let (bob, alice, erin) = (
+        person("bob@acme.com"),
+        person("alice@acme.com"),
+        person("erin@globex.com"),
+    );
+    let (team, org, globex) = ("?org=acme&team=a1", "?org=acme", "?org=globex");
+    // Every hit `bearer` gets from `/search` for `query`: the facts as search returns them.
+    let hits = |sel: &str, bearer: &str, query: &str| {
+        let (sel, bearer, query) = (sel.to_string(), bearer.to_string(), query.to_string());
+        async move {
+            fn walk(v: &Value, out: &mut Vec<Value>) {
+                match v {
+                    Value::Object(o) if o.contains_key("fact_id") => out.push(v.clone()),
+                    Value::Object(o) => o.values().for_each(|v| walk(v, out)),
+                    Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+                    _ => {}
+                }
+            }
+            let (status, raw) = post(
+                &format!("{s}/search{sel}"),
+                &bearer,
+                &json!({"data": [[0, query, 50]]}),
+            )
+            .await;
+            let mut out = vec![];
+            if status == 200 {
+                walk(&serde_json::from_str(&raw).unwrap(), &mut out);
+            }
+            (status, raw, out)
+        }
+    };
+    let vote = |sel: &str, bearer: &str, fact: &str, signal: &str| {
+        let (url, bearer) = (format!("{s}/feedback{sel}"), bearer.to_string());
+        let body = json!({"fact_id": fact, "signal": signal, "reason": "xfeedbackreason"});
+        async move { post(&url, &bearer, &body).await }
+    };
+    // Her own note in acme (no one else's to read) and her team's fact.
+    let note = json!({"source": "notes", "body": "xfeedbackmine carol's own owner note"});
+    let (_, raw) = mcp_call(s, org, carol, "remember_memory", note).await;
+    let (text, failed) = tool_text(&raw);
+    assert!(
+        !failed && text.contains("visible to user:carol@acme.com"),
+        "{raw}"
+    );
+    let ep = text
+        .split("episode ")
+        .nth(1)
+        .and_then(|t| t.split(',').next())
+        .unwrap();
+    let mine = format!("note:{ep}");
+    let (_, raw, found) = hits(team, carol, "xteamalpha1 owner").await;
+    let team_fact = found
+        .iter()
+        .find(|h| h["value"] == "xteamalpha1")
+        .and_then(|h| h["fact_id"].as_str())
+        .unwrap_or_else(|| panic!("carol finds her team's fact: {raw}"))
+        .to_string();
+    for (sel, fact) in [(team, &team_fact), (org, &mine)] {
+        let (status, body) = vote(sel, carol, fact, "positive").await;
+        assert_eq!(status, 200, "carol's vote on {fact}: {body}");
+    }
+    // Refused, as a fact that doesn't exist is: what the refusal says, with the fact's id in place of a made-up one.
+    let nonexistent = "note:0000000000000000000000000000000000000000000000000000000000000000";
+    for (who, bearer, sel, fact) in [
+        ("bob", &bob, org, &mine),
+        ("bob", &bob, org, &team_fact),
+        ("alice", &alice, org, &mine),
+        ("alice", &alice, org, &team_fact),
+        ("erin", &erin, globex, &mine),
+        ("erin", &erin, globex, &team_fact),
+    ] {
+        let (status, body) = vote(sel, bearer, fact, "very_negative").await;
+        let (s2, missing) = vote(sel, bearer, nonexistent, "very_negative").await;
+        assert_eq!(status, 404, "{who} voted on {fact} in {sel}: {body}");
+        assert_eq!(
+            (status, body.replace(fact.as_str(), "<fact>")),
+            (s2, missing.replace(nonexistent, "<fact>")),
+            "{who} on {fact} in {sel} is told apart from a fact that doesn't exist"
+        );
+        // Over MCP too: the same answer as for a fact that doesn't exist.
+        let args = |f: &str| json!({"fact_id": f, "signal": "very_negative"});
+        let (_, raw) = mcp_call(s, sel, bearer, "feedback_memory", args(fact)).await;
+        let (_, raw2) = mcp_call(s, sel, bearer, "feedback_memory", args(nonexistent)).await;
+        let ((text, failed), (text2, _)) = (tool_text(&raw), tool_text(&raw2));
+        assert!(failed, "{who} feedback_memory on {fact} in {sel}: {raw}");
+        assert_eq!(
+            text.replace(fact.as_str(), "<fact>"),
+            text2.replace(nonexistent, "<fact>"),
+            "{who} feedback_memory on {fact} in {sel}"
+        );
+        checked += 3;
+    }
+    // Selecting a scope they aren't in, people are refused before any fact is looked at.
+    for (who, bearer, sel) in [
+        ("bob", &bob, team),
+        ("alice", &alice, team),
+        ("erin", &erin, org),
+    ] {
+        let (status, body) = vote(sel, bearer, &team_fact, "very_negative").await;
+        assert_eq!(status, 403, "{who} voted in {sel}: {body}");
+        checked += 1;
+    }
+    // None of those counts: Carol's tallies hold her vote alone.
+    let one = json!({"positive": 1, "negative": 0, "very_negative": 0});
+    let t = Instant::now();
+    loop {
+        let (_, _, a) = hits(team, carol, "xteamalpha1 owner").await;
+        let (_, _, b) = hits(org, carol, "xfeedbackmine owner note").await;
+        let tally = |hs: &[Value], id: &str| {
+            hs.iter()
+                .find(|h| h["fact_id"] == id)
+                .map(|h| h["feedback"].clone())
+        };
+        let (ta, tb) = (tally(&a, &team_fact), tally(&b, &mine));
+        if ta.as_ref() == Some(&one) && tb.as_ref() == Some(&one) {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "carol's tallies: {ta:?} {tb:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // No one who can't read a fact gets its tally (or the fact) from search.
+    for (who, bearer, sel, query) in [
+        ("bob", &bob, org, "xfeedbackmine owner note"),
+        ("alice", &alice, org, "xfeedbackmine owner note"),
+        ("bob", &bob, org, "xteamalpha1 owner"),
+        ("erin", &erin, globex, "xteamalpha1 xfeedbackmine owner"),
+    ] {
+        let (status, raw, found) = hits(sel, bearer, query).await;
+        assert_eq!(status, 200, "{who} {sel}: {raw}");
+        assert!(
+            !raw.contains(&mine) && !raw.contains(&team_fact) && !raw.contains("xfeedbackmine"),
+            "{who} reads a fact (or its tally) in {sel}: {raw}"
+        );
+        assert!(
+            found.iter().all(|h| h["feedback"]["positive"] != 1),
+            "{who} gets carol's vote in {sel}: {raw}"
+        );
+        checked += 1;
+    }
+    checked
 }
 
 /// Pinned reads (`memstore::pins`): a long-running reader pins the memory it reads (`POST /pin`) and reads it
@@ -1474,38 +1859,52 @@ async fn pinned_reads(
             } else {
                 format!("?{q}&at={pin}")
             };
-            let reads = scope.as_ref().filter(|s| !ingest && *s == pin_scope);
-            let mut foreign = tags.foreign(reads);
-            if !is_carol(c) {
-                foreign.push(PRIVATE.to_string());
-                foreign.push(SESSION.to_string());
-            }
-            let mine: Vec<String> = reads
-                .map(|s| tags.of(s))
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|t| !t.starts_with("xprof") && !tags.episode_only.contains(t))
-                .collect();
-            let what = |path: &str| format!("{} {path}{sel} (pin of {pin_scope})", c.name);
-            let (status, body) = post(
-                &format!("{s}/query{sel}"),
-                &c.bearer,
-                &json!({"calls": [[{"find": "facts", "time": "all", "limit": 500}]]}),
-            )
-            .await;
-            assert_clean(&what("/query"), &body, &foreign, &[]);
-            match (scope.as_ref(), reads) {
-                // Refused here, pin or no pin.
-                (None, _) => assert_eq!(status, 403, "{}: {body}", what("/query")),
-                // An ingest key reads nothing, through a pin too (another scope's pin isn't one here either).
-                (Some(_), None) if ingest => {
-                    assert!([400, 403].contains(&status), "{}: {body}", what("/query"))
+            let view = |scope: Option<&Scope>| {
+                let reads = scope.filter(|s| !ingest && *s == pin_scope);
+                let mut foreign = tags.foreign(reads);
+                if !is_carol(c) {
+                    foreign.push(PRIVATE.to_string());
+                    foreign.push(SESSION.to_string());
                 }
-                // Another scope's pin: no pin here.
-                (Some(_), None) => assert_eq!(status, 400, "{}: {body}", what("/query")),
-                (Some(_), Some(_)) => {
-                    assert_eq!(status, 200, "{}: {body}", what("/query"));
-                    assert_sees(&what("/query"), &body, &mine);
+                if !is_acme_admin(c) {
+                    foreign.push(IMPORTED.to_string());
+                }
+                (reads.cloned(), foreign)
+            };
+            let (reads, foreign) = view(scope.as_ref());
+            let what = |path: &str| format!("{} {path}{sel} (pin of {pin_scope})", c.name);
+            {
+                // `/query` only reads: where the operator's key selects an org, it reads there.
+                let key = operator_key_reads(&c.kind, org, team, "/query");
+                let scope = key.or(scope.clone());
+                let (reads, foreign) = view(scope.as_ref());
+                let mine: Vec<String> = reads
+                    .as_ref()
+                    .map(|s| tags.of(s))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|t| !t.starts_with("xprof") && !tags.episode_only.contains(t))
+                    .collect();
+                let (status, body) = post(
+                    &format!("{s}/query{sel}"),
+                    &c.bearer,
+                    &json!({"calls": [[{"find": "facts", "time": "all", "limit": 500}]]}),
+                )
+                .await;
+                assert_clean(&what("/query"), &body, &foreign, &[]);
+                match (scope.as_ref(), reads) {
+                    // Refused here, pin or no pin.
+                    (None, _) => assert_eq!(status, 403, "{}: {body}", what("/query")),
+                    // An ingest key reads nothing, through a pin too (another scope's pin isn't one here either).
+                    (Some(_), None) if ingest => {
+                        assert!([400, 403].contains(&status), "{}: {body}", what("/query"))
+                    }
+                    // Another scope's pin: no pin here.
+                    (Some(_), None) => assert_eq!(status, 400, "{}: {body}", what("/query")),
+                    (Some(_), Some(_)) => {
+                        assert_eq!(status, 200, "{}: {body}", what("/query"));
+                        assert_sees(&what("/query"), &body, &mine);
+                    }
                 }
             }
             let (status, raw) = mcp_call(
@@ -1754,42 +2153,59 @@ async fn cross_scope_reads(
                 && org.is_none()
                 && team.is_none()
                 && matches!(&c.kind, Kind::Person(o) if o.len() != 1);
-            let read: Vec<Scope> = scope.iter().filter(|_| !ingest).flat_map(reads).collect();
-            let mine: Vec<String> = read
-                .iter()
-                .flat_map(|s| tags.of(s))
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            let mut foreign: Vec<String> = tags
-                .all()
-                .into_iter()
-                .filter(|t| !mine.contains(t))
-                .collect();
-            if !is_carol(c) {
-                foreign.push(PRIVATE.to_string());
-                foreign.push(SESSION.to_string());
-            }
-            let mine_facts: Vec<String> = mine
-                .iter()
-                .filter(|t| !t.starts_with("xprof") && !tags.episode_only.contains(t))
-                .cloned()
-                .collect();
-            let mine_memory: Vec<String> = mine
-                .iter()
-                .filter(|t| !t.starts_with("xprof"))
-                .cloned()
-                .collect();
-            let what = |path: &str| format!("{} {path}{sel} (acme reads a1)", c.name);
+            // What a caller entitled to `scope` reads, may not see, and must see (facts, then memory).
+            let view = |scope: Option<&Scope>| {
+                let read: Vec<Scope> = scope.iter().filter(|_| !ingest).flat_map(|s| reads(s)).collect();
+                let mine: Vec<String> = read
+                    .iter()
+                    .flat_map(|s| tags.of(s))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let mut foreign: Vec<String> = tags
+                    .all()
+                    .into_iter()
+                    .filter(|t| !mine.contains(t))
+                    .collect();
+                if !is_carol(c) {
+                    foreign.push(PRIVATE.to_string());
+                    foreign.push(SESSION.to_string());
+                }
+                if !is_acme_admin(c) {
+                    foreign.push(IMPORTED.to_string());
+                }
+                let mine_facts: Vec<String> = mine
+                    .iter()
+                    .filter(|t| !t.starts_with("xprof") && !tags.episode_only.contains(t))
+                    .cloned()
+                    .collect();
+                let mine_memory: Vec<String> = mine
+                    .iter()
+                    .filter(|t| !t.starts_with("xprof"))
+                    .cloned()
+                    .collect();
+                (read, foreign, mine_facts, mine_memory)
+            };
+            let (read, foreign, mine_facts, _) = view(scope.as_ref());
             let fans = read.len() > 1;
+            let what = |path: &str| format!("{} {path}{sel} (acme reads a1)", c.name);
             for (path, body, want) in [
                 (
                     "/search",
                     json!({"calls": [["owner", 50, -1, 400]]}),
-                    &mine_facts,
+                    Want::Facts,
                 ),
-                ("/episode", json!({"calls": all_ids}), &mine_memory),
+                ("/episode", json!({"calls": all_ids}), Want::Memory),
             ] {
+                // Where the operator's key selects an org, these only read: it reads there as the org's admins do.
+                let key = operator_key_reads(&c.kind, org, team, path);
+                let (read, foreign, mine_facts, mine_memory) = view(key.as_ref().or(scope.as_ref()));
+                let want = match want {
+                    Want::Facts => &mine_facts,
+                    Want::Memory => &mine_memory,
+                    Want::Nothing => &vec![],
+                };
+                let fans = read.len() > 1;
                 let (status, answer) = post(&format!("{s}{path}{sel}"), &c.bearer, &body).await;
                 assert_clean(&what(path), &answer, &foreign, &[]);
                 assert_eq!(
@@ -2793,6 +3209,222 @@ async fn asking_to_join_grants_nothing_until_an_admin_approves() {
                 && r["kind"] == "read"
                 && r["scope"] == "org:acme"),
         "the operator's view lacks the operator's read of acme: {b}"
+    );
+
+    // The operator's admin key reads an org it selects as the org's admins do, on the routes that only read: what the
+    // org shares with everyone and its lessons, never what a member keeps to himself (only the operator's own sign-in
+    // reads that) nor a forgotten episode. It writes nothing there and reads no team, and its reads are the operator's
+    // view, not the org's. A key of another org selecting acme still reads nothing of it.
+    let ops_note = crate::advice_versions::doc(
+        "advice/team/ship",
+        "# Advice: ship\n\n## When\nxqopsnote ship the release\n\n## Steps\n1. [how-to] run the checks first\n",
+    );
+    let map = json!({"categories": {"team": {"description": "d", "situations": {
+            "ship": {"when": "xqopsnote ship the release", "skills": []}}}},
+        "assign": {}, "notes": {"team/ship": "h"}, "acl": ["*"], "linked": "",
+        "written": {"team/ship": {"runs": 2, "wrong": 0, "context": "", "format": "kinds-4-general"}}});
+    store
+        .commit(
+            &Scope::org("acme").unwrap(),
+            "test",
+            &[
+                crate::advice_versions::doc("advice/map", &map.to_string()),
+                ops_note,
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+    let facts = json!({"data": [[0, {"find": "facts", "time": "all", "limit": 500}]]});
+    let t = Instant::now();
+    loop {
+        let (status, body) = post(&format!("{s}/query?org=acme"), ADMIN_KEY, &facts).await;
+        assert_eq!(status, 200, "the admin key's facts in acme: {body}");
+        assert!(
+            !body.contains("deal:xgoneacme"),
+            "the admin key read a forgotten episode in acme: {body}"
+        );
+        assert!(
+            !body.contains("deal:xbobsacme"),
+            "the admin key read what bob keeps to himself in acme: {body}"
+        );
+        if body.contains("deal:xacmeonly") {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "the admin key never read what acme shares in acme: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let t = Instant::now();
+    loop {
+        let (status, body) = post(&format!("{s}/lessons?org=acme"), ADMIN_KEY, &json!({})).await;
+        assert_eq!(status, 200, "the admin key's lessons in acme: {body}");
+        if body.contains("xqopsnote") {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "the admin key never read acme's lessons: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // What bob keeps to himself besides his notes: his profile, and his own advice (its map and a note learned for
+    // him). He reads them; acme's admin doesn't, and neither does the admin key, on any route it reads acme on.
+    let bob_space = memstore::advice::Space::mine("bob@acme.com");
+    let bob_only = |source: &str, doc: String, body: &str| {
+        let mut e = Episode::new(source, body.as_bytes(), &["user:bob@acme.com"]);
+        e.document = Some(doc);
+        e
+    };
+    let bob_map = json!({"categories": {"team": {"description": "d", "situations": {
+            "ship": {"when": "xopsminebob ship the release", "skills": []}}}},
+        "assign": {}, "notes": {"team/ship": "h"}, "acl": ["user:bob@acme.com"], "linked": "",
+        "written": {"team/ship": {"runs": 2, "wrong": 0, "context": "", "format": "kinds-4-general"}}});
+    let bob_eps = [
+        bob_only(
+            &memstore::profile::source("bob@acme.com"),
+            memstore::profile::document("bob@acme.com"),
+            "xopsprofbob indents with tabs, never spaces",
+        ),
+        bob_only(
+            "advice:mine:bob@acme.com",
+            bob_space.map(),
+            &bob_map.to_string(),
+        ),
+        bob_only(
+            "advice:mine:bob@acme.com",
+            bob_space.note("team/ship"),
+            "# Advice: ship\n\n## When\nxopsminebob ship the release\n\n## Steps\n1. [how-to] tag it first\n",
+        ),
+    ];
+    let bob_ids: Vec<String> = bob_eps.iter().map(|e| e.episode_id.clone()).collect();
+    store
+        .commit(&Scope::org("acme").unwrap(), "test", &bob_eps, &[])
+        .await
+        .unwrap();
+    let bob_tags = ["xopsprofbob", "xopsminebob"];
+    // Read by episode id, as an agent's get_episode does: how many of them it reads.
+    let reads_bobs = async |bearer: &str| -> usize {
+        let mut read = 0;
+        for id in &bob_ids {
+            let (status, raw) = mcp_call(
+                s,
+                "?org=acme",
+                bearer,
+                "get_episode",
+                json!({"episode_id": id, "whole": true}),
+            )
+            .await;
+            assert_eq!(status, 200, "{raw}");
+            let text = tool_text(&raw).0;
+            read += usize::from(bob_tags.iter().any(|t| text.contains(t)));
+        }
+        read
+    };
+    let t = Instant::now();
+    while reads_bobs(&bob_google).await < bob_ids.len() {
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "bob never read his profile and own advice"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        reads_bobs(&ann_in_acme).await,
+        0,
+        "acme's admin read bob's profile or own advice"
+    );
+    let ids: Vec<Value> = bob_ids.iter().map(|id| json!([id])).collect();
+    for (path, body) in [
+        ("/episode", json!({"calls": ids})),
+        (
+            "/search",
+            json!({"calls": [["tabs spaces ship release", 50, -1, 400]]}),
+        ),
+        (
+            "/query",
+            json!({"calls": [[{"find": "passages", "text": "tabs spaces ship release", "limit": 100}]]}),
+        ),
+        ("/browse", json!({"op": "episode", "id": bob_ids[0]})),
+        ("/browse", json!({"op": "advice_usage", "days": 30})),
+        ("/facts/list", json!({"limit": 500})),
+        ("/advice/list", json!({})),
+        ("/lessons", json!({})),
+    ] {
+        let (status, text) = post(&format!("{s}{path}?org=acme"), ADMIN_KEY, &body).await;
+        assert!(
+            status == 200 || (path == "/browse" && status == 404),
+            "the admin key's {path} in acme: {status} {text}"
+        );
+        assert!(
+            !bob_tags.iter().any(|t| text.contains(t)),
+            "the admin key read bob's profile or own advice on {path}: {text}"
+        );
+    }
+    let (status, body) = post(
+        &format!("{s}/remember?org=acme"),
+        ADMIN_KEY,
+        &json!({"source": "note", "body": "xopswrite into acme"}),
+    )
+    .await;
+    assert_eq!(status, 403, "the admin key wrote into acme: {body}");
+    let (status, body) = post(
+        &format!("{s}/lessons?org=acme&team=t1"),
+        ADMIN_KEY,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 403, "the admin key read a team: {body}");
+    let beta_reader = format!("msk_{}betadash", uuid::Uuid::new_v4().simple());
+    admin(
+        s,
+        json!({"op": "create_key", "org": "beta", "name": "dash", "role": "reader", "key": beta_reader}),
+    )
+    .await;
+    for path in ["/lessons", "/query"] {
+        let body = if path == "/query" {
+            facts.clone()
+        } else {
+            json!({})
+        };
+        let (status, text) = post(&format!("{s}{path}?org=acme"), &beta_reader, &body).await;
+        assert_eq!(status, 403, "beta's key read acme's {path}: {text}");
+        assert!(
+            !text.contains("xqopsnote") && !text.contains("xbobsacme"),
+            "{text}"
+        );
+    }
+    let (status, b) = changes(
+        &ann_in_acme,
+        json!({"op": "audit", "org": "acme", "since_secs": 3600}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    assert!(
+        !b["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["actor"] == "svc:platform" && r["kind"] == "read"),
+        "acme's audit shows the admin key's reads: {b}"
+    );
+    let (status, b) = changes(
+        ADMIN_KEY,
+        json!({"op": "audit", "operator": true, "since_secs": 3600}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    assert!(
+        b["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["actor"] == "svc:platform"
+                && r["kind"] == "read"
+                && r["scope"] == "org:acme"),
+        "the operator's view lacks the admin key's read of acme: {b}"
     );
 }
 

@@ -1,5 +1,5 @@
-//! Advice's admin ops that only the server doing the background writing runs (`hold_advice`, `ratify_advice` and
-//! `learn_advice`: each writes the advice map, which a learn rewrites from what it read, so they run where learning does, under its
+//! Advice's admin ops that only the server doing the background writing runs (`hold_advice`, `ratify_advice`,
+//! `write_advice` and `learn_advice`: each writes the advice map, which a learn rewrites from what it read, so they run where learning does, under its
 //! claim), asked of a server that doesn't. That is every serving pod of a deployment that splits serving from
 //! writing (`AMPUP_MEMORY_ROLE=serve`, a cell's pods among them, whose worker holds the cell's lease), and any server while
 //! the lease is elsewhere. An admin reaches only the serving pods, so the request is queued for the writer instead of
@@ -34,7 +34,7 @@ const SOURCE: &str = "advice:request:";
 /// One queued op, as the admin asked it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
-    /// `hold` (or release, `hold: false`), `ratify` (or withdraw, `ratify: false`) or `learn`.
+    /// `hold` (or release, `hold: false`), `ratify` (or withdraw, `ratify: false`), `write` or `learn`.
     pub op: String,
     /// Who asked.
     pub by: String,
@@ -59,6 +59,9 @@ pub struct Request {
     pub rewrite: BTreeSet<String>,
     #[serde(default)]
     pub force: bool,
+    /// `write`: the team note an admin writes, or takes out ([`crate::advice::write_admin`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<crate::advice::AdminNote>,
 }
 
 /// How often the writer looks for queued requests: `AMPUP_MEMORY_ADVICE_REQUESTS_SECS`, default 30.

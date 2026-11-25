@@ -3,8 +3,10 @@ import { useEffect, useMemo, useState } from "react";
 import { ApiError, errorText } from "../transport";
 import { browse, call } from "../memory/api";
 import { when } from "../memory/format";
-import { useChoice, useOption } from "../memory/hashOptions";
+import { useOption } from "../memory/hashOptions";
 import { Markdown } from "../memory/markdown";
+import { LessonsFor } from "./Learned";
+import { RangeSeg, scopeText, useAdviceScope } from "./adviceScope";
 import type { Selection } from "../memory/types";
 
 // Studio's Advice page: each team note agents were given, how often and to how many people, how those sessions
@@ -12,6 +14,7 @@ import type { Selection } from "../memory/types";
 // the sessions are the reader's own, or everyone's for the org's admins. Admins ratify a note for the whole team
 // (`/admin {op: "ratify_advice"}`), and find the evidence and lookup tables under "Details". The note picked
 // is in the link (`#/advice?note=<key>`); where a note was learned from, run by run, is on the Learned page.
+// Every total here is counted as Learned counts it (adviceScope.tsx): the window and whose own notes, in the link.
 
 interface Session {
   id: string;
@@ -47,6 +50,8 @@ interface Advice {
   needs_backing?: string;
   /** The reader's own note (its key `mine:`): written for them alone, served to them at once, never ratified. */
   mine?: boolean;
+  /** Whose own note it is (an engine that takes `person` says it). */
+  owner?: string;
   /** Of `used`, the sessions handed only its learned preferences, at their start. */
   recalled?: number;
   sessions: Session[];
@@ -55,16 +60,11 @@ interface Usage {
   advice: Advice[];
   /** The sessions are everyone's (the reader is an admin of an org that shows people's activity). */
   every: boolean;
+  /** The sessions counted were asked at or after this (µs); 0, all of them. */
+  since?: number;
+  /** Whose own notes stand in for the reader's (an engine that takes `person` echoes it). */
+  person?: string | null;
 }
-
-/** The windows, as the link names them (`#/advice?days=7`; 30 days when it names none). */
-const RANGES = [
-  { id: "7", days: 7, label: "7 days" },
-  { id: "30", days: 30, label: "30 days" },
-  { id: "90", days: 90, label: "90 days" },
-  { id: "all", days: null, label: "All" },
-] as const;
-const RANGE_IDS = RANGES.map((r) => r.id);
 
 /** Waiting for an admin: used, and neither ratified nor held back. */
 const waiting = (a: Advice) => !a.mine && a.used > 0 && !a.ratified && !a.held;
@@ -86,7 +86,11 @@ function Bar({ a }: { a: Advice }) {
 
 function Status({ a }: { a: Advice }) {
   if (a.mine)
-    return (
+    return a.owner ? (
+      <span className="ap-badge ap-badge-ok" title={`Learned from ${a.owner}'s own sessions, for them alone`}>
+        {a.owner}&apos;s
+      </span>
+    ) : (
       <span className="ap-badge ap-badge-ok" title="Learned from your own sessions, for you alone">
         Yours
       </span>
@@ -135,20 +139,22 @@ export function AdvicePage({
   admin: boolean;
   /** Opens a session's transcript. */
   onTrace: (id: string) => void;
-  /** Opens a team note on the Learned page: the runs it was learned from and where it was served. */
+  /** Opens a lesson on Advice's Learned tab (every lesson, by whose): `key`, or `key@owner` for a person's own. */
   onLearned?: (key: string) => void;
   /** The evidence and lookup tables, for admins. */
   diagnostics?: React.ReactNode;
 }) {
-  // In the link, so Home's "this week" opens it at 7 days, and the diagnostics under it read the same window.
-  const [range, setRange] = useChoice("days", RANGE_IDS, "30");
-  const days = (RANGES.find((r) => r.id === range) ?? RANGES[1]).days;
+  // In the link, so Home's "this week" opens it at 7 days, and Learned beside it counts the same window and notes.
+  const { range, setRange, days, person } = useAdviceScope(admin);
   const [n, setN] = useState(0);
   const [got, setGot] = useState<{ key: string; data?: Usage; error?: unknown } | null>(null);
-  const key = JSON.stringify([sel.org, sel.team, sel.branch, days, n]);
+  const key = JSON.stringify([sel.org, sel.team, sel.branch, days, person, n]);
   useEffect(() => {
     let live = true;
-    browse<Usage>({ op: "advice_usage", ...(days ? { days } : {}) }, sel).then(
+    browse<Usage>(
+      { op: "advice_usage", ...(days ? { days } : {}), ...(person ? { person } : {}) },
+      sel,
+    ).then(
       (data) => live && setGot({ key, data }),
       (error: unknown) => live && setGot({ key, error }),
     );
@@ -161,11 +167,16 @@ export function AdvicePage({
   const [filter, setFilter] = useState<"all" | "waiting">("all");
   const [query, setQuery] = useState("");
   const [picked, setPicked] = useOption("note");
-  const [tab, setTab] = useState<"sessions" | "advice">("sessions");
+  const [tab, setTab] = useState<DetailTab>("advice");
   const [went, setWent] = useState<"all" | "well" | "wrong">("all");
   const [showDiag, setShowDiag] = useState(false);
 
-  const all = data?.advice ?? [];
+  // A person's own notes name them; the reader's own are "yours" (the engine names their owner either way).
+  const all = useMemo(
+    () =>
+      (data?.advice ?? []).map((a) => (a.mine && !data?.person ? { ...a, owner: undefined } : a)),
+    [data],
+  );
   const queue = all.filter(waiting);
   const list = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -175,7 +186,8 @@ export function AdvicePage({
         (!q || `${a.situation} ${a.category}`.toLowerCase().includes(q)),
     );
   }, [all, filter, query]);
-  const chosen = list.find((a) => a.key === picked) ?? list[0];
+  // The note the link names, opened on a page of its own; none: the list.
+  const chosen = picked ? all.find((a) => a.key === picked) : undefined;
   const totals = all.reduce(
     (t, a) => ({
       used: t.used + a.used,
@@ -198,19 +210,14 @@ export function AdvicePage({
           What agents were given, how often, and how it went
           {data && !data.every ? " · the sessions listed are yours" : ""}
         </span>
-        <div className="ap-seg" role="group" aria-label="Time range">
-          {RANGES.map((r) => (
-            <button
-              key={r.id}
-              aria-pressed={range === r.id}
-              className={range === r.id ? "on" : ""}
-              onClick={() => setRange(r.id)}
-            >
-              {r.label}
-            </button>
-          ))}
-        </div>
+        <RangeSeg range={range} setRange={setRange} />
       </header>
+      {data && (
+        <p className="ap-scope ap-muted ap-small">
+          {/* The window the server applied (`since`), and whose notes it read (`person`, echoed). */}
+          {scopeText(data.person ?? "", data.since ? days : null, "sessions")}
+        </p>
+      )}
 
       {cur?.error ? (
         <p className="ap-pad ap-error" role="alert">
@@ -229,6 +236,27 @@ export function AdvicePage({
           known: yours appears here after a few of them.
         </p>
       ) : (
+        chosen ? (
+          <article className="ap-one">
+            <button className="ap-back" onClick={() => setPicked(null)}>
+              ← All advice
+            </button>
+            <Detail
+              a={chosen}
+              sel={sel}
+              admin={admin}
+              every={!!data?.every}
+              days={days}
+              tab={tab}
+              setTab={setTab}
+              went={went}
+              setWent={setWent}
+              onTrace={onTrace}
+              onLearned={onLearned}
+              onChanged={() => setN((x) => x + 1)}
+            />
+          </article>
+        ) : (
         <>
           <div className="ap-tiles">
             <div>
@@ -262,82 +290,62 @@ export function AdvicePage({
             )}
           </div>
 
-          <div className="ap-split">
-            <nav className="ap-list" aria-label="Advice">
-              <div className="ap-filter">
-                <input
-                  type="search"
-                  placeholder="Filter advice"
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  aria-label="Filter advice"
-                />
-                {admin && (
-                  <div className="ap-chips">
-                    <button
-                      className={filter === "all" ? "on" : ""}
-                      onClick={() => setFilter("all")}
-                    >
-                      All
-                    </button>
-                    <button
-                      className={filter === "waiting" ? "on" : ""}
-                      onClick={() => setFilter("waiting")}
-                    >
-                      Waiting for ratification ({queue.length})
-                    </button>
-                  </div>
-                )}
-              </div>
-              {list.length === 0 && (
-                <p className="ap-pad ap-muted ap-small">
-                  {filter === "waiting" ? "Nothing is waiting for ratification." : "No match."}
-                </p>
-              )}
-              {list.map((a) => (
-                <button
-                  key={a.key}
-                  className={`ap-item ${chosen?.key === a.key ? "on" : ""}`}
-                  aria-current={chosen?.key === a.key}
-                  onClick={() => {
-                    setPicked(a.key);
-                    setWent("all");
-                  }}
-                >
-                  <span className="ap-item-top">
-                    <b>{a.situation}</b>
-                    <span className="ap-num">{a.used}</span>
-                  </span>
-                  <span className="ap-item-sub">
-                    <span className="ap-muted ap-small">
-                      {a.category}
-                      {a.mine ? " · yours" : ""}
-                      {a.ratified ? " · ✓ ratified" : ""}
-                      {a.held ? " · held back" : ""}
-                    </span>
-                    <Bar a={a} />
-                  </span>
-                </button>
-              ))}
-            </nav>
-
-            {chosen && (
-              <Detail
-                a={chosen}
-                sel={sel}
-                admin={admin}
-                every={!!data?.every}
-                tab={tab}
-                setTab={setTab}
-                went={went}
-                setWent={setWent}
-                onTrace={onTrace}
-                onLearned={onLearned}
-                onChanged={() => setN((x) => x + 1)}
+          <nav className="ap-list" aria-label="Advice">
+            <div className="ap-filter">
+              <input
+                type="search"
+                placeholder="Filter advice"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                aria-label="Filter advice"
               />
+              {admin && (
+                <div className="ap-chips">
+                  <button className={filter === "all" ? "on" : ""} onClick={() => setFilter("all")}>
+                    All
+                  </button>
+                  <button
+                    className={filter === "waiting" ? "on" : ""}
+                    onClick={() => setFilter("waiting")}
+                  >
+                    Waiting for ratification ({queue.length})
+                  </button>
+                </div>
+              )}
+            </div>
+            {list.length === 0 && (
+              <p className="ap-pad ap-muted ap-small">
+                {filter === "waiting" ? "Nothing is waiting for ratification." : "No match."}
+              </p>
             )}
-          </div>
+            {list.map((a) => (
+              <button
+                key={a.key}
+                className="ap-item"
+                onClick={() => {
+                  setPicked(a.key);
+                  setTab("advice");
+                  setWent("all");
+                }}
+              >
+                <span className="ap-item-top">
+                  <b>{a.situation}</b>
+                  <span className="ap-num">{a.used}</span>
+                </span>
+                <span className="ap-item-sub">
+                  <span className="ap-muted ap-small">
+                    {a.category}
+                    {a.mine ? (a.owner ? ` · ${a.owner}'s` : " · yours") : ""}
+                    {a.ratified ? " · ✓ ratified" : ""}
+                    {a.held ? " · held back" : ""}
+                  </span>
+                  <Bar a={a} />
+                </span>
+              </button>
+            ))}
+          </nav>
         </>
+        )
       )}
 
       {admin && diagnostics && (
@@ -356,11 +364,15 @@ export function AdvicePage({
   );
 }
 
+/** A note's tabs: its text (first), the sessions it was served in, and the runs it was learned from. */
+type DetailTab = "sessions" | "advice" | "learned";
+
 function Detail({
   a,
   sel,
   admin,
   every,
+  days,
   tab,
   setTab,
   went,
@@ -373,8 +385,10 @@ function Detail({
   sel: Selection;
   admin: boolean;
   every: boolean;
-  tab: "sessions" | "advice";
-  setTab: (t: "sessions" | "advice") => void;
+  /** The window the page counts (null: all), so the note's trails count what its tiles do. */
+  days: number | null;
+  tab: DetailTab;
+  setTab: (t: DetailTab) => void;
   went: "all" | "well" | "wrong";
   setWent: (w: "all" | "well" | "wrong") => void;
   onTrace: (id: string) => void;
@@ -440,7 +454,9 @@ function Detail({
       )}
       {a.mine && (
         <p className="ap-muted ap-small">
-          Learned from your own sessions and given to you alone, from the next one on.
+          {a.owner
+            ? `Learned from ${a.owner}'s own sessions and given to them alone, from the next one on.`
+            : "Learned from your own sessions and given to you alone, from the next one on."}
           {a.recalled
             ? ` ${a.recalled} of its ${a.used} ${a.used === 1 ? "use was" : "uses were"} its preferences, handed when a session started.`
             : ""}
@@ -476,6 +492,14 @@ function Detail({
       <div className="ap-tabs" role="tablist">
         <button
           role="tab"
+          aria-selected={tab === "advice"}
+          className={tab === "advice" ? "on" : ""}
+          onClick={() => setTab("advice")}
+        >
+          The advice
+        </button>
+        <button
+          role="tab"
           aria-selected={tab === "sessions"}
           className={tab === "sessions" ? "on" : ""}
           onClick={() => setTab("sessions")}
@@ -484,26 +508,32 @@ function Detail({
         </button>
         <button
           role="tab"
-          aria-selected={tab === "advice"}
-          className={tab === "advice" ? "on" : ""}
-          onClick={() => setTab("advice")}
+          aria-selected={tab === "learned"}
+          className={tab === "learned" ? "on" : ""}
+          onClick={() => setTab("learned")}
         >
-          The advice
+          Learned from
         </button>
       </div>
-      {tab === "advice" ? (
+      {tab === "learned" ? (
+        <LessonsFor
+          sel={sel}
+          adviceKey={a.key}
+          mine={!!a.mine}
+          owner={a.owner}
+          days={days}
+          onLesson={(id) => onLearned?.(id)}
+          onTrace={onTrace}
+        />
+      ) : tab === "advice" ? (
         <div className="ap-note">
           <p className="ap-muted ap-small">
             Learned {when(a.learned_at)}
             {a.when ? ` · for: ${a.when}` : ""}
-            {onLearned && (
-              <>
-                {" · "}
-                <button className="ap-link" onClick={() => onLearned(a.key)}>
-                  The runs it was learned from: Learned →
-                </button>
-              </>
-            )}
+            {" · "}
+            <button className="ap-link" onClick={() => setTab("learned")}>
+              The runs it was learned from →
+            </button>
           </p>
           <Markdown text={a.text.replace(/ ?<!--i:[0-9a-f]+-->/g, "")} />
         </div>

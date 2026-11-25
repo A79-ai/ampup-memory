@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiError } from "./api";
 import { setOptions, useChoice, useFlag } from "./hashOptions";
+import { usePoll } from "./poll";
 import { ago, entityName, humanize, when } from "./format";
 import {
   entityFocus,
@@ -772,25 +773,19 @@ function DreamBanner({
   const [err, setErr] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const live = running || !!list?.dreaming.running;
-  // While a pass runs, look again every few seconds; when it ends, read everything again.
-  useEffect(() => {
-    if (!live) return;
-    let stop = false;
-    const t = setInterval(() => {
-      review.dream(sel, { limit: 1 }).then(
-        (r) => {
-          if (stop || r.dreaming.running) return;
-          setRunning(false);
-          onChanged();
-        },
-        () => {},
-      );
-    }, 3000);
-    return () => {
-      stop = true;
-      clearInterval(t);
-    };
-  }, [live, sel.org, sel.team]);
+  // While a pass runs, look again every few seconds (one look at a time, none while the page is hidden, less
+  // often while the server fails); when it ends, read everything again.
+  usePoll(
+    live,
+    3000,
+    async () => {
+      const r = await review.dream(sel, { limit: 1 });
+      if (r.dreaming.running) return;
+      setRunning(false);
+      onChanged();
+    },
+    [sel.org, sel.team],
+  );
   if (!list) return null;
   const st = dreamState(list);
   const start = () => {

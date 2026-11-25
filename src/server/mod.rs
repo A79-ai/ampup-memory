@@ -728,6 +728,8 @@ pub async fn serve_with(
     }
     // Session rows are committed in batches, never per step (`crate::sessions::flush`).
     tokio::spawn(crate::sessions::flush_every());
+    // How many sessions' ends were under way, and refused for now, each minute.
+    tokio::spawn(crate::sessions::log_ends());
     // What this process counts (usage, alert readings), written for whichever process sends telemetry.
     let usage_persist = match std::env::var("AMPUP_MEMORY_USAGE_PERSIST_SECS") {
         Ok(v) => Duration::from_secs(
@@ -1513,7 +1515,7 @@ pub async fn serve_with(
                     let _org = LogOrg::of(&scope);
                     let mut quiet = true;
                     // The org's (or team's) models, where the operator chose them (`set_settings`).
-                    let cx = scoped_models(&cx, dir.as_ref(), &scope);
+                    let cx = crate::compile::scoped_models(&cx, dir.as_ref(), &scope);
                     // Its batch size and what its sources are, where its admins said (`set_settings`): a group
                     // of sources per prompt.
                     for (sources, opts) in crate::compile::plan(dir.as_ref(), &scope, &sources) {
@@ -1905,6 +1907,17 @@ pub async fn serve_with(
         gib(index_metadata),
         gib(search::flat_budget()),
     );
+    // A jump in the memory allocated of `AMPUP_MEMORY_JUMP_MB` (default 1024) or more, with what ran then
+    // (`crate::running`); 0 turns it off.
+    let jump_mb = std::env::var("AMPUP_MEMORY_JUMP_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1024);
+    if jump_mb > 0
+        && let Some(allocated) = crate::metrics::ALLOCATED.get().copied()
+    {
+        tokio::spawn(crate::running::watch_jumps(allocated, jump_mb << 20));
+    }
     if memory_every > 0 {
         let st = state.clone();
         tokio::spawn(async move {
@@ -2242,6 +2255,7 @@ async fn listen(
                     // `/mcp/hook` apart from `/mcp`, and each console page's route apart from `other`.
                     let route = audit::metric_route(req.uri().path());
                     let started = Instant::now();
+                    let _running = crate::running::running(format!("request {route}"));
                     // Its lines name the org it selected, then the one its scope is in (`log_org`).
                     // An alias is taken as the org it names, from here on ([`named_org`]).
                     let selected = named_org(&state, &mut req).await;
@@ -2262,70 +2276,78 @@ async fn listen(
                             None => Err(req),
                         };
                         // Boxed: the request's future is large, and held in the timer's it would be on the stack.
-                        let (r, phases) = crate::phases::timed(Box::pin(async {
-                            match req {
-                                Ok(r) => Ok(r),
-                                // An approval link from a join-request mail (`join`): the page that asks,
-                                // and the POST that approves. The sealed token is the credential (an admin's
-                                // mail client has no bearer token). Dispatched here, not in `handle`, whose
-                                // frame is at the size a debug build's test thread can take.
-                                Err(req)
-                                    if !internal
-                                        && req.uri().path() == join::APPROVE_PATH
-                                        && (!state.loopback_only
-                                            || addressed_to_this_machine(req.headers())) =>
-                                {
-                                    let query = req.uri().query().unwrap_or_default().to_string();
-                                    Ok(join::route(state.clone(), req, query).await)
-                                }
-                                // The weekly digest's unsubscribe link (`unsubscribe`): its sealed token is the
-                                // credential, as an approval link's is.
-                                Err(req)
-                                    if !internal
-                                        && req.uri().path() == crate::digest::UNSUBSCRIBE_PATH
-                                        && (!state.loopback_only
-                                            || addressed_to_this_machine(req.headers())) =>
-                                {
-                                    let query = req.uri().query().unwrap_or_default().to_string();
-                                    Ok(unsubscribe::route(state.clone(), req, query).await)
-                                }
-                                // The Studio (`studio`), on `serve --local` only: the files of a web page, which
-                                // call the routes `handle` answers.
-                                Err(req)
-                                    if !internal
-                                        && state.loopback_only
-                                        && studio::is_studio(req.uri().path())
-                                        && addressed_to_this_machine(req.headers()) =>
-                                {
-                                    Ok(studio::route(req.method(), req.uri().path()))
-                                }
-                                Err(req) => {
-                                    // Its reads of a scope wait for one state of it at most
-                                    // (`one_state_per_request`).
-                                    let (r, limit) = crate::limits::watching(crate::loads::by(
-                                        "request",
-                                        crate::one_state_per_request(handle(
-                                            state.clone(),
-                                            req,
-                                            internal,
-                                        )),
-                                    ))
-                                    .await;
-                                    // A write or a model call an org's limits refused, which the handler
-                                    // answered as a failure: answered as the refusal it is.
-                                    match (r, limit) {
-                                        (Ok(r), Some(l)) if r.status().is_server_error() => {
-                                            Ok(Response::builder()
-                                                .status(limit_status(&l))
-                                                .header("content-type", "application/json")
-                                                .body(Full::new(Bytes::from(l.body().to_string())))
-                                                .unwrap())
+                        let (r, phases) = crate::phases::timed(Box::pin(crate::running::within(
+                            &_running,
+                            Box::pin(async {
+                                match req {
+                                    Ok(r) => Ok(r),
+                                    // An approval link from a join-request mail (`join`): the page that asks,
+                                    // and the POST that approves. The sealed token is the credential (an admin's
+                                    // mail client has no bearer token). Dispatched here, not in `handle`, whose
+                                    // frame is at the size a debug build's test thread can take.
+                                    Err(req)
+                                        if !internal
+                                            && req.uri().path() == join::APPROVE_PATH
+                                            && (!state.loopback_only
+                                                || addressed_to_this_machine(req.headers())) =>
+                                    {
+                                        let query =
+                                            req.uri().query().unwrap_or_default().to_string();
+                                        Ok(join::route(state.clone(), req, query).await)
+                                    }
+                                    // The weekly digest's unsubscribe link (`unsubscribe`): its sealed token is the
+                                    // credential, as an approval link's is.
+                                    Err(req)
+                                        if !internal
+                                            && req.uri().path()
+                                                == crate::digest::UNSUBSCRIBE_PATH
+                                            && (!state.loopback_only
+                                                || addressed_to_this_machine(req.headers())) =>
+                                    {
+                                        let query =
+                                            req.uri().query().unwrap_or_default().to_string();
+                                        Ok(unsubscribe::route(state.clone(), req, query).await)
+                                    }
+                                    // The Studio (`studio`), on `serve --local` only: the files of a web page, which
+                                    // call the routes `handle` answers.
+                                    Err(req)
+                                        if !internal
+                                            && state.loopback_only
+                                            && studio::is_studio(req.uri().path())
+                                            && addressed_to_this_machine(req.headers()) =>
+                                    {
+                                        Ok(studio::route(req.method(), req.uri().path()))
+                                    }
+                                    Err(req) => {
+                                        // Its reads of a scope wait for one state of it at most
+                                        // (`one_state_per_request`).
+                                        let (r, limit) = crate::limits::watching(crate::loads::by(
+                                            "request",
+                                            crate::one_state_per_request(handle(
+                                                state.clone(),
+                                                req,
+                                                internal,
+                                            )),
+                                        ))
+                                        .await;
+                                        // A write or a model call an org's limits refused, which the handler
+                                        // answered as a failure: answered as the refusal it is.
+                                        match (r, limit) {
+                                            (Ok(r), Some(l)) if r.status().is_server_error() => {
+                                                Ok(Response::builder()
+                                                    .status(limit_status(&l))
+                                                    .header("content-type", "application/json")
+                                                    .body(Full::new(Bytes::from(
+                                                        l.body().to_string(),
+                                                    )))
+                                                    .unwrap())
+                                            }
+                                            (r, _) => r,
                                         }
-                                        (r, _) => r,
                                     }
                                 }
-                            }
-                        }))
+                            }),
+                        )))
                         .await;
                         let took = started.elapsed();
                         state
@@ -3675,26 +3697,6 @@ impl std::error::Error for Forbidden {}
 /// `source_prefix` must be at least this long.
 const MIN_PREFIX: usize = 4;
 
-/// The compiler for `scope`: `cx` with the skill-library and AIP-graph models its org (or team) names
-/// (`set_settings {compile_model, aip_model}`), on `cx`'s backend; as it is where neither names one.
-fn scoped_models(
-    cx: &crate::extract::Extractor,
-    dir: Option<&crate::people::directory::Directory>,
-    scope: &Scope,
-) -> crate::extract::Extractor {
-    let Some(dir) = dir else {
-        return cx.clone();
-    };
-    let cx = match dir.model(scope, |s| s.compile_model.as_ref()) {
-        Some(m) => cx.with_model(&m),
-        None => cx.clone(),
-    };
-    match dir.model(scope, |s| s.aip_model.as_ref()) {
-        Some(m) => cx.with_aip_model(&m),
-        None => cx,
-    }
-}
-
 /// `/installations` (public port, an admin API key, or an org's own org-wide ingest key for that org's
 /// installations only: the connector service holds just that key for a hosted org): who owns each
 /// connector installation, kept in `memory_system.installations`. Body `{"op": ...}`:
@@ -4426,17 +4428,24 @@ const MAX_INGEST_AHEAD_US: i64 = 24 * 3600 * 1_000_000;
 
 /// Source families the server writes itself and reads back as its own: agents' notes and closures
 /// (`mcp:remember_memory:<author>:...`), goals (`goal:<id>`), compiled skills (`compile:skills`) and learned
-/// advice (`advice:learn`). An org's
+/// advice (`advice:learn`), and what extraction met that the schema has no type for (`schema-growth:`). An org's
 /// key may not ingest under them: with the same body its episode would be the server's (ids hash source and
 /// body, and the newest ACL row wins), and the server would take it for its own. Any `mcp:` source is
 /// refused, not just the tool it names today.
-const RESERVED_SOURCES: [&str; 4] = ["mcp:", "goal:", "compile:", "advice:"];
+const RESERVED_SOURCES: [&str; 5] = [
+    "mcp:",
+    "goal:",
+    "compile:",
+    "advice:",
+    crate::episode_types::SCHEMA_GROWTH_SOURCE,
+];
 
 /// Document keys the server writes itself: goals (`goals/`, from before they were retired), compiled skills and their AIP graphs
 /// ([`crate::compile::SKILLS`], [`crate::compile::AIP`]), learned advice ([`crate::advice::PREFIX`]), which
 /// `get_advice` serves as the scope's own, people's profiles and notes dream records ([`crate::profile::PREFIX`],
-/// [`crate::notes_dream::PREFIX`]), and sessions' transcripts ([`crate::transcripts::PREFIX`]).
-const RESERVED_DOCUMENTS: [&str; 8] = [
+/// [`crate::notes_dream::PREFIX`]), sessions' transcripts ([`crate::transcripts::PREFIX`]), and what extraction met that
+/// the schema has no type for ([`crate::schema_growth::DOC`]).
+const RESERVED_DOCUMENTS: [&str; 9] = [
     "goals/",
     crate::compile::SKILLS,
     crate::compile::AIP,
@@ -4445,6 +4454,7 @@ const RESERVED_DOCUMENTS: [&str; 8] = [
     crate::profile::PREFIX,
     crate::transcripts::PREFIX,
     crate::notes_dream::PREFIX,
+    crate::schema_growth::DOC,
 ];
 
 /// The largest version of a starter document a note may write (the hooks send files of up to this).
@@ -4458,6 +4468,82 @@ fn narrow_prefix(prefix: &str) -> bool {
     prefix
         .split_once(':')
         .is_some_and(|(kind, more)| !kind.trim().is_empty() && !more.trim().is_empty())
+}
+
+/// Source families the server files its own records under besides [`RESERVED_SOURCES`]: dreams' links
+/// ([`crate::dream::SOURCE`]), conflicts' records ([`crate::conflicts::SOURCE`]) and advice traces
+/// ([`crate::advice_traces::SOURCE`]). No ingested record is under them.
+const ENGINE_SOURCES: [&str; 3] = [
+    crate::dream::SOURCE,
+    crate::conflicts::SOURCE,
+    crate::advice_traces::SOURCE,
+];
+
+/// The most sources one `forget_source` names (as many as one `/ingest` batch writes).
+const MAX_FORGET_SOURCES: usize = MAX_INGEST_EPISODES;
+
+/// What a `forget_source` names, and how its audit names that: a `source_prefix` naming a source family and something
+/// in it (`<kind>:<more>`, [`narrow_prefix`]: never a whole org or a whole connector), or `sources`, a list of exact
+/// sources. Never under a source the server files itself ([`RESERVED_SOURCES`], [`ENGINE_SOURCES`]): its notes,
+/// sessions, goals, skills and advice go by their own ways (`forget_memory`, `forget_user`, retention).
+fn forget_source_targets(req: &Value) -> Result<(Vec<crate::AclTarget>, String)> {
+    use crate::people::directory::Invalid;
+    let engine = |s: &str| {
+        reserved_source(s)
+            || s.split_once(':').is_some_and(|(f, _)| {
+                let f = f.trim().to_ascii_lowercase();
+                ENGINE_SOURCES.iter().any(|e| e.trim_end_matches(':') == f)
+            })
+    };
+    let refuse_engine = |s: &str| -> Result<()> {
+        match engine(s) {
+            true => Err(Invalid(format!(
+                "{s:?} is under a source the server files itself ({}, {}): those go by their own ways (forget_memory, forget_user, retention)",
+                RESERVED_SOURCES.join(", "),
+                ENGINE_SOURCES.join(", ")
+            ))
+            .into()),
+            false => Ok(()),
+        }
+    };
+    match (&req["source_prefix"], &req["sources"]) {
+        (Value::String(p), Value::Null) => {
+            if !narrow_prefix(p) {
+                return Err(Invalid(format!(
+                    "source_prefix names a source family and something in it (<kind>:<more>, as doc:policy/), not {p:?}: a whole connector is too wide to delete by accident"
+                ))
+                .into());
+            }
+            refuse_engine(p)?;
+            Ok((
+                vec![crate::AclTarget::SourcePrefix(p.clone())],
+                format!("prefix {p:?}"),
+            ))
+        }
+        (Value::Null, Value::Array(a)) => {
+            if a.is_empty() || a.len() > MAX_FORGET_SOURCES {
+                return Err(Invalid(format!(
+                    "sources lists 1 to {MAX_FORGET_SOURCES} sources, got {}",
+                    a.len()
+                ))
+                .into());
+            }
+            let mut out = Vec::with_capacity(a.len());
+            for s in a {
+                let s = s
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| Invalid("sources are non-empty strings".into()))?;
+                refuse_engine(s)?;
+                out.push(crate::AclTarget::Source(s.to_string()));
+            }
+            Ok((out, format!("{} sources", a.len())))
+        }
+        _ => Err(Invalid(
+            "name exactly one of source_prefix (<kind>:<more>) or sources (a list of exact sources)".into(),
+        )
+        .into()),
+    }
 }
 
 /// Whether `source` is in a family the server owns, by the family before its first `:` (case aside).
@@ -4843,8 +4929,10 @@ async fn keep_warm(st: Arc<State>) {
         }
         for scope in scopes {
             let t = Instant::now();
+            let running = crate::running::running(format!("keep-warm {scope}: search"));
             let touched = async {
                 search::warm(&store, &scope).await?;
+                running.step(format!("keep-warm {scope}: qa_log"));
                 crate::qa_log::warm(&store, &scope).await
             };
             match Store::refreshing_after(fresh_enough, touched).await {
@@ -6447,6 +6535,41 @@ async fn handle(
         let (status, v) = ingest_reply(done);
         return Ok(reply(status, v));
     }
+    // `/runs {import}` with the operator's admin key: into the org or team it selects ([`import_runs`]). Any other
+    // credential, and any other `/runs` body, is authenticated like every caller.
+    if runs_route
+        && path == "/runs"
+        && serde_json::from_slice::<Value>(&body).is_ok_and(|v| !v["import"].is_null())
+        && let Ok(actor) = require_admin(&state, caller_token.as_deref()).await
+    {
+        let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if !view.is_main() || named_scope(&req_query).is_some() {
+            return Ok(reply(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "an import writes to main as it is now, in the org or team selected (x-memstore-org, x-memstore-team): drop the branch, snapshot and scope"}),
+            ));
+        }
+        return Ok(
+            match operator_ingest_scope(&state, sel_org.as_deref(), sel_team.as_deref()).await {
+                Ok(scope) => {
+                    let store = state.store.read().unwrap().clone();
+                    let who = Principal::new(&actor, &[]);
+                    let caller = (&who, &SignIn::default(), true, false);
+                    Box::pin(import_answer(&state, &store, &scope, caller, &args)).await
+                }
+                Err(e) => match e.downcast_ref::<BadRequest>() {
+                    Some(b) => reply(StatusCode::BAD_REQUEST, json!({"error": b.0})),
+                    None => {
+                        eprintln!("runs import failed: {e:#}");
+                        reply(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({"error": "runs import failed"}),
+                        )
+                    }
+                },
+            },
+        );
+    }
     // `/retract` with the operator's admin key: in the org or team it selects, else the served scope. Any
     // other credential is authenticated like every caller, and answered once its scope is resolved (below).
     if retract_route && let Ok(actor) = require_admin(&state, caller_token.as_deref()).await {
@@ -6641,6 +6764,18 @@ async fn handle(
         Some(a) => (Some(a.who), a.via, a.admin),
         None => (None, SignIn::default(), false),
     };
+    // The operator's admin key, in an org it selected on a route that only reads, reads there at the level of the
+    // org's admins (what the org shares with everyone, and their views), with its reads audited in the operator's view
+    // ([`operator_reads`]). It doesn't read what people keep to themselves: only the operator's own sign-in does.
+    // Anywhere else (a write, a team, no org selected) it is what it was.
+    let key_reads = operator_key_reads(&via, superuser, &path, sel_org.as_deref(), &req_query);
+    let via = match key_reads {
+        true => SignIn {
+            operator: true,
+            ..via
+        },
+        false => via,
+    };
     // The tenant headers are a platform key's: from anyone else they are refused, never ignored.
     if tenant_headers.any() && via.platform.is_none() {
         return Ok(reply(
@@ -6753,10 +6888,13 @@ async fn handle(
         let req = serde_json::from_slice::<Value>(&body).unwrap_or_default();
         let named = req["org"].as_str().map(String::from);
         let org = named.as_deref().or(sel_org.as_deref());
+        // A read of the directory alone is every cell's (the directory is in the shared catalog): answered by the
+        // server asked, so it answers while the org's cell is down.
+        let anywhere = directory_read(&req);
         // An op on another cell's org is that cell's to do, where the org's memory is: sent there whatever the op
         // (a delete, a forget, a schema, a new org's tables). A forget in every org is each cell's in its own.
         if let Some((method, uri, headers)) = &head {
-            if let Some(o) = named.as_deref().filter(|o| cell::elsewhere(o)) {
+            if let Some(o) = named.as_deref().filter(|o| !anywhere && cell::elsewhere(o)) {
                 let to = cell::forward_read((o, None), method, uri, headers.clone(), body.clone());
                 return Ok(to.await);
             }
@@ -6769,7 +6907,7 @@ async fn handle(
         // another in its body): refused before anything changes.
         if let Some(o) = named
             .as_deref()
-            .filter(|o| !memstore_core::cell::holds_org(o))
+            .filter(|o| !anywhere && !memstore_core::cell::holds_org(o))
         {
             return Ok(misdirected(o));
         }
@@ -6879,8 +7017,8 @@ async fn handle(
                 }
                 // An operator, as the platform's support, reads all of the org's memory: what its people keep to
                 // themselves or share with a few too, not only what is shared with the whole org. Its own sign-in
-                // only, never a key made from it.
-                if operator_reads(&via) {
+                // only, never a key made from it, nor the operator's admin key (`operator_key_reads`).
+                if operator_reads(&via) && !key_reads {
                     w = w.reading_all();
                 }
             }
@@ -6951,6 +7089,37 @@ async fn handle(
             ),
             _ => Value::Null,
         };
+        // The org this request is in (its scope's), and what the caller may do in each org they belong to, each as
+        // the ops it names decide it, from the directory alone: a page shows a section to whoever its calls would
+        // answer, without trying them, and an org whose cell is down still says (none is named to ask).
+        // - `admin`: the org admins' reads (`activity`, `advice_trail`, branches, traces): its admin, or an admin key;
+        // - `activity`: whether the org shows its people's activity, without which `activity` and `advice_trail`
+        //   are refused to its admins too;
+        // - `review`: owner review and the entity graph (`entity_owners`, proposals, conflicts): whoever reads the org;
+        // - `lessons`: what the memory learned (`/lessons`): whoever reads the org.
+        // `/admin` itself is refused to every key (a directory key manages its org's members only), to a provisioner
+        // and on a server that identifies no one.
+        let org = scope.as_ref().ok().and_then(|s| s.org_name());
+        let capabilities: serde_json::Map<String, Value> = match &dir {
+            Ok(d) => {
+                let manages = !(state.fixed() && via.local_admin.is_none())
+                    && via.provisioner.is_none()
+                    && via.key.is_none();
+                let orgs = memberships.as_object().into_iter().flat_map(|m| m.keys());
+                orgs.map(|o| {
+                    let member = d.resolve(who.user(), &via, Some(o), None).is_ok();
+                    let can = json!({
+                        "admin": manages && (superuser || d.is_admin(who.user(), &via, o)),
+                        "activity": d.shows_activity(o),
+                        "review": manages && member,
+                        "lessons": reads && member,
+                    });
+                    (o.clone(), can)
+                })
+                .collect()
+            }
+            Err(_) => Default::default(),
+        };
         let (scope, refused) = match &scope {
             Ok(s) => (json!(s.to_string()), Value::Null),
             Err(e) => (Value::Null, json!(e.to_string())),
@@ -6961,7 +7130,8 @@ async fn handle(
             json!({"user": who.user(), "groups": who.groups(), "admin": superuser || via.operator, "scope": scope,
                    "refused": refused, "memberships": memberships, "names": names, "profile": profile,
                    "signed_in_for": via.orgs, "provider_groups": via.groups, "api_key": via.key,
-                   "auth0_orgs": auth0_orgs, "pending": pending, "signin": signin}),
+                   "auth0_orgs": auth0_orgs, "pending": pending, "signin": signin, "org": org,
+                   "capabilities": capabilities}),
         ));
     }
     if let Ok(s) = &scope {
@@ -7785,6 +7955,11 @@ async fn handle(
         }
         let store = state.store.read().unwrap().clone();
         let args: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        // Graded runs imported as the org's (`{import: "<label>", runs: [...]}`), by its admin.
+        if path == "/runs" && !args["import"].is_null() {
+            let caller = (&who, &via, superuser, acting.is_some());
+            return Ok(Box::pin(import_answer(&state, &store, &scope, caller, &args)).await);
+        }
         // A batch (`{runs: [...]}`, `{rewards: [...]}`) answers with every id, in order; one, with its id.
         let ids = |r: Result<Vec<String>>| r.map(|ids| json!({"run_ids": ids}));
         let one = |r: Result<String>| r.map(|id| json!({"run_id": id}));
@@ -9076,6 +9251,44 @@ fn operator_reads(via: &SignIn) -> bool {
     via.operator && via.key.is_none()
 }
 
+/// The routes on which the operator's admin key reads an org it selects ([`operator_key_reads`]): those that only read
+/// its memory (search, queries, episodes, the Explorer's browse and its lists, lessons). Never one that writes
+/// (`/remember`, `/ingest`, `/facts`, `/sessions`, `/mcp`, whose tools write too).
+const OPERATOR_KEY_READS: [&str; 7] = [
+    "/search",
+    "/query",
+    "/episode",
+    "/browse",
+    "/facts/list",
+    "/advice/list",
+    "/lessons",
+];
+
+/// Whether this request is the operator's admin key (a keys-file key marked admin, no org's key, platform's or
+/// provisioner's) reading an org it selected (`org`) on one of [`OPERATOR_KEY_READS`]: it reads there as the org's
+/// admins do (what the org shares with everyone, and their views, as lessons), the org's scope only (not a team's, as
+/// an operator is in none), and its reads are audited in the operator's view ([`operator_reads`]). Not what people keep
+/// to themselves (a person's notes or profile): only the operator's own sign-in reads those. It already exports,
+/// ingests into and retracts in any org; this lets it read what the org's members read without being one.
+fn operator_key_reads(
+    via: &SignIn,
+    superuser: bool,
+    path: &str,
+    org: Option<&str>,
+    query: &str,
+) -> bool {
+    superuser
+        && !via.person
+        && !via.operator
+        && via.key.is_none()
+        && via.platform.is_none()
+        && via.provisioner.is_none()
+        && via.local_admin.is_none()
+        && org.is_some()
+        && named_scope(query).is_none()
+        && OPERATOR_KEY_READS.contains(&path)
+}
+
 /// A person's sign-in into `org`, for the audit, if they belong to it: recorded beside the request rather than on its
 /// way, since whether they belong is the directory's, which a request in a burst may otherwise wait on another's
 /// reading of. Nothing the request answers depends on it.
@@ -9500,8 +9713,9 @@ async fn served_workspace(
 
 /// The `/admin` ops a directory key may send (`KeyRole::Directory`): its org's view, and the changes `plan`
 /// lets it make there.
-const DIRECTORY_KEY_OPS: [&str; 7] = [
+const DIRECTORY_KEY_OPS: [&str; 8] = [
     "show",
+    "standing",
     "add_member",
     "remove_member",
     "add_to_team",
@@ -9514,7 +9728,7 @@ const DIRECTORY_KEY_OPS: [&str; 7] = [
 /// the org's memory (its people's activity, advice, branches, owners and reviews, schema, offboarding). Not the
 /// directory's changes (it holds no local org), the operator's, or dreams (Kubernetes jobs): those are refused
 /// as not available locally.
-const LOCAL_ADMIN_OPS: [&str; 40] = [
+const LOCAL_ADMIN_OPS: &[&str] = &[
     "show",
     "get_schema",
     "set_schema",
@@ -9533,7 +9747,9 @@ const LOCAL_ADMIN_OPS: [&str; 40] = [
     "name_session_tasks",
     "hold_advice",
     "ratify_advice",
+    "write_advice",
     "learn_advice",
+    "advice_status",
     "set_entity_owner",
     "remove_entity_owner",
     "entity_owners",
@@ -9552,6 +9768,7 @@ const LOCAL_ADMIN_OPS: [&str; 40] = [
     "apply_dream_decision",
     "dream_now",
     "forget_user",
+    "forget_source",
     "export_org",
     "purge_retracted",
     "retention",
@@ -9559,13 +9776,14 @@ const LOCAL_ADMIN_OPS: [&str; 40] = [
 
 /// The `/admin` ops a provisioner key may send ([`SignIn::provisioner`]). `set_schema` only as its handler
 /// allows one: a built-in by name, on an org it created that has no schema yet.
-const PROVISIONER_OPS: [&str; 6] = [
+const PROVISIONER_OPS: [&str; 7] = [
     "create_org",
     "set_auth0_org",
     "create_key",
     "set_limits",
     "set_schema",
     "show",
+    "standing",
 ];
 
 /// The directory a provisioner key's check on `org` reads: this server's fold when it already shows `org` as one the
@@ -9595,9 +9813,101 @@ fn op_label(op: &str) -> &'static str {
         .iter()
         .chain(&DIRECTORY_KEY_OPS)
         .chain(&PROVISIONER_OPS)
+        .chain(&["orgs", "standing"])
         .find(|o| **o == op)
         .copied()
         .unwrap_or("admin op")
+}
+
+/// What an org's directory holds, as `show {org}`'s view has it: what `show` may be asked for alone (`fields`),
+/// never its usage, which counts the org's memory on its cell.
+const ORG_FIELDS: &[&str] = &[
+    "members",
+    "teams",
+    "profile",
+    "provider",
+    "auth0_org",
+    "domains",
+    "groups",
+    "keys",
+    "workspace",
+    "settings",
+    "team_settings",
+    "pending",
+    "signin_requests",
+    "signin_approved",
+    "created_by",
+    "limits",
+    "tenant",
+    "attrs",
+    "display_name",
+    "aliases",
+];
+
+/// Whether an `/admin` request reads the directory alone, which is in the catalog every cell shares: `standing`,
+/// and `show` of one org's `fields`. The server asked answers it, never the org's cell, so it answers while that
+/// cell is down.
+fn directory_read(req: &Value) -> bool {
+    req["op"] == "standing" || (req["op"] == "show" && !req["fields"].is_null())
+}
+
+/// `show`'s `fields`: None when it asks for the whole view (with the org's usage); else each one named, all
+/// [`ORG_FIELDS`].
+fn org_fields(req: &Value) -> Result<Option<Vec<String>>> {
+    use crate::people::directory::Invalid;
+    let named = match &req["fields"] {
+        Value::Null => return Ok(None),
+        Value::Array(a) => a,
+        _ => return Err(Invalid("fields is a list of the org's directory fields".into()).into()),
+    };
+    if req["org"].is_null() {
+        return Err(Invalid("fields are one org's: name it (org)".into()).into());
+    }
+    let mut out = Vec::with_capacity(named.len());
+    for f in named {
+        match f.as_str() {
+            Some("usage") => {
+                return Err(Invalid(
+                    "usage isn't in the directory: show without fields counts it, on the org's cell".into(),
+                )
+                .into());
+            }
+            Some(f) if ORG_FIELDS.contains(&f) => out.push(f.to_string()),
+            _ => {
+                return Err(Invalid(format!(
+                    "{f} isn't one of an org's directory fields: {}",
+                    ORG_FIELDS.join(", ")
+                ))
+                .into());
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+/// `view` (an org's, as `show` gives it to its caller) with only `fields` kept: what the caller may see of each,
+/// as without them. No org (null) stays null.
+fn only_fields(view: Value, fields: &[String]) -> Value {
+    match view {
+        Value::Object(mut m) => {
+            m.retain(|k, _| fields.iter().any(|f| f == k));
+            Value::Object(m)
+        }
+        v => v,
+    }
+}
+
+/// `standing {org}`: what the org is held to (its limits, as `show` gives them) and whether its time ran out (a
+/// trial's end), from the directory alone: no usage, which counts its memory on its cell.
+fn standing(name: &str, org: Option<&crate::people::directory::Org>) -> Value {
+    match org {
+        Some(o) => json!({
+            "org": name,
+            "limits": crate::limits::limits_json(&o.limits),
+            "expired": o.limits.expires_at.is_some_and(|t| t <= chrono::Utc::now()),
+        }),
+        None => json!({"org": name, "limits": null, "expired": null}),
+    }
 }
 
 /// `show {org}`'s limits and usage: `"limits"` (each one, null where unset) and `"usage"` (this month's model tokens,
@@ -9846,17 +10156,28 @@ async fn directory_change(
             ))
             .into());
         }
-        if op == "show" {
-            *state.shown_at.lock().unwrap() = Some(Instant::now());
+        if op == "show" || op == "standing" {
+            // `fields` and `standing` read the directory alone: no usage counted.
+            let fields = match op {
+                "show" => org_fields(&req)?,
+                _ => None,
+            };
+            if op == "show" && fields.is_none() {
+                *state.shown_at.lock().unwrap() = Some(Instant::now());
+            }
             let org = req["org"].as_str().unwrap_or_default();
             let store = state.store.read().unwrap().clone();
             let dir = provisioner_directory(&store, org, key).await?;
             return match dir.orgs.get(org) {
-                Some(o) if crate::people::directory::created_by(o, key) => {
-                    let mut v = json!({"view": o});
-                    with_limits(&store, org, o, &mut v).await;
-                    Ok(v)
-                }
+                Some(o) if crate::people::directory::created_by(o, key) => match (op, fields) {
+                    ("standing", _) => Ok(standing(org, Some(o))),
+                    (_, Some(f)) => Ok(json!({"view": only_fields(json!(o), &f)})),
+                    _ => {
+                        let mut v = json!({"view": o});
+                        with_limits(&store, org, o, &mut v).await;
+                        Ok(v)
+                    }
+                },
                 _ => Err(Refused(format!(
                     "a provisioner key reads only the orgs it created, and {org:?} is not one"
                 ))
@@ -10127,14 +10448,63 @@ async fn directory_change(
         return Ok(json!({"check": check, "agrees": check.problems.is_empty(),
                          "loaded": {"events": folded.events, "from_snapshot": folded.snapshot_events}}));
     }
-    if req["op"] == "show" {
-        *state.shown_at.lock().unwrap() = Some(Instant::now());
+    if req["op"] == "orgs" {
+        // Every org on this server, each with what an operator's list of orgs shows: its member count, its admins
+        // and its Auth0 org. The operator's alone (an admin key, an Auth0 operator), as `show` lists every org to
+        // them only. Answered here from the directory requests are signed in by, never by an org's cell: it reads
+        // no org's memory, no key usage and no episode count, so one call costs the same however many orgs there are.
+        if !superuser && !via.operator {
+            return Err(Refused(format!(
+                "{} may not list every org (only the operator may)",
+                who.user()
+            ))
+            .into());
+        }
+        let folded = store.directory_behind().await?;
+        crate::phases::mark("directory read");
+        let orgs: Vec<Value> = folded
+            .dir
+            .orgs
+            .iter()
+            .map(|(name, o)| {
+                let admins: Vec<&String> = o
+                    .members
+                    .iter()
+                    .filter(|(_, r)| **r == crate::people::directory::Role::Admin)
+                    .map(|(m, _)| m)
+                    .collect();
+                json!({"org": name, "members": o.members.len(), "admins": admins,
+                       "auth0_org": o.auth0_org})
+            })
+            .collect();
+        return Ok(json!({ "orgs": orgs }));
+    }
+    if req["op"] == "show" || req["op"] == "standing" {
+        // `fields`: only those of the org's view, from the directory alone (`directory_read`): its keys' last uses
+        // only when its keys are asked for, and never its usage. `standing`: its limits, from the directory alone.
+        let fields = match req["op"] == "show" {
+            true => org_fields(&req)?,
+            false => None,
+        };
+        let keys = req["op"] == "show"
+            && fields
+                .as_ref()
+                .is_none_or(|f| f.iter().any(|f| f == "keys"));
+        if keys {
+            *state.shown_at.lock().unwrap() = Some(Instant::now());
+        }
         // An admin key and an operator see every org; a person sees the orgs they belong to. A read, decided by the
         // directory requests are signed in by (`Directory::behind`): this server's own changes show at once.
         let dir = Directory::behind(&store).await?;
         crate::phases::mark("directory read");
-        let dir = dir.with_usage(&state.key_usage(&store).await);
-        crate::phases::mark("key usage read");
+        let dir = match keys {
+            true => {
+                let dir = dir.with_usage(&state.key_usage(&store).await);
+                crate::phases::mark("key usage read");
+                dir
+            }
+            false => dir,
+        };
         let access = dir.access(who.user(), via);
         let mine = |o: &str| superuser || via.operator || access.contains_key(o);
         // The whole org: the operator, its admins (a person: a file key in an admin's name manages nothing),
@@ -10146,18 +10516,45 @@ async fn directory_change(
                     via.directory_key().is_some() || a.role == crate::people::directory::Role::Admin
                 })
         };
+        if req["op"] == "standing" {
+            // Whoever sees the org's limits in `show`: its whole view's readers. A member who isn't an admin sees
+            // themselves there, without them.
+            let o = req["org"]
+                .as_str()
+                .ok_or_else(|| Invalid("standing is one org's: name it (org)".into()))?;
+            return match (whole(o), mine(o)) {
+                (true, _) => Ok(standing(o, dir.orgs.get(o))),
+                (false, true) => Err(Refused(format!(
+                    "{} may not read org {o}'s standing (only its admins may)",
+                    who.user()
+                ))
+                .into()),
+                (false, false) => {
+                    Err(Refused(format!("{} is not a member of org {o}", who.user())).into())
+                }
+            };
+        }
         return Ok(match req["org"].as_str() {
             None => json!({"view": dir.orgs.keys().filter(|o| mine(o)).collect::<Vec<_>>()}),
-            Some(o) if whole(o) => {
-                let mut v = json!({"view": dir.orgs.get(o)});
-                if let Some(org) = dir.orgs.get(o) {
-                    with_limits(&store, o, org, &mut v).await;
-                    crate::phases::mark("usage counted");
+            Some(o) if whole(o) => match &fields {
+                Some(f) => json!({"view": only_fields(json!(dir.orgs.get(o)), f)}),
+                None => {
+                    let mut v = json!({"view": dir.orgs.get(o)});
+                    if let Some(org) = dir.orgs.get(o) {
+                        with_limits(&store, o, org, &mut v).await;
+                        crate::phases::mark("usage counted");
+                    }
+                    v
                 }
-                v
-            }
+            },
             Some(o) if mine(o) => match (dir.orgs.get(o), access.get(o)) {
-                (Some(org), Some(a)) => json!({"view": org.member_view(who.user(), a)}),
+                (Some(org), Some(a)) => {
+                    let view = org.member_view(who.user(), a);
+                    json!({"view": match &fields {
+                        Some(f) => only_fields(view, f),
+                        None => view,
+                    }})
+                }
                 _ => json!({"view": null}),
             },
             Some(o) => {
@@ -10361,9 +10758,13 @@ async fn directory_change(
                 .map_err(|e| Refused(format!("{e:#}")))?;
             let id = req["id"].as_str().unwrap_or_default();
             let log = crate::qa_log::list(&store, &scope, None).await?;
-            let theirs = log
-                .iter()
-                .any(|l| l.answer_id == id && l.asker == who.user());
+            // Runs imported as the org's (`crate::runs::import`) are no person's activity: its admins read them
+            // whatever the activity setting.
+            let admin = dir.is_admin(who.user(), via, org);
+            let theirs = log.iter().any(|l| {
+                l.answer_id == id
+                    && (l.asker == who.user() || (admin && crate::runs::is_import(&l.asker)))
+            });
             let found = match theirs {
                 true => crate::activity::transcript(&store, &scope, &log, id).await?,
                 false => None,
@@ -10558,6 +10959,31 @@ async fn directory_change(
             true => crate::advice::categories(&store, &scope, who).await?,
             false => crate::advice::trail(&store, &scope, who, req["key"].as_str()).await?,
         };
+        v["org"] = json!(org);
+        v["scope"] = json!(scope.to_string());
+        return Ok(v);
+    }
+    if req["op"] == "advice_status" {
+        // Where the team's advice learning stands: counts of runs and notes, the learn under way and the last one,
+        // no one's runs. The org's admins (and the operator), as for `learn_advice`; a team's only for its readers.
+        let org = req["org"].as_str().unwrap_or_default();
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
+        let dir = Directory::load(&store).await?;
+        if !superuser && !dir.is_admin(who.user(), via, org) {
+            return Err(Refused(format!(
+                "{} may not read org {org}'s advice status (only its admins may)",
+                who.user()
+            ))
+            .into());
+        }
+        let scope = match req["team"].as_str().filter(|t| !t.is_empty()) {
+            Some(t) if superuser => Scope::team(org, t).map_err(|e| Invalid(e.to_string()))?,
+            Some(t) => dir
+                .resolve(who.user(), via, Some(org), Some(t))
+                .map_err(|e| Refused(format!("{e:#}")))?,
+            None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
+        };
+        let mut v = crate::advice_loop::status(&store, &scope).await?;
         v["org"] = json!(org);
         v["scope"] = json!(scope.to_string());
         return Ok(v);
@@ -10761,6 +11187,7 @@ async fn directory_change(
                 resort: false,
                 rewrite: Default::default(),
                 force: false,
+                note: None,
             };
             let id = crate::advice_requests::queue(&store, &scope, &r).await?;
             let doing = match (ratifying, if ratifying { ratify } else { hold }) {
@@ -10815,6 +11242,143 @@ async fn directory_change(
             if hold { "held" } else { "released" }
         );
         return Ok(json!({"org": org, "scope": scope.to_string(), "held": held}));
+    }
+    if req["op"] == "write_advice" {
+        // A team note an org admin writes as it is, for one kind of task (`crate::advice::write_admin`): a team's
+        // runbook, or a note learned elsewhere, served as written and pinned against learning; `note` left out takes
+        // the note an admin wrote there out. The org's admins (or the operator); `dry_run: true` says what it would
+        // do and writes nothing. It writes the advice map, as a learn does: the writer lease's holder, while no
+        // learn runs in the scope.
+        let org = req["org"].as_str().unwrap_or_default();
+        crate::check_name("org", org).map_err(|e| Invalid(e.to_string()))?;
+        let dir = Directory::load(&store).await?;
+        if !superuser && !dir.is_admin(who.user(), via, org) {
+            return Err(Refused(format!(
+                "{} may not write advice in org {org} (only its admins may)",
+                who.user()
+            ))
+            .into());
+        }
+        let scope = match req["team"].as_str().filter(|t| !t.is_empty()) {
+            Some(t) if superuser => Scope::team(org, t).map_err(|e| Invalid(e.to_string()))?,
+            Some(t) => dir
+                .resolve(who.user(), via, Some(org), Some(t))
+                .map_err(|e| Refused(format!("{e:#}")))?,
+            None => Scope::org(org).map_err(|e| Invalid(e.to_string()))?,
+        };
+        let text = |f: &str| -> Result<String> {
+            match &req[f] {
+                Value::Null => Ok(String::new()),
+                Value::String(s) => Ok(s.clone()),
+                _ => Err(Invalid(format!("{f} is text")).into()),
+            }
+        };
+        let note = crate::advice::AdminNote {
+            category: text("category")?,
+            about: text("about")?,
+            situation: text("situation")?,
+            when: text("when")?,
+            note: match &req["note"] {
+                Value::Null => None,
+                Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+                _ => {
+                    return Err(Invalid(
+                        "note is the note's markdown; leave it out to take the note out".into(),
+                    )
+                    .into());
+                }
+            },
+            label: text("label")?,
+        };
+        let acl: Option<Vec<String>> = match &req["acl"] {
+            Value::Null => None,
+            v => Some(serde_json::from_value(v.clone()).map_err(|_| {
+                Invalid("acl is a list of ACL entries, such as group:sales".into())
+            })?),
+        };
+        let dry_run = req["dry_run"] == true;
+        if !cell::mine(&scope) {
+            return Err(Refused(format!(
+                "{org} is served by its own cell: select it (?org={org} or x-memstore-org) to write its advice"
+            ))
+            .into());
+        }
+        let refused = |e: anyhow::Error| match e.downcast_ref::<crate::extract::Refused>() {
+            Some(r) => Refused(r.to_string()).into(),
+            None => e,
+        };
+        // Not the server doing the background writing: checked here (a dry run), so a note that can't be written is
+        // refused now, and queued for the writer (`crate::advice_requests`).
+        if !state.writer.holds() {
+            let would =
+                crate::advice::write_admin(&store, &scope, who.user(), acl.as_deref(), &note, true)
+                    .await
+                    .map_err(refused)?;
+            if dry_run {
+                return Ok(
+                    json!({"org": org, "scope": scope.to_string(), "dry_run": true,
+                                 "advice": would}),
+                );
+            }
+            let r = crate::advice_requests::Request {
+                op: "write".into(),
+                by: who.user().to_string(),
+                at: crate::now_micros(),
+                acl: acl.clone().unwrap_or_default(),
+                keys: [would.key.clone()].into(),
+                hold: false,
+                ratify: false,
+                min_wrong: 0,
+                resort: false,
+                rewrite: Default::default(),
+                force: false,
+                note: Some(note),
+            };
+            let id = crate::advice_requests::queue(&store, &scope, &r).await?;
+            eprintln!(
+                "write_advice: {} queued {} {} in {scope} for the writer ({id})",
+                who.user(),
+                would.action,
+                would.key
+            );
+            return Ok(json!({"org": org, "scope": scope.to_string(), "queued": id,
+                             "key": would.key, "action": would.action,
+                             "applies": QUEUED_FOR_WRITER}));
+        }
+        let _claim = match dry_run {
+            true => None,
+            false => Some(crate::advice_loop::claim(&scope).ok_or_else(|| {
+                Refused(format!(
+                    "advice is being learned in {scope}: try again when it is done"
+                ))
+            })?),
+        };
+        let wrote = crate::advice::write_admin(
+            &state.writing_store(),
+            &scope,
+            who.user(),
+            acl.as_deref(),
+            &note,
+            dry_run,
+        )
+        .await
+        .map_err(refused)?;
+        if !dry_run {
+            eprintln!(
+                "write_advice: {} {} {} in {scope}{}",
+                who.user(),
+                wrote.action,
+                wrote.key,
+                match &note.note {
+                    Some(_) => format!(" ({})", note.label.trim()),
+                    None => String::new(),
+                }
+            );
+        }
+        return Ok(
+            json!({"org": org, "scope": scope.to_string(), "dry_run": dry_run,
+                         "advice": wrote}),
+        );
     }
     if matches!(
         req["op"].as_str(),
@@ -10891,6 +11455,7 @@ async fn directory_change(
                 resort,
                 rewrite,
                 force,
+                note: None,
             };
             let id = crate::advice_requests::queue(&store, &scope, &r).await?;
             eprintln!(
@@ -10899,7 +11464,8 @@ async fn directory_change(
             );
             return Ok(
                 json!({"org": org, "team": req["team"], "learning": "queued", "queued": id,
-                             "applies": QUEUED_FOR_WRITER}),
+                             "applies": LEARN_QUEUED_FOR_WRITER,
+                             "status": {"op": "advice_status", "org": org, "team": req["team"]}}),
             );
         }
         // One learn at a time in a scope: the server's own timer (`crate::advice_loop`) may be learning there.
@@ -10918,8 +11484,9 @@ async fn directory_change(
                 resort,
                 rewrite,
                 force,
+                ..Default::default()
             };
-            let learn = crate::advice::learn_with(&store, &s, &cx, &acl, min_wrong, &pass);
+            let learn = crate::advice_loop::learn_all(&store, &s, &cx, &acl, min_wrong, pass, None);
             let done = crate::log_org::with(s.org_name(), learn).await;
             match done {
                 Ok(done) => eprintln!("advice {s:?}: {}", json!(done)),
@@ -10928,7 +11495,8 @@ async fn directory_change(
         });
         return Ok(
             json!({"org": org, "team": req["team"], "learning": true, "resort": resort,
-                   "rewrite": req["rewrite"], "force": force}),
+                   "rewrite": req["rewrite"], "force": force,
+                   "status": {"op": "advice_status", "org": org, "team": req["team"]}}),
         );
     }
     if req["op"] == "clear_org" {
@@ -10975,6 +11543,37 @@ async fn directory_change(
             done
         });
         return clearing.await.context("the clear stopped")?;
+    }
+    if req["op"] == "forget_source" {
+        // An import undone: an org's admins in their own org, the operator anywhere (`crate::offboard::forget_sources`).
+        let actor = Actor {
+            user: who.user().to_string(),
+            superuser,
+            via: via.clone(),
+            owner: false,
+            file_keys: Default::default(),
+        };
+        let org = req["org"]
+            .as_str()
+            .ok_or_else(|| Invalid("which org?".into()))?;
+        let (targets, named) = forget_source_targets(&req)?;
+        let dry_run = req["dry_run"] == true;
+        let done = crate::offboard::forget_sources(
+            &store,
+            &actor,
+            org,
+            req["team"].as_str(),
+            &targets,
+            &named,
+            dry_run,
+        )
+        .await?;
+        if !dry_run {
+            // This server's own caches of what was rewritten go with a fresh store, and the training log with it.
+            renew_store(state);
+            sweep_train_log(&store, Some(org)).await;
+        }
+        return Ok(done);
     }
     if req["op"] == "forget_user"
         || req["op"] == "export_org"
@@ -13035,7 +13634,9 @@ async fn mcp(
                     "description": "Forget something you remembered (remember_memory), by the episode id it \
                         answered with: no one reads it or the facts drawn from it any more. Only its author may. \
                         Given `matching` (words of it) instead, it forgets nothing: it lists your notes that hold \
-                        them, with their ids, to confirm with the user first.",
+                        them, with their ids, and the facts drawn from them that hold the words. When only part of a \
+                        note should go (one thing in it stopped being true), end that fact with close_memory and keep \
+                        the note; forget a whole note only when the user wants all of it gone, confirmed first.",
                     "inputSchema": {"type": "object", "properties": {
                         "episode_id": {"type": "string"},
                         "matching": {"type": "string", "description": "Words of the note, when you don't have its id"},
@@ -13104,6 +13705,7 @@ async fn mcp(
         "tools/call" => {
             crate::phases::mark("call");
             let name = req["params"]["name"].as_str().unwrap_or_default();
+            let _running = crate::running::running(format!("tool {name}"));
             // The advice and session tools carry what a person typed: masked before anything reads it.
             let said = matches!(name, "get_advice" | "start_session" | "end_session").then(|| {
                 let mut a = said_redacted(req["params"]["arguments"].clone());
@@ -13497,20 +14099,7 @@ async fn mcp(
                     let eid = args["episode_id"].as_str().unwrap_or_default();
                     match args["matching"].as_str().filter(|m| eid.is_empty() && !m.trim().is_empty()) {
                         // Words, not an id: the caller's own notes that hold them, forgetting nothing yet.
-                        Some(m) => crate::keep::own_matching(session, &store, who, m).await.map(|found| {
-                            match found.is_empty() {
-                                true => format!("none of your notes holds every word of {m:?}"),
-                                false => format!(
-                                    "your notes holding {m:?}, newest first (nothing forgotten yet: confirm \
-                                     with the user, then forget one by its episode_id):\n{}",
-                                    found
-                                        .iter()
-                                        .map(|(id, t)| format!("- {id}: {t}"))
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                ),
-                            }
-                        }),
+                        Some(m) => Box::pin(forget_matching(session, &store, scope, who, m)).await,
                         None => forget(state, &store, scope, who, eid).await,
                     }
                 }
@@ -13711,6 +14300,14 @@ async fn mcp(
             }
             match result {
                 Ok(t) => ok(text(t, false)),
+                // A session's end refused for now: the tool's own error, saying when to send it again, as a start past
+                // the day's most does (`capped_start`), but no `daily_cap`: the hooks keep the end to send again.
+                Err(e) if e.downcast_ref::<crate::sessions::EndBusy>().is_some() => {
+                    let busy = e.downcast_ref::<crate::sessions::EndBusy>().expect("busy");
+                    let mut answer = text(busy.why.clone(), true);
+                    answer["_meta"] = json!({"retry_after_secs": busy.retry_after_secs});
+                    ok(answer)
+                }
                 Err(e) => {
                     eprintln!("mcp tool failed: {e:#}");
                     // Only messages written for the caller (bad arguments) are shown; the rest stay in the log.
@@ -14822,6 +15419,7 @@ fn session_tools() -> Vec<Value> {
                 "outcome": {"type": "string", "description": "How it turned out"},
                 "reward": {"type": "number", "minimum": -1, "maximum": 1, "description": "If known: -1 it went wrong, 1 it worked"},
                 "reason": {"type": "string", "description": "Why the reward"},
+                "repo": {"type": "string", "description": "The code repository the work was in, as owner/name (acme/api), if any"},
                 "keep": KEEP_ARG.clone(),
             }, "required": ["session_id"]},
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false},
@@ -14990,6 +15588,11 @@ async fn open_session(
 const QUEUED_FOR_WRITER: &str = "queued for the server doing the background writing, which applies it within a minute \
 (see the server's log, or the advice trail)";
 
+/// What an admin is told of a learn queued for the writer: where to follow it.
+const LEARN_QUEUED_FOR_WRITER: &str = "queued for the server doing the background writing, which starts it within a \
+minute and learns from every rewarded run not sorted yet; follow it with {\"op\": \"advice_status\"} (runs sorted \
+and waiting, the learn under way, what the last one did and skipped)";
+
 /// Applies the advice requests queued in `scope` for this server, the writer ([`crate::advice_requests`]), under the
 /// scope's learn claim its caller holds; whether every one was dealt with (applied, or failed and said so). Ones it
 /// stopped writing during are left for the next holder of the lease.
@@ -15032,15 +15635,33 @@ async fn apply_advice_requests(st: &State, store: &Store, scope: &Scope) -> bool
                         resort: r.resort,
                         rewrite: r.rewrite.clone(),
                         force: r.force,
+                        ..Default::default()
                     };
-                    crate::advice::learn_with(store, scope, &cx, &r.acl, r.min_wrong, &pass)
-                        .await
-                        .map(|l| format!("learned: {}", json!(l)))
+                    crate::advice_loop::learn_all(
+                        store,
+                        scope,
+                        &cx,
+                        &r.acl,
+                        r.min_wrong,
+                        pass,
+                        Some(&id),
+                    )
+                    .await
+                    .map(|l| format!("learned: {}", json!(l)))
                 }
                 Ok(None) => Err(anyhow::anyhow!(
                     "this server has no model to learn advice with"
                 )),
                 Err(e) => Err(e),
+            },
+            "write" => match &r.note {
+                Some(note) => {
+                    let acl = (!r.acl.is_empty()).then_some(r.acl.as_slice());
+                    crate::advice::write_admin(store, scope, &r.by, acl, note, false)
+                        .await
+                        .map(|w| format!("{} {}", w.action, w.key))
+                }
+                None => Err(anyhow::anyhow!("a write request holds no note")),
             },
             other => Err(anyhow::anyhow!("no advice op {other:?}")),
         };
@@ -15376,7 +15997,8 @@ async fn session_moment(
 
 /// What a hook's step hands the agent of `text`, the lines of a note its session was served: them, if the session
 /// is under its cap and the decisions model finds them useful now (with the note's `When`, `when`, and the step in
-/// it, read with `asked`), else nothing new. The lookup is recorded either way.
+/// it, read with `asked`), else nothing new, and the note is not asked about again until the user's next message. The
+/// lookup is recorded whenever the model is asked.
 async fn hand_on(
     store: &Store,
     scope: &Scope,
@@ -15400,6 +16022,12 @@ async fn hand_on(
         crate::sessions::note_lookup(store, scope, who, id, lookup).await;
         return Ok(NO_NEW_ADVICE.into());
     }
+    // A note turned down at an earlier step waits for the user's next message: no model call, nothing recorded.
+    if let Some(k) = situation.as_deref()
+        && crate::sessions::declined(scope, who, id, k)
+    {
+        return Ok(NO_NEW_ADVICE.into());
+    }
     let useful = crate::sessions::useful(question, conversation, text, when, Some(asked))
         .await
         .map_err(runs_error)?;
@@ -15413,6 +16041,9 @@ async fn hand_on(
     );
     crate::sessions::note_lookup(store, scope, who, id, lookup).await;
     if useful != Useful::Yes {
+        if let Some(k) = situation.as_deref() {
+            crate::sessions::decline(scope, who, id, k);
+        }
         return Ok(NO_NEW_ADVICE.into());
     }
     crate::sessions::hand(scope, who, id, text);
@@ -16238,10 +16869,13 @@ async fn end_session(
         backfill,
     )
     .await?;
+    // Claimed before its row is read: an end of it already under way refuses this one for now, and one sent once that
+    // end lands reads the row it left.
+    let claim = crate::sessions::claim_end(scope, &resolved)?;
     let l = crate::sessions::find(store, scope, who, &resolved).await?;
     recorder_writes(via, &l)?;
     let signed = provenance(who, "");
-    let l = crate::sessions::end(store, scope, who.user(), &signed, l, args).await?;
+    let l = crate::sessions::end(store, scope, who.user(), &signed, l, args, Some(claim)).await?;
     // The person's messages in its transcript the session hasn't read yet: the preferences in them are kept.
     if args["keep"].as_bool() != Some(false) {
         let t = args["transcript"].as_str().unwrap_or_default();
@@ -16484,6 +17118,20 @@ fn sessions_reply(e: anyhow::Error) -> Response<Full<Bytes>> {
             .body(Full::new(Bytes::from(body.to_string())))
             .unwrap()
     };
+    // A session's end refused for now: 429, with when to send it again.
+    if let Some(busy) = e.downcast_ref::<crate::sessions::EndBusy>() {
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("content-type", "application/json")
+            .header(
+                hyper::header::RETRY_AFTER,
+                busy.retry_after_secs.to_string(),
+            )
+            .body(Full::new(Bytes::from(
+                json!({"error": busy.why, "retry_after_secs": busy.retry_after_secs}).to_string(),
+            )))
+            .unwrap();
+    }
     match e.downcast_ref::<crate::runs::Refused>() {
         Some(r)
             if r.0.contains("is a key")
@@ -16732,6 +17380,192 @@ async fn record_runs(
         runs,
     )
     .await
+}
+
+/// [`import_runs`]'s answer: within the org's own limits (`crate::limits`), 403 for a caller who may not import,
+/// 400 for a refused import.
+async fn import_answer(
+    state: &State,
+    store: &Store,
+    scope: &Scope,
+    caller: (&Principal, &SignIn, bool, bool),
+    args: &Value,
+) -> Reply {
+    if let Some(l) = crate::limits::write_gate(scope.org_name()) {
+        return json_reply(limit_status(&l), l.body());
+    }
+    match import_runs(state, store, scope, caller, args).await {
+        Ok(v) => json_reply(StatusCode::OK, v),
+        Err(e) => match (
+            e.downcast_ref::<Forbidden>(),
+            e.downcast_ref::<crate::runs::Refused>(),
+        ) {
+            (Some(Forbidden(m)), _) => {
+                eprintln!("runs import refused for {}: {m}", caller.0.user());
+                json_reply(StatusCode::FORBIDDEN, json!({"error": m}))
+            }
+            (_, Some(r)) => json_reply(StatusCode::BAD_REQUEST, json!({"error": r.to_string()})),
+            _ => {
+                eprintln!("runs import failed: {e:#}");
+                crate::report::failure("runs import", &e);
+                json_reply(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "runs import failed"}),
+                )
+            }
+        },
+    }
+}
+
+/// `POST /runs {import: "<label>", runs: [...], acl?: [...]}`: graded runs imported as the org's, under the import
+/// source the label names ([`crate::runs::import`]). Only an admin of the scope's org signed in as themselves (as
+/// `/admin` takes them; never through a key), the operator, or the one caller of a server that identifies no one,
+/// may: a member records their own runs, a service
+/// key records none, and a recorder key acting for a member records that member's. Answers every run's id, in
+/// order, and how many were new.
+async fn import_runs(
+    state: &State,
+    store: &Store,
+    scope: &Scope,
+    (who, via, superuser, acting): (&Principal, &SignIn, bool, bool),
+    args: &Value,
+) -> Result<Value> {
+    if acting {
+        return Err(Forbidden(
+            "an import is the org's, sent by one of its admins: a key acting for a member records that member's runs \
+             only"
+                .into(),
+        )
+        .into());
+    }
+    let dir = crate::people::directory::Directory::load(store).await?;
+    let admin = superuser
+        || operator_reads(via)
+        || state.fixed()
+        || (via.key.is_none()
+            && scope
+                .org_name()
+                .is_some_and(|o| dir.is_admin(who.user(), via, o)));
+    if !admin {
+        return Err(Forbidden(format!(
+            "{} may not import runs into {scope}: an import is the org's, and only its admins (or the operator) \
+             send one",
+            who.user()
+        ))
+        .into());
+    }
+    let label = match &args["import"] {
+        Value::String(l) => l.as_str(),
+        _ => {
+            return Err(crate::runs::Refused(
+                "import is the label naming where the runs come from, as a string".into(),
+            )
+            .into());
+        }
+    };
+    let runs = batch_of(&args["runs"], "runs")?;
+    let acl = import_acl(state, &dir, scope, who, &args["acl"])?;
+    let done = crate::runs::import(store, scope, who.user(), label, &acl, runs).await?;
+    let source = crate::runs::import_source(label)?;
+    eprintln!(
+        "runs: {} imported {} new of {} runs as {source} into {scope}, readable by {}",
+        who.user(),
+        done.recorded,
+        done.ids.len(),
+        acl.join(", ")
+    );
+    Ok(json!({"run_ids": done.ids, "recorded": done.recorded,
+              "already": runs.len() - done.recorded, "import": source}))
+}
+
+/// Who reads an import's traces in `scope` ([`import_runs`]): the `acl` it names, each a person of the scope's org
+/// (and team), `user:<id>`, or the whole of it, `group:<org>.all`, never `*`; else the org's admins who read the
+/// scope, each by their own entry, as the directory has them now (an admin made later reads them as they read
+/// every person's runs, through `conversation`). On a server that identifies no one, its one caller's groups, as
+/// its own runs are kept, or those of them the `acl` names.
+fn import_acl(
+    state: &State,
+    dir: &crate::people::directory::Directory,
+    scope: &Scope,
+    who: &Principal,
+    named: &Value,
+) -> Result<Vec<String>> {
+    let bad = |m: String| -> anyhow::Error { crate::runs::Refused(m).into() };
+    let named: Option<Vec<String>> = match named {
+        Value::Null => None,
+        Value::Array(a) if !a.is_empty() => Some(
+            a.iter()
+                .map(|e| e.as_str().map(|e| e.trim().to_string()))
+                .collect::<Option<_>>()
+                .ok_or_else(|| bad("acl entries are strings".into()))?,
+        ),
+        _ => return Err(bad("acl is a list of at least one entry".into())),
+    };
+    if state.fixed() {
+        let own: Vec<String> = who.groups().iter().map(|g| format!("group:{g}")).collect();
+        if own.is_empty() {
+            return Err(bad(format!(
+                "{} can't be named in an ACL, so the imported traces couldn't be kept to it",
+                who.user()
+            )));
+        }
+        return match named {
+            None => Ok(own),
+            Some(n) => match n.iter().find(|e| !own.contains(e)) {
+                Some(e) => Err(bad(format!(
+                    "acl names who reads the imported traces among this server's caller's groups ({}), not {e}",
+                    own.join(", ")
+                ))),
+                None => Ok(n),
+            },
+        };
+    }
+    let Some(org) = scope.org_name() else {
+        return Err(bad(format!(
+            "{scope} is no org's: runs are imported into an org or a team"
+        )));
+    };
+    let team = match scope {
+        Scope::Team(id) => id.split_once('/').map(|(_, t)| t),
+        _ => None,
+    };
+    let readers = |u: &str| dir.holds_member(u, org, team);
+    match named {
+        Some(n) => {
+            let all = format!("group:{}", auth::acl::org_wide(org));
+            for e in &n {
+                let ok = *e == all
+                    || e.strip_prefix("user:")
+                        .is_some_and(|u| auth::is_acl_id(u) && readers(u));
+                if !ok {
+                    return Err(bad(format!(
+                        "acl names who reads the imported traces within {scope}: a member, user:<id>, or the whole \
+                         org, {all}; not {e}"
+                    )));
+                }
+            }
+            Ok(n)
+        }
+        None => {
+            let admins: Vec<String> = dir
+                .orgs
+                .get(org)
+                .map(|o| {
+                    o.members
+                        .iter()
+                        .filter(|(u, r)| **r == crate::people::directory::Role::Admin && readers(u))
+                        .map(|(u, _)| format!("user:{u}"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if admins.is_empty() {
+                return Err(bad(format!(
+                    "{scope} has no admin of {org} to keep the imported traces to: name who reads them (acl)"
+                )));
+            }
+            Ok(admins)
+        }
+    }
 }
 
 /// A batch's items: a list of 1 to [`crate::runs::MAX_BATCH`].
@@ -17171,6 +18005,86 @@ async fn post_facts(
     }
     store.commit(scope, who.user(), &[], &facts).await?;
     Ok(facts.into_iter().map(|f| f.fact_id).collect())
+}
+
+/// `forget_memory` given words rather than an id: the caller's own notes that hold them and, where a note says more than
+/// the part someone wants gone, the facts drawn from them that hold the words, each one to end with close_memory.
+/// Forgets nothing.
+async fn forget_matching(
+    session: &crate::Session,
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    m: &str,
+) -> Result<String> {
+    let found = crate::keep::own_matching(session, store, who, m).await?;
+    // Its informative words: "who is on call for ledgerline" asks about "call" and "ledgerline", which a fact
+    // names, not "who" or "is".
+    const ASKING: [&str; 12] = [
+        "who", "what", "when", "where", "which", "how", "about", "told", "said", "that", "this",
+        "the",
+    ];
+    let words: Vec<String> = crate::search::terms(m)
+        .into_iter()
+        .filter(|w| {
+            w.chars().count() >= 3
+                && !ASKING.contains(&w.as_str())
+                && !STOPWORDS.contains(&w.as_str())
+        })
+        .collect();
+    // A note often says more than the part someone wants gone ("forget who's on call" from a note that also says
+    // where the service runs): the open facts drawn from what they wrote (notes, their sessions' records) that hold
+    // the words, each one to end on its own.
+    let facts = match words.is_empty() {
+        true => vec![],
+        false => {
+            store
+                .facts_from(scope, who, who.user(), &HashSet::new(), 2_000)
+                .await?
+                .0
+        }
+    };
+    let parts: Vec<String> = facts
+        .iter()
+        .filter(|f| f.valid_to.is_none())
+        .filter(|f| {
+            let held = crate::search::terms(&format!("{} {} {}", f.entity, f.predicate, f.value));
+            words.iter().all(|w| held.contains(w))
+        })
+        .take(10)
+        .map(|f| {
+            format!(
+                "- {}: {} · {}: {}",
+                f.fact_id, f.entity, f.predicate, f.value
+            )
+        })
+        .collect();
+    if found.is_empty() && parts.is_empty() {
+        return Ok(format!("none of your notes holds every word of {m:?}"));
+    }
+    let mut out = String::new();
+    if !found.is_empty() {
+        out.push_str(&format!(
+            "your notes holding {m:?}, newest first (nothing forgotten yet):\n{}\n",
+            found
+                .iter()
+                .map(|(id, t)| format!("- {id}: {t}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if !parts.is_empty() {
+        out.push_str(&format!(
+            "What was drawn from what you remembered that holds those words:\n{}\nWhen only that part stopped \
+             being true or should no longer be used, end those facts with close_memory, the user's words as the \
+             reason: the rest of each note stays. ",
+            parts.join("\n")
+        ));
+    }
+    out.push_str(
+        "Forget a whole note by its episode_id only when the user wants all of it gone; confirm with them first.",
+    );
+    Ok(out)
 }
 
 /// `forget_memory` and `/forget`: forget an episode the caller remembered. The same answer for an episode

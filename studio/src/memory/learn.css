@@ -277,10 +277,9 @@
   margin: 0 0 var(--s4);
 }
 
-/* Under an Ask answer, inside its card. */
-.memory .agent-result > .learn-inline {
+/* Under a playground answer, in its own flow (agent.tsx). */
+.memory .pg-answer > .learn-inline {
   margin: 0;
-  padding: 0 var(--s6) var(--s5);
 }
 
 /* The page's reset reverts `hidden`: the picker is opened from the drop zone, never shown. */

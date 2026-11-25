@@ -91,6 +91,7 @@ pub mod repo_advice;
 pub mod report;
 pub mod runs;
 pub mod schema_change;
+pub mod schema_growth;
 pub mod served_checks;
 pub mod server;
 pub mod service;

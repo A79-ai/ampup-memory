@@ -501,8 +501,13 @@ fn an_end_the_memory_couldnt_take_is_sent_again_where_it_was_going() {
         .join(format!("end-{sid}.json"));
     until("the end kept to send again", || waiting.exists());
     // The memory is back, and the person has moved to org globex: the next session's start sends the end
-    // to acme, as it was going.
+    // to acme, as it was going, once its back-off is out (made due here, rather than waited out).
     down.store(false, Ordering::SeqCst);
+    let mut item: Value =
+        serde_json::from_str(&std::fs::read_to_string(&waiting).unwrap()).unwrap();
+    assert!(item["next_at"].as_u64().is_some(), "{item}");
+    item["next_at"] = json!(0);
+    std::fs::write(&waiting, item.to_string()).unwrap();
     hook_in(
         port,
         cwd,

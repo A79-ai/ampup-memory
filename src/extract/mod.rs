@@ -1647,7 +1647,14 @@ impl Extractor {
 
 /// An episode's grounded facts the schema accepts, why each one it refused was (a drop's code), and why the first
 /// was refused (a reason code and the predicate: never the text's words).
-type Found = (Vec<Fact>, Vec<String>, Option<String>);
+/// An episode's facts, the codes of those dropped, why the first was, and what the schema had no room for among
+/// them ([`crate::schema_growth`]).
+type Found = (
+    Vec<Fact>,
+    Vec<String>,
+    Option<String>,
+    Vec<crate::schema_growth::Miss>,
+);
 
 /// An episode read, the facts it gave and why each one it refused was: what reconcile takes.
 type Reading = (Episode, Vec<Fact>, Vec<String>);
@@ -1864,7 +1871,8 @@ impl Extractor {
                 .iter()
                 .map(|d| d["code"].as_str().unwrap_or("?").to_string())
                 .collect();
-            return Ok((found.facts, codes, why));
+            let misses = goals::misses(ep, &found.dropped);
+            return Ok((found.facts, codes, why, misses));
         }
         let (mut refused, mut why) = (vec![], None);
         let facts = self
@@ -1889,7 +1897,7 @@ impl Extractor {
                 false
             })
             .collect();
-        Ok((facts, refused, why))
+        Ok((facts, refused, why, vec![]))
     }
 
     /// One episode's facts reconciled with what is known (committed) now, as `acts` says.
@@ -2552,6 +2560,9 @@ pub struct Run {
     pub closed: usize,
     /// Known facts recorded in conflict with a new one ([`crate::conflicts`]).
     pub conflicts: usize,
+    /// What the schema had no type or predicate for, among the facts dropped: names only, never a value
+    /// ([`crate::schema_growth`]). Only a run that commits records them.
+    pub misses: Vec<crate::schema_growth::Miss>,
 }
 
 impl Run {
@@ -2568,6 +2579,7 @@ impl Run {
         self.repeats += o.repeats;
         self.closed += o.closed;
         self.conflicts += o.conflicts;
+        self.misses.extend(o.misses.iter().cloned());
     }
 
     /// Count facts dropped, one per code: why each was.
@@ -2870,6 +2882,7 @@ pub async fn run_added(store: &Store, scope: &Scope, ex: &Extractor, limit: usiz
             done.add(&run_with(store, scope, ex, rest, &active, Some(&only), None, false).await?);
         }
     }
+    crate::schema_growth::grow(store, scope, ex, &done.misses).await;
     if done.refused > 0 {
         REFUSALS
             .lock()
@@ -2922,6 +2935,9 @@ pub async fn run_on(
         && let Some(only) = unclaimed(store, scope).await?
     {
         done.add(&run_with(store, scope, ex, rest, &active, only.as_ref(), None, true).await?);
+    }
+    if branch == MAIN {
+        crate::schema_growth::grow(store, scope, ex, &done.misses).await;
     }
     if done.refused > 0 {
         REFUSALS
@@ -3137,7 +3153,7 @@ async fn run_with(
                 };
                 let r = log.run(ex.found(schema, offer, listing, &ep, &known)).await;
                 log.verdict(match &r {
-                    Ok((facts, refused, why)) => {
+                    Ok((facts, refused, why, _)) => {
                         json!({"facts_kept": facts.len(), "facts_refused": refused.len(), "why_refused": why})
                     }
                     Err(e) => json!({"error": format!("{e:#}").chars().take(300).collect::<String>()}),
@@ -3160,7 +3176,10 @@ async fn run_with(
             match r {
                 // Every fact it found refused: not read, but a failed try, so it is read again and then given
                 // up on ([`crate::EXTRACT_TRIES`]), said loudly rather than recorded as an episode with nothing.
-                Ok((facts, codes, why)) if facts.is_empty() && !codes.is_empty() => {
+                Ok((facts, codes, why, misses)) if facts.is_empty() && !codes.is_empty() => {
+                    if dry.is_none() {
+                        done.misses.extend(misses);
+                    }
                     let (refused, why) = (codes.len(), why.unwrap_or_default());
                     eprintln!(
                         "ERROR extract {scope}: every fact of episode {} was refused ({refused}; the first: {why})",
@@ -3183,7 +3202,10 @@ async fn run_with(
                     }
                     failed.push(try_failed(ep.episode_id));
                 }
-                Ok((facts, codes, why)) => {
+                Ok((facts, codes, why, misses)) => {
+                    if dry.is_none() {
+                        done.misses.extend(misses);
+                    }
                     if let (Some(why), None) = (why, &dry) {
                         record_refused(scope, &ep.episode_id, codes.len(), why);
                     }

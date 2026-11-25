@@ -72,8 +72,8 @@ export type Area =
 
 /**
  * Whether a transport reaches what a group of sections needs: `true`, `false` (the sections are hidden), or
- * `"probe"`: ask the server once (`probe` in `MemoryStudio`) and show them only if it answers, so they appear on
- * their own once the server allows them.
+ * `"probe"`: ask the server once (`probe` in `MemoryStudio`: what `/me` says the caller may do, else a call that
+ * only a caller allowed can make) and show them only if it allows them, so they appear on their own once it does.
  */
 export type Capability = boolean | "probe";
 
@@ -102,7 +102,8 @@ export interface Arm {
   id: string;
   name: string;
   tools: string[];
-  model: "haiku" | "sonnet" | "opus";
+  /** A name memstore's `/agent/run` takes (its `MODELS`). */
+  model: "haiku" | "sonnet" | "opus" | "fable" | "gpt-sol" | "gpt-terra" | "deepseek" | "qwen";
   maxToolCalls: number;
   /** One every memory has, not saved and not deletable. */
   builtin?: boolean;
@@ -186,8 +187,8 @@ export function errorText(e: unknown): string {
 }
 
 /**
- * The calls each probed capability is checked with: a harmless read that only a caller allowed it can make.
- * A reply is a yes; a refusal is a no.
+ * The calls each probed capability is checked with where `/me` doesn't say (a server before its `capabilities`): a
+ * harmless read that only a caller allowed it can make. A reply is a yes; a refusal is a no.
  */
 const PROBES: Record<"admin" | "review" | "lessons", [Area, Record<string, unknown>]> = {
   // Each answers without reading every session: the categories' names alone, and the lessons' probe.
@@ -206,12 +207,50 @@ export type Resolved = {
   settings: boolean;
 };
 
-/** Asks the server about each capability given as `"probe"`. */
+/**
+ * What memstore's `/me` says the caller may do in each org they belong to (`capabilities`), and the org the request
+ * was in (`org`). A server before it says neither.
+ */
+interface MeCapabilities {
+  org?: string | null;
+  capabilities?: Record<
+    string,
+    { admin?: boolean; activity?: boolean; review?: boolean; lessons?: boolean }
+  >;
+}
+
+/**
+ * The probed capabilities as `/me` says them, or undefined where it doesn't (a server before it, or `/me` failed):
+ * then each is probed. The selection's org, else the one the request was in (a local server's, which the pages
+ * name as they like). Each answers as its probe did: `admin` only where the org shows its people's activity, which
+ * the admin probe (`advice_trail`) needs too.
+ */
+async function told(t: Transport, sel: Selection): Promise<Record<keyof typeof PROBES, boolean> | undefined> {
+  let me: MeCapabilities;
+  try {
+    me = await t.call<MeCapabilities>(sel, "me");
+  } catch {
+    return undefined;
+  }
+  const all = me?.capabilities;
+  if (!all || typeof all !== "object") return undefined;
+  const c = all[sel.org] ?? (me.org ? all[me.org] : undefined);
+  return {
+    admin: c?.admin === true && c.activity !== false,
+    review: c?.review === true,
+    lessons: c?.lessons === true,
+  };
+}
+
+/** Asks the server about each capability given as `"probe"`: `/me` once, else a call per capability. */
 export async function probe(t: Transport, sel: Selection): Promise<Resolved> {
   const caps = t.capabilities;
+  const keys = Object.keys(PROBES) as (keyof typeof PROBES)[];
+  const said = keys.some((k) => caps[k] === "probe") ? await told(t, sel) : undefined;
   const one = async (k: keyof typeof PROBES): Promise<boolean> => {
     const c = caps[k];
     if (c !== "probe") return c ?? false;
+    if (said) return said[k];
     const [area, body] = PROBES[k];
     return t.call(sel, area, body).then(
       () => true,

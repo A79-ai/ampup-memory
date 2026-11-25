@@ -10,7 +10,9 @@
 //!   and leaves no tombstone; made an admin again, she runs the forget again and it finishes:
 //! - acme's admin forgets carol: her episodes are gone from search, queries and episode reads, through pins taken
 //!   before the forget too (a forget wins over a pin), and from every file in the warehouse and the search index;
-//!   everyone else's memory stays; a tombstone is in acme's audit and carol no longer belongs to acme;
+//!   everyone else's memory stays; a tombstone is in acme's audit and carol no longer belongs to acme; the
+//!   feedback she gave (a vote and a served-fact check's flag in her session) and others' feedback on the facts of
+//!   her episodes leave every tally and every file, while others' feedback on the rest stays;
 //! - the operator clears an org's memory (`clear_org`, its name repeated) and keeps the org: its admin and
 //!   another org's are refused and an unconfirmed clear changes nothing; after it nothing of the org's memory is
 //!   read or stored, and its admin still signs in and writes to it;
@@ -373,6 +375,47 @@ fn files_with(root: &Path, tag: &str) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// The hits `bearer` gets from `/search` for `query` in selection `sel`, by the value each fact holds.
+async fn hits(s: &str, sel: &str, bearer: &str, query: &str) -> HashMap<String, Value> {
+    fn walk(v: &Value, out: &mut HashMap<String, Value>) {
+        match v {
+            Value::Object(o) if o.contains_key("fact_id") => {
+                out.insert(o["value"].as_str().unwrap_or_default().into(), v.clone());
+            }
+            Value::Object(o) => o.values().for_each(|v| walk(v, out)),
+            Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let (status, text) = post(
+        &format!("{s}/search{sel}"),
+        bearer,
+        &json!({"data": [[0, query, 50]]}),
+    )
+    .await;
+    assert_eq!(status, 200, "/search{sel}: {text}");
+    let mut out = HashMap::new();
+    walk(&serde_json::from_str(&text).unwrap(), &mut out);
+    out
+}
+
+/// `POST /feedback` as `bearer`: the HTTP status and the raw answer.
+async fn feedback(
+    s: &str,
+    sel: &str,
+    bearer: &str,
+    fact_id: &str,
+    signal: &str,
+    reason: &str,
+) -> (u16, String) {
+    post(
+        &format!("{s}/feedback{sel}"),
+        bearer,
+        &json!({"fact_id": fact_id, "signal": signal, "reason": reason}),
+    )
+    .await
 }
 
 /// A memory written straight to the catalog (as ingest would): an episode holding `tag` and a fact whose
@@ -1071,6 +1114,13 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         ),
         (&bob, json!({"op": "advice_trail", "org": "acme"})),
         (&gary, json!({"op": "advice_trail", "org": "acme"})),
+        // Where the team's learning stands: the org's admins only, never a key.
+        (&bob, json!({"op": "advice_status", "org": "acme"})),
+        (&gary, json!({"op": "advice_status", "org": "acme"})),
+        (
+            &ALICE_FILE_KEY.to_string(),
+            json!({"op": "advice_status", "org": "acme"}),
+        ),
         // Ratifying a note serves it to everyone: the org's admins only, never a key.
         (
             &bob,
@@ -1092,6 +1142,10 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         (
             &alice,
             json!({"op": "advice_trail", "org": "acme", "team": "a1"}),
+        ),
+        (
+            &alice,
+            json!({"op": "advice_status", "org": "acme", "team": "a1"}),
         ),
         // A branch's diff and its merge into main: the org's admins, a team's only for its readers.
         (
@@ -1122,6 +1176,13 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
             "{body}"
         );
     }
+    // The org's admin reads it: counts and note keys, no one's runs.
+    let (status, body) = admin_as(s, &alice, json!({"op": "advice_status", "org": "acme"})).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !body.contains("xqcarolasked") && !body.contains("xqmixedfact"),
+        "{body}"
+    );
     // The setting is the org's: a team's is refused, never taken and ignored.
     let (status, body) = admin_as(
         s,
@@ -1596,6 +1657,83 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
             "the operator exported {t}, which she forgot"
         );
     }
+    // Feedback ahead of the forget. Carol flags Bob's fact wrong, and a served-fact check flags the org's fact in
+    // her session (her vote, its reason naming the session, counted as acme turns fact checks on). Bob votes on the
+    // org's fact and on the fact her note and his back. Bob's tallies count them all.
+    let (status, body) = admin_as(
+        s,
+        &alice,
+        json!({"op": "set_settings", "org": "acme", "settings": {"fact_checks": true}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let fact_of = |h: &HashMap<String, Value>, tag: &str| -> String {
+        h.get(tag)
+            .and_then(|v| v["fact_id"].as_str())
+            .unwrap_or_else(|| panic!("no {tag} hit: {h:?}"))
+            .to_string()
+    };
+    let bob_hits = hits(
+        s,
+        "?org=acme",
+        &bob,
+        "owner deal xqbobfact xqorgalpha xqmixedfact",
+    )
+    .await;
+    let [bob_fact, org_fact, mixed_fact] =
+        ["xqbobfact", "xqorgalpha", "xqmixedfact"].map(|t| fact_of(&bob_hits, t));
+    for (who, fact, signal, reason) in [
+        (
+            &carol,
+            &bob_fact,
+            "negative",
+            "xqcarolvoted the owner is wrong",
+        ),
+        (
+            &carol,
+            &org_fact,
+            "negative",
+            "shown wrong in session xqcarolflagged",
+        ),
+        (&bob, &org_fact, "positive", "xqbobvotedkeeps"),
+        (&bob, &mixed_fact, "very_negative", "xqbobvotedmixed"),
+    ] {
+        let (status, body) = feedback(s, "?org=acme", who, fact, signal, reason).await;
+        assert_eq!(status, 200, "{reason}: {body}");
+    }
+    let tally = |h: &HashMap<String, Value>, tag: &str| h.get(tag).map(|v| v["feedback"].clone());
+    let t = Instant::now();
+    loop {
+        let h = hits(
+            s,
+            "?org=acme",
+            &bob,
+            "owner deal xqbobfact xqorgalpha xqmixedfact",
+        )
+        .await;
+        let counted = tally(&h, "xqbobfact")
+            == Some(json!({"positive": 0, "negative": 1, "very_negative": 0}))
+            && tally(&h, "xqorgalpha")
+                == Some(json!({"positive": 1, "negative": 1, "very_negative": 0}))
+            && tally(&h, "xqmixedfact")
+                == Some(json!({"positive": 0, "negative": 0, "very_negative": 1}));
+        if counted {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "tallies before the forget: {h:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    for t in [
+        "xqcarolvoted",
+        "xqcarolflagged",
+        "xqbobvotedkeeps",
+        "xqbobvotedmixed",
+    ] {
+        assert!(!in_files(t).is_empty(), "{t} should be in the warehouse");
+    }
     // Acme's admin is demoted as she forgets Carol: right after the directory takes Carol out of acme, before
     // anything of hers is deleted. The forget stops there, refused, and says how to finish it: Carol is out of
     // acme, nothing of hers is deleted, and no tombstone is left. Made an admin again, Alice runs it again below,
@@ -1840,6 +1978,38 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     for t in acme_tags.iter().chain(&globex_tags) {
         assert!(!in_files(t).is_empty(), "{t} lost by forgetting carol");
     }
+    // The feedback she gave is gone (her flag on Bob's fact, the check's flag in her session), and so is Bob's vote
+    // on the fact her note backed; his vote on the org's fact stays and is all its tally counts.
+    let t = Instant::now();
+    loop {
+        let h = hits(
+            s,
+            "?org=acme",
+            &bob,
+            "owner deal xqbobfact xqorgalpha xqmixedfact",
+        )
+        .await;
+        let counted = h.contains_key("xqbobfact")
+            && tally(&h, "xqbobfact") == Some(Value::Null)
+            && tally(&h, "xqorgalpha")
+                == Some(json!({"positive": 1, "negative": 0, "very_negative": 0}))
+            && !h.contains_key("xqmixedfact");
+        if counted {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "tallies after the forget: {h:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    for t in ["xqcarolvoted", "xqcarolflagged", "xqbobvotedmixed"] {
+        assert_eq!(in_files(t), Vec::<PathBuf>::new(), "{t} still stored");
+    }
+    assert!(
+        !in_files("xqbobvotedkeeps").is_empty(),
+        "bob's vote lost by forgetting carol"
+    );
     // Globex reads as before.
     until(
         s,

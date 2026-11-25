@@ -4,10 +4,14 @@
 //!
 //! - **learned from**: the runs and sessions its situation was learned from (the map's assignments), each with how
 //!   it went: right or wrong, and who said so (a person's grade or rating, what came of its PRs, a recorded reward,
-//!   or the judge);
+//!   or the judge); how many people they came from, and apart from them how many were imported as the org's
+//!   (`imported`) and from which import sources (`imports`, `import:<label>`: `crate::runs::import`);
 //! - **served in**: the sessions it was served in since, each with where in the session it was handed (`start`,
 //!   `prompt`, `stuck`, …), whether the judge found it helped, and how the session went, by the same order of who
 //!   said so.
+//!
+//! A note an org admin wrote rather than learned from runs (`crate::advice::write_admin`) says so: `written_by`, with
+//! the label they gave where it came from.
 //!
 //! What a caller reads is what they may read elsewhere: their own lessons and the team's, and in a trail the runs
 //! and sessions that are their own; everyone else's are only counted. An org's admins on the org's own memory, where
@@ -25,6 +29,13 @@
 //! `"after"?: <next>` starts after the last page's, whose `next` says where (null on the last page). `count` is how
 //! many `show` keeps, and `groups` how many there are of each whose (the team's, `owner` null, and each person's),
 //! with the runs they were learned from, the sessions they were served in and how many it helped, summed.
+//!
+//! Counted as the Advice page counts (`/browse {op: "advice_usage"}`): `"days"?: <1 to 3650>` counts only the runs
+//! and sessions asked in the last that many days (all of them when absent), by the same cut `advice_usage` makes, so
+//! a lesson's runs, sessions served and helped, its trails and the `groups` summed from them are that window's.
+//! `"as_usage": true` reads the notes `advice_usage` lists: the team's and the reader's own, or `person`'s own in
+//! their place (an admin's view of someone), leaving out conversation situations' notes and merged situations'
+//! (neither is served as advice). The answer echoes `days` and `as_usage` as it applied them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -75,6 +86,21 @@ pub async fn run(
         .as_u64()
         .map_or(LIMIT, |n| n as usize)
         .clamp(1, MAX_LIMIT);
+    // The window the runs and sessions are counted over, as `advice_usage` reads it.
+    let days = match &req["days"] {
+        Value::Null => None,
+        v => Some(
+            v.as_u64()
+                .filter(|d| (1..=3650).contains(d))
+                .ok_or_else(|| bad("days is a whole number of days, 1 to 3650"))?,
+        ),
+    };
+    let as_usage = req["as_usage"] == true;
+    let want = Want {
+        space: space.to_string(),
+        person,
+        as_usage,
+    };
     // A probe (the Studio asking whether this server has lessons): yes, without reading every session.
     if req["probe"] == true {
         return Ok(
@@ -84,7 +110,7 @@ pub async fn run(
     }
 
     if req["count"] == true {
-        return count(store, session, reader, space, person, only, since).await;
+        return count(store, session, reader, &want, only, since).await;
     }
     // Which of them the page shows: the team's, the reader's own, or one person's own (an admin's view of them).
     let show = match req["show"].as_str().unwrap_or_default() {
@@ -110,7 +136,7 @@ pub async fn run(
         Value::String(a) => Some(cursor_of(a).ok_or_else(|| bad("after is a page's next"))?),
         _ => return Err(bad("after is a page's next")),
     };
-    let full = full_kept(store, session, reader, space, person, limit).await?;
+    let full = full_kept(store, session, reader, &want, limit, days).await?;
     crate::phases::mark("lessons read");
     let matching: Vec<&Value> = full
         .lessons
@@ -135,7 +161,40 @@ pub async fn run(
         "groups": groups,
         "lessons": &shown[from..to],
         "next": next,
+        "days": days,
+        "as_usage": as_usage,
     }))
+}
+
+/// Whose lessons a request reads: `space`, `person`'s (only an admin names someone else), and whether as
+/// `advice_usage` lists them (`as_usage`: the team's and the reader's own or `person`'s, served situations only).
+struct Want {
+    space: String,
+    person: Option<String>,
+    as_usage: bool,
+}
+
+impl Want {
+    /// What a kept answer is kept by, of what it reads.
+    fn key(&self) -> String {
+        format!(
+            "{}\n{}\n{}",
+            self.space,
+            self.person.as_deref().unwrap_or_default(),
+            self.as_usage
+        )
+    }
+
+    /// Whether the team's lessons are read: not for `mine`, and not where a person is named, unless as
+    /// `advice_usage` reads them (the team's beside that person's own).
+    fn team(&self) -> bool {
+        self.space != "mine" && (self.person.is_none() || self.as_usage)
+    }
+
+    /// Whether `l` is read: as `advice_usage` reads them, no conversation situation's note and no merged one.
+    fn holds(&self, l: &Listed) -> bool {
+        !self.as_usage || (!l.conversation && l.merged_into.is_none())
+    }
 }
 
 /// Lessons one page lists at most (`page`).
@@ -222,10 +281,12 @@ async fn full_kept(
     store: &Store,
     session: &Session,
     reader: Reader<'_>,
-    space: &str,
-    person: Option<String>,
+    want: &Want,
     limit: usize,
+    days: Option<u64>,
 ) -> Result<std::sync::Arc<Full>> {
+    // The window ends when the answer is worked out: kept by the span of time it was asked in, as `advice_usage`.
+    let since = move || days.map_or(0, |d| crate::now_micros() - d as i64 * 86_400_000_000);
     let at = match session.on_main_now() {
         true => {
             let mark = crate::kept_answers::Mark::read(store, session.scope()).await?;
@@ -241,16 +302,7 @@ async fn full_kept(
     crate::phases::mark("lessons sessions");
     let Some(mut at) = at else {
         return Ok(std::sync::Arc::new(
-            full(
-                store,
-                session,
-                reader,
-                space,
-                person.as_deref(),
-                limit,
-                &log,
-            )
-            .await?,
+            full(store, session, reader, want, limit, since(), &log).await?,
         ));
     };
     let newest = log.iter().map(|l| l.updated_at.max(l.asked_at)).max();
@@ -260,17 +312,25 @@ async fn full_kept(
         newest.unwrap_or_default()
     ));
     let key = format!(
-        "{}\n{}\n{space}\n{}\n{limit}",
+        "{}\n{}\n{}\n{limit}\n{}",
         crate::kept_answers::reader_key(reader.who),
         reader.every_session,
-        person.as_deref().unwrap_or_default()
+        want.key(),
+        days.map_or_else(
+            || "all".to_string(),
+            |d| format!("{d} in {}", crate::kept_answers::span())
+        )
     );
-    let (store2, session2, who, every, space2) = (
+    let (store2, session2, who, every, want2) = (
         store.clone(),
         session.clone(),
         reader.who.clone(),
         reader.every_session,
-        space.to_string(),
+        Want {
+            space: want.space.clone(),
+            person: want.person.clone(),
+            as_usage: want.as_usage,
+        },
     );
     FULL.get(
         &session.scope().namespace(),
@@ -282,16 +342,7 @@ async fn full_kept(
                 who: &who,
                 every_session: every,
             };
-            full(
-                &store2,
-                &session2,
-                reader,
-                &space2,
-                person.as_deref(),
-                limit,
-                &log,
-            )
-            .await
+            full(&store2, &session2, reader, &want2, limit, since(), &log).await
         },
     )
     .await
@@ -300,20 +351,21 @@ async fn full_kept(
 /// How many people's lessons [`full`] reads at once.
 const PEOPLE_PARALLEL: usize = 8;
 
-/// Every lesson `reader` reads of `space` (and `person`'s), each with its trails, as [`Full`] holds them.
+/// Every lesson `reader` reads of `want`, each with its trails of the runs and sessions asked at `since` (µs) or
+/// later, as [`Full`] holds them.
 async fn full(
     store: &Store,
     session: &Session,
     reader: Reader<'_>,
-    space: &str,
-    person: Option<&str>,
+    want: &Want,
     limit: usize,
+    since: i64,
     log: &[Logged],
 ) -> Result<Full> {
     let me = norm_id(reader.who.user());
     let scope = session.scope();
     let by_id: BTreeMap<&str, &Logged> = log.iter().map(|l| (l.answer_id.as_str(), l)).collect();
-    let people = people_of(log, &me, reader.every_session, space, person);
+    let people = people_of(log, &me, reader.every_session, want);
     let build_started = std::time::Instant::now();
     let mut out: Vec<Value> = vec![];
     let mut owners: BTreeSet<String> = BTreeSet::new();
@@ -339,15 +391,25 @@ async fn full(
     for r in each {
         let (owner, listed, assigned, times, took) = r?;
         read.add(&owner, times, took);
-        for l in listed {
-            if let Some(v) = lesson(&l, Some(&owner), &assigned, log, &by_id, &me, reader, limit) {
+        for l in listed.iter().filter(|l| want.holds(l)) {
+            if let Some(v) = lesson(
+                l,
+                Some(&owner),
+                &assigned,
+                log,
+                &by_id,
+                &me,
+                reader,
+                limit,
+                since,
+            ) {
                 owners.insert(owner.clone());
                 out.push(v);
             }
         }
     }
     let mut team_read: Option<String> = None;
-    if space != "mine" && person.is_none() {
+    if want.team() {
         let team = Space::team();
         let team_started = std::time::Instant::now();
         let (((listed, assigned, times), map_took), (bar, bar_took), (tallies, tallies_took)) = tokio::try_join!(
@@ -372,8 +434,10 @@ async fn full(
             tallies_took.as_millis(),
         ));
         if !listed.is_empty() {
-            for l in listed {
-                if let Some(mut v) = lesson(&l, None, &assigned, log, &by_id, &me, reader, limit) {
+            for l in listed.iter().filter(|l| want.holds(l)) {
+                if let Some(mut v) =
+                    lesson(l, None, &assigned, log, &by_id, &me, reader, limit, since)
+                {
                     // Ratified: by an admin, or backed by outcomes or people and past the evidence bar. Every
                     // lesson listed here is served either way.
                     let earned = tallies
@@ -461,19 +525,20 @@ impl PeopleRead {
 }
 
 /// Whose own lessons a reader reads: their own, or for a reader of everyone's, everyone who ran or asked something
-/// here; only `person`'s where one is named; none for the team's (`space` `team`).
-fn people_of(
-    log: &[Logged],
-    me: &str,
-    every_session: bool,
-    space: &str,
-    person: Option<&str>,
-) -> BTreeSet<String> {
+/// here; only `person`'s where one is named; none for the team's (`space` `team`). As `advice_usage` reads them,
+/// only the reader's own or `person`'s.
+fn people_of(log: &[Logged], me: &str, every_session: bool, want: &Want) -> BTreeSet<String> {
+    let person = want.person.as_deref();
     let mut people: BTreeSet<String> = BTreeSet::new();
-    if space != "team" {
+    if want.space != "team" {
         people.insert(me.to_string());
-        if every_session {
-            people.extend(log.iter().map(|l| norm_id(l.asker.trim())));
+        // An import source ([`crate::runs::import`]) is no one: it has no lessons of its own.
+        if every_session && !want.as_usage {
+            people.extend(
+                log.iter()
+                    .filter(|l| !crate::runs::is_import(&l.asker))
+                    .map(|l| norm_id(l.asker.trim())),
+            );
         }
         if let Some(p) = person {
             people.retain(|u| u == p);
@@ -496,8 +561,7 @@ async fn count(
     store: &Store,
     session: &Session,
     reader: Reader<'_>,
-    space: &str,
-    person: Option<String>,
+    want: &Want,
     only: Option<&str>,
     since: Option<i64>,
 ) -> Result<Value> {
@@ -518,17 +582,21 @@ async fn count(
     let noted = match at {
         Some(at) => {
             let key = format!(
-                "{}\n{}\n{space}\n{}",
+                "{}\n{}\n{}",
                 crate::kept_answers::reader_key(reader.who),
                 reader.every_session,
-                person.as_deref().unwrap_or_default()
+                want.key()
             );
-            let (store, session2, who, every, space) = (
+            let (store, session2, who, every, want2) = (
                 store.clone(),
                 session.clone(),
                 reader.who.clone(),
                 reader.every_session,
-                space.to_string(),
+                Want {
+                    space: want.space.clone(),
+                    person: want.person.clone(),
+                    as_usage: want.as_usage,
+                },
             );
             NOTED
                 .get(
@@ -536,22 +604,12 @@ async fn count(
                     &key,
                     at,
                     true,
-                    || async move {
-                        noted(&store, &session2, &who, every, &space, person.as_deref()).await
-                    },
+                    || async move { noted(&store, &session2, &who, every, &want2).await },
                 )
                 .await?
         }
         None => std::sync::Arc::new(
-            noted(
-                store,
-                session,
-                reader.who,
-                reader.every_session,
-                space,
-                person.as_deref(),
-            )
-            .await?,
+            noted(store, session, reader.who, reader.every_session, want).await?,
         ),
     };
     let mut owners: BTreeSet<&str> = BTreeSet::new();
@@ -582,24 +640,29 @@ async fn noted(
     session: &Session,
     who: &Principal,
     every_session: bool,
-    space: &str,
-    person: Option<&str>,
+    want: &Want,
 ) -> Result<Noted> {
     let me = norm_id(who.user());
     let log = crate::sessions::list(store, session.scope()).await?;
     let mut out = vec![];
-    for owner in people_of(&log, &me, every_session, space, person) {
+    for owner in people_of(&log, &me, every_session, want) {
         // A person's own lessons are written for them alone: read as them (an admin reads them as `notes/` does).
         let as_owner = Principal::from_parts(owner.clone(), vec![]);
         let reading = if owner == me { who } else { &as_owner };
         for l in crate::advice::listed(session, store, reading, &Space::mine(&owner)).await? {
+            if !want.holds(&l) {
+                continue;
+            }
             if let Some((_, at, _)) = l.note {
                 out.push((Some(owner.clone()), l.key, at));
             }
         }
     }
-    if space != "mine" && person.is_none() {
+    if want.team() {
         for l in crate::advice::listed(session, store, who, &Space::team()).await? {
+            if !want.holds(&l) {
+                continue;
+            }
             if let Some((_, at, _)) = l.note {
                 out.push((None, l.key, at));
             }
@@ -619,6 +682,7 @@ fn lesson(
     me: &str,
     reader: Reader<'_>,
     limit: usize,
+    since: i64,
 ) -> Option<Value> {
     let (note_id, at, text) = l.note.as_ref()?;
     let untagged = l
@@ -639,6 +703,10 @@ fn lesson(
             Some((id, at)) => (id, at.parse::<usize>().ok()),
             None => (run.as_str(), None),
         };
+        // In a window, only the runs asked in it (one no longer in the log has no time: left out of a window).
+        if since > 0 && by_id.get(id).is_none_or(|l| l.asked_at < since) {
+            continue;
+        }
         let e = sources.entry(id).or_default();
         let (right, by) = by_id
             .get(id)
@@ -648,6 +716,8 @@ fn lesson(
     }
     let (mut runs, mut right, mut wrong, mut hidden) = (0, 0, 0, 0);
     let mut learners: BTreeSet<String> = BTreeSet::new();
+    // Runs imported as the org's (`crate::runs::import`), by their import source: counted apart from people.
+    let (mut imported, mut imports) = (0, BTreeSet::new());
     let mut learned: Vec<Value> = vec![];
     for (id, (outcomes, by)) in &sources {
         runs += outcomes.len();
@@ -658,8 +728,15 @@ fn lesson(
         right += r;
         wrong += w;
         let l = by_id.get(id);
-        if let Some(l) = l {
-            learners.insert(norm_id(l.asker.trim()));
+        match l {
+            Some(l) if crate::runs::is_import(&l.asker) => {
+                imported += outcomes.len();
+                imports.insert(l.asker.trim().to_string());
+            }
+            Some(l) => {
+                learners.insert(norm_id(l.asker.trim()));
+            }
+            None => {}
         }
         match l {
             Some(l) if readable(&l.asker) => learned.push(json!({
@@ -687,7 +764,8 @@ fn lesson(
         let Some(s) = x.session.as_ref() else {
             continue;
         };
-        if crate::sessions::automated(x)
+        if x.asked_at < since
+            || crate::sessions::automated(x)
             || !(s.served.contains(&l.key)
                 || crate::advice_lookups::recalled(s).contains(l.key.as_str()))
             || owner.is_some_and(|o| norm_id(x.asker.trim()) != *o)
@@ -790,6 +868,7 @@ fn lesson(
         "status": status,
         "learned_from": {
             "runs": runs, "right": right, "wrong": wrong, "people": learners.len(),
+            "imported": imported, "imports": imports,
             "trail": learned, "more": more, "hidden": hidden,
         },
         "served_in": {
@@ -800,6 +879,10 @@ fn lesson(
     // Why outcomes or people don't back it yet, so it isn't ratified: served all the same.
     if let Some(why) = &l.needs_backing {
         v["needs_backing"] = json!(why);
+    }
+    // A note an org admin wrote rather than one learned from runs: where they said it came from.
+    if let Some((label, at)) = &l.admin {
+        v["written_by"] = json!({"admin": true, "label": label, "at": at});
     }
     Some(v)
 }

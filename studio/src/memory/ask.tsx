@@ -16,7 +16,7 @@ export const ALL_PARTS: AskParts = { facts: true, advice: true, episodes: true }
  * One MCP tool call's text, as an agent gets it. A call cut off on the way (502 or 504: the ingress gives a
  * request 60 s, and a cold search can take longer) is made once more.
  */
-async function tool(sel: Selection, name: string, args: Record<string, unknown>): Promise<string> {
+export async function tool(sel: Selection, name: string, args: Record<string, unknown>): Promise<string> {
   const once = () =>
     mcp<{ content?: { text?: string }[]; isError?: boolean }>(sel, "tools/call", {
       name,
@@ -32,11 +32,11 @@ async function tool(sel: Selection, name: string, args: Record<string, unknown>)
 }
 
 const STILL = /still being looked up/i;
-const SESSION = /session_id: ([0-9a-f-]{36})/;
+export const SESSION = /session_id: ([0-9a-f-]{36})/;
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** get_advice answers later for a new question: ask again with its session until the advice is in. */
-async function advice(sel: Selection, question: string): Promise<string> {
+export async function advice(sel: Selection, question: string): Promise<string> {
   let text = await tool(sel, "get_advice", { question });
   const session = SESSION.exec(text)?.[1];
   for (let i = 0; i < 10 && session && STILL.test(text); i++) {
@@ -287,7 +287,7 @@ function PartCard<T>({
 }
 
 /** A fact's line with its markers (`[e3 t14]`) as links to the episode they cite. */
-function Marked({
+export function Marked({
   line,
   sources,
   onFocus,

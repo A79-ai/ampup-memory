@@ -970,7 +970,16 @@ impl Schema {
         }
         for (ty, nd) in &self.types {
             let Some(od) = old.types.get(ty) else {
-                out.push(format!("type {ty} added"));
+                // With what it holds, so a reviewer reads the type whole.
+                let preds: Vec<String> = nd
+                    .predicates
+                    .iter()
+                    .map(|(p, d)| format!("{p} ({})", d.value.as_str()))
+                    .collect();
+                out.push(match preds.is_empty() {
+                    true => format!("type {ty} added"),
+                    false => format!("type {ty} added: {}", preds.join(", ")),
+                });
                 continue;
             };
             for (p, np) in &nd.predicates {
@@ -1241,7 +1250,10 @@ impl Sources {
 
     /// Whether this episode is one of the sources: its source starts with one of the prefixes, it is about an
     /// entity of one of the types, and it occurred in the window (each check passes when unset). The engine's
-    /// own documents never are.
+    /// own documents never are, nor a person's session records and transcripts: they are filed under the notes'
+    /// prefix (`mcp:remember_memory:<them>:memstore:session:…`), so a schema that names agents' notes would claim them
+    /// too, and the contract never reads them. Left unclaimed, the goal-blind extraction reads a session's record
+    /// once it ends, as it does in a scope whose schema names no notes.
     pub fn matches(&self, ep: &Episode) -> bool {
         let micros = |t: &Option<String>| {
             t.as_deref()
@@ -1250,6 +1262,7 @@ impl Sources {
         };
         // The engine's own documents (goals once, compiled skills, learned advice) are about the memory, not sources.
         !crate::episode_types::engine_source(&ep.source)
+            && crate::session_record_source(&ep.source).is_none()
             && !ep
                 .document
                 .as_deref()

@@ -36,6 +36,7 @@ pub mod platform;
 pub mod query;
 pub mod retention;
 pub mod retry;
+pub mod running;
 pub mod search;
 pub mod usage;
 pub mod workspace;
@@ -2969,6 +2970,15 @@ type VisTables = (
     Arc<Vec<RecordBatch>>,
 );
 type CachedVis = (VisStamp, Arc<Vis>);
+/// Branches' states other than main's a store keeps per scope ([`side_state`]).
+const MAX_SIDE_STATES: usize = 2;
+
+/// Whether a visibility key's branch is one other than main: a review's, a proposal's or a session's branch, not
+/// main and not a pinned page of it.
+fn side_state(branch: &str) -> bool {
+    branch != MAIN && !branch.contains('@')
+}
+
 /// Held while one visibility state is built (see `Store::visibility_at`).
 type VisBuild = Arc<tokio::sync::Mutex<()>>;
 /// Per visibility key: its build's gate, and how many readers hold it ([`GateHeld`]).
@@ -3798,6 +3808,10 @@ pub struct Store {
     /// Per visibility key: held while that state is built, so readers that miss it together wait for one
     /// build and take what it built rather than each building it again.
     vis_builds: VisBuilds,
+    /// One build at a time of a branch's state other than main's ([`side_state`]), whichever branch: a review's
+    /// or a proposal's branch is built in full, at main's size, so several at once (a burst of writes stales them
+    /// all) holds that much memory several times over.
+    side_builds: Arc<tokio::sync::Semaphore>,
     /// Per visibility key: its background build, while reads are served the last state.
     vis_refresh: Arc<Mutex<HashMap<(String, String), VisRefresh>>>,
     /// Per scope: when memory was last remembered or ingested into it through this store
@@ -3911,6 +3925,7 @@ impl Store {
             tail: Arc::default(),
             vis: Arc::default(),
             vis_builds: Arc::default(),
+            side_builds: Arc::new(tokio::sync::Semaphore::new(1)),
             vis_refresh: Arc::default(),
             written: Arc::default(),
             sent_here: Arc::default(),
@@ -4001,6 +4016,7 @@ impl Store {
         self.tail = other.tail.clone();
         self.vis = other.vis.clone();
         self.vis_builds = other.vis_builds.clone();
+        self.side_builds = other.side_builds.clone();
         self.vis_refresh = other.vis_refresh.clone();
         self.written = other.written.clone();
         self.sent_here = other.sent_here.clone();
@@ -8587,6 +8603,12 @@ impl Store {
             Ok(g) => (g, false),
             Err(_) => (held.gate.clone().lock_owned().await, true),
         };
+        // A branch other than main's waits for any other such branch's build ([`Store::side_builds`]): held by
+        // the build itself, below, so a reader giving up mid-build lets no other start beside it.
+        let side = match side_state(&key.1) {
+            true => Some(self.side_builds.clone().acquire_owned().await?),
+            false => None,
+        };
         if waited {
             // A reader that waited for another's build takes the newest state built since it read its tables: one
             // built from tables read after them holds every change they hold, a removal included (a table's cached
@@ -8694,8 +8716,9 @@ impl Store {
             decisions,
         );
         let key = key.clone();
+        let running = running::running(format!("visibility build {} {}", key.0, key.1));
         let build = async move {
-            let _building = (held, building);
+            let _building = (held, building, side, running);
             let pinned = pinned.as_ref().map(|(p, h)| (p.as_str(), h.as_slice()));
             store
                 .view_built(&branch, pinned, key, tables, stamp, read_at)
@@ -9188,6 +9211,20 @@ impl Store {
                 .count();
             if paged >= 32 {
                 cached.retain(|(n, b), _| *n != key.0 || !b.contains("@page-"));
+            }
+        }
+        // A few branches' states other than main's per scope, the newest built: each is main's size, and one asked
+        // for again is built again.
+        if side_state(&key.1) {
+            let mut side: Vec<((String, String), Instant)> = cached
+                .iter()
+                .filter(|((n, b), _)| *n == key.0 && *b != key.1 && side_state(b))
+                .map(|(k, (_, v))| (k.clone(), v.built_at))
+                .collect();
+            side.sort_by_key(|(_, at)| *at);
+            let over = (side.len() + 1).saturating_sub(MAX_SIDE_STATES);
+            for (k, _) in side.into_iter().take(over) {
+                cached.remove(&k);
             }
         }
         cached.insert(key, (stamp, vis.clone()));
@@ -10115,7 +10152,19 @@ impl Store {
         prefix: &str,
     ) -> Result<Vec<String>> {
         let target = AclTarget::SourcePrefix(prefix.to_string());
-        self.retract_rows(scope, actor, std::slice::from_ref(&target), Mark::Release)
+        self.release_all(scope, actor, std::slice::from_ref(&target))
+            .await
+    }
+
+    /// [`Store::retract_released`] for several targets at once, in one commit: what any of them names now is gone
+    /// for every reader, and the same episode written again later is current again.
+    pub async fn release_all(
+        &self,
+        scope: &Scope,
+        actor: &str,
+        targets: &[AclTarget],
+    ) -> Result<Vec<String>> {
+        self.retract_rows(scope, actor, targets, Mark::Release)
             .await
     }
 

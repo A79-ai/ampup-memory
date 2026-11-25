@@ -123,6 +123,7 @@ Requests carry `X-Title: ampup-memory`, so their spend shows apart on a shared k
 | `AMPUP_MEMORY_SESSION_IDLE_SECS` (1800), `AMPUP_MEMORY_SESSION_SWEEP_SECS` (60) | Ending idle sessions; judging ended ones. |
 | `AMPUP_MEMORY_RUNS_PER_DAY` (100), `AMPUP_MEMORY_LOG_PER_DAY` (1000), `AMPUP_MEMORY_SESSIONS_PER_DAY` (1000) | Per-person daily caps. Past sessions `ampup-memory-client index` sends have none and never count toward these. |
 | `AMPUP_MEMORY_INDEX_NOTES_PER_DAY` (20) | Times a day a person may have `index`'s Memory Replay notes written on the server's model (`POST /index/notes`). |
+| `AMPUP_MEMORY_IMPORT_RUNS_PER_DAY` (5000) | Runs imported as an org's (`POST /runs {import}`) per scope a day, every import source together; never counted toward a person's caps. |
 
 ## Mail and the weekly digest
 

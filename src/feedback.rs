@@ -121,12 +121,13 @@ pub async fn give(
 }
 
 /// The feedback on `facts` as `who` may see it: for each fact they can read that has any, its tally. A fact
-/// whose episodes they can't all read shows none.
+/// whose episodes they can't all read shows none. `checks_count`: whether the flags served-fact checks gave count.
 pub async fn tallies(
     store: &Store,
     scope: &Scope,
     who: &Principal,
     facts: &[(String, Vec<String>)],
+    checks_count: bool,
 ) -> Result<HashMap<String, Tally>> {
     if facts.is_empty() {
         return Ok(HashMap::new());
@@ -151,7 +152,14 @@ pub async fn tallies(
         let reason = optional_strings(b, "reason");
         let at = timestamps(b, "recorded_at");
         for i in 0..b.num_rows() {
+            // A served-fact check's flag counts only where the checks flag (`crate::served_checks::counts_flags`).
+            let checks = || {
+                reason[i]
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with(crate::served_checks::REASON))
+            };
             if !wanted.contains_key(fact[i].as_str())
+                || (!checks_count && checks())
                 || !vis.committed.contains(&commit[i])
                 || split_list(&episodes[i]).iter().any(|e| vis.is_gone(e))
             {

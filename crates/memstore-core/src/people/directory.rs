@@ -134,7 +134,7 @@ impl std::str::FromStr for PersonalRuns {
     }
 }
 /// What a scope's compile sources may be said to be (`Settings::compile_kind`); `""` unsets it.
-pub const COMPILE_KINDS: &[&str] = &["", "errors"];
+pub const COMPILE_KINDS: &[&str] = &["", "errors", "changes"];
 /// How advice routes over a scope's compiled skills (`Settings::advice_skills`); `""` unsets it.
 pub const ADVICE_SKILLS: &[&str] = &["", "fallback", "together", "off"];
 /// How the MCP instructions and the session tools' descriptions read (`Settings::instructions`); `""` unsets it.
@@ -1040,7 +1040,8 @@ pub struct SignIn {
     /// Signed in through the platform's Auth0 tenant for the operators' Organization
     /// (`AMPUP_MEMORY_AUTH0_OPERATORS_ORG`): an admin of every org without being its member ([`Directory::access`]),
     /// who also makes the changes that are the platform's ([`Change::operators`]: create orgs, bind them to Auth0,
-    /// set their limits).
+    /// set their limits). The server sets it too for the operator's admin key reading an org it selected on a route
+    /// that only reads, so it reads there as an org admin, audited as the operator's sign-in is.
     pub operator: bool,
     /// A recorder key acting for the member this names (`x-memstore-as`): what it records is the key's account of
     /// the member's work, never the member's own words, so nothing is kept as theirs from it (`memstore::keep`).
@@ -1320,6 +1321,11 @@ pub struct Settings {
     /// `AMPUP_MEMORY_NOTES_DREAM_ON` decides (off by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_dream: Option<bool>,
+    /// Whether a fact served in a session that the conversation shows wrong is flagged as its person's negative
+    /// feedback (`memstore::served_checks`): true, flagged; false, not checked, and no flag it gave before is
+    /// counted. Unset, the server's `AMPUP_MEMORY_SERVED_FACT_CHECKS` decides (`on` unless set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact_checks: Option<bool>,
     /// Whether the notes a session is handed (a person's own and what their team shares) are picked by a decisions
     /// model judging which bear on the task (`memstore::keep::bearing_on`), on the route the server's extraction
     /// takes. Set false, a person's notes never go to that model: the ones that share a word with the task are
@@ -1359,6 +1365,13 @@ pub struct Settings {
     /// unless set false (where a decisions model is configured: without one, every proposal waits for its owners).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_review: Option<bool>,
+    /// Whether the scope's schema grows with what extraction meets (`memstore::schema_growth`): where several
+    /// episodes hold things of a kind the schema has no type or predicate for, a model drafts an additive change
+    /// (new types, or new predicates on existing ones), which goes to the scope's entity owners for review, or is
+    /// set on main where no entity has an owner, as an admin's change would be. Its team's setting wins over its
+    /// org's; off unless set true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_growth: Option<bool>,
     /// Whether text written into the scope (ingest, `remember_memory`, a fact's closing reason) has its personal
     /// identifiers replaced before it is stored (`crate::pii`): payment card numbers, US social security numbers,
     /// IBANs and international phone numbers become `[card]`, `[ssn]`, `[iban]` and `[phone]`. Only text written
@@ -1415,12 +1428,14 @@ impl Settings {
             && self.transcripts.is_none()
             && self.instructions.is_none()
             && self.notes_dream.is_none()
+            && self.fact_checks.is_none()
             && self.notes_decide.is_none()
             && self.reads.is_none()
             && self.purge.is_none()
             && self.activity.is_none()
             && self.session_branches.is_none()
             && self.auto_review.is_none()
+            && self.schema_growth.is_none()
             && self.pii.is_none()
             && self.digest.is_none()
             && self.require_mfa.is_none()
@@ -1463,6 +1478,9 @@ impl Settings {
         }
         if other.auto_review.is_some() {
             self.auto_review = other.auto_review;
+        }
+        if other.schema_growth.is_some() {
+            self.schema_growth = other.schema_growth;
         }
         if other.pii.is_some() {
             self.pii = other.pii;
@@ -1532,6 +1550,9 @@ impl Settings {
         }
         if other.notes_dream.is_some() {
             self.notes_dream = other.notes_dream;
+        }
+        if other.fact_checks.is_some() {
+            self.fact_checks = other.fact_checks;
         }
         if other.notes_decide.is_some() {
             self.notes_decide = other.notes_decide;
@@ -2976,6 +2997,12 @@ impl Directory {
             .or(org.settings.advice_traces)
     }
 
+    /// Whether `scope`'s schema grows with what extraction meets (`Settings::schema_growth`): its team's setting,
+    /// else its org's; off where neither sets it, and in a scope the directory doesn't hold.
+    pub fn grows_schema(&self, scope: &crate::Scope) -> bool {
+        self.setting(scope, |s| s.schema_growth, false)
+    }
+
     /// Whether text written into `scope` has personal identifiers replaced first (`Settings::pii`): its team's
     /// setting, else its org's; off where neither sets it, and in a scope the directory doesn't hold.
     pub fn redacts_pii(&self, scope: &crate::Scope) -> bool {
@@ -3055,6 +3082,12 @@ impl Directory {
     /// hold also gets.
     pub fn dreams_notes(&self, scope: &crate::Scope, default: bool) -> bool {
         self.setting(scope, |s| s.notes_dream, default)
+    }
+
+    /// Whether facts served in `scope` that a session shows wrong are flagged (`Settings::fact_checks`): its team's
+    /// setting, else its org's; none where neither sets it (the server's mode decides).
+    pub fn fact_checks(&self, scope: &crate::Scope) -> Option<bool> {
+        self.team_or_org(scope, |s| s.fact_checks)
     }
 
     /// Whether the notes a session in `scope` is handed may be judged by a decisions model
@@ -3656,10 +3689,12 @@ impl Change {
                     && settings.transcripts.is_none()
                     && settings.instructions.is_none()
                     && settings.notes_dream.is_none()
+                    && settings.fact_checks.is_none()
                     && settings.notes_decide.is_none()
                     && settings.activity.is_none()
                     && settings.session_branches.is_none()
                     && settings.auto_review.is_none()
+                    && settings.schema_growth.is_none()
                     && settings.pii.is_none()
                     && settings.digest.is_none()
             }
@@ -3846,7 +3881,7 @@ pub(crate) fn check_values(settings: &Settings) -> Result<()> {
         && !COMPILE_KINDS.contains(&k.as_str())
     {
         invalid!(
-            "invalid compile_kind {k:?}: \"errors\" (the sources are error reports), or \"\" to unset it"
+            "invalid compile_kind {k:?}: \"errors\" (the sources are error reports), \"changes\" (records of single changes: one skill per procedure they repeat), or \"\" to unset it"
         );
     }
     Ok(())
@@ -4631,7 +4666,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             if settings.is_empty() {
                 invalid!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"compile_kind_sources\": [\"<source prefix>\"], \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"pii\": true|false, \"digest\": true|false, \"require_mfa\": true|false, \"require_sso\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"advice_eval\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\", \"compile_kind_sources\": [\"<source prefix>\"], \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"schema_growth\": true|false, \"pii\": true|false, \"digest\": true|false, \"require_mfa\": true|false, \"require_sso\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"advice_eval\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"fact_checks\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             check_values(settings)?;

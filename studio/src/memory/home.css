@@ -2,7 +2,7 @@
 
 .memory {
   .hm {
-    max-width: 1040px;
+    max-width: 1120px;
   }
   .hm-head {
     display: flex;
@@ -38,8 +38,7 @@
     flex-wrap: wrap;
     align-items: center;
     gap: var(--s2) var(--s3);
-    max-width: 640px;
-    margin-bottom: var(--s6);
+    margin-bottom: var(--s5);
     padding: var(--s3) var(--s4);
     border: 1px solid var(--line);
     border-radius: var(--r);
@@ -63,157 +62,315 @@
     gap: 4px;
     white-space: nowrap;
   }
-  /* Nothing waits on the reader: one calm line. */
-  .hm-calm {
-    display: flex;
-    align-items: center;
-    gap: var(--s2);
+  .hm-title {
     margin: 0;
-    font-size: var(--t-sm);
-    color: var(--muted);
+    font-size: var(--t-2xl);
+    font-weight: 650;
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
   }
-  .hm-calm .icon {
-    color: var(--ok);
-  }
-  .hm-calm + .hm-needs {
-    margin-top: var(--s3);
-  }
-  .hm-sec {
-    margin-bottom: var(--s8);
-  }
-  .hm-sec .h-section {
-    margin-top: 0;
-  }
-  .hm-tiles {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-    gap: var(--s3);
-  }
-  .hm-tiles-sm {
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-  }
-  .hm-tile {
+  /* What waits on the reader: a full-width banner each, only when something does. */
+  .hm-banners {
+    list-style: none;
+    margin: 0 0 var(--s5);
+    padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: var(--s2);
+  }
+  .hm-banner a {
+    display: flex;
+    align-items: center;
+    gap: var(--s3);
+    padding: var(--s3) var(--s4);
+    border: 1px solid var(--warn);
+    border-radius: var(--r-lg);
+    background: var(--warn-soft);
+    color: var(--ink);
+    font-size: var(--t-sm);
+    font-weight: 600;
+    text-decoration: none;
+  }
+  .hm-banner a > .icon {
+    color: var(--warn);
+  }
+  .hm-banner-go {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--ink-2);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .hm-banner a:hover .hm-banner-go {
+    color: var(--ink);
+  }
+  /* The figures: one row of plain cards, a label over a big number. */
+  .hm-stats {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: var(--s4);
+    margin-bottom: var(--s5);
+  }
+  .hm-stat {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
     padding: var(--s4) var(--s5);
     background: var(--surface);
     border: 1px solid var(--line);
     border-radius: var(--r-lg);
-    box-shadow: var(--shadow-sm);
     color: var(--ink);
     text-decoration: none;
     transition: border-color 0.12s;
   }
-  .hm-tile:hover {
+  .hm-stat:hover,
+  .hm-panel:hover {
     border-color: var(--line-strong);
   }
-  .hm-tile:focus-visible,
-  .hm-need a:focus-visible,
+  .hm-stat-label {
+    font-family: var(--mono);
+    font-size: var(--t-xs);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .hm-n {
+    font-family: var(--mono);
+    font-size: 2rem;
+    font-weight: 500;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+  }
+  .hm-note {
+    margin-top: auto;
+    font-size: var(--t-xs);
+    color: var(--faint);
+  }
+  .hm-fig {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .hm-stat:focus-visible,
+  .hm-banner a:focus-visible,
   .hm-source:focus-visible {
     outline: none;
     box-shadow: var(--focus);
   }
-  .hm-n {
-    font-family: var(--mono);
-    font-size: var(--t-2xl);
-    font-weight: 600;
-    line-height: 1.15;
-    letter-spacing: -0.02em;
+  /* Two panels under the figures: where this week's facts came from, and the sources by their newest. */
+  .hm-panels {
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+    gap: var(--s4);
+    align-items: stretch;
   }
-  .hm-tiles-sm .hm-n {
-    font-size: var(--t-xl);
+  .hm-panel {
+    min-width: 0;
+    padding: var(--s5) var(--s6);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    transition: border-color 0.12s;
   }
-  .hm-label {
+  .hm-panel-h {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 0 0 var(--s4);
+    font-size: var(--t-md);
+    font-weight: 650;
+    color: var(--ink);
+  }
+  .hm-all {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     font-size: var(--t-sm);
-    color: var(--ink-2);
-  }
-  .hm-note {
-    font-size: var(--t-xs);
+    font-weight: 500;
     color: var(--muted);
+    text-decoration: none;
   }
-  .hm-fig {
-    font-family: var(--mono);
+  .hm-all:hover {
+    color: var(--ink);
   }
-  .hm-by {
-    margin: var(--s3) 0 0;
-    font-size: var(--t-sm);
-    color: var(--muted);
-  }
-  .hm-needs {
+  .hm-sources {
     list-style: none;
     margin: 0;
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: var(--s2);
-    max-width: 640px;
+    gap: var(--s1);
   }
-  .hm-need a {
-    display: flex;
+
+  .hm-source:hover {
+    background: var(--sunken);
+  }
+
+
+
+
+  /* The last 30 days: a bar a day, the day's new facts (light) on its sessions (the theme's slate). */
+  .hm-legend {
+    display: inline-flex;
     align-items: center;
     gap: var(--s2);
-    padding: var(--s3) var(--s4);
-    border: 1px solid var(--line);
-    border-radius: var(--r);
-    background: var(--surface);
+    font-family: var(--mono);
+    font-size: var(--t-xs);
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
     color: var(--muted);
-    text-decoration: none;
   }
-  .hm-need a .icon {
-    margin-left: auto;
-    color: var(--faint);
+  .hm-key {
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
   }
-  .hm-need a:hover {
-    border-color: var(--line-strong);
+  .hm-key-asks {
+    margin-left: var(--s2);
   }
-  .hm-need-on a {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-    color: var(--accent-text);
-    font-weight: 600;
+  .hm-key-facts,
+  .hm-seg-facts {
+    background: color-mix(in srgb, var(--k-code) 28%, transparent);
   }
-  .hm-sources {
-    list-style: none;
-    margin: var(--s4) 0 0;
-    padding: 0;
+  .hm-key-asks,
+  .hm-seg-asks {
+    background: var(--k-code);
+  }
+  .hm-chart {
+    margin: 0;
+  }
+  .hm-cols {
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    height: 180px;
+    padding-bottom: var(--s2);
+    border-bottom: 1px solid var(--line);
+  }
+  .hm-col {
+    flex: 1 1 0;
+    min-width: 0;
+    height: 100%;
+    display: flex;
+    align-items: flex-end;
+    border-radius: 3px;
+  }
+  .hm-col:hover,
+  .hm-col.on {
+    background: var(--sunken);
+  }
+  .hm-col:focus-visible {
+    outline: none;
+    box-shadow: var(--focus);
+  }
+  .hm-cols {
+    position: relative;
+  }
+  /* The hovered day's card: its date, then each count with its key. */
+  .hm-tip {
+    position: absolute;
+    z-index: 2;
+    min-width: 168px;
+    padding: var(--s3) var(--s4);
     border: 1px solid var(--line);
     border-radius: var(--r-lg);
     background: var(--surface);
-    overflow: hidden;
+    box-shadow: var(--shadow-lg);
+    pointer-events: none;
+    font-size: var(--t-sm);
   }
-  .hm-sources li + li {
-    border-top: 1px solid var(--line);
+  .hm-tip-date {
+    margin-bottom: var(--s2);
+    color: var(--ink);
+    font-weight: 600;
+  }
+  .hm-tip-row {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    color: var(--muted);
+    line-height: 1.8;
+  }
+  .hm-tip-row b {
+    margin-left: auto;
+    padding-left: var(--s4);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-weight: 500;
+  }
+  .hm-stack {
+    width: 100%;
+    min-height: 2px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .hm-stack:empty {
+    background: var(--line);
+    border-radius: 2px;
+  }
+  .hm-seg {
+    flex-basis: 0;
+    min-height: 2px;
+    border-radius: 3px;
+  }
+  .hm-axis {
+    display: flex;
+    justify-content: space-between;
+    margin-top: var(--s2);
+    font-family: var(--mono);
+    font-size: var(--t-xs);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--faint);
   }
   .hm-source {
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    grid-template-columns: auto minmax(0, 1fr) auto 4em;
     align-items: center;
     gap: var(--s3);
-    padding: var(--s2) var(--s4);
+    padding: var(--s2);
+    margin: 0 calc(-1 * var(--s2));
+    border-radius: var(--r);
     color: var(--ink);
     text-decoration: none;
-    font-size: var(--t-sm);
+    font-size: var(--t-md);
   }
-  .hm-source:hover {
-    background: var(--sunken);
+  .hm-source .hm-fig {
+    text-align: right;
+    color: var(--ink-2);
   }
   .hm-source-name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .hm-fresh,
-  .hm-quiet {
-    min-width: 11em;
-    text-align: right;
+  .hm-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--line-strong);
+  }
+  .hm-dot-on {
+    background: var(--ok);
+  }
+  .hm-when {
+    font-size: var(--t-sm);
+    color: var(--faint);
     white-space: nowrap;
   }
-  .hm-fresh {
-    color: var(--ok);
-  }
-  .hm-quiet {
+  .hm-foot {
+    margin: var(--s3) 0 0;
+    font-size: var(--t-xs);
     color: var(--faint);
+  }
+  .hm-quiet-line {
+    margin: 0;
+    font-size: var(--t-sm);
+    color: var(--muted);
   }
   .hm-new .state {
     margin-bottom: var(--s6);
@@ -235,63 +392,46 @@
     margin: 0 0 var(--s3);
     font-size: var(--t-sm);
   }
-  @media (max-width: 600px) {
-    .hm-source {
-      grid-template-columns: auto minmax(0, 1fr) auto;
+  @media (max-width: 900px) {
+    .hm-stats {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
-    .hm-source .hm-fresh,
-    .hm-source .hm-quiet {
-      grid-column: 2 / -1;
-      text-align: left;
+    .hm-panels {
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 }
 
-/* With the host drawing the sections, Home fills the host's page: no width caps, and from 1280px its
-   sections (what needs you, what it learned, what it answered, what it holds back) in two columns under the
-   title and the dream, which keep the whole width. */
+/* With the host drawing the sections, Home fills the host's page. */
 .memory-studio[data-navigation="host"] .memory {
   .hm,
-  .hm-dream,
-  .hm-needs {
+  .hm-dream {
     max-width: none;
-  }
-  @media (min-width: 1280px) {
-    .hm {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      column-gap: var(--s8);
-      align-items: start;
-    }
-    .hm > :not(.hm-sec) {
-      grid-column: 1 / -1;
-    }
   }
 }
 
 /* While Home's reads are out: each tile's and each row's place, shimmering (the .sk shimmer is memory.css's). */
 .memory {
-  .hm-tile-sk {
-    gap: var(--s2);
-    box-shadow: none;
-    min-height: 86px;
+  .hm-stat-sk {
     justify-content: center;
   }
-  .hm-tile-sk .sk-n {
-    height: 24px;
-    width: 42%;
+  .hm-stat-sk .sk-label {
+    height: 10px;
+    width: 40%;
   }
-  .hm-tile-sk .sk-label {
-    height: 12px;
-    width: 70%;
-  }
-  .hm-need-sk {
-    height: 44px;
-    border-radius: var(--r);
+  .hm-stat-sk .sk-n {
+    height: 28px;
+    width: 55%;
   }
 }
 
 /* A host that draws the sections has its own search box: Home doesn't offer a second. */
 .memory-studio[data-navigation="host"] .memory .hm-search {
   display: none;
+}
+
+/* Home fits the window: nothing under its last panel (the pane's own bottom padding is for pages that scroll). */
+.memory .pane-inner:has(> .hm),
+.memory-studio[data-navigation] .memory .pane-inner:has(> .hm) {
+  padding-bottom: 0;
 }

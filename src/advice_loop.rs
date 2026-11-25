@@ -26,6 +26,19 @@
 //! [`claim`] the scope. A person's own advice is learned once at a time for them ([`claim_person`]): it writes their
 //! space alone, so it never holds the team's learning up, nor the team's it.
 //! The run goes to the judge between two lines of a fence it can't guess: data, not instructions.
+//!
+//! **An admin's learn learns from every run** ([`learn_all`]). The server that learns is often not the one the runs
+//! were recorded on (a serving pod records them, the worker holding the writer lease learns), and a server reads
+//! another's writes from its cache, up to `AMPUP_MEMORY_HARD_STALENESS_MS` (60 s) behind. A learn queued right after
+//! a load read the answer log as the worker had last cached it: on staging, Nov 24 2026, it sorted the 229 runs of
+//! the first three recorders' batches of six (454 runs), and the rest waited for the timer's next round. So an
+//! admin's learn reads the log as it is now, and learns again, up to [`LEARN_PASSES`] passes, while enough runs it
+//! hadn't seen are still unsorted after a pass (recorded while it learned).
+//!
+//! **Where it stands** ([`status`], the admin op `advice_status`): the scope's rewarded runs, how many the map has
+//! sorted and how many wait, its situations and notes, what the last learn did and skipped, the learn in progress
+//! and the last error. The learning server keeps the last three in a document of the scope (`advice-status`), so any
+//! server answers it, the one an admin reaches included.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -33,13 +46,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::StreamExt;
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
-use crate::advice::Learned;
+use crate::advice::{Learned, Pass};
 use crate::extract::{Extractor, Refused};
 use crate::qa_log::{JUDGED, Judgement, Logged};
-use crate::{MAIN, Scope, Store};
+use crate::{Episode, MAIN, Scope, Store};
 
 /// Advice's map (`crate::advice`): JSON whose `assign` holds each run it has sorted, by id, and `acl` the
 /// audience it was learned for.
@@ -162,6 +175,359 @@ pub fn claim_person(scope: &Scope, person: &str) -> Option<PersonClaim> {
         .then(|| PersonClaim(scope.clone(), person.to_string()))
 }
 
+/// The most passes one admin's learn makes ([`learn_all`]): runs still arriving after them wait for the timer, and
+/// `advice_status` says how many.
+pub const LEARN_PASSES: usize = 5;
+
+/// Where the learning server says how the scope's team learning stands ([`Status`]): outside `advice/`, which holds
+/// the notes.
+const STATUS: &str = "advice-status";
+/// Its source: the engine's own (`advice:`), which no caller may write.
+const STATUS_SOURCE: &str = "advice:status";
+/// Who may read it: no one (no sign-in names an address under `.invalid`). [`status`] reads it from storage, for an
+/// org's admins.
+const STATUS_ACL: &str = "user:advice-status@memstore.invalid";
+/// The actor its commits are made as.
+const STATUS_ACTOR: &str = "advice:status";
+
+/// How the scope's team learning stands, as the server that learns keeps it ([`STATUS`]). No person is named in it:
+/// who asked for a learn is in the server's log.
+#[derive(Default, Serialize, Deserialize)]
+struct Status {
+    /// The learn under way, if one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    learning: Option<Progress>,
+    /// The last learn that finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last: Option<Finished>,
+    /// The last learn that failed, and why. A learn that finishes after it leaves it, with its time, so an admin sees
+    /// it was before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<Failed>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Progress {
+    /// When it began (µs).
+    since: i64,
+    /// `admin` (`learn_advice`) or `timer`.
+    by: String,
+    /// The queued request it applies ([`crate::advice_requests`]), if one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queued: Option<String>,
+    /// The pass under way, from 1.
+    pass: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Finished {
+    started_at: i64,
+    finished_at: i64,
+    by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queued: Option<String>,
+    /// What each pass did ([`Learned`]), in order.
+    passes: Vec<Value>,
+    /// Runs recorded while it learned that it left to the timer, after its last pass ([`LEARN_PASSES`]).
+    #[serde(default)]
+    left_to_timer: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Failed {
+    at: i64,
+    by: String,
+    error: String,
+}
+
+/// The scope's [`Status`] as `session` holds it; empty before anything learned there, or where it doesn't parse.
+async fn read_status(session: &crate::Session, store: &Store) -> Status {
+    match session.engine_document(store, STATUS).await {
+        Ok(Some(b)) => serde_json::from_slice(&b).unwrap_or_default(),
+        Ok(None) => Status::default(),
+        Err(e) => {
+            eprintln!(
+                "advice {}: its learning status wasn't read: {e:#}",
+                session.scope()
+            );
+            Status::default()
+        }
+    }
+}
+
+/// Changes the scope's [`Status`] as `change` does, and writes it. Saying where learning stands never fails the
+/// learn: a status not written is said in the log.
+async fn update_status(store: &Store, scope: &Scope, change: impl FnOnce(&mut Status)) {
+    let wrote = async {
+        let session = store.pin(scope, MAIN).await?;
+        let mut s = read_status(&session, store).await;
+        change(&mut s);
+        let doc = Episode::sourced(STATUS_SOURCE, &serde_json::to_vec(&s)?, &[STATUS_ACL])
+            .version_of(STATUS)
+            .without_text_index();
+        store.commit(scope, STATUS_ACTOR, &[doc], &[]).await?;
+        anyhow::Ok(())
+    };
+    if let Err(e) = wrote.await {
+        eprintln!("advice {scope}: its learning status wasn't written: {e:#}");
+    }
+}
+
+/// Says a learn began in `scope` (`by`: `admin` or `timer`), applying the queued request `queued` if one.
+async fn began(
+    store: &Store,
+    scope: &Scope,
+    by: &str,
+    queued: Option<&str>,
+    since: i64,
+    pass: usize,
+) {
+    let p = Progress {
+        since,
+        by: by.into(),
+        queued: queued.map(String::from),
+        pass,
+    };
+    update_status(store, scope, |s| s.learning = Some(p)).await;
+}
+
+/// Says the learn that began at `since` finished, with what each pass did.
+async fn finished(
+    store: &Store,
+    scope: &Scope,
+    by: &str,
+    queued: Option<&str>,
+    since: i64,
+    passes: &[Learned],
+    left_to_timer: usize,
+) {
+    let f = Finished {
+        started_at: since,
+        finished_at: crate::now_micros(),
+        by: by.into(),
+        queued: queued.map(String::from),
+        passes: passes.iter().map(|l| json!(l)).collect(),
+        left_to_timer,
+    };
+    update_status(store, scope, |s| {
+        s.learning = None;
+        s.last = Some(f);
+    })
+    .await;
+}
+
+/// Says a learn failed, and why.
+async fn failed(store: &Store, scope: &Scope, by: &str, e: &anyhow::Error) {
+    let f = Failed {
+        at: crate::now_micros(),
+        by: by.into(),
+        error: format!("{e:#}"),
+    };
+    update_status(store, scope, |s| {
+        s.learning = None;
+        s.error = Some(f);
+    })
+    .await;
+}
+
+/// Makes this server's next reads of `scope`'s runs read them as they are now, not as its cache last held them: the
+/// answer log, the traces and the ledger, which another server may have written moments ago.
+fn read_fresh(store: &Store, scope: &Scope) {
+    store.invalidate(crate::SYSTEM_NS, "ledger");
+    store.invalidate(&scope.namespace(), crate::EPISODES);
+    store.invalidate(&scope.namespace(), crate::QA_LOG);
+}
+
+/// An admin's learn of `scope`'s team advice (`learn_advice`, here or queued as `queued`), as `pass` asks: from every
+/// rewarded run the map doesn't hold, read as the log is now ([`read_fresh`]), not from what this server's cache last
+/// held. After a pass, runs it hadn't seen that are still unsorted (recorded while it learned) are learned in another
+/// once there are as many as the timer waits for (`AMPUP_MEMORY_ADVICE_MIN_NEW`), up to [`LEARN_PASSES`]; fewer are
+/// left to the timer, and said. One the model left out of every situation isn't learned again here. A later pass updates
+/// the notes an earlier one wrote with the runs their situations gained ([`Pass::written_now`]): nobody has been served
+/// them yet, so they are neither idle nor put on trial. Says where it stands in the scope's status ([`status`]) as it
+/// goes. The caller holds the scope's [`claim`].
+pub async fn learn_all(
+    store: &Store,
+    scope: &Scope,
+    cx: &Extractor,
+    acl: &[String],
+    min_wrong: usize,
+    pass: Pass,
+    queued: Option<&str>,
+) -> Result<Vec<Learned>> {
+    let since = crate::now_micros();
+    began(store, scope, "admin", queued, since, 1).await;
+    let mut done: Vec<Learned> = vec![];
+    // Runs a pass found unsorted before it learned: one still unsorted after was the model's to sort, and left out.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let force = pass.force;
+    let mut pass = Some(pass);
+    let learned = async {
+        loop {
+            read_fresh(store, scope);
+            let (before, _) = unsorted(store, scope).await?;
+            seen.extend(before);
+            // A later pass sorts what came in meanwhile, and updates the notes the passes before it wrote with it.
+            let p = pass.take().unwrap_or_else(|| Pass {
+                force,
+                written_now: done
+                    .iter()
+                    .flat_map(|l| l.written.iter().map(|w| w.key.clone()))
+                    .collect(),
+                ..Pass::default()
+            });
+            done.push(crate::advice::learn_with(store, scope, cx, acl, min_wrong, &p).await?);
+            read_fresh(store, scope);
+            let (after, _) = unsorted(store, scope).await?;
+            let arrived = after.iter().filter(|id| !seen.contains(*id)).count();
+            if arrived == 0 {
+                return anyhow::Ok(0);
+            }
+            // Fewer than the timer waits for aren't worth another pass's model calls; nor are more after the last.
+            if arrived < min_new() || done.len() >= LEARN_PASSES {
+                eprintln!(
+                    "advice {scope}: {arrived} runs recorded while learning are left to the timer after {} passes",
+                    done.len()
+                );
+                return Ok(arrived);
+            }
+            eprintln!(
+                "advice {scope}: {arrived} runs recorded while learning aren't sorted yet: learning again (pass {})",
+                done.len() + 1
+            );
+            began(store, scope, "admin", queued, since, done.len() + 1).await;
+        }
+    };
+    match learned.await {
+        Ok(left) => {
+            finished(store, scope, "admin", queued, since, &done, left).await;
+            Ok(done)
+        }
+        Err(e) => {
+            failed(store, scope, "admin", &e).await;
+            Err(e)
+        }
+    }
+}
+
+/// Where `scope`'s team advice stands, for its admins (`advice_status`): the rewarded runs a learn sorts and how many
+/// the map holds or waits for, the map's situations and notes, the learns queued and under way, what the last one did
+/// and skipped, and the last error. It costs the log's rows as this server holds them (decoded once per data file, not
+/// per call) and a few documents. Read from main as built now ([`Store::pin`]), not the last state while the next is
+/// built: an admin following a learn on a server that isn't learning would otherwise see it run on for seconds after
+/// it ended. The timer's settings are this server's, which a deployment's servers share.
+pub async fn status(store: &Store, scope: &Scope) -> Result<Value> {
+    let session = store.pin(scope, MAIN).await?;
+    let (rewarded, apart) = rewarded_runs(store, scope).await?;
+    let map: Value = match session.engine_document(store, MAP).await? {
+        Some(b) => serde_json::from_slice(&b).unwrap_or_default(),
+        None => Value::Null,
+    };
+    let sorted_ids = crate::advice::assigned_ids(map["assign"].as_object());
+    let sorted = rewarded
+        .iter()
+        .filter(|id| sorted_ids.contains(id.as_str()))
+        .count();
+    let situations: usize = map["categories"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(_, c)| c["situations"].as_object().map_or(0, |s| s.len()))
+        .sum();
+    let count = |k: &str| match &map[k] {
+        Value::Object(o) => o.len(),
+        Value::Array(a) => a.len(),
+        _ => 0,
+    };
+    let s = read_status(&session, store).await;
+    // Learns queued for the writer and not applied yet ([`crate::advice_requests`]), oldest first.
+    let mut queued = vec![];
+    for key in session.engine_documents(crate::advice_requests::PREFIX) {
+        let Some(body) = session.engine_document(store, &key).await? else {
+            continue;
+        };
+        if let Ok(r) = serde_json::from_slice::<crate::advice_requests::Request>(&body)
+            && r.op == "learn"
+        {
+            queued.push((
+                r.at,
+                key[crate::advice_requests::PREFIX.len()..].to_string(),
+            ));
+        }
+    }
+    queued.sort();
+    let at = |t: i64| {
+        chrono::DateTime::from_timestamp_micros(t)
+            .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    };
+    let last = s.last.as_ref().map(|f| {
+        let passes: Vec<&Value> = f.passes.iter().collect();
+        let sum = |k: &str| passes.iter().map(|p| p[k].as_u64().unwrap_or(0)).sum::<u64>();
+        // The last pass decided every situation: what it skipped is what the map holds now.
+        let end = passes.last().copied().cloned().unwrap_or(Value::Null);
+        let n = |k: &str| end[k].as_u64().unwrap_or(0);
+        // Each note it wrote, as its last pass left it.
+        let mut written: BTreeMap<String, Value> = BTreeMap::new();
+        for w in passes
+            .iter()
+            .flat_map(|p| p["written"].as_array().into_iter().flatten())
+        {
+            let key = w["key"].as_str().unwrap_or_default().to_string();
+            let new = written.get(&key).map_or(&w["new"], |was| &was["new"]).clone();
+            written.insert(
+                key,
+                json!({"key": w["key"], "runs": w["runs"], "right": w["right"], "wrong": w["wrong"], "new": new}),
+            );
+        }
+        json!({
+            "by": f.by,
+            "queued": f.queued,
+            "started_at": at(f.started_at),
+            "finished_at": at(f.finished_at),
+            "passes": passes.len(),
+            "runs_read": n("runs"),
+            "sorted": sum("sorted"),
+            "left_unsorted": n("unsorted"),
+            "left_to_timer": f.left_to_timer,
+            "situations": n("situations"),
+            "eligible": n("eligible"),
+            "notes_written": written.len(),
+            "skipped": {
+                "too_few_runs": n("too_few"),
+                "too_few_people": n("few_people"),
+                "conversation": n("conversation"),
+                "waiting_for_more_runs": n("waiting"),
+                "idle": n("idle"),
+                "refused": n("dropped") + n("malformed"),
+                "unbacked": n("unbacked"),
+            },
+            "written": written.into_values().collect::<Vec<_>>(),
+        })
+    });
+    Ok(json!({
+        "runs": {
+            "rewarded": rewarded.len(),
+            "sorted": sorted,
+            "waiting": rewarded.len() - sorted,
+            "set_apart": apart,
+        },
+        "situations": situations,
+        "notes": count("notes"),
+        "held": count("held"),
+        "learning": s.learning.as_ref().map(|p| json!({
+            "since": at(p.since), "by": p.by, "queued": p.queued, "pass": p.pass, "passes_at_most": LEARN_PASSES,
+        })),
+        "queued": queued.iter().map(|(t, id)| json!({"id": id, "at": at(*t)})).collect::<Vec<_>>(),
+        "last_learn": last,
+        "last_error": s.error.as_ref().map(|e| json!({"at": at(e.at), "by": e.by, "error": e.error})),
+        "timer": {
+            "on": enabled(),
+            "every_secs": every().as_secs(),
+            "learns_once_waiting": min_new(),
+        },
+    }))
+}
+
 fn env_secs(var: &str, default: u64) -> u64 {
     std::env::var(var)
         .ok()
@@ -271,12 +637,25 @@ pub async fn round(
         } else {
             audience
         };
+        let since = crate::now_micros();
+        began(store, scope, "timer", None, since, 1).await;
         match crate::advice::learn(store, scope, cx, &acl, MIN_WRONG).await {
             Ok(l) => {
+                finished(
+                    store,
+                    scope,
+                    "timer",
+                    None,
+                    since,
+                    std::slice::from_ref(&l),
+                    0,
+                )
+                .await;
                 done.learned = Some(l);
                 tried.extend(new);
             }
             Err(e) => {
+                failed(store, scope, "timer", &e).await;
                 // A model that refused, or answered without the map, isn't asked again until more runs are new.
                 done.down = e.downcast_ref::<Refused>().is_none();
                 if !done.down {
@@ -578,18 +957,7 @@ async fn personal(
 /// hold yet, and the audience the map was learned for (none before the first learn). Only what a learn sorts
 /// ([`crate::advice::sorts`]): counted as new, one it never sorts would start a learn every round that sorts nothing.
 async fn unsorted(store: &Store, scope: &Scope) -> Result<(Vec<String>, Vec<String>)> {
-    // Nor the runs of accounts set apart from the team's learning (`advice_learn_exclude`): never sorted there.
-    let apart: BTreeSet<String> = crate::advice::learn_excluded(store, scope)
-        .await
-        .into_iter()
-        .collect();
-    let rewarded: Vec<String> = crate::qa_log::list(store, scope, None)
-        .await?
-        .into_iter()
-        .filter(crate::advice::sorts)
-        .filter(|l| !apart.contains(&crate::auth::acl::norm_id(l.asker.trim())))
-        .map(|l| l.answer_id)
-        .collect();
+    let (rewarded, _) = rewarded_runs(store, scope).await?;
     let session = store.pin(scope, MAIN).await?;
     let map: Value = match session.engine_document(store, MAP).await? {
         Some(b) => serde_json::from_slice(&b).unwrap_or_default(),
@@ -608,6 +976,28 @@ async fn unsorted(store: &Store, scope: &Scope) -> Result<(Vec<String>, Vec<Stri
         .map(String::from)
         .collect();
     Ok((new, audience))
+}
+
+/// The ids of the scope's runs (and rated answers) a team learn sorts ([`crate::advice::sorts`]), and how many more
+/// are of the accounts set apart from the team's learning (`advice_learn_exclude`), which are never sorted there.
+async fn rewarded_runs(store: &Store, scope: &Scope) -> Result<(Vec<String>, usize)> {
+    let apart: BTreeSet<String> = crate::advice::learn_excluded(store, scope)
+        .await
+        .into_iter()
+        .collect();
+    let (mut rewarded, mut set_apart) = (vec![], 0);
+    for l in crate::qa_log::list(store, scope, None)
+        .await?
+        .into_iter()
+        .filter(crate::advice::sorts)
+    {
+        if apart.contains(&crate::auth::acl::norm_id(l.asker.trim())) {
+            set_apart += 1;
+        } else {
+            rewarded.push(l.answer_id);
+        }
+    }
+    Ok((rewarded, set_apart))
 }
 
 /// Judges up to `max` runs of `scope` that nobody rewarded, rated or judged, recorded at least `after` µs

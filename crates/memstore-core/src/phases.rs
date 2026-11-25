@@ -29,6 +29,7 @@ pub async fn timed<F: std::future::Future>(f: F) -> (F::Output, String) {
 
 /// Notes that the timed request (if any) reached `what`.
 pub fn mark(what: &'static str) {
+    crate::running::at(what);
     let _ = MARKS.try_with(|m| {
         let mut m = m.borrow_mut();
         let ms = m.0.elapsed().as_millis();

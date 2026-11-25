@@ -699,9 +699,12 @@ impl Reads {
                 }
             }
         }
-        let mut out = crate::feedback::tallies(store, self.own.scope(), who, facts).await?;
+        let own = self.own.scope();
+        let c = crate::served_checks::counts_flags(store, own).await;
+        let mut out = crate::feedback::tallies(store, own, who, facts, c).await?;
         for s in &self.also {
-            for (id, t) in crate::feedback::tallies(store, s.scope(), who, facts).await? {
+            let c = crate::served_checks::counts_flags(store, s.scope()).await;
+            for (id, t) in crate::feedback::tallies(store, s.scope(), who, facts, c).await? {
                 out.entry(id).or_insert(t);
             }
         }

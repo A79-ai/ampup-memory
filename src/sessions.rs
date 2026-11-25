@@ -527,7 +527,12 @@ pub async fn start(
     }
     crate::phases::mark("daily cap");
     let since = now_micros() - 86_400_000_000;
-    let all = crate::qa_log::list(store, scope, None).await?;
+    // Only the named id's entry and this person's sessions are read ([`crate::qa_log::list_where`]).
+    let all = crate::qa_log::list_where(store, scope, None, |l| {
+        named == Some(l.answer_id.as_str())
+            || (l.kind.as_deref() == Some(KIND) && l.asker == who.user())
+    })
+    .await?;
     // A named id is new: one the log has (anyone's, of any kind) is never taken over.
     if let Some(n) = named
         && all.iter().any(|l| l.answer_id == n)
@@ -700,7 +705,13 @@ pub async fn open_named(
     harness: Option<&str>,
     backfill: bool,
 ) -> Result<String> {
-    let sessions = list(store, scope).await?;
+    let own = {
+        use sha2::Digest as _;
+        let h = sha2::Sha256::digest(crate::people::directory::user_id(who.user()).as_bytes());
+        let hash: String = h[..6].iter().map(|b| format!("{b:02x}")).collect();
+        format!("{id}.{hash}")
+    };
+    let sessions = list_where(store, scope, |l| l.answer_id == id || l.answer_id == own).await?;
     if sessions.iter().any(|l| l.answer_id == id) {
         return Ok(id.to_string());
     }
@@ -711,12 +722,6 @@ pub async fn open_named(
     if !named {
         return Err(refuse(format!("no session {id} that you started")));
     }
-    let own = {
-        use sha2::Digest as _;
-        let h = sha2::Sha256::digest(crate::people::directory::user_id(who.user()).as_bytes());
-        let hash: String = h[..6].iter().map(|b| format!("{b:02x}")).collect();
-        format!("{id}.{hash}")
-    };
     if sessions.iter().any(|l| l.answer_id == own) {
         return Ok(own);
     }
@@ -1286,14 +1291,24 @@ fn ended_final(l: &Logged) -> bool {
 /// The scope's sessions as they stand: the log's, with the rows held for the next flush over them (an end its
 /// agent made is final, as in the log).
 pub async fn list(store: &Store, scope: &Scope) -> Result<Vec<Logged>> {
+    list_where(store, scope, |_| true).await
+}
+
+/// [`list`], only the sessions `keep` keeps, which reads fields every row of a session shares (its id, asker,
+/// kind): only those are copied ([`crate::qa_log::list_where`]).
+pub async fn list_where(
+    store: &Store,
+    scope: &Scope,
+    keep: impl Fn(&Logged) -> bool,
+) -> Result<Vec<Logged>> {
     let settling = SETTLING.read().await;
-    let mut all = crate::qa_log::list(store, scope, None).await?;
+    let mut all = crate::qa_log::list_where(store, scope, None, &keep).await?;
     let (server, ns) = (store.server_id(), scope.namespace());
     let held: Vec<Logged> = BUFFER
         .lock()
         .unwrap()
         .iter()
-        .filter(|((s, n, _), _)| *s == server && *n == ns)
+        .filter(|((s, n, _), h)| *s == server && *n == ns && keep(&h.l))
         .map(|(_, h)| h.l.clone())
         .collect();
     drop(settling);
@@ -1330,10 +1345,12 @@ pub async fn list(store: &Store, scope: &Scope) -> Result<Vec<Logged>> {
 
 /// Session `id`, as it stands, if `who` started it.
 pub async fn find(store: &Store, scope: &Scope, who: &Principal, id: &str) -> Result<Logged> {
-    list(store, scope)
+    let mine =
+        |l: &Logged| l.answer_id == id && l.asker == who.user() && l.kind.as_deref() == Some(KIND);
+    list_where(store, scope, mine)
         .await?
         .into_iter()
-        .find(|l| l.answer_id == id && l.asker == who.user() && l.kind.as_deref() == Some(KIND))
+        .find(mine)
         .ok_or_else(|| refuse(format!("no session {id} that you started")))
 }
 
@@ -1882,6 +1899,18 @@ pub(crate) async fn commit_unless_held(
     actor: &str,
     ep: &Episode,
 ) -> Result<()> {
+    commit_holding(store, scope, actor, ep, ()).await
+}
+
+/// [`commit_unless_held`], keeping `hold` until the commit lands, even when the request that asked for it is dropped
+/// first ([`landed`]): a session's end keeps its [`EndTurn`] so, and what is under way stays counted while it is.
+async fn commit_holding(
+    store: &Store,
+    scope: &Scope,
+    actor: &str,
+    ep: &Episode,
+    hold: impl Send + 'static,
+) -> Result<()> {
     let one = std::slice::from_ref(ep);
     let turn = one_write(scope, &ep.episode_id).await;
     if store
@@ -1898,12 +1927,176 @@ pub(crate) async fn commit_unless_held(
     let (store, scope_of, actor, ep) =
         (store.clone(), scope.clone(), actor.to_string(), ep.clone());
     landed(scope, turn, async move {
+        let _hold = hold;
         store
             .commit_record(&scope_of, &actor, std::slice::from_ref(&ep))
             .await
     })
     .await?;
     Ok(())
+}
+
+/// How many sessions' ends one server works on at once (their transcripts read, built and committed):
+/// `AMPUP_MEMORY_SESSION_ENDS_AT_ONCE`, default 4, read once. Each end commits its transcript on its own, and a burst
+/// of them at once (a client sending every session's end again) holds that many transcripts and commits in memory.
+fn ends_at_once() -> usize {
+    static AT_ONCE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("AMPUP_MEMORY_SESSION_ENDS_AT_ONCE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(4)
+    });
+    *AT_ONCE
+}
+
+/// How long an end waits for one of the [`ends_at_once`] before it is refused for now.
+const END_WAIT: Duration = Duration::from_secs(2);
+/// When an end refused for now ([`EndBusy`]) is worth sending again.
+const END_RETRY_SECS: u64 = 30;
+
+static END_SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(ends_at_once())));
+/// The sessions whose end is under way in this process, by scope and id ([`claim_end`]).
+static ENDING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// What the ends did since they were last logged ([`log_ends`]).
+struct EndCounts {
+    most: std::sync::atomic::AtomicUsize,
+    begun: std::sync::atomic::AtomicU64,
+    refused: std::sync::atomic::AtomicU64,
+    /// When a refusal was last logged (unix seconds).
+    refusal_logged: std::sync::atomic::AtomicI64,
+}
+
+static ENDS: EndCounts = EndCounts {
+    most: std::sync::atomic::AtomicUsize::new(0),
+    begun: std::sync::atomic::AtomicU64::new(0),
+    refused: std::sync::atomic::AtomicU64::new(0),
+    refusal_logged: std::sync::atomic::AtomicI64::new(0),
+};
+
+/// A session's end refused for now: another end of it is under way, or this server works on as many ends as it
+/// takes at once ([`ends_at_once`]). Its caller sends it again after `retry_after_secs`; the text says it
+/// "can't be kept right now", which the hooks keep in their outbox to send again.
+#[derive(Debug)]
+pub struct EndBusy {
+    pub why: String,
+    pub retry_after_secs: u64,
+}
+
+impl std::fmt::Display for EndBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for EndBusy {}
+
+fn end_busy(id: &str, why: &str) -> anyhow::Error {
+    use std::sync::atomic::Ordering::Relaxed;
+    ENDS.refused.fetch_add(1, Relaxed);
+    let now = now_micros() / 1_000_000;
+    let last = ENDS.refusal_logged.load(Relaxed);
+    if now - last >= 10
+        && ENDS
+            .refusal_logged
+            .compare_exchange(last, now, Relaxed, Relaxed)
+            .is_ok()
+    {
+        eprintln!(
+            "sessions: end of {id} refused for now ({why}): {} under way, {} refused this minute (at most {} at \
+             once)",
+            ends_under_way(),
+            ENDS.refused.load(Relaxed),
+            ends_at_once()
+        );
+    }
+    EndBusy {
+        why: format!(
+            "session {id}'s end can't be kept right now: {why}; send it again in {END_RETRY_SECS} s"
+        ),
+        retry_after_secs: END_RETRY_SECS,
+    }
+    .into()
+}
+
+/// Session `id` of `scope` claimed for its end ([`claim_end`]); let go when dropped.
+pub struct EndClaim {
+    key: String,
+    id: String,
+}
+
+impl Drop for EndClaim {
+    fn drop(&mut self) {
+        ENDING.lock().unwrap().remove(&self.key);
+    }
+}
+
+/// Claims session `id` of `scope` for its end, before its row is read: an end of it already under way in this process
+/// refuses this one for now ([`EndBusy`]), rather than both doing the same work. Once that end lands, one sent again
+/// reads the row it left (ended, or reopened as [`end`] allows).
+pub fn claim_end(scope: &Scope, id: &str) -> Result<EndClaim> {
+    let key = format!("{scope}\u{0}{id}");
+    if !ENDING.lock().unwrap().insert(key.clone()) {
+        return Err(end_busy(id, "another end of it is under way"));
+    }
+    Ok(EndClaim {
+        key,
+        id: id.to_string(),
+    })
+}
+
+/// How many of the [`ends_at_once`] are held now: as the slots themselves count them.
+fn ends_under_way() -> usize {
+    ends_at_once().saturating_sub(END_SLOTS.available_permits())
+}
+
+/// An end under way: its session's claim and one of the [`ends_at_once`], both let go once the end is answered and
+/// its transcript's commit landed, whichever is later (the commit keeps a copy, [`commit_holding`]).
+#[derive(Clone)]
+struct EndTurn(#[allow(dead_code)] std::sync::Arc<(EndClaim, tokio::sync::OwnedSemaphorePermit)>);
+
+impl EndClaim {
+    /// Waits up to [`END_WAIT`] for one of the [`ends_at_once`]; refused for now ([`EndBusy`]) when none frees up.
+    async fn turn(self) -> Result<EndTurn> {
+        use std::sync::atomic::Ordering::Relaxed;
+        match tokio::time::timeout(END_WAIT, END_SLOTS.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => {
+                ENDS.most.fetch_max(ends_under_way(), Relaxed);
+                ENDS.begun.fetch_add(1, Relaxed);
+                Ok(EndTurn(std::sync::Arc::new((self, permit))))
+            }
+            _ => Err(end_busy(
+                &self.id,
+                &format!(
+                    "this server is ending the most sessions it takes at once ({})",
+                    ends_at_once()
+                ),
+            )),
+        }
+    }
+}
+
+/// Logs once a minute how many sessions' ends were under way and how many were refused for now ([`EndBusy`]), when
+/// any were.
+pub async fn log_ends() {
+    use std::sync::atomic::Ordering::Relaxed;
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let under_way = ends_under_way();
+        let most = ENDS.most.swap(under_way, Relaxed);
+        let begun = ENDS.begun.swap(0, Relaxed);
+        let refused = ENDS.refused.swap(0, Relaxed);
+        if begun + refused > 0 || most > 0 {
+            eprintln!(
+                "sessions: ends in the last minute: {begun} begun, {refused} refused for now, at most {most} under \
+                 way at once, {under_way} now (at most {} at once)",
+                ends_at_once()
+            );
+        }
+    }
 }
 
 /// Runs `commit`, a write of the record whose turn ([`one_write`]) is `turn`, in a task of its own that keeps the
@@ -2175,6 +2368,9 @@ struct Asked {
     handed: std::collections::HashSet<u64>,
     /// Pieces of advice handed on.
     count: usize,
+    /// Notes (by situation) whose lines the decisions model turned down at a step since the user's last message:
+    /// not asked about again until the user says something new ([`declined`]).
+    declined: std::collections::HashSet<String>,
     /// The procedures the session was served with no note (`Served::Procedures`), by situation: they are not
     /// recorded in the session, so the steps of a skill are ranked from here.
     procedures: Vec<(String, String)>,
@@ -2211,6 +2407,7 @@ fn asked_in<R>(scope: &Scope, who: &Principal, id: &str, f: impl FnOnce(&mut Ask
         stepped: None,
         handed: Default::default(),
         count: 0,
+        declined: Default::default(),
         procedures: vec![],
         notes_owed: false,
         late: None,
@@ -2244,8 +2441,25 @@ pub fn new_at_step(scope: &Scope, who: &Principal, id: &str, question: &str) -> 
         let h = hash_of(question);
         let new = a.stepped != Some(h);
         a.stepped = Some(h);
+        if new {
+            a.declined.clear();
+        }
         new
     })
+}
+
+/// Whether the decisions model turned down note `situation` at an earlier step of session `id` since the user's
+/// last message ([`decline`]): asked again at every step, it said no again (one session on a production deployment
+/// had one note judged 25 times in two hours, none handed on), so it waits for the user's next message.
+pub fn declined(scope: &Scope, who: &Principal, id: &str, situation: &str) -> bool {
+    asked_in(scope, who, id, |a| a.declined.contains(situation))
+}
+
+/// Notes that the decisions model turned down note `situation` at a step of session `id` ([`declined`]).
+pub fn decline(scope: &Scope, who: &Principal, id: &str, situation: &str) {
+    asked_in(scope, who, id, |a| {
+        a.declined.insert(situation.to_string());
+    });
 }
 
 /// Whether session `id` may be handed more advice by its hooks: it is under its cap.
@@ -3309,7 +3523,9 @@ pub fn discarded(l: &Logged) -> bool {
 
 /// Ends open session `l` of `asker`: its transcript (given, else the conversation so far) kept as an episode
 /// signed `signed` (`mcp:remember_memory:<asker>:`), its outcome and an explicit reward if given. Returns the
-/// entry as ended.
+/// entry as ended. With its `claim` ([`claim_end`], a caller's end; the idle sweep, one session at a time, has none),
+/// the transcript is read, built and committed only in one of the [`ends_at_once`], refused for now ([`EndBusy`])
+/// when none frees up.
 pub async fn end(
     store: &Store,
     scope: &Scope,
@@ -3317,6 +3533,7 @@ pub async fn end(
     signed: &str,
     mut l: Logged,
     args: &Value,
+    claim: Option<EndClaim>,
 ) -> Result<Logged> {
     let id = l.answer_id.clone();
     // Its owner ending a session the server ended idle, with the transcript: the whole transcript replaces the idle
@@ -3370,6 +3587,11 @@ pub async fn end(
         ),
     }
     .map(|t| t.min(now_micros()));
+    // What costs memory and a commit starts here: an end that would be refused above never waits for its turn.
+    let turn = match claim {
+        Some(c) => Some(c.turn().await?),
+        None => None,
+    };
     // The transcript given, else the last conversation the session was sent (its episode).
     let transcript = match (text(args, "transcript"), s.conversation.take()) {
         _ if discard => None,
@@ -3440,11 +3662,20 @@ pub async fn end(
         .into(),
     );
     if let Some(t) = &transcript {
-        let mut ep = transcript_episode(signed, &id, &l.question, t, outcome, &s.acl);
+        let repo = repo_arg(args);
+        let mut ep = transcript_episode(
+            signed,
+            &id,
+            &l.question,
+            t,
+            outcome,
+            &s.acl,
+            repo.as_deref(),
+        );
         if let Some(at) = occurred {
             ep.occurred_at = at;
         }
-        commit_unless_held(store, scope, asker, &ep).await?;
+        commit_holding(store, scope, asker, &ep, turn.clone()).await?;
         l.episodes.push(ep.episode_id);
     }
     l.answer = outcome.map(|o| head(o, MAX_OUTCOME));
@@ -3573,17 +3804,40 @@ fn transcript_episode(
     t: &str,
     outcome: Option<&str>,
     acl: &[String],
+    repo: Option<&str>,
 ) -> Episode {
-    let mut body = format!("Session {id}\n\nTask: {task}\n\nTrace:\n{t}\n");
+    // The repository it ran in, before its task (what reads the task takes what lies between `Task: ` and the trace).
+    let ran_in = repo.map_or(String::new(), |r| format!("Repo: {r}\n\n"));
+    let mut body = format!("Session {id}\n\n{ran_in}Task: {task}\n\nTrace:\n{t}\n");
     if let Some(o) = outcome {
         body.push_str(&format!("\nOutcome: {o}\n"));
     }
     let acl: Vec<&str> = acl.iter().map(String::as_str).collect();
-    Episode::sourced(
+    let mut ep = Episode::sourced(
         &format!("{signed}{}{id}", crate::SESSION_SOURCE),
         body.as_bytes(),
         &acl,
-    )
+    );
+    // About the repository, as a code host's connector names it, so what extraction finds in the session lands on
+    // the same entity as its pull requests' facts. Readable by the session's own reader alone, like the record.
+    if let Some(r) = repo {
+        ep.about = vec![format!("repo:{r}")];
+    }
+    ep
+}
+
+/// The repository `end_session` names (`repo`, the hook's `owner/name` from the checkout's origin), if it reads as
+/// one: two parts of letters, digits, `.`, `_` and `-`. Anything else names none, and the session ends all the same.
+fn repo_arg(args: &Value) -> Option<String> {
+    let r = text(args, "repo")?;
+    let (owner, name) = r.split_once('/')?;
+    let part = |p: &str| {
+        !p.is_empty()
+            && p.len() <= 100
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    (part(owner) && part(name)).then(|| r.to_string())
 }
 
 /// What became of a PR, for `who`'s sessions that opened it or pushed to its branch (`POST /sessions/prs`,
@@ -3788,7 +4042,7 @@ pub async fn judge(
                     }
                     _ => l.question.clone(),
                 };
-                let ep = transcript_episode(signed, &l.answer_id, &task, &c, None, &s.acl);
+                let ep = transcript_episode(signed, &l.answer_id, &task, &c, None, &s.acl, None);
                 let k = (
                     ep.episode_id.clone(),
                     String::from_utf8_lossy(&ep.body).into_owned(),
@@ -4473,6 +4727,8 @@ pub async fn sweep(
     let (mut tried, mut rejudged) = (0, 0);
     let before = now_micros() - idle.as_micros() as i64;
     let settled = now_micros() - judge_wait().as_micros() as i64;
+    // What the served-fact checks do here (`crate::served_checks::Mode`): read once a sweep.
+    let fact_checks = crate::served_checks::Mode::of(store, scope).await;
     let sessions: Vec<Logged> = list(store, scope)
         .await?
         .into_iter()
@@ -4515,7 +4771,7 @@ pub async fn sweep(
             };
             let asker = l.asker.clone();
             // One session failing doesn't hold up the rest: it is tried again at the next sweep.
-            match end(store, scope, &asker, &signed(&asker), l, &Value::Null).await {
+            match end(store, scope, &asker, &signed(&asker), l, &Value::Null, None).await {
                 Ok(l) => {
                     done.ended += 1;
                     l
@@ -4532,7 +4788,7 @@ pub async fn sweep(
         // The facts served in it, checked against how it went once it settled (`crate::served_checks`): a person's
         // session, not a program's or an eval's, and only where advice learns: a team that turned learning off sends
         // no transcript to a model. Once checked, what it served is no longer held, so a later sweep asks nothing.
-        let checkable = crate::served_checks::on()
+        let checkable = fact_checks != crate::served_checks::Mode::Off
             && learning
             && s.ended_at.is_some()
             && !automated(&l)
@@ -4542,12 +4798,22 @@ pub async fn sweep(
         if checkable && last_step(&l) > settled {
             done.facts_waiting += 1;
         } else if checkable && let Some(d) = decider.as_ref() {
-            match crate::served_checks::check(store, scope, d, &l).await {
+            // Reads a little before its start count as its own (a hook's recall beside its start), never ones
+            // before the end of the person's session that came before it.
+            let before = sessions
+                .iter()
+                .filter(|o| o.asker == l.asker && o.answer_id != l.answer_id)
+                .filter_map(|o| o.session.as_ref()?.ended_at)
+                .filter(|e| *e <= l.asked_at)
+                .max();
+            let from =
+                (l.asked_at - crate::served_checks::EARLY).max(before.map_or(i64::MIN, |e| e + 1));
+            match crate::served_checks::check(store, scope, d, &l, from).await {
                 Ok(c) if c.asked > 0 => {
                     done.facts_checked += 1;
                     eprintln!(
-                        "sessions {scope}: {} served facts checked in {}, {} flagged",
-                        c.asked, l.answer_id, c.flagged
+                        "sessions {scope}: {} served facts checked in {}, {} sure wrong, {} flagged",
+                        c.asked, l.answer_id, c.sure, c.flagged
                     )
                 }
                 Ok(_) => {}

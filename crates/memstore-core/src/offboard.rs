@@ -1,5 +1,6 @@
 //! Offboarding: an org deleted with its memory (`memstore org delete`), a person forgotten
-//! (`memstore users forget`), and an org's memory exported (`memstore org export`).
+//! (`memstore users forget`), what was ingested from some sources deleted (`/admin {"op": "forget_source"}`), and an
+//! org's memory exported (`memstore org export`).
 //!
 //! Deleting means the bytes are gone from the customer's storage, not hidden. The Iceberg crate this
 //! engine uses (iceberg-rust 0.10) can append and expire snapshots, but has no row delete, overwrite or
@@ -2325,6 +2326,42 @@ impl Store {
         Ok(out)
     }
 
+    /// The ids of every episode stored in `ns` whose source one of `targets` names: current, retired by a newer
+    /// version, or already retracted, as long as its row is there.
+    async fn stored_from(&self, ns: &str, targets: &[crate::AclTarget]) -> Result<HashSet<String>> {
+        let ident = TableIdent::new(NamespaceIdent::new(ns.into()), EPISODES.into());
+        if !self.catalog().table_exists(&ident).await? {
+            return Ok(HashSet::new());
+        }
+        let rows = read_files(&self.table(ns, EPISODES).await?, HashMap::new()).await?;
+        Ok(rows
+            .values()
+            .flat_map(|v| v.iter())
+            .flat_map(|b| {
+                strings(b, "episode_id")
+                    .into_iter()
+                    .zip(strings(b, "source"))
+            })
+            .filter(|(id, source)| targets.iter().any(|t| t.matches(id, source)))
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    /// How many fact rows of `ns` cite any of `ids`: those an erasure of them deletes.
+    async fn facts_citing(&self, ns: &str, ids: &HashSet<String>) -> Result<usize> {
+        let ident = TableIdent::new(NamespaceIdent::new(ns.into()), FACTS.into());
+        if ids.is_empty() || !self.catalog().table_exists(&ident).await? {
+            return Ok(0);
+        }
+        let rows = read_files(&self.table(ns, FACTS).await?, HashMap::new()).await?;
+        Ok(rows
+            .values()
+            .flat_map(|v| v.iter())
+            .flat_map(|b| strings(b, "source_episodes"))
+            .filter(|src| src.split(',').any(|e| ids.contains(e.trim())))
+            .count())
+    }
+
     /// Delete the episodes `ids` of `scope` for good, and what was drawn from them (an [`Erasure`], as a forget
     /// does): for a row the engine derived that must not outlive what it was drawn from (a person's profile
     /// version committed just as a note it cites was forgotten or deleted).
@@ -3307,6 +3344,94 @@ pub async fn purge_retracted(store: &Store, actor: &Actor, org: &str) -> Result<
         }])
         .await?;
     Ok(json!({"org": org, "purged": total}))
+}
+
+/// `forget_source`: delete for good every episode of one scope (`org`, or its `team`) that `targets` name by source (an
+/// exact source, or a source prefix), as an import undone: the episodes and their bodies, every fact citing any of them
+/// and what was drawn from them ([`Erasure`]), the scope's search indexes, and every version of each record (one a
+/// newer version only retired too). First they are retracted for every reader in one commit, holding nothing back
+/// ([`Store::release_all`]): the same record sent again later is current again, as a corrected import. Then they are
+/// erased from storage, as `org purge` erases. Which sources a caller may name (never the server's own) is the
+/// server's to check. With `dry_run` nothing changes: it answers what would go. Org admins in their org, the operator
+/// anywhere. Recorded in the org's audit: who, what was named and how much went, never what it said. Can be run again:
+/// one that stopped partway finds what it left.
+pub async fn forget_sources(
+    store: &Store,
+    actor: &Actor,
+    org: &str,
+    team: Option<&str>,
+    targets: &[crate::AclTarget],
+    named: &str,
+    dry_run: bool,
+) -> Result<Value> {
+    crate::cell::check_org(org)?;
+    if crate::check_name("org", org).is_err() {
+        return Err(Invalid(format!("invalid org name {org:?}")).into());
+    }
+    let dir = Directory::load(store).await?;
+    may_manage(&dir, actor, org, "delete sources")?;
+    let known = dir.orgs.get(org);
+    if org != DEFAULT_ORG && known.is_none() {
+        return Err(refused(format!("no org {org}")));
+    }
+    let scope = match team {
+        None => Scope::org(org)?,
+        Some(t) => {
+            if !known.is_some_and(|o| o.teams.contains_key(t)) {
+                return Err(refused(format!("no team {t} in org {org}")));
+            }
+            Scope::team(org, t)?
+        }
+    };
+    let ns = scope.namespace();
+    if dry_run {
+        let gone = store.stored_from(&ns, targets).await?;
+        let current = store
+            .current_episodes(&scope)
+            .await?
+            .into_keys()
+            .filter(|id| gone.contains(id))
+            .count();
+        let facts = store.facts_citing(&ns, &gone).await?;
+        return Ok(
+            json!({"scope": scope.to_string(), "named": named, "dry_run": true,
+                         "episodes": gone.len(), "current": current, "facts": facts}),
+        );
+    }
+    // Before anything changes: a catalog that can't rewrite a table would leave the delete halfway.
+    store.check_rewrites().await?;
+    // Gone for every reader at once, before the tables are rewritten one by one.
+    let retracted = store.release_all(&scope, &actor.user, targets).await?;
+    // Every stored version, read after the retraction, so a record sent just before it goes too.
+    let gone = store.stored_from(&ns, targets).await?;
+    let erased = match gone.is_empty() {
+        true => Forgotten::default(),
+        false => store.erase_episodes(&scope, gone).await?,
+    };
+    let detail = format!(
+        "delete sources {named}: {} ({} were current)",
+        serde_json::to_string(&erased)?,
+        retracted.len()
+    );
+    store
+        .append_audit(&[crate::audit::Entry {
+            at: chrono::Utc::now().timestamp_micros(),
+            kind: crate::audit::Kind::Change,
+            org: Some(org.to_string()),
+            incarnation: Some(known.map_or(0, |o| o.created_at)),
+            actor: crate::audit::clean(&actor.user),
+            scope: Some(scope.to_string()),
+            path: None,
+            detail: Some(detail),
+            status: None,
+            count: 1,
+            reads: 0,
+            writes: 0,
+        }])
+        .await?;
+    Ok(
+        json!({"scope": scope.to_string(), "named": named, "current": retracted.len(), "deleted": erased}),
+    )
 }
 
 /// `memstore org retention`: show an org's (or one of its teams') retention policy, or with `rules` set a

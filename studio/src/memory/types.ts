@@ -40,7 +40,12 @@ export type AdviceView = {
     needs_backing?: string | null;
     merged_into?: string | null;
   };
+  /** Every version of its note the reader may read, newest first (the first is the one above). */
+  history?: DocVersion[];
 };
+
+/** One version of an engine document (a note, a compiled skill): read in full with the `episode` op. */
+export type DocVersion = { episode_id: string; occurred_at: number; title: string };
 
 export type Listing = {
   path: string[];
@@ -84,10 +89,9 @@ export type Aip = {
   source_ids?: string[];
 };
 
-/** `skills/<goal>/<name>`: a compiled skill (with its AIP graph, null before it has one) or a routing index. */
+/** `skills/<name>`: a compiled skill (with its AIP graph, null before it has one) or a routing index. */
 export type SkillView = {
   path: string[];
-  goal: string;
   name: string;
   kind: "skill" | "skill_index";
   markdown: string;
@@ -97,6 +101,8 @@ export type SkillView = {
   /** The episodes the skill was compiled from that the reader may read, and how many more they may not. */
   sources?: { episode_id: string; name: string }[];
   sources_hidden?: number;
+  /** Every version of the skill the reader may read, newest first (the first is the one shown). */
+  history?: DocVersion[];
 };
 
 /** A branch of the scope, with how many compiled skills the reader may read on it. */

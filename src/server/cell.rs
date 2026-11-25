@@ -6,6 +6,13 @@
 //! - `AMPUP_MEMORY_CELL`: this server's cell (default `default`).
 //! - `AMPUP_MEMORY_CELL_MAP`: JSON, org to cell (`{"acme": "acme"}`); an org not named is the default cell's.
 //! - `AMPUP_MEMORY_CELL_URLS`: JSON, cell to the URL the default cell forwards to (`{"acme": "http://memstore-acme"}`).
+//! - `AMPUP_MEMORY_CELL_READ_TIMEOUT_SECS`: how long a console read sent to another cell may take before it is
+//!   answered 504 here and the forward dropped (default 45, under the console proxy's own 50 s).
+//! - `AMPUP_MEMORY_CELL_MAX_READS`: console reads in flight to any one cell at once; past it, 503 (default 64).
+//!
+//! Only the console's reads ([`console_read`]) have a deadline or a cap. A write or an agent's call (`/mcp`,
+//! `/remember`, a session's start or end) is waited on for as long as it takes: its client, told it timed out,
+//! would send it again while the first one still runs.
 //!
 //! A user's own scope's background work and the catalog-wide work (the ledger's compaction) are the default
 //! cell's. Only the default cell forwards, so a request never goes round in a loop. Another cell's org is never
@@ -54,7 +61,7 @@ fn url_of(org: &str) -> Option<&'static str> {
 /// The answer for another cell's `org` when that cell can't take the request (no ready server, or no URL):
 /// asked again later, never served here, so its memory is never loaded beside the default cell's.
 pub fn unavailable(org: &str) -> Response<Full<Bytes>> {
-    reply(
+    later(
         StatusCode::SERVICE_UNAVAILABLE,
         &format!("{org}'s servers aren't taking requests just now: try again"),
     )
@@ -130,14 +137,100 @@ pub async fn forward(org: &str, req: Request<Incoming>, max_body: usize) -> Resp
     let Ok(body) = body else {
         return reply(StatusCode::PAYLOAD_TOO_LARGE, "request too large");
     };
+    let body = body.to_bytes();
+    if !console_read(&parts.method, parts.uri.path(), &body) {
+        return send(url, &parts.method, &parts.uri, parts.headers, body, None).await;
+    }
+    // Held until the read is answered or given up on, so a cell that has stopped answering holds no more of
+    // this server's requests than the cap.
+    let Ok(_reading) = reads_to(url).try_acquire_owned() else {
+        eprintln!(
+            "cell at {url}: {} console reads already waiting on it: answered 503",
+            *MAX_READS
+        );
+        return later(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("{org}'s servers are busy just now: try again"),
+        );
+    };
+    let deadline = Some(*READ_DEADLINE);
     send(
         url,
         &parts.method,
         &parts.uri,
         parts.headers,
-        body.to_bytes(),
+        body,
+        deadline,
     )
     .await
+}
+
+/// How long a console read sent to another cell may take (`AMPUP_MEMORY_CELL_READ_TIMEOUT_SECS`, default 45 s):
+/// under the console proxy's own 50 s, so this server stops waiting on it no later than its caller does.
+static READ_DEADLINE: LazyLock<Duration> = LazyLock::new(|| {
+    let secs = std::env::var("AMPUP_MEMORY_CELL_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(45);
+    Duration::from_secs(secs)
+});
+
+/// Console reads in flight to any one cell at once (`AMPUP_MEMORY_CELL_MAX_READS`, default 64).
+static MAX_READS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("AMPUP_MEMORY_CELL_MAX_READS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(64)
+});
+
+/// The console reads in flight to the cell at `url`.
+fn reads_to(url: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
+    static READS: LazyLock<
+        std::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>,
+    > = LazyLock::new(Default::default);
+    READS
+        .lock()
+        .unwrap()
+        .entry(url.into())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(*MAX_READS)))
+        .clone()
+}
+
+/// The `/admin` ops the console reads with (its review and admin pages): none of them changes anything.
+const ADMIN_READS: &[&str] = &[
+    "show",
+    "get_schema",
+    "audit",
+    "activity",
+    "conversation",
+    "user_facts",
+    "advice_trail",
+    "advice_traces",
+    "advice_status",
+    "branch_diff",
+    "entity_owners",
+    "list_proposals",
+    "get_proposal",
+    "entity_graph",
+    "list_conflicts",
+    "dream_decisions",
+];
+
+/// Whether a request is one of the console's reads: `/me`, the Explorer's `/browse` and its lists (`/lessons`
+/// among them), and the `/admin` ops in [`ADMIN_READS`]. Only these are given up on ([`READ_DEADLINE`]): asked
+/// again, they change nothing. Every other route, and an `/admin` op that isn't listed, is waited on.
+fn console_read(method: &hyper::Method, path: &str, body: &[u8]) -> bool {
+    match path {
+        "/me" => true,
+        "/browse" | "/facts/list" | "/advice/list" | "/lessons" => method == hyper::Method::POST,
+        "/admin" => serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["op"].as_str().map(|op| ADMIN_READS.contains(&op)))
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// A request already read here (`body`) that turned out to be for `org` (and its `team`, where the scope is
@@ -162,7 +255,8 @@ pub async fn forward_read(
             headers.insert(h, v);
         }
     }
-    send(url, method, uri, headers, body).await
+    // Waited on whatever it is: this path forwards writes and agents' calls too.
+    send(url, method, uri, headers, body, None).await
 }
 
 const HOP: [&str; 5] = [
@@ -181,13 +275,25 @@ fn reply(code: StatusCode, msg: &str) -> Response<Full<Bytes>> {
     r
 }
 
-/// The request answered by the cell at `url`.
+/// [`reply`], with when to ask again: about when [`reachable`] looks at the cell again.
+fn later(code: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+    let mut r = reply(code, msg);
+    r.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static("5"),
+    );
+    r
+}
+
+/// The request answered by the cell at `url`; given up on after `deadline`, where there is one, and answered 504:
+/// the forward is dropped then, which closes its connection, so the cell can stop on it too.
 async fn send(
     url: &str,
     method: &hyper::Method,
     uri: &hyper::Uri,
     mut headers: hyper::HeaderMap,
     body: Bytes,
+    deadline: Option<Duration>,
 ) -> Response<Full<Bytes>> {
     static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         reqwest::Client::builder()
@@ -207,21 +313,43 @@ async fn send(
             "this org's server didn't answer: try again",
         )
     };
-    let res = match HTTP
-        .request(method.clone(), format!("{url}{path}"))
-        .headers(headers)
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("forwarding to the cell at {url} failed: {e}");
-            return gone();
-        }
+    let exchange = async {
+        let res = match HTTP
+            .request(method.clone(), format!("{url}{path}"))
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("forwarding to the cell at {url} failed: {e}");
+                return None;
+            }
+        };
+        let (status, headers) = (res.status(), res.headers().clone());
+        let body = res.bytes().await.ok()?;
+        Some((status, headers, body))
     };
-    let (status, mut headers) = (res.status(), res.headers().clone());
-    let Ok(body) = res.bytes().await else {
+    let answered = match deadline {
+        None => exchange.await,
+        Some(d) => match tokio::time::timeout(d, exchange).await {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!(
+                    "cell at {url} didn't answer {} {} within {}s: given up, answered 504",
+                    method,
+                    uri.path(),
+                    d.as_secs()
+                );
+                return later(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "this org's server is slow to answer just now: try again",
+                );
+            }
+        },
+    };
+    let Some((status, mut headers, body)) = answered else {
         return gone();
     };
     for h in HOP {

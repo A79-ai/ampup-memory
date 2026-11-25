@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 
 use super::{
     Client, Harness, KEEP_EVERY, injected, marker, message_of, normalized, redact, repo_name,
-    session_of, transcript_entries, transcript_of, warn, worth_retrying,
+    said_wait, session_of, transcript_entries, transcript_of, warn, worth_retrying,
 };
 
 /// A tool call's input or result kept whole up to this many bytes; past it, its first and last [`BLOCK_END`].
@@ -848,9 +848,10 @@ pub(super) async fn send(client: &Client, input: &Value, harness: Harness, due: 
     // next hook that sends what waits there (the next hook sends it again otherwise).
     let unreached = |e: anyhow::Error, rest: &[Part]| {
         if due == Due::Ending {
+            let said = said_wait(&e);
             for p in rest {
                 let name = format!("{session}-{:08}", from + p.start);
-                client.queue("transcript", &name, "/transcripts", body(p), None);
+                client.queue("transcript", &name, "/transcripts", body(p), None, said);
             }
         }
         e.context("the session's transcript waits to be sent")

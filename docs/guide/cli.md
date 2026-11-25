@@ -111,7 +111,7 @@ manifest and the steps to make it are in [self-hosting](self-hosting.md#sources-
 
 | Command | What it does |
 |---|---|
-| `ampup-memory runs load <scope> <file> [--as user] [--local DIR]` | Record a JSON-lines file of runs, scored or not, as one batch. |
+| `ampup-memory runs load <scope> <file> [--as user \| --import label [--acl ...]] [--local DIR]` | Record a JSON-lines file of runs, scored or not, as one batch; `--import` records graded runs as the org's import source instead of a person. |
 | `ampup-memory advice <scope> [--acl …] [--min-wrong N] [--local DIR]` | Learn advice from rewarded runs. |
 | `ampup-memory compile <scope> [--sources kb:,…] [--branch b] [--limit N] [--local DIR]` | Compile skills and AIP graphs. |
 | `ampup-memory extract [scope] [--limit N] [--dry-run] [--branch b] [--local DIR]` | Extract facts once. |

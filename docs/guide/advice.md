@@ -97,6 +97,13 @@ curl -s localhost:8080/runs/reward -d '{"run_id": "…", "reward": 1, "reason": 
 - **From a file.** `ampup-memory runs load <scope> runs.jsonl --as <user>` records one run a line as one batch.
   With `--local <dir>` (server stopped) it writes a `serve --local` store.
 - Limits: `AMPUP_MEMORY_RUNS_PER_DAY` (100) runs and `AMPUP_MEMORY_LOG_PER_DAY` (1000) answer-log entries per person a day.
+- **Imports.** An org's admin (or the operator) imports runs graded elsewhere as the org's:
+  `POST /runs {"import": "ci-nightly", "runs": [...], "acl"?: [...]}`, or `ampup-memory runs load <scope> runs.jsonl
+  --import ci-nightly`. Each run carries its `reward`. They are recorded as `import:ci-nightly`, not as a person;
+  their traces are the org's admins' (or the `acl` named: members or `group:<org>.all`, never `*`). Importing the
+  same runs again records nothing new. Imports have their own `AMPUP_MEMORY_IMPORT_RUNS_PER_DAY` (5000) per scope and
+  never count toward a person's caps. An imported run its grader rewarded counts as evidence of an outcome, so an
+  import alone can teach a team note; one person's own runs still need a second person.
 - Unrewarded runs older than `AMPUP_MEMORY_ADVICE_JUDGE_AFTER_SECS` (1800) are judged by a model (1, -1 or "can't
   tell"); a recorder's own reward later replaces the judgement. `AMPUP_MEMORY_ADVICE_JUDGE=off` turns that off.
   `ampup-memory qa-log <scope>` shows each judgement.
@@ -121,7 +128,8 @@ Rules that matter:
   that went wrong. One person's traces can't make a team note. Whether outcomes or people back it decides only
   whether it is [ratified](#ratified); a note whose runs they don't back is written again after 5 new runs or 2 new
   wrong ones of any kind, one whose runs they do after that many new backed ones. A note a repository seeded stays
-  until runs outcomes or people back come in.
+  until runs outcomes or people back come in. A note an org admin wrote stays as written until an admin replaces or
+  removes it ([Notes an admin writes](#notes-an-admin-writes)).
 - **What a team note is held for.** A team note is served to no one when an org admin held it (`/admin {"op":
   "hold_advice", "org", "keys"}`), when its situation is the conversation itself (going on with or steering work
   under way: the team writes those no note), or, where the scope curates, when its served runs scored worse.
@@ -132,7 +140,12 @@ Rules that matter:
   (600) once `AMPUP_MEMORY_ADVICE_MIN_NEW` (10) new rewarded runs are in. `serve --local` learns in its own scope
   without the setting. `AMPUP_MEMORY_ADVICE_LEARN=off` stops the timer; `AMPUP_MEMORY_ADVICE=off` stops learning.
 - **By hand.** `ampup-memory advice <scope> [--acl …] [--min-wrong N] [--local DIR]`, or `/admin {"op":
-  "learn_advice", "org", "team"?}` on a server.
+  "learn_advice", "org", "team"?}` on a server. The admin op learns from every rewarded run not sorted yet, read as
+  the log is now (the server that learns may not be the one the runs were recorded on), and learns again, up to 5
+  passes, once runs recorded while it learned reach `AMPUP_MEMORY_ADVICE_MIN_NEW` (fewer wait for the timer).
+- **Where it stands.** `/admin {"op": "advice_status", "org", "team"?}` (the org's admins): rewarded runs, how many
+  are sorted and how many wait, situations and notes, the learn queued or under way (since when, which pass), what
+  the last one did and skipped (too few runs, too few people, waiting for more runs, idle), and the last error.
 - **Audience.** Learning reads every rewarded run in the scope, so only an org's admins start it or turn it on,
   and the notes are written for the audience they name (`--acl`, default `*`).
 
@@ -233,6 +246,42 @@ the server writes it into notes for the kinds of task coding sessions are routed
   `POST /advice/seed` ([http-api.md](http-api.md#the-learning-loop)): at most 80 sources and 600 KB a call, and 20
   calls that keep something new per person a day on one server.
 
+## Notes an admin writes
+
+A team may already have the note it wants served for a kind of task: its runbook or playbook, or a note learned
+elsewhere (in another organization, by an earlier build). An org admin (or the operator) writes it into the team's
+advice as it is, and `get_advice` serves it for that kind of task:
+
+```json
+{"op": "write_advice", "org": "acme", "team": "ops"?, "category": "Incident response", "about"?: "…",
+ "situation": "Diagnose checkout failures", "when": "The report is about checkout errors or timeouts.",
+ "note": "# Advice: …\n\n## When\n…\n\n## Steps\n1. …\n\n## Pitfalls\n- …",
+ "label": "the payments team's runbook", "acl"?: ["*"], "dry_run"?: true}
+```
+
+- **Routed as any situation.** The situation goes into the map (its `when` is the line routing reads; needed for a
+  situation the map doesn't hold, and given for one it does, it replaces it), so a question of that kind of task is
+  routed to it as to a learned one.
+- **Served as written.** The note is markdown in a learned note's sections, its Steps made of `- ` or `1. ` items
+  (detail indented under each); one whose Steps hold no item, or a line outside an item, is refused. Nothing trims
+  it: no note budget, no redundant items dropped. Like any note, it is served without its Evidence and Freshness
+  sections, and without a dated `[state]` item once it is older than `AMPUP_MEMORY_ADVICE_STATE_DAYS`. `dry_run: true` writes nothing and answers the note as an agent would be served it.
+- **Marked as the admin's.** Its skill line says `written by an admin (<label>)`, its `Skill` is `"from": "admin"`,
+  and `/lessons` (the Learned tab) and `list_advice` carry `written_by` with the label, so nobody takes it for a note
+  learned from runs. It is ratified: an admin vouched for it.
+- **Pinned.** No learn writes it again, trims it, withholds it for its served runs' scores, merges its situation into
+  another or takes it out of the map, whatever runs come in, `resort` and `rewrite` included; runs of its kind of
+  task are still sorted into its situation and shown in its trail. It replaces the note the situation had, learned
+  or a repository's (a rewrite on trial is dropped, a hold lifted).
+- **Taken out.** The same op without `note` takes the note an admin wrote out of serving (it refuses a learned note:
+  `hold_advice` holds those). Its situation stays only where runs are sorted into it or procedures linked to it, and
+  learning may then write it a note from those runs. The note's document stays as its history, as a learned note's
+  does.
+- **Audience.** It is written for the map's audience, every note's: `acl` defaults to it (everyone, `*`, where the
+  scope has no advice yet), and another is refused. A learn for another audience leaves it as written, readable by
+  the audience it was written for, until an admin writes it again for the new one.
+- On a server that doesn't do the background writing it is checked, then queued for the writer, as `hold_advice` is.
+
 ## Procedures: AIP skills and step graphs
 
 A scope's chosen documents are compiled into a skill library as they come in. A skill is what an agent should do in
@@ -264,6 +313,16 @@ ampup-memory compile org --sources kb: --local ./store                    # a la
 - **Audiences.** Sources with different ACLs never share a batch. A skill is readable by exactly its sources' ACL.
 - `compile_kind: errors` tells the compiler its sources are error reports, so each skill's *When* names the
   exception and message.
+- `compile_kind: changes` tells it its sources are records of single changes (pull requests, tickets, commits): a
+  skill is a procedure people repeat (`add-a-database-migration`), which each change is folded into, not one skill
+  per change; a one-off change gives none. `AMPUP_MEMORY_COMPILE_KIND` sets a kind for a server whose settings name
+  none (`serve --local`), and `ampup-memory compile --kind` for one run.
+- **`changes` rebuilds.** Once a scope compiles as `changes`, skills compiled from those sources under other
+  prompts (before the kind was set) aren't shown to the model, so the library is compiled again from the sources rather than from the old skills; those stay served
+  until `ampup-memory compile <scope> --retire` lists the ones whose every source the current compile has read, and
+  `--retire --apply` retires them on main (every version, kept in the ledger) and writes their indexes again. It
+  also retires the documents compiled under `goals/` before skills were compiled per scope. A new model under the
+  same prompt updates the library in place, as before, and other kinds never rebuild.
 - `AMPUP_MEMORY_COMPILE=off` turns compiling off for the server; `set_settings {"compile": false}` for one org or team.
 
 ## Models

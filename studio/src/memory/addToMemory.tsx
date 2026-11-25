@@ -299,6 +299,10 @@ export type AddToMemoryProps = {
   /** A heading of its own; by default "Add to memory". */
   title?: string;
 };
+type AddToMemoryDialogProps = AddToMemoryProps & {
+  /** The opening button as an icon alone (the playground's composer), named for a screen reader. */
+  compact?: boolean;
+};
 
 /**
  * Add to memory: drop files or paste text, choose whose it is, and see the receipt of what was learned. For the
@@ -568,7 +572,7 @@ export function AddToMemoryButton({ open: openAtFirst = false, ...props }: AddTo
  * Add to memory as one button that opens the form in a dialog, for a page whose own layout leaves no room for
  * it (Home's quick actions and its first steps). Leaving the page, as the receipt's links do, closes it.
  */
-export function AddToMemoryDialog(props: AddToMemoryProps) {
+export function AddToMemoryDialog({ compact, ...props }: AddToMemoryDialogProps) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [open, setOpen] = useState(false);
   useEffect(() => {
@@ -580,9 +584,21 @@ export function AddToMemoryDialog(props: AddToMemoryProps) {
   if (!canLearn()) return null;
   return (
     <>
-      <button type="button" className="btn" onClick={() => setOpen(true)}>
-        <Icon name="doc" size={14} /> Add to memory
-      </button>
+      {compact ? (
+        <button
+          type="button"
+          className="btn learn-add-icon"
+          aria-label="Add to memory"
+          title="Add to memory"
+          onClick={() => setOpen(true)}
+        >
+          <Icon name="plus" size={14} />
+        </button>
+      ) : (
+        <button type="button" className="btn" onClick={() => setOpen(true)}>
+          <Icon name="doc" size={14} /> Add to memory
+        </button>
+      )}
       <dialog
         ref={dialog}
         className="learn-dialog"

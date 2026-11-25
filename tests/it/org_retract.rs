@@ -12,7 +12,14 @@
 //! never comes back, also one a newer version had only retired (`replaces_source`), which sent again alone would.
 //! A prefix holds only what exists now. With `"hold": false` (a prefix only) the delete holds nothing back: what
 //! it took is gone, purged too, and the same record sent again later is back.
+//!
+//! An import undone (`/admin {"op": "forget_source"}`): an org's admins in their org and the operator delete every
+//! episode of the org whose source a prefix (`<kind>:<more>`, never a whole connector) or a list names, every version
+//! of each, with every fact citing them, for every reader and from storage at once; never a source the server files
+//! itself, never another org's. A member, a key and another org's admin are refused; a dry run changes nothing. The
+//! same record sent again later is back.
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use http_body_util::Full;
@@ -103,6 +110,29 @@ async fn post(url: &str, bearer: &str, headers: &[(&str, &str)], body: &Value) -
     (r.status().as_u16(), r.json().await.unwrap_or_default())
 }
 
+/// Every file under `root` whose path doesn't hold `besides` and whose bytes hold `tag`.
+fn files_with(root: &Path, besides: &str, tag: &str) -> Vec<PathBuf> {
+    let mut out = vec![];
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if !p.to_string_lossy().contains(besides)
+                && let Ok(bytes) = std::fs::read(&p)
+                && bytes.windows(tag.len()).any(|w| w == tag.as_bytes())
+            {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// One episode as a connector sends it.
 fn batch(source: &str, body: &str, acl: &[&str]) -> Value {
     json!({"episodes": [{"source": source, "occurred_at": 1_760_000_000_000_000i64, "acl": acl, "body": body}]})
@@ -115,7 +145,9 @@ async fn an_org_retracts_its_own_episodes_and_nobody_elses() {
     let catalog = platform::local(&format!("file://{}", dir.path().display()))
         .await
         .unwrap();
-    let store = Store::new(catalog.clone());
+    // Its own index, beside the catalog, so a check of what is left on disk sees the index's files too.
+    let store =
+        Store::new(catalog.clone()).with_index_base(dir.path().join("index").display().to_string());
     store.ensure_scope(&Scope::Org).await.unwrap();
     let keys = json!([{"id": "platform", "sha256": auth::hex(&sha2::Sha256::digest(ADMIN_KEY.as_bytes())),
                        "user": "svc:platform", "admin": true}]);
@@ -136,6 +168,7 @@ async fn an_org_retracts_its_own_episodes_and_nobody_elses() {
         Options {
             listener: Some(listener),
             catalog: Some(catalog.clone()),
+            index_base: Some(store.index_base().to_string()),
             token_auth: Some(auth),
             directory_only: true,
             ..Default::default()
@@ -671,4 +704,260 @@ async fn an_org_retracts_its_own_episodes_and_nobody_elses() {
     assert!(!live().await.contains(&web1));
     ingest(&a_ingest, "sentry:acme/web/1", "Hydration mismatch").await;
     assert!(live().await.contains(&web1));
+
+    // An import undone: what acme's connector sent under `doc:policy/` (a document and the newer version that retired
+    // it, another document), a fact drawn from them, and one document outside the prefix; globex sent one of the
+    // very same records.
+    let tag = "zephyrimport";
+    let all = format!("group:{}", memstore::auth::acl::org_wide("acme"));
+    let doc = async |bearer: &str, source: &str, text: &str| -> String {
+        let body = json!({"episodes": [{"source": source, "occurred_at": 1_760_000_000_000_000i64,
+                          "acl": [all.as_str()], "body": text, "replaces_source": true}]});
+        let (status, v) = post(&format!("{s}/ingest"), bearer, &[], &body).await;
+        assert_eq!(status, 200, "{v}");
+        v["episode_ids"][0].as_str().unwrap().to_string()
+    };
+    let leave1 = doc(
+        &a_ingest,
+        "doc:policy/leave",
+        &format!("{tag} leave: 10 days"),
+    )
+    .await;
+    let leave2 = doc(
+        &a_ingest,
+        "doc:policy/leave",
+        &format!("{tag} leave: 20 days"),
+    )
+    .await;
+    let travel = doc(
+        &a_ingest,
+        "doc:policy/travel",
+        &format!("{tag} travel: economy"),
+    )
+    .await;
+    let intro = doc(&a_ingest, "doc:handbook/intro", "welcome aboard").await;
+    let theirs = doc(
+        &b_ingest,
+        "doc:policy/travel",
+        &format!("{tag} travel: economy"),
+    )
+    .await;
+    let mut f = Fact::new("policy:leave", "days", &format!("{tag} 20"));
+    f.source_episodes = vec![leave2.clone(), intro.clone()];
+    store
+        .commit(&acme, "extract:test", &[], &[f])
+        .await
+        .unwrap();
+    let reader = Principal::new("ann@acme.com", &["acme.all"]);
+    let fact_values = async || -> Vec<String> {
+        store
+            .read(&acme, &reader, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.value)
+            .collect()
+    };
+    let t = Instant::now();
+    while !fact_values().await.iter().any(|v| v.contains(tag)) {
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "the fact never showed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Globex's copy of the same record is the only one that may stay on disk.
+    let globex_ns = globex.namespace();
+    // Acme's admin reads it on the read paths checked after the delete.
+    let paths = |id: &str| {
+        [
+            (
+                "/query",
+                json!({"data": [[0, {"find": "passages", "text": tag, "limit": 100}]]}),
+            ),
+            ("/episode", json!({"data": [[0, id]]})),
+        ]
+    };
+    for id in [&leave2, &travel] {
+        for (path, body) in paths(id) {
+            let t = Instant::now();
+            loop {
+                let (status, v) = post(&format!("{s}{path}"), &alice, &in_acme, &body).await;
+                assert_eq!(status, 200, "{path}: {v}");
+                if v.to_string().contains(tag) {
+                    break;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(15),
+                    "{path} never read it: {v}"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+    let before_files = files_with(dir.path(), &globex_ns, tag);
+    assert!(
+        !before_files.is_empty(),
+        "the import is not on disk: {before_files:?}"
+    );
+    let before = live().await;
+    for id in [&leave2, &travel, &intro] {
+        assert!(before.contains(id), "{id} isn't current: {before:?}");
+    }
+    let forget = async |bearer: &str, body: Value| {
+        let mut body = body;
+        body["op"] = json!("forget_source");
+        post(&format!("{s}/admin"), bearer, &[], &body).await
+    };
+    let gary = id_token(&issuer, "gary@globex.com");
+    let policy = json!({"org": "acme", "source_prefix": "doc:policy/"});
+    // Refused, and nothing changes: who may not, and what nobody may name this way.
+    for (who, bearer, body, want) in [
+        ("an acme member", bob.as_str(), policy.clone(), 403),
+        ("acme's ingest key", a_ingest.as_str(), policy.clone(), 403),
+        ("acme's reader key", a_reader.as_str(), policy.clone(), 403),
+        ("globex's admin", gary.as_str(), policy.clone(), 403),
+        ("no credential", "", policy.clone(), 401),
+        (
+            "a whole connector",
+            alice.as_str(),
+            json!({"org": "acme", "source_prefix": "doc:"}),
+            400,
+        ),
+        (
+            "no family",
+            alice.as_str(),
+            json!({"org": "acme", "source_prefix": "doc"}),
+            400,
+        ),
+        (
+            "the whole org",
+            alice.as_str(),
+            json!({"org": "acme", "source_prefix": ""}),
+            400,
+        ),
+        (
+            "the server's notes",
+            alice.as_str(),
+            json!({"org": "acme", "source_prefix": "mcp:remember_memory:"}),
+            400,
+        ),
+        (
+            "the server's notes, as the operator",
+            ADMIN_KEY,
+            json!({"org": "acme", "source_prefix": "MCP:remember_memory:"}),
+            400,
+        ),
+        (
+            "learned advice",
+            alice.as_str(),
+            json!({"org": "acme", "sources": ["advice:learn"]}),
+            400,
+        ),
+        (
+            "a dream's links",
+            alice.as_str(),
+            json!({"org": "acme", "source_prefix": "dream:same/"}),
+            400,
+        ),
+        (
+            "both",
+            alice.as_str(),
+            json!({"org": "acme", "source_prefix": "doc:policy/", "sources": ["doc:policy/leave"]}),
+            400,
+        ),
+        ("neither", alice.as_str(), json!({"org": "acme"}), 400),
+        (
+            "an empty list",
+            alice.as_str(),
+            json!({"org": "acme", "sources": []}),
+            400,
+        ),
+    ] {
+        let (status, v) = forget(bearer, body).await;
+        assert_eq!(status, want, "{who}: {v}");
+    }
+    assert_eq!(live().await, before);
+    // A dry run says what would go, and changes nothing.
+    let mut dry = policy.clone();
+    dry["dry_run"] = json!(true);
+    let (status, v) = forget(&alice, dry).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(
+        (&v["episodes"], &v["current"], &v["facts"]),
+        (&json!(3), &json!(2), &json!(1)),
+        "{v}"
+    );
+    assert_eq!(live().await, before);
+    assert!(fact_values().await.iter().any(|v| v.contains(tag)));
+    // Acme's admin deletes it: every version of each record, the fact citing one, for every reader and from disk.
+    let (status, v) = forget(&alice, policy.clone()).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(
+        (
+            &v["current"],
+            &v["deleted"]["episodes"],
+            &v["deleted"]["facts"]
+        ),
+        (&json!(2), &json!(3), &json!(1)),
+        "{v}"
+    );
+    let now = live().await;
+    for id in [&leave1, &leave2, &travel] {
+        assert!(!now.contains(id), "{id} survived: {now:?}");
+    }
+    assert!(now.contains(&intro), "{now:?}");
+    assert!(!fact_values().await.iter().any(|v| v.contains(tag)));
+    for (path, body) in [
+        ("/search", json!({"data": [[0, tag, 50, -1]]})),
+        (
+            "/query",
+            json!({"data": [[0, {"find": "passages", "text": tag, "limit": 100}]]}),
+        ),
+        (
+            "/query",
+            json!({"data": [[0, {"find": "facts", "time": "all", "limit": 500}]]}),
+        ),
+        ("/episode", json!({"data": [[0, leave1]]})),
+        ("/episode", json!({"data": [[0, leave2]]})),
+        ("/episode", json!({"data": [[0, travel]]})),
+    ] {
+        let (status, v) = post(&format!("{s}{path}"), &alice, &in_acme, &body).await;
+        assert_eq!(status, 200, "{path}: {v}");
+        assert!(!v.to_string().contains(tag), "{path} still reads it: {v}");
+    }
+    let left = files_with(dir.path(), &globex_ns, tag);
+    assert!(left.is_empty(), "still on disk: {left:?}");
+    // Globex's own copy of the same record stays, as it was.
+    assert!(
+        store
+            .current_episodes(&globex)
+            .await
+            .unwrap()
+            .contains_key(&theirs),
+        "globex's episode went with acme's"
+    );
+    // Run again, nothing is left to delete.
+    let (status, v) = forget(&alice, policy.clone()).await;
+    assert_eq!((status, &v["deleted"]["episodes"]), (200, &json!(0)), "{v}");
+    // A corrected import of the same record is current again.
+    assert_eq!(
+        doc(
+            &a_ingest,
+            "doc:policy/travel",
+            &format!("{tag} travel: economy")
+        )
+        .await,
+        travel
+    );
+    assert!(live().await.contains(&travel));
+    // The operator deletes by a list of exact sources.
+    let (status, v) = forget(
+        ADMIN_KEY,
+        json!({"org": "acme", "sources": ["doc:policy/travel"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(&v["deleted"]["episodes"], &json!(1), "{v}");
+    assert!(!live().await.contains(&travel));
 }
