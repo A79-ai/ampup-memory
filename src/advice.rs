@@ -2488,7 +2488,7 @@ pub async fn usage(
                     "used": used, "recalled": recalled, "people": people.len(), "went_well": ok,
                     "went_wrong": bad, "no_outcome": used - ok - bad, "last_used_at": last,
                     "ratified": !mine && team_ratified(approved, unbacked.is_some(), earned),
-                    "untested": !mine && tallies.get(&k).map_or(true, |t| t.served + t.withheld == 0),
+                    "untested": !mine && tallies.get(&k).is_none_or(|t| t.served + t.withheld == 0),
                     "approved": approved, "sessions_count": listed});
                 if note.is_some() {
                     v["sessions"] = json!(sessions);
