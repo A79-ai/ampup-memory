@@ -21,7 +21,7 @@ export default defineConfig({
   server: {
     port: 5174,
     proxy: Object.fromEntries(
-      ["/browse", "/search", "/me", "/lessons", "/mcp", "/agent/run", "/admin", "/learn"].map((p) => [
+      ["/browse", "/search", "/me", "/lessons", "/mcp", "/agent/run", "/admin", "/learn", "/skills"].map((p) => [
         p,
         memory,
       ]),

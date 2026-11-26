@@ -6,7 +6,16 @@ import { advice, Marked, SESSION, tool } from "./ask";
 import { entityName, humanize, short, when } from "./format";
 import { EntityLink } from "./layouts";
 import { Markdown } from "./markdown";
-import { readSearch, type Found } from "./searchText";
+import {
+  citeIndex,
+  citeParts,
+  readSearch,
+  resultTeam,
+  searchTexts,
+  type Cited,
+  type ContextMessage,
+  type Found,
+} from "./searchText";
 import { adviceStarters, type AdviceEntry, type Starter } from "./starters";
 import type { Fact, Focus, Listing, Selection } from "./types";
 import { ErrorState, Icon, Skeleton } from "./ui";
@@ -103,11 +112,7 @@ interface Step {
 }
 /** What the model was given (memstore's `/agent/run` sends it from late 2026; older servers don't). */
 interface Context {
-  messages: {
-    role: string;
-    content?: string | null;
-    tool_calls?: { function?: { name?: string; arguments?: string } }[];
-  }[];
+  messages: ContextMessage[];
   tools: { function?: { name?: string; description?: string } }[];
 }
 interface Run {
@@ -149,9 +154,15 @@ export function Agent({
   onFocus,
   addToMemory,
   connect,
+  teams = [],
+  onScope,
 }: {
   sel: Selection;
   onFocus?: (f: Focus) => void;
+  /** The teams whose memory the reader may ask, besides the org's own: the namespaces a question is scoped to. */
+  teams?: string[];
+  /** Ask in another team's memory (none: the org's), and open `then` there. */
+  onScope?: (team: string | undefined, then?: Focus) => void;
   /** The host's "Add to memory" control, for an empty memory's first step. */
   addToMemory?: React.ReactNode;
   /** Where the host connects a source and an agent (as Home's `connect`). */
@@ -194,6 +205,9 @@ export function Agent({
   const arms = [...BUILTIN, ...saved];
   const selKey = JSON.stringify([sel.org, sel.team, sel.branch]);
   const open = (f: Focus) => onFocus?.(f);
+  /** Opens `f` in `team`'s memory, where a result the agent found is (none: the one being asked). */
+  const openIn = (f: Focus, team?: string) =>
+    team && team !== sel.team && onScope ? onScope(team, f) : open(f);
 
   useEffect(() => {
     const store = armStore();
@@ -339,13 +353,30 @@ export function Agent({
 
   // The columns: the conversation's own, then each arm compared with it.
   const columns = [PRIMARY, ...compare.filter((id) => arms.some((a) => a.id === id))];
-  const scope = [
-    sel.org,
-    sel.team && `team ${sel.team}`,
-    sel.branch && sel.branch !== "main" && sel.branch,
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  // The namespace a question is asked in: the org's memory or one of its teams', picked here where there is a choice.
+  const branch = sel.branch && sel.branch !== "main" ? ` · ${sel.branch}` : "";
+  const scope =
+    onScope && (teams.length > 0 || sel.team) ? (
+      <>
+        <select
+          className="pg-scope-pick mono"
+          aria-label="Namespace"
+          title="The memory a question is asked in: the org's, or one team's"
+          value={sel.team ?? ""}
+          onChange={(e) => onScope(e.target.value || undefined)}
+        >
+          <option value="">{sel.org}</option>
+          {[...new Set([...(sel.team ? [sel.team] : []), ...teams])].map((t) => (
+            <option key={t} value={t}>
+              {sel.org} / {t}
+            </option>
+          ))}
+        </select>
+        {branch}
+      </>
+    ) : (
+      `${sel.org}${sel.team ? ` / ${sel.team}` : ""}${branch}`
+    );
   const composer = (placeholder: string) => (
     <Composer
       boxRef={box}
@@ -535,7 +566,7 @@ export function Agent({
                                 result={result}
                                 sel={sel}
                                 question={t.question}
-                                onFocus={open}
+                                onFocus={openIn}
                                 retry={() => runArm(i, t.question, key, arm, turns.slice(0, i))}
                                 withoutMemory={
                                   key === PRIMARY &&
@@ -705,11 +736,19 @@ function useStarters(sel: Selection): Starter[] | undefined {
     const fill = (learned: Starter[]) =>
       [...learned, ...SUGGESTIONS.map(([, question]) => ({ question }))].slice(0, 3);
     setStarters(undefined);
-    tool(sel, "list_advice", { space: "all", limit: 200 })
-      .then((text) => {
-        const answered = JSON.parse(text || "{}") as { advice?: AdviceEntry[] };
-        if (live) setStarters(fill(adviceStarters(answered.advice ?? [])));
+    const read = (args: Record<string, unknown>) =>
+      tool(sel, "list_advice", { ...args, limit: 200 }).then(
+        (text) => (JSON.parse(text || "{}") as { advice?: AdviceEntry[] }).advice ?? [],
+      );
+    // The best backed rank first, and a note that helped once is backed best: the team's notes that helped give
+    // the same three as every note does, where they give three, without reading the reader's own notes (which have
+    // no tally) or the rest. Where they don't, every note is read.
+    read({ space: "team", min_helped: 1 })
+      .then((helped) => {
+        const best = adviceStarters(helped);
+        return best.length >= 3 ? best : read({ space: "all" }).then((all) => adviceStarters(all));
       })
+      .then((learned) => live && setStarters(fill(learned)))
       .catch(() => live && setStarters(fill([])));
     return () => {
       live = false;
@@ -818,7 +857,7 @@ function Composer({
   onSend: () => void;
   disabled?: boolean;
   placeholder: string;
-  scope: string;
+  scope: React.ReactNode;
   left?: React.ReactNode;
   right?: React.ReactNode;
   hint?: React.ReactNode;
@@ -1026,7 +1065,8 @@ function Answer({
   withoutMemory,
   onFocus,
 }: {
-  onFocus: (f: Focus) => void;
+  /** Opens a focus, in the team whose memory a result is in where it names one. */
+  onFocus: (f: Focus, team?: string) => void;
   arm: Arm;
   result: Result;
   sel: Selection;
@@ -1056,6 +1096,8 @@ function Answer({
     );
   const { run } = result;
   const ran = run.steps.filter((s) => s.ran).length;
+  // The search answers whole (what the model was given), not their traces cut short: a citation may point past the cut.
+  const cited = citeIndex(searchTexts(run.steps, run.context?.messages));
   return (
     <div className="pg-answer">
       {run.steps.length > 0 && (
@@ -1069,7 +1111,18 @@ function Answer({
         <div className="pg-stopped">{STOPPED[run.stopped] ?? run.stopped}</div>
       )}
       <div className="pg-md">
-        {run.answer ? <Markdown text={run.answer} /> : <span className="pg-muted">No answer.</span>}
+        {run.answer ? (
+          <Markdown
+            text={run.answer}
+            cite={(inside) => {
+              // A bracket that cites nothing it can open reads as written.
+              const parts = citeParts(inside);
+              return parts.length ? <Citation parts={parts.map(cited)} onFocus={onFocus} /> : null;
+            }}
+          />
+        ) : (
+          <span className="pg-muted">No answer.</span>
+        )}
       </div>
       <div className="pg-meta">
         <span>{modelName(run.model || arm.model)}</span>
@@ -1094,6 +1147,57 @@ function Answer({
   );
 }
 
+/**
+ * An answer's citation (`[e6 @347, e2 @876]`), one pill per subject it cites: the subject's name, opening it; an
+ * episode the search listed where no subject carries the marker; the marker as written where neither is known.
+ */
+function Citation({
+  parts,
+  onFocus,
+}: {
+  parts: Cited[];
+  onFocus: (f: Focus, team?: string) => void;
+}) {
+  const shown = parts.filter(
+    (p, i) => !p.entity || parts.findIndex((q) => q.entity === p.entity) === i,
+  );
+  return (
+    <>
+      {shown.map((p) =>
+        p.entity ? (
+          <button
+            key={p.marker}
+            type="button"
+            className="pg-cite"
+            title={`${p.entity}${p.team ? ` · in team ${p.team}` : ""}${p.marker !== p.entity ? ` · cited as ${p.marker}` : ""}`}
+            onClick={() => onFocus({ kind: "entity", path: entityPath(p.entity!) }, p.team)}
+          >
+            {entityName(p.entity).name}
+          </button>
+        ) : p.episode ? (
+          <button
+            key={p.marker}
+            type="button"
+            className="pg-cite mono"
+            title={`Episode ${p.episode} · cited as ${p.marker}`}
+            onClick={() => onFocus({ kind: "episode", id: p.episode! })}
+          >
+            {short(p.episode)}
+          </button>
+        ) : (
+          <span
+            key={p.marker}
+            className="pg-cite pg-cite-unknown mono"
+            title="Not in a search it made"
+          >
+            {p.marker}
+          </span>
+        ),
+      )}
+    </>
+  );
+}
+
 const STOPPED: Record<string, string> = {
   "tool budget": "Stopped at its tool-call cap",
   "time budget": "Stopped at the time limit",
@@ -1101,7 +1205,13 @@ const STOPPED: Record<string, string> = {
 };
 
 /** A tool call as one row, as an agent's trace shows it: the tool, what it asked, how it went; open for what it got. */
-function StepRow({ step, onFocus }: { step: Step; onFocus: (f: Focus) => void }) {
+function StepRow({
+  step,
+  onFocus,
+}: {
+  step: Step;
+  onFocus: (f: Focus, team?: string) => void;
+}) {
   // A search the agent made reads as the facts it found, each linked; what the model got stays one click away.
   const found =
     step.ran && !step.error && step.tool === "search_memory" ? readSearch(step.text) : undefined;
@@ -1132,7 +1242,10 @@ function StepRow({ step, onFocus }: { step: Step; onFocus: (f: Focus) => void })
           <ul className="pg-step-hits">
             {hits.results.map((r, i) => (
               <li key={i}>
-                <EntityLink entity={r.entity} onFocus={onFocus} />
+                <EntityLink
+                  entity={r.entity}
+                  onFocus={(f) => onFocus(f, resultTeam(` · ${r.when}`))}
+                />
                 <span className="pg-step-line">
                   <Marked line={r.lines[0] ?? ""} sources={hits.sources} onFocus={onFocus} />
                 </span>
@@ -1978,7 +2091,7 @@ function SearchPane({
   question: string;
   onSearch: (q: string) => void;
   onFocus: (f: Focus) => void;
-  scope: string;
+  scope: React.ReactNode;
 }) {
   const [draft, setDraft] = useState(question);
   const [found, setFound] = useState<Part<Hit[]>>({ status: "idle" });

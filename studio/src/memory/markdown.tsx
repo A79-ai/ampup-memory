@@ -6,28 +6,39 @@
 export function Markdown({
   text,
   code,
+  cite,
 }: {
   text: string;
   code?: (span: string) => React.ReactNode | null;
+  /** How a citation (`[e6 @347]`, `[topic:memstore_cli]`) reads, given what's inside its brackets; as written where it gives none. */
+  cite?: (inside: string) => React.ReactNode | null;
 }) {
   const inline = (s: string, at: number): React.ReactNode[] =>
-    s.split(/(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\))/).map((part, i) => {
-      const k = `${at}-${i}`;
-      if (part.startsWith("**") && part.endsWith("**") && part.length > 4)
-        return <b key={k}>{part.slice(2, -2)}</b>;
-      if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
-        const span = part.slice(1, -1);
-        return <span key={k}>{code?.(span) ?? <code>{span}</code>}</span>;
-      }
-      const link = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/.exec(part);
-      if (link)
-        return (
-          <a key={k} href={link[2]} target="_blank" rel="noopener noreferrer">
-            {link[1]}
-          </a>
-        );
-      return part;
-    });
+    s
+      .split(
+        /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\)|\[(?:e\d+|[a-z][a-z0-9_]*:[^\s\]])[^\]\n]*\](?!\())/,
+      )
+      .map((part, i) => {
+        const k = `${at}-${i}`;
+        if (cite && /^\[(?:e\d+|[a-z][a-z0-9_]*:[^\s\]])[^\]\n]*\]$/.test(part)) {
+          const shown = cite(part.slice(1, -1));
+          if (shown != null) return <span key={k}>{shown}</span>;
+        }
+        if (part.startsWith("**") && part.endsWith("**") && part.length > 4)
+          return <b key={k}>{part.slice(2, -2)}</b>;
+        if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
+          const span = part.slice(1, -1);
+          return <span key={k}>{code?.(span) ?? <code>{span}</code>}</span>;
+        }
+        const link = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/.exec(part);
+        if (link)
+          return (
+            <a key={k} href={link[2]} target="_blank" rel="noopener noreferrer">
+              {link[1]}
+            </a>
+          );
+        return part;
+      });
   const out: React.ReactNode[] = [];
   let list: { ordered: boolean; start: number; items: React.ReactNode[] } | null = null;
   let table: string[][] | null = null;

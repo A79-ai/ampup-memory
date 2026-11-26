@@ -20,6 +20,7 @@ export class LocalTransport implements Transport {
     // The org's settings are the hosted directory's: a local server keeps none to change.
     settings: false,
     learn: true,
+    repoSkills: true,
   };
 
   /** `base`: where the server answers, when not the pages' own origin (a dev server proxies it instead). */
@@ -60,6 +61,8 @@ export class LocalTransport implements Transport {
         const { op, ...rest } = body;
         return this.send<T>("POST", op === "status" ? "/learn/status" : "/learn", sel, rest);
       }
+      case "skills":
+        return this.send<T>("POST", "/skills/review", sel, body);
     }
   }
 

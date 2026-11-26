@@ -1401,6 +1401,7 @@ fn main() -> Result<()> {
     // a session tool's first call overflowed it. Reserved, not committed, so the debug size costs nothing idle.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(worker_threads())
         .thread_stack_size(if cfg!(debug_assertions) {
             32 << 20
         } else {
@@ -1414,7 +1415,14 @@ fn main() -> Result<()> {
         std::thread::Builder::new()
             .name("main".into())
             .stack_size(64 << 20)
-            .spawn_scoped(s, || rt.block_on(Box::pin(run(cli.command, cli.direct))))
+            .spawn_scoped(s, || {
+                rt.block_on(Box::pin(async {
+                    let done = run(cli.command, cli.direct).await;
+                    // The answers servers share, purged for what the command removed (done or not), before exiting.
+                    memstore::shared_answers::settled(std::time::Duration::from_secs(60)).await;
+                    done
+                }))
+            })
             .map(|t| t.join())
     });
     let done = match done {
@@ -2922,6 +2930,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             local: Some(dir),
         } => {
             let store = local_store(dir).await?;
+            memstore::shared_answers::install_object_for(&store);
             return retract_facts(&store, scope, fact.as_deref(), extractor.as_deref()).await;
         }
         Cmd::CompactLedger {
@@ -2930,6 +2939,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             local: Some(dir),
         } => {
             let store = local_store(dir).await?;
+            memstore::shared_answers::install_object_for(&store);
             return compact_ledger(&store, *dry_run, aggregates.as_deref()).await;
         }
         Cmd::MergeSubjects {
@@ -2940,6 +2950,7 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
             local: Some(dir),
         } => {
             let store = local_store(dir).await?;
+            memstore::shared_answers::install_object_for(&store);
             return merge_subjects(
                 &store,
                 scope,
@@ -2955,6 +2966,11 @@ async fn run(cmd: Cmd, direct: bool) -> Result<()> {
     }
     let catalog = platform::catalog_from_env().await?;
     let store = Store::new(catalog.clone());
+    // What a command removes purges the answers servers share (`AMPUP_MEMORY_SHARED_ANSWERS=object`), as a
+    // server's removals do. A server installs its own.
+    if !matches!(cmd, Cmd::Serve { .. }) {
+        memstore::shared_answers::install_object_for(&store);
+    }
     match cmd {
         Cmd::DreamSchedule {
             scope,
@@ -3891,6 +3907,25 @@ async fn search_batch(
 /// `DIR/index` and the vectors an index update computes in `DIR/embeddings` (unless AMPUP_MEMORY_EMBED_CACHE says
 /// otherwise). Not the default index location (`~/.cache/memstore/index`), which every local store would share:
 /// an index built there for one store was read, and overwritten, as another's.
+/// The async runtime's worker threads: as many as the CPUs this process may use (`TOKIO_WORKER_THREADS` says
+/// otherwise), and never fewer than [`MIN_WORKERS`]. A container's CPU limit can give few, and work that holds a
+/// worker for seconds between awaits (a part of Studio's Home over a large memory, a search's scoring, a build of a
+/// visibility state) then keeps every other request waiting to be polled again, even one with nothing left to do but
+/// answer: with one worker, Home parts that do a few milliseconds of work each were answered in 0.5-0.6 s. With more
+/// threads than CPUs, the operating system shares the CPUs between them instead.
+fn worker_threads() -> usize {
+    let cpus = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|n| n.trim().parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(1);
+    cpus.max(MIN_WORKERS)
+}
+
+/// The fewest worker threads the runtime is given ([`worker_threads`]).
+const MIN_WORKERS: usize = 8;
+
 async fn local_store(dir: &std::path::Path) -> Result<Store> {
     Ok(on_local(dir, memstore::platform::local_dir(dir).await?))
 }

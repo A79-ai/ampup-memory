@@ -100,6 +100,29 @@ pub struct Reader<'a> {
     pub every_session: bool,
 }
 
+/// The `/browse` ops, as the Studio's read latency names them (`memstore_studio_read_seconds`): one of these, else
+/// `other`, never the caller's own text. `home` and `scopes` the server answers itself; the rest [`run`] does.
+const OPS: [&str; 12] = [
+    "home",
+    "scopes",
+    "facts",
+    "advice",
+    "advice_usage",
+    "lessons",
+    "ls",
+    "sources",
+    "episode",
+    "entity",
+    "branches",
+    "schema",
+];
+
+/// A `/browse` request's op as a metric's label ([`OPS`]); a request naming none is an `ls`, as [`run`] takes it.
+pub fn op_label(req: &Value) -> &'static str {
+    let op = req["op"].as_str().unwrap_or("ls");
+    OPS.into_iter().find(|o| *o == op).unwrap_or("other")
+}
+
 /// Answers one `/browse` request as `reader`.
 pub async fn run(
     store: &Store,
@@ -112,8 +135,8 @@ pub async fn run(
         // The filterable lists (`crate::listing`): `/facts/list` and `/advice/list` are these ops.
         "facts" => crate::listing::facts(store, session, who, req).await,
         "advice" => crate::listing::advice(store, session, who, req).await,
-        // The advice page: each team note's use, outcomes and sessions, everyone's sessions for those who read
-        // everyone's notes (an org's admins, where it shows people's activity), else the reader's own.
+        // The advice page: each team note's use and outcomes, and with `note`, that note's sessions: everyone's for
+        // those who read everyone's notes (an org's admins, where it shows people's activity), else the reader's own.
         "advice_usage" => {
             let days = match &req["days"] {
                 Value::Null => None,
@@ -124,8 +147,16 @@ pub async fn run(
                 ),
             };
             // One person's own notes instead of the reader's: an admin's view of someone (as `/lessons` reads
-            // them), or the reader naming themselves.
+            // them), or the reader naming themselves. Every person's own notes at once (`"person": "*"`) are the
+            // platform operator's view, for support: only a reader of all of the org's memory, whose own sign-in
+            // already reads what people keep to themselves, never an org's admin or the operator's admin key.
             let person = match req["person"].as_str().filter(|p| !p.is_empty()) {
+                Some(crate::advice::EVERYONE) if !who.reads_all() => {
+                    return Err(bad(
+                        "only the platform's operator reads every person's own advice",
+                    ));
+                }
+                Some(crate::advice::EVERYONE) => Some(crate::advice::EVERYONE.to_string()),
                 Some(p)
                     if !reader.every_session
                         && crate::auth::acl::norm_id(p)
@@ -135,7 +166,17 @@ pub async fn run(
                 }
                 p => p.map(crate::auth::acl::norm_id),
             };
-            usage_kept(store, session.scope(), reader, days, person).await
+            // One note's key: that note alone, with its sessions (the list carries only their count).
+            let note = match &req["note"] {
+                Value::Null => None,
+                v => Some(
+                    v.as_str()
+                        .filter(|k| !k.is_empty() && k.len() <= 1024)
+                        .ok_or_else(|| bad("note is an advice note's key"))?
+                        .to_string(),
+                ),
+            };
+            usage_kept(store, session.scope(), reader, days, person, note).await
         }
         // What it learned, lesson by lesson, with where each came from and where it was served (`/lessons`).
         "lessons" => crate::lessons::run(store, session, reader, req).await,
@@ -155,11 +196,12 @@ pub async fn run(
                 .clamp(1, MAX_LIMIT);
             let after = req["after"].as_str();
             let narrow = Narrow::of(req, reader)?;
-            // The entities and their types, and the sessions, unnarrowed: kept ([`entities_kept`]).
+            // The entities and their types, the sessions and the skills, unnarrowed: kept ([`entities_kept`]).
             if narrow.is_empty()
                 && match path.first().map(String::as_str) {
                     Some("entities") => path.len() <= 2,
                     Some("sessions") => true,
+                    Some("skills") => path.len() == 1,
                     _ => false,
                 }
             {
@@ -193,10 +235,17 @@ pub async fn run(
         "branches" => branches(store, session.scope(), who, req["build"] != false).await,
         // The schema the memory is typed with on the branch read, and every version committed there (oldest
         // first): it holds no memory, only the types and what its `extract` section names.
+        // `history: false`: only how many versions there are (`versions`), not each of them (a page counting them
+        // needn't read every version's types).
         "schema" => {
-            let history: Vec<&crate::query::schema::Schema> =
-                session.vis().schemas.iter().map(|s| &**s).collect();
-            Ok(json!({"schema": session.schema().as_deref(), "history": history}))
+            let schemas = &session.vis().schemas;
+            let mut v = json!({"schema": session.schema().as_deref(), "versions": schemas.len()});
+            if req["history"] != false {
+                let history: Vec<&crate::query::schema::Schema> =
+                    schemas.iter().map(|s| &**s).collect();
+                v["history"] = json!(history);
+            }
+            Ok(v)
         }
         op => Err(bad(format!(
             "unknown op {op:?}: ls, entity, episode, branches, schema, sources, facts, advice, advice_usage, lessons or home"
@@ -318,33 +367,37 @@ impl Narrow {
 
 /// Each reader's advice page (`advice_usage`), by memory state and answer log.
 static USAGE: std::sync::LazyLock<crate::kept_answers::Kept<Value>> =
-    std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(500));
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500));
 
-/// `advice_usage` over the last `days` (none: all), kept by memory state and the scope's answer log
-/// ([`crate::kept_answers`]): it reads every note the reader may read and every session logged. Kept by the reader
-/// (who, every group they read as, and whether they read everyone's sessions) and the days asked for, and, for a
-/// window of days, the span of time it was asked in ([`crate::kept_answers::span`]): the window ends when the answer
-/// was worked out, never more than [`crate::kept_answers::STALE`] before now.
+/// `advice_usage` over the last `days` (none: all), of every note or only `note`, kept by memory state and the scope's
+/// answer log ([`crate::kept_answers`]): it reads every note the reader may read and every session logged. Kept by
+/// the reader (who, every group they read as, and whether they read everyone's sessions), the note and the days asked
+/// for. A window of days ends when the answer was worked out ([`crate::kept_answers::At::windowed`]), never more than
+/// [`crate::kept_answers::SUMMARY_STALE`] before now.
 async fn usage_kept(
     store: &Store,
     scope: &crate::Scope,
     reader: Reader<'_>,
     days: Option<u64>,
     person: Option<String>,
+    note: Option<String>,
 ) -> Result<Value> {
     let mark = crate::kept_answers::Mark::read(store, scope).await?;
     let now = store.lagging_visibility(scope, crate::MAIN).await?;
     let log = crate::kept_answers::Log::read(store, scope).await?;
     let at = crate::kept_answers::At::with_log(mark, &now, log);
+    let at = match days {
+        Some(_) => at.windowed(),
+        None => at,
+    };
     let key = format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         crate::kept_answers::reader_key(reader.who),
         reader.every_session,
         person.as_deref().unwrap_or_default(),
-        days.map_or_else(
-            || "all".to_string(),
-            |d| format!("{d} in {}", crate::kept_answers::span())
-        )
+        // None for the list: a note's key is never empty.
+        note.as_deref().unwrap_or_default(),
+        days.map_or_else(|| "all".to_string(), |d| d.to_string())
     );
     let (store2, scope2, who, every) = (
         store.clone(),
@@ -355,20 +408,34 @@ async fn usage_kept(
     let usage = USAGE
         .get(&scope.namespace(), &key, at, true, || async move {
             let since = days.map_or(0, |d| crate::now_micros() - d as i64 * 86_400_000_000);
-            crate::advice::usage(&store2, &scope2, &who, every, since, person.as_deref()).await
+            crate::advice::usage(
+                &store2,
+                &scope2,
+                &who,
+                every,
+                since,
+                person.as_deref(),
+                note.as_deref(),
+            )
+            .await
         })
         .await?;
     Ok((*usage).clone())
 }
 
-/// Each reader's listing of the entity types, of one type's entities, or of their sessions, by memory state (none: no
-/// such type or folder).
+/// Each reader's listing of the entity types, of one type's entities, of their sessions or of the skills, by memory
+/// state (none: no such type or folder).
 static ENTITIES: std::sync::LazyLock<crate::kept_answers::Kept<Option<Value>>> =
     std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(500));
 
-/// `ls` of `entities` or `entities/<type>`, or of `sessions` (and its folders), unnarrowed, kept by memory state
-/// ([`crate::kept_answers`]) for main as it is now: listing them reads every fact, or every episode, the reader may
-/// read. Kept by the reader (who, and every group they read
+/// [`ENTITIES`] for the skills (`ls skills`): the Skills page's list, a page's summary kept for a return visit within
+/// the hour ([`crate::kept_answers::Kept::summary`]).
+static SKILLS: std::sync::LazyLock<crate::kept_answers::Kept<Option<Value>>> =
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500));
+
+/// `ls` of `entities` or `entities/<type>`, of `sessions` (and its folders) or of `skills`, unnarrowed, kept by memory
+/// state ([`crate::kept_answers`]) for main as it is now: listing them reads every fact, every episode or every
+/// routing index the reader may read. Kept by the reader (who, and every group they read
 /// as) and what they listed (the path, the page); a read of a branch or of a past state lists them itself.
 async fn entities_kept(
     store: &Store,
@@ -412,8 +479,13 @@ async fn entities_kept(
         reader.who.clone(),
         reader.every_session,
     );
+    let kept: &'static crate::kept_answers::Kept<Option<Value>> =
+        match path.first().map(String::as_str) {
+            Some("skills") => &SKILLS,
+            _ => &ENTITIES,
+        };
     let (path, after) = (path.to_vec(), after.map(String::from));
-    let listed = ENTITIES
+    let listed = kept
         .get(
             &session.scope().namespace(),
             &key,
@@ -469,7 +541,7 @@ async fn ls(
         None => {
             // Until the caller's counts are worked out every folder shows, without a count: one that turns out
             // empty drops from a later listing.
-            let children: Vec<Value> = match root_counts(store, session, who) {
+            let children: Vec<Value> = match root_counts(store, session, who).await {
                 Some(counts) => counts
                     .iter()
                     .filter(|(name, n)| *n != 0 || matches!(*name, "entities" | "sources"))
@@ -831,12 +903,18 @@ async fn skills(
             let skills = skill_keys(session, who);
             // When each skill applies, from the index lines (`- `slug`: when (`aip key`)`) of every index
             // the caller may read.
+            // The indexes are read at once: each is a body read from object storage.
+            let indexes = futures::future::try_join_all(index_keys(session, who).into_iter().map(
+                |(name, key)| async move {
+                    let doc = session.document(store, who, &key, None).await?;
+                    anyhow::Ok(doc.map(|(_, at, body)| (name, at, body)))
+                },
+            ))
+            .await?;
+            crate::phases::mark("skills indexes read");
             let mut when: BTreeMap<String, String> = BTreeMap::new();
             let mut children = vec![];
-            for (name, key) in index_keys(session, who) {
-                let Some((_, at, body)) = session.document(store, who, &key, None).await? else {
-                    continue;
-                };
+            for (name, at, body) in indexes.into_iter().flatten() {
                 let mut lines = 0;
                 for line in String::from_utf8_lossy(&body).lines() {
                     let Some((slug, rest)) =
@@ -976,8 +1054,14 @@ const ROOT_STALE: std::time::Duration = std::time::Duration::from_secs(600);
 const MAX_ROOTS: usize = 1000;
 
 struct RootCounts {
-    /// The ledger state they were counted at (or, while none are kept yet, are being counted at).
-    heads: Vec<String>,
+    /// The state they were counted at (or, while none are kept yet, are being counted at): its ledger heads and
+    /// its removals ([`crate::Vis::removals`]). A loss that commits nothing (an erasure or a retention policy
+    /// rewrites the tables, the heads stay) is a state of its own: the counts before it are not its counts.
+    state: (Vec<String>, u64),
+    /// For counts read on main as it is now, main's state with the scope's loss count and facts table read before
+    /// it was pinned ([`crate::kept_answers::At`]): counts from before a loss this server counted (an erasure, a
+    /// forget of a fact) are never answered after it, though neither the heads nor the removals moved.
+    main: Option<crate::kept_answers::At>,
     at: std::time::Instant,
     /// None until the reader's first count is done.
     counts: Option<Counts>,
@@ -992,11 +1076,18 @@ static ROOTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Str
 /// The root's counts for the caller, if they are known yet. Counting reads every fact the caller may read, which
 /// takes long in a large org, so it never runs on the request: the counts are kept by reader, and at the same
 /// ledger state they are the same. On main as it is now, counts from an earlier state answer, however old, while
-/// the new state's are counted in the background. With none kept for the caller (a first visit, a restart, or a
-/// read off main whose state moved) this answers None and counts in the background for a later read.
-fn root_counts(store: &Store, session: &Session, who: &Principal) -> Option<Counts> {
-    let heads = session.vis().heads().to_vec();
+/// the new state's are counted in the background, but only while memory lost nothing since they were counted (the
+/// same removals, loss count and facts generation: [`crate::kept_answers`]): past a loss they answer None, so a
+/// page waiting for them (Home's) shows the new state's once counted, never what was taken away. With none kept for
+/// the caller (a first visit, a restart, or a read off main whose state moved) this answers None and counts in the
+/// background for a later read.
+async fn root_counts(store: &Store, session: &Session, who: &Principal) -> Option<Counts> {
+    let state = (session.vis().heads().to_vec(), session.vis().removals);
     let now_main = session.on_main_now();
+    let main = match now_main {
+        true => main_at(store, session).await,
+        false => None,
+    };
     let key = format!(
         "{}\n{now_main}\n{}\n{}",
         session.scope().namespace(),
@@ -1006,12 +1097,22 @@ fn root_counts(store: &Store, session: &Session, who: &Principal) -> Option<Coun
     let mut kept = ROOTS.lock().unwrap();
     let (answer, refresh) = match kept.get_mut(&key) {
         Some(c) => {
-            let current = c.heads == heads;
-            let answer = if current || now_main {
+            // Lost since they were counted: a loss this server counted, or one main's state shows. Without a mark
+            // to compare (a read off main, or a state not main's now), the removals alone.
+            let lost = match (&c.main, &main) {
+                (Some(was), Some(now)) => !was.lost_nothing(now),
+                _ => c.state.1 != state.1,
+            };
+            let current = c.state == state && !lost;
+            let answer = if current || now_main && !lost {
                 c.counts.clone()
             } else {
                 None
             };
+            // Counts from an earlier state: shown, never shared as this state's.
+            if !current && answer.is_some() {
+                crate::kept_answers::not_sharable();
+            }
             let refresh = !c.refreshing && !(current && c.counts.is_some());
             if refresh {
                 c.refreshing = true;
@@ -1019,7 +1120,14 @@ fn root_counts(store: &Store, session: &Session, who: &Principal) -> Option<Coun
             (answer, refresh)
         }
         None => {
-            keep_root(&mut kept, key.clone(), heads.clone(), None, true);
+            keep_root(
+                &mut kept,
+                key.clone(),
+                state.clone(),
+                main.clone(),
+                None,
+                true,
+            );
             (None, true)
         }
     };
@@ -1030,7 +1138,7 @@ fn root_counts(store: &Store, session: &Session, who: &Principal) -> Option<Coun
             let got = count_root(&store, &session, &who).await;
             let mut kept = ROOTS.lock().unwrap();
             match got {
-                Ok(counts) => keep_root(&mut kept, key, heads, Some(counts), false),
+                Ok(counts) => keep_root(&mut kept, key, state, main, Some(counts), false),
                 Err(e) => {
                     eprintln!("root counts: {}: {e:#}", session.scope().namespace());
                     // Counts kept from before still answer; a first count that failed is tried again on the
@@ -1047,10 +1155,27 @@ fn root_counts(store: &Store, session: &Session, who: &Principal) -> Option<Coun
     answer
 }
 
+/// Main's state as `session` reads it, with the scope's loss count and facts table read before it ([`At::of`]), when
+/// `session` reads main's state as it is now: None when a read fails, or `session` pinned a state main has moved on
+/// from since (its counts then answer by its removals alone).
+///
+/// [`At::of`]: crate::kept_answers::At::of
+async fn main_at(store: &Store, session: &Session) -> Option<crate::kept_answers::At> {
+    let mark = crate::kept_answers::Mark::read(store, session.scope())
+        .await
+        .ok()?;
+    let now = store
+        .lagging_visibility(session.scope(), crate::MAIN)
+        .await
+        .ok()?;
+    std::ptr::eq(session.vis(), &*now).then(|| crate::kept_answers::At::of(mark, &now))
+}
+
 fn keep_root(
     kept: &mut std::collections::HashMap<String, RootCounts>,
     key: String,
-    heads: Vec<String>,
+    state: (Vec<String>, u64),
+    main: Option<crate::kept_answers::At>,
     counts: Option<Counts>,
     refreshing: bool,
 ) {
@@ -1064,7 +1189,8 @@ fn keep_root(
     kept.insert(
         key,
         RootCounts {
-            heads,
+            state,
+            main,
             at,
             counts,
             refreshing,
@@ -1357,9 +1483,19 @@ async fn titled(store: &Store, scope: &Scope, mut listed: Value) -> Result<Value
 
 /// Every committed episode the session sees that the caller may read, once each.
 pub(crate) async fn episodes(store: &Store, session: &Session, who: &Principal) -> Result<Vec<Ep>> {
+    let files = store.episode_files(session.scope()).await?;
+    Ok(episodes_in(&files, session, who))
+}
+
+/// [`episodes`] of the episodes table's files as already read ([`Store::episode_files`]).
+pub(crate) fn episodes_in(
+    files: &std::collections::HashMap<String, std::sync::Arc<Vec<arrow_array::RecordBatch>>>,
+    session: &Session,
+    who: &Principal,
+) -> Vec<Ep> {
     let vis = session.vis();
     let mut out: BTreeMap<String, Ep> = BTreeMap::new();
-    for bs in store.episode_files(session.scope()).await?.values() {
+    for bs in files.values() {
         for b in bs.iter() {
             let (commit, id, source) = (
                 crate::strings(b, "commit_id"),
@@ -1383,7 +1519,7 @@ pub(crate) async fn episodes(store: &Store, session: &Session, who: &Principal) 
             }
         }
     }
-    Ok(out.into_values().collect())
+    out.into_values().collect()
 }
 
 /// Browsing a [`Store`]'s scopes (an inherent impl until the store moved to memstore-core).

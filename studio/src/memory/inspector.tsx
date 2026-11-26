@@ -375,6 +375,9 @@ function keptCount(path: string[], sel: Selection, narrow: Record<string, string
   return undefined;
 }
 
+/** The skills listed at a time (each row says when the skill applies: about 330 bytes). */
+const SKILLS_PAGE = 80;
+
 function FolderView({
   path,
   sel,
@@ -393,18 +396,41 @@ function FolderView({
   const learned = path[0] === "entities" && path.length <= 2;
   const link = useNarrow();
   const narrow = learned ? link : { from: "", by: "" };
-  const req = { op: "ls", path, limit: 500, ...narrowReq(narrow) };
+  // The skills are a thousand on a busy memory, each with when it applies: a page of them at a time.
+  const skillsRoot = path.length === 1 && path[0] === "skills";
+  const req = { op: "ls", path, limit: skillsRoot ? SKILLS_PAGE : 500, ...narrowReq(narrow) };
   const onFocus = (f: Focus) => keepNarrow(narrow, focus, f);
   const [s, retry] = useLoad(
     () => browse<Listing>(req, sel),
     [path, sel, narrow.from, narrow.by],
     () => keptBrowse<Listing>(req, sel),
   );
+  // The pages after the first, read on "Show more": they carry on from where the first page stopped (`from`, its
+  // cursor), so a fresh first page that stops at the same place (the kept one replaced) keeps them.
+  const [later, setLater] = useState<{ from: string; children: Child[]; next: string | null }>();
+  const [paging, setPaging] = useState<"idle" | "loading" | "failed">("idle");
+  const first = s.status === "ok" ? s.data : undefined;
+  const extra = later && first?.next != null && later.from === first.next ? later : undefined;
+  const next = extra ? extra.next : (first?.next ?? null);
+  const listed = first ? [...first.children, ...(extra?.children ?? [])] : [];
+  const showMore = () => {
+    const from = first?.next;
+    if (!from || !next) return;
+    setPaging("loading");
+    browse<Listing>({ ...req, after: next }, sel).then(
+      (l) => {
+        setLater({ from, children: [...(extra?.children ?? []), ...l.children], next: l.next });
+        setPaging("idle");
+      },
+      () => setPaging("failed"),
+    );
+  };
   const root = path.length === 1 ? ROOTS[path[0] ?? ""] : undefined;
   const name = path.at(-1) ?? "";
   // A folder with more than one page of children says how much it holds as its parent listing counts it
   // (episodes under a source, entities of a type, skills), read from what this page already has, else read once.
-  const more = s.status === "ok" && s.data.next != null;
+  // The skills always page, so their count is read beside their first page rather than after it.
+  const more = skillsRoot || (s.status === "ok" && s.data.next != null);
   const parentNarrow = learned && path.length === 2 ? narrowReq(narrow) : {};
   const [held, setHeld] = useState<number | undefined>(undefined);
   useEffect(() => {
@@ -449,14 +475,14 @@ function FolderView({
           </h1>
           <div className="subtitle">
             {s.status === "ok" &&
-              (more && held != null ? (
+              (next != null && held != null ? (
                 <span>
                   {held.toLocaleString()} {held === 1 ? unit.replace(/s$/, "") : unit}
                 </span>
               ) : (
                 <span>
-                  {s.data.children.length.toLocaleString()}
-                  {more ? "+" : ""} {s.data.children.length === 1 ? "item" : "items"}
+                  {listed.length.toLocaleString()}
+                  {next != null ? "+" : ""} {listed.length === 1 ? "item" : "items"}
                 </span>
               ))}
             {root && <span>{root.note}</span>}
@@ -472,7 +498,7 @@ function FolderView({
         <AddToMemoryButton sel={sel} onOpen={onFocus} onAdded={retry} />
       )}
       <Loading s={s} retry={retry}>
-        {(l) => (
+        {() => (
           <>
             {path[0] === "skills" && path.length === 2 && (
               <div className="list" style={{ marginBottom: "var(--s4)" }}>
@@ -485,15 +511,15 @@ function FolderView({
                 />
               </div>
             )}
-            {l.children.length === 0 ? (
+            {listed.length === 0 ? (
               <EmptyState title="This folder is empty">
                 {narrow.from || narrow.by
                   ? "Nothing here was learned from that, or nothing of it that you can read."
                   : "There is nothing here that you can read."}
               </EmptyState>
-            ) : l.children.every((c) => c.kind === "folder") ? (
+            ) : listed.every((c) => c.kind === "folder") ? (
               <div className="grid">
-                {ordered(path, l.children, l.next).map((c) => (
+                {ordered(path, listed, next).map((c) => (
                   <button
                     key={JSON.stringify(c.path)}
                     className="tile"
@@ -523,7 +549,7 @@ function FolderView({
               </div>
             ) : (
               <div className="list">
-                {ordered(path, l.children, l.next).map((c) => (
+                {ordered(path, listed, next).map((c) => (
                   <Row
                     key={JSON.stringify(c.path) + (c.episode_id ?? "")}
                     c={c}
@@ -532,10 +558,19 @@ function FolderView({
                 ))}
               </div>
             )}
-            {l.next && (
-              <p className="fine">
-                Showing the first {l.children.length}; the tree pages through the rest.
-              </p>
+            {next && (
+              <button
+                className="btn"
+                style={{ marginTop: "var(--s4)" }}
+                disabled={paging === "loading"}
+                onClick={showMore}
+              >
+                {paging === "loading"
+                  ? "Loading…"
+                  : paging === "failed"
+                    ? "Couldn't load more: try again"
+                    : `Show more (${listed.length.toLocaleString()} shown)`}
+              </button>
             )}
           </>
         )}

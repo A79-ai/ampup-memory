@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 
 use super::{BATCH, MAX_PAGES, OVERLAP, Progress, SWEEP, SWEEP_EVERY, Source, http, micros};
 
-fn check_repo(repo: &str) -> Result<()> {
+pub(super) fn check_repo(repo: &str) -> Result<()> {
     let ok = |p: &str| {
         !p.is_empty()
             && p.len() <= 100

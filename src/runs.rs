@@ -96,13 +96,13 @@ pub fn import_source(label: &str) -> Result<String> {
 }
 
 /// Most imported runs a scope records in a day, from every import source together ([`import`]):
-/// `AMPUP_MEMORY_IMPORT_RUNS_PER_DAY`, default 5000. Apart from the per-person caps, which imports never count
+/// `AMPUP_MEMORY_IMPORT_RUNS_PER_DAY`, default 100,000. Apart from the per-person caps, which imports never count
 /// toward.
 pub fn max_imported_per_day() -> usize {
     std::env::var("AMPUP_MEMORY_IMPORT_RUNS_PER_DAY")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(5_000)
+        .unwrap_or(100_000)
 }
 
 /// What [`import`] did: every run's id, in order, and how many of them were new (the rest were imported before).

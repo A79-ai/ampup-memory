@@ -99,6 +99,8 @@ pub mod server;
 pub mod service;
 pub mod session_prs;
 pub mod sessions;
+pub mod shared_answers;
+pub mod skill_review;
 pub mod sources;
 pub mod support_bundle;
 pub mod telemetry;

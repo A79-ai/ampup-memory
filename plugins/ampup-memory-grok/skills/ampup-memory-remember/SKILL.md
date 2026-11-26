@@ -24,7 +24,7 @@ ends. Don't remember the session itself. Remember what should outlast it.
 | Ephemeral chat, one-off events, work in progress, your own guesses | No | |
 | Secrets, credentials, personal data, raw transcripts or tool output | Never | |
 
-Where no hook records the conversation (ChatGPT, Claude Desktop, an IDE without AmpUp Memory's hooks), this is the only way what the user tells you outlasts it, so don't leave it for later in the conversation. The server knows who signed in, so you never name the user.
+Where no hook records the conversation (ChatGPT, Claude Desktop, Grok Bot, an IDE without AmpUp Memory's hooks), this is the only way what the user tells you outlasts it, so don't leave it for later in the conversation. The server knows who signed in, so you never name the user.
 
 ## How to write it
 

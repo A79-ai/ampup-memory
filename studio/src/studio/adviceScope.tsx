@@ -1,12 +1,12 @@
 import "./advice-page.css";
-import { useEffect, useState } from "react";
-import { call } from "../memory/api";
 import { useChoice, useOption } from "../memory/hashOptions";
-import type { Selection } from "../memory/types";
 
-// What every total in Advice is counted over, shared by its Served and Learned tabs: one window (`days` in the link:
+// What every total in Advice is counted over, shared by its Advice and Serving tabs: one window (`days` in the link:
 // 7, 30, 90 or all; 30 when it names none) and one set of notes (the team's and the reader's own, or for the org's
-// admins one person's own in the reader's place: `person` in the link). Moving between the tabs keeps both.
+// admins one person's own in the reader's place: `person` in the link), shown all at once or only the reader's own or
+// the team's (`show`: the All / Mine / Team pill above both tabs). Moving between the tabs keeps all three. The
+// platform's operator may also count every person's own notes at once on Served (`person=*`); Learned then counts the
+// reader's own.
 
 /** The windows, as the link names them (`#/advice?days=7`; 30 days when it names none). */
 export const RANGES = [
@@ -19,17 +19,41 @@ const RANGE_IDS = RANGES.map((r) => r.id);
 type RangeId = (typeof RANGES)[number]["id"];
 
 /** The link's options Advice's tabs carry from one to the other. */
-export const SCOPE_OPTIONS = ["days", "person"] as const;
+export const SCOPE_OPTIONS = ["days", "person", "show"] as const;
+
+/** `person` naming every person's own notes at once (`person=*` in the link): the platform operator's view. */
+export const EVERYONE = "*";
 
 /**
  * The window and whose own notes are counted, as the link says. `person` is honoured for the org's admins only (the
- * server refuses anyone else naming another person); empty, the reader's own.
+ * server refuses anyone else naming another person), and everyone's (`*`) for the platform's operator only
+ * (`everyone`; the server refuses anyone else); empty, the reader's own.
  */
-export function useAdviceScope(admin: boolean) {
+export function useAdviceScope(admin: boolean, everyone = false) {
   const [range, setRange] = useChoice("days", RANGE_IDS, "30");
   const [picked, setPerson] = useOption("person");
   const days = (RANGES.find((r) => r.id === range) ?? RANGES[1]).days;
-  return { range, setRange, days, person: admin ? picked : "", setPerson };
+  const person = picked === EVERYONE ? (everyone ? EVERYONE : "") : admin ? picked : "";
+  return { range, setRange, days, person, setPerson };
+}
+
+/** Whose own notes Served counts beside the team's, for the platform's operator: theirs, or every person's. */
+export function WhoseSeg({ person, setPerson }: { person: string; setPerson: (p: string | null) => void }) {
+  return (
+    <div className="ap-seg" role="group" aria-label="Whose own notes">
+      <button aria-pressed={!person} className={!person ? "on" : ""} onClick={() => setPerson(null)}>
+        Yours
+      </button>
+      <button
+        aria-pressed={person === EVERYONE}
+        className={person === EVERYONE ? "on" : ""}
+        onClick={() => setPerson(EVERYONE)}
+        title="Every person's own notes in this org, each with whose it is (the operator's view)"
+      >
+        Everyone&apos;s
+      </button>
+    </div>
+  );
 }
 
 /** The window's segmented control. */
@@ -61,60 +85,12 @@ export function RangeSeg({
  * applied (null: all of them); `what` names what the window cuts ("sessions", "runs and sessions").
  */
 export function scopeText(person: string, days: number | null, what: string): string {
-  const whose = person ? `the team's notes and ${person}'s` : "the team's notes and yours";
+  const whose =
+    person === EVERYONE
+      ? "the team's notes and every person's own"
+      : person
+        ? `the team's notes and ${person}'s`
+        : "the team's notes and yours";
   const span = days ? `${what} in the last ${days} days` : `every one of their ${what}`;
   return `Counting ${whose}, ${span}`;
-}
-
-/**
- * For the org's admins: whose own notes Advice counts beside the team's, one chip per person who has notes of their
- * own (as `/lessons` knows them). Nothing for anyone else, or where no one else has notes of their own.
- */
-export function PersonPicker({ sel, admin }: { sel: Selection; admin: boolean }) {
-  const { person, setPerson } = useAdviceScope(admin);
-  const [got, setGot] = useState<{
-    key: string;
-    me: string;
-    everyone: boolean;
-    people: string[];
-  } | null>(null);
-  const key = JSON.stringify([sel.org, sel.team, sel.branch]);
-  useEffect(() => {
-    if (!admin) return;
-    let live = true;
-    call<{ reader: { user: string; everyone: boolean }; people: string[] }>(sel, "lessons", {
-      count: true,
-    }).then(
-      (v) =>
-        live &&
-        setGot({ key, me: v.reader.user, everyone: v.reader.everyone, people: v.people ?? [] }),
-      () => live && setGot({ key, me: "", everyone: false, people: [] }),
-    );
-    return () => {
-      live = false;
-    };
-  }, [key, admin]);
-  const cur = got?.key === key ? got : null;
-  if (!admin || !cur?.everyone) return null;
-  const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
-  const others = cur.people.filter((p) => !same(p, cur.me));
-  if (!others.length && !person) return null;
-  return (
-    <nav className="ap-chips ap-person" aria-label="Whose own notes">
-      <span className="ap-muted ap-small">Beside the team&apos;s:</span>
-      <button className={!person ? "on" : ""} aria-pressed={!person} onClick={() => setPerson(null)}>
-        Yours
-      </button>
-      {others.map((p) => (
-        <button
-          key={p}
-          className={same(person, p) ? "on" : ""}
-          aria-pressed={same(person, p)}
-          onClick={() => setPerson(p)}
-        >
-          {p}
-        </button>
-      ))}
-    </nav>
-  );
 }

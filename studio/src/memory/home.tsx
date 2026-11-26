@@ -11,9 +11,11 @@ import { errorText, transport, type Resolved } from "../transport";
 // Studio's Home (`#/home`): the memory being read (the org's, or the team picked) as its builders see it. What
 // changed this week, what was answered from it, and what waits on the reader, each number a link into the
 // section that holds it. Every number is one another section's read would give; one with no cheap read is left out,
-// and one the reader may not make (an admin's, a review's) is too. They come in one read (`home`), counts and short
-// lists only; from a server before it, a read each. A server that fails the one read is not asked for each part
-// instead: Home shows its last answer, marked as not refreshed, or says it failed, with a way to try again.
+// and one the reader may not make (an admin's, a review's) is too. They come from the server's Home read (`home`),
+// counts and short lists only, a part at a time: every part is asked for at once, on its own, and each panel shows
+// the moment its own part lands, never waiting on the slowest. From a server before that read, a read each. A server
+// that fails every part is not asked for the older reads instead: Home shows its last answer, marked as not
+// refreshed, or says it failed, with a way to try again.
 
 const WEEK_DAYS = 7;
 const WEEK_US = WEEK_DAYS * 86_400_000_000;
@@ -43,8 +45,9 @@ export interface HomeProps {
    */
   connect?: { sources?: string; agents?: string };
   /**
-   * What the one read (`home`) answered so far, for the page around Home: the branches and how many types the
-   * schema declares, so it reads neither while Home is open. null: no such read (a server before it, or it failed).
+   * What the Home read (`home`, a part at a time) answered so far, for the page around Home: the branches and how
+   * many types the schema declares, so it reads neither while Home is open. null: no such read (a server before
+   * it, or it failed).
    */
   onSummary?: (h: HomeSummary | null) => void;
 }
@@ -83,16 +86,34 @@ export interface HomeSummary {
   schema?: { types: number };
 }
 
-/** How many times Home asks again for the parts still worked out (an ask that failed included), before it leaves
- * them out. */
+/** How many times Home asks again for a part still worked out (an ask that failed included), before it leaves it
+ * out. */
 const ASK_AGAIN = 5;
+
+/**
+ * The parts Home asks for, each in a read of its own, all at once: what Home or the page around it shows (the lessons
+ * aren't). The admins' and the reviewers' too, whoever reads: the server answers null for a part the reader may not
+ * read, and Home shows those only to whom they are for. Asked for whatever the reader turns out to be, so learning
+ * that after Home opened doesn't ask for every part again.
+ */
+const PARTS = [
+  "counts",
+  "week",
+  "branches",
+  "schema",
+  "proposals",
+  "conflicts",
+  "activity",
+  "dream",
+];
+
 /** How long Home waits before asking again after an ask failed, doubled with each failure in a row. */
 const AFTER_FAILED_MS = 1000;
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Whether the server doesn't know the one read (`home`): a server from before it, which refuses an op it doesn't
+ * Whether the server doesn't know the Home read (`home`): a server from before it, which refuses an op it doesn't
  * know with a 400 "unknown op". Only that is answered with a read each; a server that fails it otherwise (5xx, a
  * timeout, a dropped connection) is struggling, and a read each would only add to its load.
  */
@@ -103,11 +124,9 @@ const unknownOp = (e: unknown) =>
 const fieldsOf = (part: string) =>
   part === "week" ? ["week", "sources", "advice", "month"] : [part];
 
-/** `h` with what is still pending left out: null, as a part that failed. */
-function settled(h: HomeSummary): HomeSummary {
-  const gone = (h.pending ?? []).flatMap(fieldsOf);
-  return { ...h, ...Object.fromEntries(gone.map((p) => [p, null])), pending: [] };
-}
+/** A part's fields from an answer: those it left out are null, as a part that failed. */
+const fieldsFrom = (part: string, from: Partial<HomeSummary>) =>
+  Object.fromEntries(fieldsOf(part).map((f) => [f, from[f as keyof HomeSummary] ?? null]));
 
 /**
  * Where the host keeps Home's last complete answer (`Transport.kept`), with its shape's version: a change to
@@ -128,6 +147,22 @@ function keepable(h: HomeSummary): boolean {
     Object.values(counts).every((n) => typeof n === "number") &&
     !(counts.sources === 0 && counts.entities === 0)
   );
+}
+
+/**
+ * Keeps a part that just landed in the host's copy, when there is one to keep it in (a whole answer, from an open
+ * that had every part): the next open shows it, even if this one is left before every part lands. Not the root's
+ * counts while some folder is still being counted, nor those of an empty memory.
+ */
+function keepPart(sel: Selection, part: string, fields: Partial<HomeSummary>) {
+  if (part === "counts" && !keepable({ since: 0, counts: fields.counts })) return;
+  const kept = keptHome(sel);
+  if (!kept) return;
+  try {
+    transport().kept?.set(sel, KEPT, { ...kept, ...fields });
+  } catch {
+    // Not kept: the next open shows it as it was.
+  }
 }
 
 /** What the host kept for this selection, if it is a Home answer at all. */
@@ -216,10 +251,6 @@ function useRoot(
   return { data: mine?.data, done: !on || mine !== null };
 }
 
-function useRead<T>(key: string, on: boolean, load: () => Promise<T>): T | undefined {
-  return useGot(key, on, load).data;
-}
-
 interface FactsPage {
   count: number;
   facts: { entity: string; sources?: { episode_id: string; source?: string | null }[] }[];
@@ -248,68 +279,95 @@ export function Home({
 }: HomeProps) {
   const key = JSON.stringify([sel.org, sel.team, sel.branch]);
 
-  // Every number in one read, shown as it answers: the parts not worked out in time are asked for again. null: a
-  // server with no such read (it refused the op as unknown), and Home makes a read each, as before it.
+  // Every part in a read of its own, all asked for at once, each shown as it lands: a part not worked out in time is
+  // asked for again, on its own. null: a server with no such read (it refused the op as unknown), and Home makes a
+  // read each, as before it.
   const [said, setSaid] = useState<{ key: string; h: HomeSummary | null } | null>(null);
-  // The one read failed (other than as unknown): why, shown over the kept answer or on its own, with "Try again".
+  // Every part failed (other than as unknown): why, shown over the kept answer or on its own, with "Try again".
   const [failed, setFailed] = useState<{ key: string; why: string } | null>(null);
-  // Bumped by "Try again": the one read is made again.
+  // Bumped by "Try again": every part is asked for again.
   const [tries, setTries] = useState(0);
-  // The answer the host kept from the last open, shown at once while the read is out (and, part by part, while the
-  // server works out the rest), with a quiet "updating" beside the title. The fresh answer replaces it.
+  // The answer the host kept from the last open, shown at once while the reads are out (and, part by part, until each
+  // part's own lands), with a quiet "updating" beside the title. Each part's fresh answer replaces it.
   const kept = useMemo(() => keptHome(sel), [key]);
   useEffect(() => {
     let live = true;
     setFailed(null);
-    void (async () => {
-      let h: HomeSummary;
-      try {
-        h = await browse<HomeSummary>({ op: "home" }, sel);
-      } catch (e) {
-        if (!live) return;
-        if (unknownOp(e)) setSaid({ key, h: null });
-        else setFailed({ key, why: errorText(e) });
-        return;
+    // The answer so far: every part pending until its read lands.
+    let h: HomeSummary = { since: kept?.since ?? 0, pending: [...PARTS] };
+    let refused = 0;
+    let gaveUp = false;
+    setSaid({ key, h });
+    const land = (part: string, fields: Partial<HomeSummary>, since?: number) => {
+      h = { ...h, ...fields, since: since ?? h.since, pending: h.pending!.filter((p) => p !== part) };
+      setSaid({ key, h });
+      if (h.pending!.length) return;
+      if (!gaveUp && keepable(h)) {
+        try {
+          transport().kept?.set(sel, KEPT, h);
+        } catch {
+          // Not kept: the next open reads it again, as before.
+        }
       }
-      for (let again = 0, fails = 0; live; again++) {
-        if (!h.pending?.length || again === ASK_AGAIN) {
-          setSaid({ key, h: settled(h) });
-          if (keepable(h)) {
-            try {
-              transport().kept?.set(sel, KEPT, h);
-            } catch {
-              // Not kept: the next open reads it again, as before.
-            }
+    };
+    // A part not answered: what was kept of it stays shown, else it is left out.
+    const leave = (part: string) => {
+      gaveUp = true;
+      const from = kept && fieldsOf(part).every((f) => f in kept) ? kept : {};
+      land(part, fieldsFrom(part, from));
+    };
+    const ask = async (part: string) => {
+      for (let again = 0, fails = 0; live && again <= ASK_AGAIN; again++) {
+        let got: HomeSummary;
+        try {
+          got = await browse<HomeSummary>({ op: "home", parts: [part] }, sel);
+          fails = 0;
+        } catch (e) {
+          if (!live) return;
+          if (unknownOp(e)) {
+            live = false;
+            setSaid({ key, h: null });
+            return;
           }
+          // A first ask that fails isn't made again (a server that fails it is struggling): the part is left out,
+          // and when every part is, Home says why.
+          if (again === 0) {
+            leave(part);
+            if (++refused === PARTS.length) setFailed({ key, why: errorText(e) });
+            return;
+          }
+          // Asked again after a wait that grows with each failure in a row (none after the last ask): what it
+          // waited for goes on being worked out, and is kept for it.
+          if (again < ASK_AGAIN) await wait(AFTER_FAILED_MS * 2 ** fails++);
+          continue;
+        }
+        if (!live) return;
+        if (!got.pending?.includes(part)) {
+          const fields = fieldsFrom(part, got);
+          land(part, fields, got.since);
+          keepPart(sel, part, fields);
           return;
         }
-        setSaid({ key, h });
-        try {
-          h = { ...h, ...(await browse<HomeSummary>({ op: "home", parts: h.pending }, sel)) };
-          fails = 0;
-        } catch {
-          // Asked again on the next turn, after a wait that grows with each failure in a row (none after the last
-          // ask): what it waited for goes on being worked out, and is kept for it.
-          if (again + 1 < ASK_AGAIN) await wait(AFTER_FAILED_MS * 2 ** fails++);
-        }
       }
-    })();
+      if (live) leave(part);
+    };
+    for (const part of PARTS) void ask(part);
     return () => {
       live = false;
     };
   }, [key, tries]);
-  // undefined until it answers; null: a read each.
+  // The parts so far, those not landed yet pending; null: a read each.
   const fresh = said?.key === key ? said.h : undefined;
-  // Until the fresh answer is whole, the kept one fills in for what it hasn't answered yet. A server without the
-  // one read (null) drops it: Home then reads each part. One that failed it leaves the kept answer as it is. Made
+  // Until every part has landed, the kept answer fills in for those that haven't. A server without the Home read
+  // (null) drops it: Home then makes a read each. A part that failed shows what was kept of it. Made
   // once per answer: a new object each render would tell the page around Home (`onSummary`) again on every render,
   // which renders Home again.
   const one = useMemo(
     () => (fresh === undefined ? kept : fresh && kept ? overKept(fresh, kept) : fresh),
     [fresh, kept],
   );
-  // Why the one read failed, for this selection: nothing fresh comes, and Home shows the kept answer as it was
-  // (not as "updating"), or, with none kept, says so.
+  // Why every part failed, for this selection: nothing fresh comes, and Home shows the kept answer as it was (not as
+  // "updating"), or, with none kept, says so.
   const why = failed?.key === key ? failed.why : null;
   const retry = () => setTries((n) => n + 1);
   const updating = !why && !!kept && (fresh === undefined || !!fresh?.pending?.length);
@@ -317,7 +375,8 @@ export function Home({
   useEffect(() => {
     if (one !== undefined) onSummary?.(one);
   }, [one]);
-  // A part has answered (or isn't the reader's): from the one read, once it isn't pending; else once its own read has.
+  // A part has answered (or isn't the reader's): from the Home read, once it isn't pending; else once its own read
+  // has.
   const done = (part: string, got: { done: boolean }) =>
     each ? got.done : one !== undefined && !one.pending?.includes(part);
 
@@ -325,15 +384,16 @@ export function Home({
   const since = useMemo(() => Date.now() * 1000 - WEEK_US, [key]);
 
   // What the memory holds: the Explorer's root, with each folder's count.
-  // Only when the one read is refused (an older server): the root's counts, asked again until counted.
+  // Only when the Home read is refused (an older server): the root's counts, asked again until counted.
   const rootGot = useRoot(key, each, sel);
   const counts: Record<string, number | null | undefined> | undefined = one
     ? (one.counts ?? undefined)
     : rootGot.data && Object.fromEntries(rootGot.data.children.map((c) => [c.name, c.count]));
   // Each source and when it last brought something.
-  const sources = useRead(key, each, () =>
+  const sourcesGot = useGot(key, each, () =>
     browse<Listing>({ op: "ls", path: ["sources"], limit: 200 }, sel),
   );
+  const sources = sourcesGot.data;
   // The facts that took effect this week: how many, on how many entities, and from where.
   const factsGot = useGot(key, each, () =>
     browse<FactsPage>(
@@ -505,9 +565,6 @@ export function Home({
           <h1 className="hm-title">{scope}</h1>
           <p className="subtitle">
             What your memory holds, and its last 30 days
-            {sel.branch && sel.branch !== "main" ? (
-              <span className="mono">· branch {sel.branch}</span>
-            ) : null}
             {updating && (
               <span
                 className="hm-updating"
@@ -583,8 +640,10 @@ export function Home({
               </h2>
               {days ? (
                 <DailyChart days={days} asks={withAsks} />
+              ) : done("week", factsGot) ? (
+                <p className="hm-quiet-line">Nothing to chart yet</p>
               ) : (
-                <p className="hm-quiet-line">{done("week", factsGot) ? "Nothing to chart yet" : ""}</p>
+                <div className="sk hm-chart-sk" aria-hidden="true" />
               )}
             </section>
 
@@ -601,8 +660,14 @@ export function Home({
                     <SourceRow key={c.name} c={c} at={at} since={since} href={href} />
                   ))}
                 </ul>
-              ) : (
+              ) : done("week", sourcesGot) ? (
                 <p className="hm-quiet-line">No sources yet</p>
+              ) : (
+                <div className="hm-sources" aria-hidden="true">
+                  {[0, 1, 2, 3].map((i) => (
+                    <span key={i} className="sk hm-source-sk" />
+                  ))}
+                </div>
               )}
             </section>
           </div>

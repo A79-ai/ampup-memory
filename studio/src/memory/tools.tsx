@@ -3,6 +3,8 @@ import { ApiError, call } from "./api";
 import { Markdown } from "./markdown";
 import type { Focus, Selection } from "./types";
 import { EmptyState, ErrorState, Icon, Skeleton } from "./ui";
+import { useCanWrite } from "./writes";
+import { READS_ONLY } from "../transport";
 
 type Tool = {
   name: string;
@@ -87,6 +89,17 @@ const WRITES: Record<string, string> = {
   forget_memory: "forgets something from your memory",
 };
 const writes = (name: string) => WRITES[name.split("__").pop() ?? name];
+/** The tools a viewer, who only reads, is refused: those that change something, and those that record a run, a
+ * vote, an answer or a session. */
+const REFUSED_TO_VIEWERS = new Set([
+  ...Object.keys(WRITES),
+  "close_memory",
+  "record_run",
+  "reward_run",
+  "feedback_memory",
+  "log_answer",
+]);
+const refusedToViewers = (name: string) => REFUSED_TO_VIEWERS.has(name.split("__").pop() ?? name);
 
 export function Tools({
   sel,
@@ -108,6 +121,7 @@ export function Tools({
   const [attempt, setAttempt] = useState(0);
   // The writing tools the person has said they mean to run.
   const [meant, setMeant] = useState<Set<string>>(new Set());
+  const mayWrite = useCanWrite();
 
   useEffect(() => {
     mcp<{ tools: Tool[] }>(sel, "tools/list").then(
@@ -167,7 +181,9 @@ export function Tools({
   }
 
   const changes = writes(current.name);
-  const blocked = !!changes && !meant.has(current.name);
+  // A viewer only reads: a tool that writes or records is refused to them, so it isn't run from here.
+  const readsOnly = !mayWrite && refusedToViewers(current.name);
+  const blocked = readsOnly || (!!changes && !meant.has(current.name));
   const run = async () => {
     if (parseError || busy === current.name || blocked) return;
     const tool = current.name;
@@ -271,7 +287,11 @@ export function Tools({
         }}
         rows={Math.min(16, Math.max(4, text.split("\n").length + 1))}
       />
-      {changes && (
+      {readsOnly ? (
+        <p className="tool-writes muted">
+          {READS_ONLY}: this tool {changes ?? "records what you do in it"}, so it isn't run for a viewer.
+        </p>
+      ) : changes && (
         <label className="tool-writes">
           <input
             type="checkbox"
@@ -292,6 +312,7 @@ export function Tools({
         <button
           className="btn btn-primary"
           disabled={busy === current.name || !!parseError || blocked}
+          title={readsOnly ? READS_ONLY : undefined}
           onClick={run}
         >
           <Icon name="play" size={13} /> {busy === current.name ? "Running…" : "Run"}

@@ -247,7 +247,8 @@ function ServedNote({
     call<{ notes: { key: string; note?: string | null }[] }>(
       { org: sel.org, team: sel.team },
       "admin",
-      { op: "advice_trail", key: noteKey },
+      // Light: the note's text and only the newest of its runs and sessions.
+      { op: "advice_trail", key: noteKey, light: true },
     ).then(
       (t) => {
         const n = t.notes.find((x) => x.key === noteKey);

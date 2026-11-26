@@ -172,6 +172,7 @@ pub const OPS: &[&str] = &[
     "workspace.set",
     "team.create",
     "team.delete",
+    "team.purged",
     "team.add",
     "team.remove",
     "member.add",
@@ -313,7 +314,7 @@ impl Event {
             version: 1,
         }
     }
-    fn team(mut self, team: &str) -> Self {
+    pub(crate) fn team(mut self, team: &str) -> Self {
         self.team = Some(team.into());
         self
     }
@@ -346,6 +347,7 @@ impl Event {
             "org.delete" => format!("delete org {org}"),
             "org.purged" => format!("purge the memory of org {org}"),
             "org.cleared" => format!("clear the memory of org {org}"),
+            "team.purged" => format!("purge the memory of team {org}/{team}"),
             "member.forget" => match self
                 .detail
                 .as_deref()
@@ -517,6 +519,10 @@ pub enum Role {
     Admin,
     #[default]
     Member,
+    /// Reads the org's memory and writes nothing: no memory, runs, votes, sessions or logged answers, and only reader
+    /// personal keys ([`Directory::reads_only`]). Not counted among the people an org learns from (shared facts, a
+    /// team note's holdout).
+    Viewer,
 }
 
 impl Role {
@@ -524,6 +530,16 @@ impl Role {
         match self {
             Role::Admin => "admin",
             Role::Member => "member",
+            Role::Viewer => "viewer",
+        }
+    }
+
+    /// How much it holds: an invite raises a role to this, never lowers it.
+    fn rank(self) -> u8 {
+        match self {
+            Role::Viewer => 0,
+            Role::Member => 1,
+            Role::Admin => 2,
         }
     }
 
@@ -531,7 +547,8 @@ impl Role {
         match s {
             "admin" => Ok(Role::Admin),
             "member" => Ok(Role::Member),
-            _ => anyhow::bail!("role is admin or member, got {s:?}"),
+            "viewer" => Ok(Role::Viewer),
+            _ => anyhow::bail!("role is admin, member or viewer, got {s:?}"),
         }
     }
 }
@@ -634,6 +651,14 @@ pub struct Org {
     /// written before it is no longer the org's: a slow writer that read it before the clear writes none of it after.
     #[serde(skip)]
     pub cleared_at: i64,
+    /// When each team was last made (`team.create`), µs. A team made again after `purge_team` is a new team:
+    /// what was asked or written in the old one before it is not the new one's.
+    #[serde(skip)]
+    pub team_made_at: BTreeMap<String, i64>,
+    /// Teams whose memory was deleted (`team.purged`, `purge_team`), and when, µs: until such a team is made
+    /// again, nothing is written for it, and once it is, nothing from before its making.
+    #[serde(skip)]
+    pub team_purged: BTreeMap<String, i64>,
     /// What people see it called (`set_names`). None: its name, which is what its memory is kept under and
     /// never changes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -672,14 +697,68 @@ impl Org {
         self.created_at.max(self.cleared_at)
     }
 
+    /// From when (µs) a team's rows in the shared ledger are its own: all of them for a team never purged (0); none
+    /// while a purged team is gone (`i64::MAX`), a write that lagged its purge included; once re-created, those
+    /// from its making on. A purge leaves the rows to the ledger's next compaction, which drops the rest.
+    pub fn ledger_since(&self, team: &str) -> i64 {
+        let Some(purged) = self.team_purged.get(team) else {
+            return 0;
+        };
+        match self.teams.contains_key(team) {
+            true => self
+                .team_made_at
+                .get(team)
+                .map_or(*purged, |m| (*m).max(*purged)),
+            false => i64::MAX,
+        }
+    }
+
+    /// Since when what is asked or written in `scope` (one of this org's) is still its: the org's [`Org::since`],
+    /// and for a team also its making. None for a team the org no longer has: nothing written for it is kept.
+    pub fn since_in(&self, scope: &crate::Scope) -> Option<i64> {
+        let crate::Scope::Team(id) = scope else {
+            return Some(self.since());
+        };
+        let team = id.split_once('/').map_or(id.as_str(), |(_, t)| t);
+        if !self.teams.contains_key(team) {
+            // A purged team is gone; a scope the directory never held as a team (a local server's, the default
+            // org's) or one deleted keeping its memory (`delete_team`) is the org's as before.
+            return match self.team_purged.contains_key(team) {
+                true => None,
+                false => Some(self.since()),
+            };
+        }
+        Some(
+            self.since()
+                .max(self.team_made_at.get(team).copied().unwrap_or(0)),
+        )
+    }
+
     /// The org as one of its members who isn't an admin sees it (`/admin {"op": "show"}`): themselves, with
-    /// their role and teams, and the org's profile (which agents that connect are shown anyway). Not the
-    /// other members, other people's keys, the provider, the domains or who asked to join: those are its admins'.
+    /// their role and teams, the people in those teams (each with their role: who they share a memory with),
+    /// and the org's profile (which agents that connect are shown anyway). Not the org's other members, other
+    /// teams, other people's keys, the provider, the domains or who asked to join: those are its admins'.
     pub fn member_view(&self, user: &str, access: &Access) -> Value {
         let user = user_id(user);
-        let teams: BTreeMap<&String, [&String; 1]> =
-            access.teams.iter().map(|t| (t, [&user])).collect();
-        let mut v = json!({"members": {&user: access.role}, "teams": teams});
+        let teams: BTreeMap<&String, Vec<&String>> = access
+            .teams
+            .iter()
+            .map(|t| {
+                let people: Vec<&String> = match self.teams.get(t) {
+                    Some(p) if p.contains(&user) => p.iter().collect(),
+                    _ => vec![&user],
+                };
+                (t, people)
+            })
+            .collect();
+        let mut members: BTreeMap<&String, Role> = BTreeMap::new();
+        for p in teams.values().flatten() {
+            if let Some(role) = self.members.get(*p) {
+                members.insert(p, *role);
+            }
+        }
+        members.insert(&user, access.role);
+        let mut v = json!({"members": members, "teams": teams});
         if let Some(p) = &self.profile {
             v["profile"] = json!(p);
         }
@@ -1045,6 +1124,11 @@ pub struct SignIn {
     /// set their limits). The server sets it too for the operator's admin key reading an org it selected on a route
     /// that only reads, so it reads there as an org admin, audited as the operator's sign-in is.
     pub operator: bool,
+    /// One of the people the server makes super admins (`AMPUP_MEMORY_SUPER_ADMINS`,
+    /// [`crate::auth::listed_super_admin`]), signed in as themselves through the platform's Auth0 tenant: an admin of
+    /// every org ([`Directory::access`]), who reads all of the memory of an org they select, while staying the member
+    /// they are where they are one. Never a key's.
+    pub super_admin: bool,
     /// A recorder key acting for the member this names (`x-memstore-as`): what it records is the key's account of
     /// the member's work, never the member's own words, so nothing is kept as theirs from it (`memstore::keep`).
     pub recorded: bool,
@@ -1062,18 +1146,22 @@ pub struct SignIn {
     pub platform: Option<String>,
     /// The tenant a platform key's request named (`x-memstore-tenant`): its rate-limit bucket's.
     pub tenant: Option<String>,
+    /// A viewer of the scope this request reads ([`Directory::reads_only`]): they only read, as a reader key does.
+    /// Only the server sets it, once the scope is known.
+    pub read_only: bool,
 }
 
 impl SignIn {
-    /// Whether this caller may write memory: anyone but a reader, directory or recorder key (a recorder
-    /// writes as the member it acts for, never as itself).
+    /// Whether this caller may write memory: anyone but a viewer, or a reader, directory or recorder key (a
+    /// recorder writes as the member it acts for, never as itself).
     pub fn may_write(&self) -> bool {
-        self.key.as_ref().is_none_or(|k| {
-            !matches!(
-                k.role,
-                KeyRole::Reader | KeyRole::Directory | KeyRole::Recorder
-            )
-        })
+        !self.read_only
+            && self.key.as_ref().is_none_or(|k| {
+                !matches!(
+                    k.role,
+                    KeyRole::Reader | KeyRole::Directory | KeyRole::Recorder
+                )
+            })
     }
 
     /// Whether this caller may read memory: anyone but an ingest, directory or recorder key.
@@ -1098,13 +1186,14 @@ impl SignIn {
 
     /// Whether requests are a person's own: signed in as themselves, or with their personal key. Their runs,
     /// sessions and votes are theirs; a service key has none.
-    /// A reader personal key reads only: it records nothing, not even runs or votes.
+    /// A reader personal key reads only: it records nothing, not even runs or votes. Nor does a viewer.
     pub fn is_person(&self) -> bool {
-        self.person
-            || self
-                .key
-                .as_ref()
-                .is_some_and(|k| k.owner.is_some() && k.role == KeyRole::Writer)
+        !self.read_only
+            && (self.person
+                || self
+                    .key
+                    .as_ref()
+                    .is_some_and(|k| k.owner.is_some() && k.role == KeyRole::Writer))
     }
 }
 
@@ -1386,6 +1475,11 @@ pub struct Settings {
     /// unless set false (where a decisions model is configured: without one, every proposal waits for its owners).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_review: Option<bool>,
+    /// Whether `serve` reviews the org's skills by itself (`memstore::skill_review`): a skill with new evidence since
+    /// its last review (sessions that used it, a failure, a vote against it) gets a revision proposed by the
+    /// learning model, for its readers to take or leave. An org setting; on unless set false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_review: Option<bool>,
     /// Whether the scope's schema grows with what extraction meets (`memstore::schema_growth`): where several
     /// episodes hold things of a kind the schema has no type or predicate for, a model drafts an additive change
     /// (new types, or new predicates on existing ones), which goes to the scope's entity owners for review, or is
@@ -1459,6 +1553,7 @@ impl Settings {
             && self.activity.is_none()
             && self.session_branches.is_none()
             && self.auto_review.is_none()
+            && self.skill_review.is_none()
             && self.schema_growth.is_none()
             && self.pii.is_none()
             && self.digest.is_none()
@@ -1505,6 +1600,9 @@ impl Settings {
         }
         if other.auto_review.is_some() {
             self.auto_review = other.auto_review;
+        }
+        if other.skill_review.is_some() {
+            self.skill_review = other.skill_review;
         }
         if other.schema_growth.is_some() {
             self.schema_growth = other.schema_growth;
@@ -1689,6 +1787,10 @@ struct SnapOrg {
     created_at: i64,
     #[serde(default, skip_serializing_if = "is_zero")]
     cleared_at: i64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    team_made_at: BTreeMap<String, i64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    team_purged: BTreeMap<String, i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_by: Option<String>,
     #[serde(default, skip_serializing_if = "crate::limits::OrgLimits::is_empty")]
@@ -2132,11 +2234,30 @@ impl Directory {
             };
             match (e.op.as_str(), team, user) {
                 ("org.cleared", _, _) => org.cleared_at = e.at,
+                ("team.purged", Some(t), _) => {
+                    org.team_purged.insert(t.into(), e.at);
+                    // Nothing reads the purged team any more, nor a team made again under its name later:
+                    // a read set for the old team doesn't carry over to it.
+                    let named = format!("team:{}/{t}", e.org);
+                    for s in std::iter::once(&mut org.own_settings)
+                        .chain(std::iter::once(&mut org.settings))
+                        .chain(org.team_settings.values_mut())
+                    {
+                        if let Some(r) = &mut s.reads {
+                            r.retain(|x| *x != named);
+                            if r.is_empty() {
+                                s.reads = None;
+                            }
+                        }
+                    }
+                }
                 ("team.create", Some(t), _) => {
                     org.teams.entry(t.into()).or_default();
+                    org.team_made_at.insert(t.into(), e.at);
                 }
                 ("team.delete", Some(t), _) => {
                     org.teams.remove(t);
+                    org.team_made_at.remove(t);
                     org.team_settings.remove(t);
                     // A team made again later is a new team: its old keys don't come back with it.
                     org.keys.retain(|_, k| k.team.as_deref() != Some(t));
@@ -2405,6 +2526,8 @@ impl Directory {
                     signin_declined: o.signin_declined.clone(),
                     created_at: o.created_at,
                     cleared_at: o.cleared_at,
+                    team_made_at: o.team_made_at.clone(),
+                    team_purged: o.team_purged.clone(),
                     created_by: o.created_by.clone(),
                     limits: o.own_limits.clone(),
                     workspace: o.workspace.clone(),
@@ -2490,6 +2613,8 @@ impl Directory {
                     signin_declined: o.signin_declined,
                     created_at: o.created_at,
                     cleared_at: o.cleared_at,
+                    team_made_at: o.team_made_at,
+                    team_purged: o.team_purged,
                     created_by: o.created_by,
                     limits: Default::default(),
                     workspace: o.workspace,
@@ -2625,8 +2750,8 @@ impl Directory {
             }
             // A personal key holds what its member holds through the directory (never what a domain or a
             // provider's group would give them: the key proves nothing about those), as a member, never an
-            // admin, and nothing once they are out, or once the org requires a sign-in the one that made the
-            // key wasn't (`require_sso`, `require_mfa`).
+            // admin (a viewer's, as a viewer), and nothing once they are out, or once the org requires a sign-in
+            // the one that made the key wasn't (`require_sso`, `require_mfa`).
             if let Some(u) = &held.owner {
                 if !self.holds_member(u, &k.org, None) || !Self::key_meets(org, held) {
                     return out;
@@ -2637,13 +2762,11 @@ impl Directory {
                     .filter(|(_, m)| m.contains(u))
                     .map(|(t, _)| t.clone())
                     .collect();
-                out.insert(
-                    k.org.clone(),
-                    Access {
-                        role: Role::Member,
-                        teams,
-                    },
-                );
+                let role = match org.members.get(u) {
+                    Some(Role::Viewer) => Role::Viewer,
+                    _ => Role::Member,
+                };
+                out.insert(k.org.clone(), Access { role, teams });
                 return out;
             }
             let teams = match &k.team {
@@ -2706,6 +2829,18 @@ impl Directory {
             }
             teams.extend(by_group);
             out.insert(name.clone(), Access { role, teams });
+        }
+        // A super admin is an admin of every org, as the platform's engineers debugging it: where they are a member
+        // they keep their teams; elsewhere they are in none (a team keeps its memory from its org's admins too).
+        if via.super_admin && via.person {
+            for name in self.orgs.keys() {
+                out.entry(name.clone())
+                    .and_modify(|a| a.role = Role::Admin)
+                    .or_insert(Access {
+                        role: Role::Admin,
+                        teams: BTreeSet::new(),
+                    });
+            }
         }
         out
     }
@@ -2897,6 +3032,14 @@ impl Directory {
         self.orgs
             .get(org)
             .and_then(|o| o.settings.auto_review)
+            .unwrap_or(true)
+    }
+
+    /// Whether `serve` reviews `org`'s skills by itself (its `skill_review` setting): on unless the org set it false.
+    pub fn skill_review(&self, org: &str) -> bool {
+        self.orgs
+            .get(org)
+            .and_then(|o| o.settings.skill_review)
             .unwrap_or(true)
     }
 
@@ -3272,6 +3415,54 @@ impl Directory {
 
     pub fn is_admin(&self, user: &str, via: &SignIn, org: &str) -> bool {
         self.access(user, via).get(org).map(|a| a.role) == Some(Role::Admin)
+    }
+
+    /// Whether `user` only reads `scope` ([`SignIn::read_only`]): its org holds them as a viewer, or it is a team
+    /// they are not in, opened because their org's memory reads it ([`Directory::resolve_reading`]). Their own scope
+    /// (`scope=mine`, no org's) too, when every org that holds them holds them as a viewer.
+    pub fn reads_only(&self, user: &str, via: &SignIn, scope: &crate::Scope) -> bool {
+        let access = self.access(user, via);
+        match (scope, scope.org_name()) {
+            (crate::Scope::Team(id), Some(org)) => {
+                let team = id.split_once('/').map_or(id.as_str(), |(_, t)| t);
+                access
+                    .get(org)
+                    .is_some_and(|a| a.role == Role::Viewer || !a.teams.contains(team))
+            }
+            (_, Some(org)) => access.get(org).is_some_and(|a| a.role == Role::Viewer),
+            (_, None) => !access.is_empty() && access.values().all(|a| a.role == Role::Viewer),
+        }
+    }
+
+    /// The memory a read route gives `user` for a selection: [`Directory::resolve`]'s, and also a team they are not
+    /// in where their org's memory reads that team ([`Directory::reads`], the operator's setting): what they already
+    /// find of it through the org they may open as the team's own page, read only ([`Directory::reads_only`]). Only
+    /// for a person signed in: a key (an org's, or a server's file key, the operator's included) reads the scope it
+    /// is for, and a team's memory stays its own otherwise.
+    pub fn resolve_reading(
+        &self,
+        user: &str,
+        via: &SignIn,
+        org: Option<&str>,
+        team: Option<&str>,
+    ) -> Result<Scope> {
+        let refused = match self.resolve(user, via, org, team) {
+            Ok(s) => return Ok(s),
+            Err(e) => e,
+        };
+        let Some(t) = team.filter(|_| via.person && via.key.is_none()) else {
+            return Err(refused);
+        };
+        let Ok(org_scope) = self.resolve(user, via, org, None) else {
+            return Err(refused);
+        };
+        let Some(name) = org_scope.org_name() else {
+            return Err(refused);
+        };
+        match Scope::team(name, t) {
+            Ok(s) if self.reads(&org_scope).contains(&s) => Ok(s),
+            _ => Err(refused),
+        }
     }
 
     /// The orgs `user` belongs to, with their role and teams there.
@@ -3694,9 +3885,9 @@ pub fn valid_auth0_org(id: &str) -> bool {
 }
 
 impl Change {
-    /// Whether an operator (`SignIn::operator`) may make this change in `dir`, as an admin key would:
-    /// create an org, bind (or rebind) it to Auth0, set its admins and members, choose its models, and make or
-    /// revoke its `ingest` keys (the control plane's feed into a new org; an ingest key only writes). Nothing else an
+    /// Whether an operator (`SignIn::operator`) or a super admin (`SignIn::super_admin`) may make this change in
+    /// `dir`, as an admin key would: create an org, bind (or rebind) it to Auth0, set its admins and members, set any
+    /// of its or its teams' settings (its models, training log and reads included), and make or revoke its `ingest` keys (the control plane's feed into a new org; an ingest key only writes). Nothing else an
     /// admin key may do (delete an org, its teams, other keys, providers, domains, profile, imports) is
     /// theirs directly, but an admin they make, themselves included, holds everything an org admin holds
     /// there: an ingest key reaches no further than that.
@@ -3712,46 +3903,9 @@ impl Change {
             | Change::DeclineSignIn { .. }
             | Change::SetNames { .. }
             | Change::SetLimits { .. } => true,
-            // An org's models, its training log, which scopes its readers also search and which sign-ins it
-            // takes (as binding it to Auth0 is theirs), and nothing else of its settings.
-            Change::SetSettings { settings, .. } => {
-                (settings.sets_models()
-                    || settings.train_log.is_some()
-                    || settings.advice_traces.is_some()
-                    || settings.reads.is_some()
-                    || settings.require_mfa.is_some()
-                    || settings.require_sso.is_some())
-                    && settings.compile.is_none()
-                    && settings.advice.is_none()
-                    && settings.advice_procedures.is_none()
-                    && settings.advice_evidence.is_none()
-                    && settings.advice_learn_people.is_none()
-                    && settings.advice_personal_runs.is_none()
-                    && settings.advice_skills.is_none()
-                    && settings.advice_learn_exclude.is_none()
-                    && settings.share_people.is_none()
-                    && settings.share_facts.is_none()
-                    && settings.extract.is_none()
-                    && settings.classic_ranking.is_none()
-                    && settings.freshness.is_none()
-                    && settings.conflicts.is_none()
-                    && settings.advice_curation.is_none()
-                    && settings.advice_automated.is_none()
-                    && settings.advice_eval.is_none()
-                    && settings.purge.is_none()
-                    && settings.profile.is_none()
-                    && settings.transcripts.is_none()
-                    && settings.instructions.is_none()
-                    && settings.notes_dream.is_none()
-                    && settings.fact_checks.is_none()
-                    && settings.notes_decide.is_none()
-                    && settings.activity.is_none()
-                    && settings.session_branches.is_none()
-                    && settings.auto_review.is_none()
-                    && settings.schema_growth.is_none()
-                    && settings.pii.is_none()
-                    && settings.digest.is_none()
-            }
+            // Any of an org's or team's settings, as its admins set them: the platform's support tunes an org it is
+            // helping (its advice, compiling, sharing, models, sign-ins) without making itself the org's admin.
+            Change::SetSettings { .. } => true,
             Change::CreateKey { role, .. } => *role == KeyRole::Ingest,
             Change::RevokeKey { org, name } | Change::SetKeySources { org, name, .. } => dir
                 .orgs
@@ -4261,9 +4415,11 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
     if let Some(p) = &actor.via.platform {
         crate::people::tenants::platform_may(dir, p, change)?;
     }
-    // An operator makes the changes that are theirs as an admin key would, and no other.
+    // An operator, or a super admin (`AMPUP_MEMORY_SUPER_ADMINS`, their own sign-in), makes the changes that are an
+    // operator's as an admin key would, and no other.
     let superuser = actor.superuser
-        || (actor.via.operator && change.operators(dir))
+        || ((actor.via.operator || (actor.via.super_admin && actor.via.key.is_none()))
+            && change.operators(dir))
         || actor.via.provisioner.is_some()
         || actor.via.platform.is_some();
     // Creating and deleting orgs is the catalog owner's; the rest is the org's admins'.
@@ -4644,11 +4800,12 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 for t in &m.teams {
                     has_team(t)?;
                 }
-                // An invite never demotes: an admin invited again as a member stays an admin.
+                // An invite never demotes: an admin invited again as a member stays an admin, a member invited
+                // again as a viewer stays a member.
                 match org.members.get(&u) {
                     None => out.push(ev("member.add").user(&u).role(m.role)),
-                    Some(Role::Member) if m.role == Role::Admin => {
-                        out.push(ev("member.add").user(&u).role(Role::Admin))
+                    Some(r) if m.role.rank() > r.rank() => {
+                        out.push(ev("member.add").user(&u).role(m.role))
                     }
                     _ => {}
                 }
@@ -4731,6 +4888,9 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             if team.is_some() && settings.auto_review.is_some() {
                 invalid!("auto_review is the org's setting, not a team's: set it without a team");
             }
+            if team.is_some() && settings.skill_review.is_some() {
+                invalid!("skill_review is the org's setting, not a team's: set it without a team");
+            }
             if team.is_some() && settings.digest.is_some() {
                 invalid!("digest is the org's setting, not a team's: set it without a team");
             }
@@ -4754,7 +4914,7 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
             }
             if settings.is_empty() {
                 invalid!(
-                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\"|\"changes\"|\"conversations\", \"compile_kind_sources\": [\"<source prefix>\"], \"compile_kinds\": {{\"<kind>\": [\"<source prefix>\"]}}, \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"share_people\": <people>, \"share_facts\": true|false, \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"schema_growth\": true|false, \"pii\": true|false, \"digest\": true|false, \"require_mfa\": true|false, \"require_sso\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"advice_eval\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"fact_checks\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
+                    "settings names nothing to set (settings: {{\"compile\": true|false, \"compile_sources\": [\"<source prefix>\" | \"*\"], \"compile_batch\": <sources>, \"compile_kind\": \"errors\"|\"changes\"|\"conversations\", \"compile_kind_sources\": [\"<source prefix>\"], \"compile_kinds\": {{\"<kind>\": [\"<source prefix>\"]}}, \"advice\": true|false, \"advice_procedures\": true|false, \"advice_evidence\": <people>, \"advice_learn_people\": <people>, \"advice_personal_runs\": <runs>|\"off\", \"advice_learn_exclude\": [\"<user id>\"], \"share_people\": <people>, \"share_facts\": true|false, \"advice_skills\": \"fallback\"|\"together\"|\"off\", \"error_leads\": true|false, \"extract\": true|false, \"train_log\": true|false, \"advice_traces\": true|false, \"classic_ranking\": true|false, \"purge\": true|false, \"activity\": true|false, \"session_branches\": true|false, \"auto_review\": true|false, \"skill_review\": true|false, \"schema_growth\": true|false, \"pii\": true|false, \"digest\": true|false, \"require_mfa\": true|false, \"require_sso\": true|false, \"freshness\": true|false, \"conflicts\": true|false, \"advice_curation\": true|false, \"advice_automated\": true|false, \"advice_eval\": true|false, \"profile\": true|false, \"instructions\": \"default\"|\"purpose\", \"transcripts\": true|false, \"notes_dream\": true|false, \"fact_checks\": true|false, \"notes_decide\": true|false, \"reads\": [\"team:<org>/<team>\"], \"extract_model\" |\"compile_model\" | \"aip_model\": \"<model>\"}})"
                 );
             }
             check_values(settings)?;
@@ -4777,9 +4937,16 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                 );
             }
             // Which other scopes a scope's readers search decides who reads what: the operator's to set, and only
-            // within the org (one org, so one cell: `cell::of_org`).
+            // within the org (one org, so one cell: `cell::of_org`). One exception, the org's admins': a team of
+            // theirs may read the org's own memory, which every member of the team reads already as the org's
+            // member (its team-pinned keys and connections then read it too), or stop reading it.
             if let Some(reads) = &settings.reads {
-                if !superuser {
+                let org_scope = crate::Scope::org(org_name)?;
+                let org_only = team.is_some()
+                    && reads
+                        .iter()
+                        .all(|r| crate::Scope::parse(r).is_ok_and(|s| s == org_scope));
+                if !superuser && !org_only {
                     refuse!(
                         "{me} may not set which scopes org {org_name}'s readers also search: it decides who reads what, so only the operator (an admin key or an operator sign-in) may"
                     );
@@ -5018,6 +5185,13 @@ fn plan_change(dir: &Directory, actor: &Actor, change: &Change) -> Result<Vec<Ev
                         invalid!(
                             "a personal key reads (reader) or reads and writes (writer) as its member, not {}",
                             role.as_str()
+                        );
+                    }
+                    if *role != KeyRole::Reader
+                        && org.members.get(&user_id(me)) == Some(&Role::Viewer)
+                    {
+                        refuse!(
+                            "{me} is a viewer of org {org_name}: their personal key only reads (--role reader)"
                         );
                     }
                     if team.is_some() {
@@ -5336,6 +5510,18 @@ pub async fn apply(store: &Store, actor: &Actor, change: &Change) -> Result<Vec<
         && Directory::load(store).await?.purged.contains(org)
     {
         crate::offboard::purge_memory(store, org).await?;
+    }
+    // A purged team's name taken again: whatever a lagging server wrote for the old team after its purge goes
+    // first, so the new team starts with nothing of the old one's.
+    if let Change::CreateTeam { org, team } = change
+        && Directory::fresh(store)
+            .await?
+            .orgs
+            .get(org)
+            .is_some_and(|o| o.team_purged.contains_key(team) && !o.teams.contains_key(team))
+    {
+        plan(&Directory::fresh(store).await?, actor, change)?;
+        crate::offboard::purge_team_memory(store, org, team).await?;
     }
     // Deleting an org rewrites the audit and key usage tables after the directory change: a catalog that
     // can't is refused before anything changes (once the change is known to be allowed), not halfway.

@@ -87,6 +87,8 @@ interface Lesson {
     trail: LearnedFrom[];
     /** Older entries the trail leaves out. */
     more: number;
+    /** Entries a page's `trail` left out of it, which a read of the lesson lists. */
+    cut?: number;
     /** Other people's, counted and not listed. */
     hidden: number;
   };
@@ -98,6 +100,7 @@ interface Lesson {
     bad: number;
     trail: ServedIn[];
     more: number;
+    cut?: number;
     hidden: number;
   };
   evidence?: { ratified?: boolean };
@@ -137,7 +140,7 @@ function scoped(days: number | null, person: string): Record<string, unknown> {
 }
 
 /** Lessons a page asks for at a time. */
-const PAGE = 30;
+const PAGE = 12;
 
 /**
  * A lesson as a link names it: a team lesson by its key, a person's own by its key and its owner (two people's
@@ -427,7 +430,9 @@ function Trail<T>({
   title,
   summary,
   dots,
-  rows,
+  rows: listed,
+  cut = 0,
+  whole,
   hidden,
   more,
   empty,
@@ -437,12 +442,31 @@ function Trail<T>({
   summary: React.ReactNode;
   dots: { ok: number; bad: number; other: number };
   rows: T[];
+  /** Entries the page left out of `rows`, which `whole` reads. */
+  cut?: number;
+  whole?: () => Promise<T[] | undefined>;
   hidden: string | null;
   more: number;
   empty: string;
   render: (r: T) => React.ReactNode;
 }) {
   const [all, setAll] = useState(false);
+  const [read, setRead] = useState<{ rows?: T[]; busy: boolean; error?: unknown } | null>(null);
+  const rows = read?.rows ?? listed;
+  // Every entry the lesson lists, where the page cut some: read on "show all", once.
+  const total = read?.rows ? rows.length : listed.length + (whole ? cut : 0);
+  const showAll = () => {
+    if (all) return setAll(false);
+    if (read?.rows || !whole || !cut) return setAll(true);
+    setRead({ busy: true });
+    whole().then(
+      (r) => {
+        setRead({ rows: r ?? listed, busy: false });
+        setAll(true);
+      },
+      (error: unknown) => setRead({ busy: false, error }),
+    );
+  };
   const shown = all ? rows : rows.slice(0, SHOWN);
   return (
     <section className="lr-trail">
@@ -456,22 +480,23 @@ function Trail<T>({
       ) : (
         !hidden && <p className="ap-muted ap-small">{empty}</p>
       )}
-      {(rows.length > SHOWN || more > 0 || hidden) && (
+      {(total > SHOWN || more > 0 || hidden) && (
         <p className="ap-muted ap-small lr-trail-foot">
-          {rows.length > SHOWN && (
-            <button className="ap-link" onClick={() => setAll(!all)}>
-              {all ? "show fewer" : `show all ${rows.length}`}
+          {total > SHOWN && (
+            <button className="ap-link" disabled={read?.busy} onClick={showAll}>
+              {read?.busy ? "reading…" : all ? "show fewer" : `show all ${total}`}
             </button>
           )}
+          {!!read?.error && <span className="ap-error"> {errorText(read.error)}</span>}
           {more > 0 && (
             <span>
-              {rows.length > SHOWN ? " · " : ""}
+              {total > SHOWN ? " · " : ""}
               {more} older not listed
             </span>
           )}
           {hidden && (
             <span>
-              {rows.length > SHOWN || more > 0 ? " · " : ""}
+              {total > SHOWN || more > 0 ? " · " : ""}
               {hidden}
             </span>
           )}
@@ -489,15 +514,18 @@ function LessonCard({
   onTrace,
   onAdvice,
   days,
+  whole,
 }: {
   l: Lesson;
   me: string;
   focused: boolean;
+  /** The lesson whole, every trail entry it lists, where the page cut its trails (`trail`). */
+  whole?: () => Promise<Lesson | undefined>;
   /** The window its runs and sessions were counted over, as the server applied it (null: all of them). */
   days?: number | null;
   onLesson: (id: string) => void;
   onTrace: (id: string) => void;
-  /** Opens the lesson on Advice's Served tab; absent where it is shown there already. */
+  /** Opens the lesson on the Serving tab; absent where it is shown there already. */
   onAdvice?: (key: string) => void;
 }) {
   const f = l.learned_from;
@@ -568,6 +596,8 @@ function LessonCard({
           }
           dots={{ ok: f.right, bad: f.wrong, other: f.runs - f.right - f.wrong }}
           rows={f.trail}
+          cut={f.cut}
+          whole={whole && (() => whole().then((w) => w?.learned_from.trail))}
           hidden={others(f.hidden, "run")}
           more={f.more}
           empty={days ? `No runs in the last ${days} days.` : "No runs left in the log."}
@@ -600,6 +630,8 @@ function LessonCard({
           }
           dots={{ ok: s.good, bad: s.bad, other: s.sessions - s.good - s.bad }}
           rows={s.trail}
+          cut={s.cut}
+          whole={whole && (() => whole().then((w) => w?.served_in.trail))}
           hidden={others(s.hidden, "session")}
           more={s.more}
           empty={
@@ -752,6 +784,7 @@ export function Learned({
     let live = true;
     call<Lessons>(sel, "lessons", {
       page: PAGE,
+      trail: SHOWN,
       ...scoped(days, person),
       ...(showAs ? { show: showAs } : {}),
     }).then(
@@ -772,6 +805,7 @@ export function Learned({
     setMore({ key, busy: true });
     call<Lessons>(sel, "lessons", {
       page: PAGE,
+      trail: SHOWN,
       after: next,
       ...scoped(days, person),
       ...(showAs ? { show: showAs } : {}),
@@ -844,20 +878,13 @@ export function Learned({
     }),
     { lessons: 0, runs: 0, sessions: 0, helped: 0 },
   );
-  // Whose own lessons are counted beside the team's is picked above both tabs (PersonPicker): here only which of
-  // the two to list.
-  const tabs: { id: string; label: string }[] = [
-    { id: "", label: "All" },
-    { id: "team", label: "Team" },
-    { id: "mine", label: person ? `${person}'s` : "Yours" },
-  ];
   const picked = lesson && !found && !next ? lesson : null;
   const anyLessons = groups.some((g) => g.lessons > 0);
 
   return (
     <div className="studio ap lr">
       <header className="ap-head">
-        <h1>Learned</h1>
+        <h1>Advice</h1>
         <span className="ap-muted">
           What separated the runs that went right from those that didn&apos;t, handed to agents the
           next time the same kind of task comes up
@@ -905,21 +932,6 @@ export function Learned({
               <dd>{totals.helped.toLocaleString()}</dd>
             </div>
           </dl>
-          <nav className="ap-chips lr-chips" aria-label="Whose lessons">
-            {tabs.map((t) => (
-              <button
-                key={t.id || "all"}
-                className={show === t.id ? "on" : ""}
-                aria-pressed={show === t.id}
-                onClick={() => setShow(t.id || null)}
-              >
-                {t.label}{" "}
-                <span className="ap-num">
-                  {inView(t.id).reduce((k, g) => k + g.lessons, 0)}
-                </span>
-              </button>
-            ))}
-          </nav>
           {picked && (
             <p className="ap-pad ap-muted ap-small">
               The lesson this link names isn&apos;t in this view.{" "}
@@ -940,6 +952,12 @@ export function Learned({
                   onLesson={onLesson}
                   onTrace={onTrace}
                   onAdvice={onAdvice}
+                  whole={() =>
+                    // Read as the page reads it, so the same answer the server keeps for it answers.
+                    call<Lessons>(sel, "lessons", { key: l.key, ...scoped(days, person) }).then((w) =>
+                      w.lessons.find((x) => x.key === l.key && x.owner === l.owner),
+                    )
+                  }
                 />
               ))
             ) : (

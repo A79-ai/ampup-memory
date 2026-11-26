@@ -103,6 +103,17 @@ once a day, so a busy issue isn't written every round. A server a session starts
 `SENTRY_AUTH_TOKEN` and `SENTRY_URL` from that session's environment; the background service has neither, but it
 carries `AMPUP_MEMORY_SENTRY_TOKEN_FILE` and `AMPUP_MEMORY_SENTRY_URL` and reads `~/.sentryclirc`.
 
+`ampup-memory sources add skills OWNER/REPO [--dir DIR]` reads a repository's `SKILL.md` files from its default
+branch's tree each round, with the token `github` uses. Each is a version of the document
+`repo-skills/OWNER/REPO/<path>` (source `github:OWNER/REPO#skill/<path>`), written again only when its blob changed.
+A session's skill uses are read from its transcript as it ends; `/skills/review` (`list`, `get`, `review`) grades a
+skill by what came of those sessions and the votes on `skill:<name>` (`/feedback`), and `review` writes a proposed
+revision under `skill-proposals/` for the skill's readers. A file removed from the repository stays in memory.
+`serve` also reviews by itself, every `AMPUP_MEMORY_SKILL_REVIEW_SECS` (default an hour), in every org that doesn't
+set `skill_review` false: a repository's skill or a compiled one, once it has new evidence since its last review
+(five sessions that used it, one that failed, a new vote against it, or the skill changed), at most once a day a skill
+and three a scope a round.
+
 `ampup-memory sources add slack CHANNEL [--since DATE] [--dir DIR]` reads a Slack channel (its name without `#`, or
 its id) the same way, with a bot token from a Slack app you make in your own workspace, `SLACK_BOT_TOKEN` in the
 server's environment. Each message, and each reply in its threads, is written as its own episode in the hosted
@@ -265,7 +276,8 @@ ledger last. A backup holds what was deleted after it: apply forgets and deletes
 - **Metrics.** `/metrics` is Prometheus text. Serve it on its own port with `AMPUP_MEMORY_METRICS_PORT=9464` (expose it
   to the scraper only), or read it on the public port with the operator's admin key. Labels come from fixed sets:
   route templates, statuses, reason codes, the directory's orgs. Useful series: `memstore_http_requests_total`,
-  `memstore_http_request_seconds`, `memstore_auth_refusals_total`, `memstore_index_freshness_lag_seconds`,
+  `memstore_http_request_seconds`, `memstore_studio_read_seconds` (the Studio's reads by op and org),
+  `memstore_auth_refusals_total`, `memstore_index_freshness_lag_seconds`,
   `memstore_store_commit_failures_total`, `memstore_extraction_backlog_episodes`, `memstore_model_tokens_total`,
   `memstore_model_cache_total`, `memstore_writer_lease_held`, `memstore_directory_blocked`.
 - **Slow requests.** A request taking `AMPUP_MEMORY_SLOW_REQUEST_MS` (1000) or longer is logged with its route and time.

@@ -54,7 +54,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::client::{Unreached, sent_error};
+use crate::client::{SignedOut, Unreached, sent_error};
 
 /// Longest session body sent, under the server's `/remember` limit: the whole conversation, all but the longest
 /// (one in a hundred ran past 600,000 characters over three days of one person's sessions); past it, its start
@@ -689,6 +689,12 @@ fn worth_retrying(e: &anyhow::Error) -> bool {
         || format!("{e:#}").contains("can't be kept right now")
 }
 
+/// Whether `e` is a sign-in its provider won't renew ([`SignedOut`]): nothing gets through until the person signs in
+/// again, and then it does.
+fn signed_out(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<SignedOut>().is_some())
+}
+
 fn tool_call(name: &str, args: &Value) -> Value {
     json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
            "params": {"name": name, "arguments": args}})
@@ -807,8 +813,10 @@ fn queue_if_unreached<T>(
 
 /// Sends what the outbox holds, oldest first, each to where it was going: until the memory fails to take one
 /// (it is down, and the rest would wait out the same timeout) or `budget` is spent. An item whose back-off isn't
-/// out (`next_at`) is left alone, and one that fails again waits longer ([`outbox_wait`]). What the memory refuses
-/// is dropped, as is what waited past [`OUTBOX_DAYS`]; a session's waiting keep goes once its end waits too.
+/// out (`next_at`) is left alone, and one that fails again waits longer ([`outbox_wait`]). What goes with a sign-in
+/// its provider won't renew ([`SignedOut`]) waits as it was for the person to sign in again, which no back-off brings
+/// sooner: the sign-in is tried once a drain, and the rest going with it wait untried. What the memory refuses is
+/// dropped, as is what waited past [`OUTBOX_DAYS`]; a session's waiting keep goes once its end waits too.
 async fn send_outbox(budget: Duration) {
     let dir = outbox_dir();
     let Ok(listed) = std::fs::read_dir(&dir) else {
@@ -856,15 +864,32 @@ async fn send_outbox(budget: Duration) {
         items.push((age, p));
     }
     items.sort_by_key(|(age, _)| std::cmp::Reverse(*age));
+    let too_old =
+        |v: &Value| unix_now().saturating_sub(v["at"].as_u64().unwrap_or(0)) > OUTBOX_DAYS * 86_400;
+    // The sign-ins (server and org) whose provider refused to renew them in this drain, how many items wait for one,
+    // and why: said once, after.
+    let mut signed_out_of: Vec<(Value, Value)> = vec![];
+    let mut waiting_for_sign_in = 0;
+    let mut sign_in_refused = None;
     for (_, p) in items {
         if started.elapsed() > budget {
             break;
         }
+        let queued = read_item(&p);
         // Not yet due: the memory may still be taking the copy that failed (a timed-out end's commit runs on).
-        if read_item(&p)
+        if queued
+            .as_ref()
             .and_then(|v| v["next_at"].as_u64())
             .is_some_and(|at| at > unix_now())
         {
+            continue;
+        }
+        // Going with a sign-in refused already in this drain: it waits as it is, untried, unless it waited too long.
+        if let Some(q) = &queued
+            && signed_out_of.contains(&(q["url"].clone(), q["org"].clone()))
+            && !too_old(q)
+        {
+            waiting_for_sign_in += 1;
             continue;
         }
         let claimed = p.with_extension(format!("json.sending.{pid}.{}", unix_now()));
@@ -880,11 +905,13 @@ async fn send_outbox(budget: Duration) {
             item["kind"].as_str().unwrap_or("a write"),
             item["session"].as_str().unwrap_or("?")
         );
-        if unix_now().saturating_sub(item["at"].as_u64().unwrap_or(0)) > OUTBOX_DAYS * 86_400 {
+        if too_old(&item) {
             warn(format!("outbox: {what} waited {OUTBOX_DAYS} days, dropped"));
             let _ = std::fs::remove_file(&claimed);
             continue;
         }
+        // As it waited, to put back as it was when the sign-in is refused.
+        let as_queued = item.clone();
         // Counted as failed until it is taken, written before it is sent: a copy killed mid-send leaves it backed
         // off, and the claim reads as fresh, so no other copy takes it back while this one waits on the memory.
         let attempts = item["attempts"].as_u64().unwrap_or(0) + 1;
@@ -921,6 +948,23 @@ async fn send_outbox(budget: Duration) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&claimed);
             }
+            // Signed out: nothing reaches the memory until the person signs in again, which no back-off brings
+            // sooner. It waits as it was, its tries uncounted; the rest going with the same sign-in wait untried.
+            Err(e) if signed_out(&e) => {
+                signed_out_of.push((item["url"].clone(), item["org"].clone()));
+                waiting_for_sign_in += 1;
+                sign_in_refused.get_or_insert_with(|| format!("{e:#}"));
+                match p.exists() {
+                    // A newer one of the same kind and session waits already: it carries more.
+                    true => {
+                        let _ = std::fs::remove_file(&claimed);
+                    }
+                    false => {
+                        let _ = write_private(&dir, &claimed, &as_queued.to_string());
+                        let _ = std::fs::rename(&claimed, &p);
+                    }
+                }
+            }
             Err(e) if worth_retrying(&e) => {
                 // Waits from now, the failure seen, at least as long as the memory said.
                 let next_at = unix_now() + outbox_wait(attempts, said_wait(&e));
@@ -952,6 +996,11 @@ async fn send_outbox(budget: Duration) {
                 let _ = std::fs::remove_file(&claimed);
             }
         }
+    }
+    if let Some(e) = sign_in_refused {
+        warn(format!(
+            "outbox: {waiting_for_sign_in} waiting until you sign in again: {e}"
+        ));
     }
 }
 
@@ -1568,12 +1617,11 @@ async fn run_event(event: &str, harness: Harness) -> Result<()> {
     {
         return rate_typed(&input, harness, reward, &why).await;
     }
-    // The agent opening a session itself (its server's instructions say to, and the hook's session line hadn't
-    // reached it yet): the call names this conversation, so the server hands back the session the hooks opened
-    // for it, or the one the hooks open next joins it. One conversation is one session.
+    // The agent opening or ending a session itself (its server's instructions say to, and the hook's session line
+    // hadn't reached it yet): one conversation is one session, opened and ended by the hooks.
     if event == "pre-tool"
         && !detached
-        && let Some(out) = own_start_in_thread(&input, harness)
+        && let Some(out) = own_session_call(&input, harness)
     {
         println!("{out}");
         return Ok(());
@@ -2927,23 +2975,43 @@ fn hook_event(harness: Harness, event: &str) -> &'static str {
     }
 }
 
-/// For Claude Code's PreToolUse of AmpUp Memory's own `start_session` (an MCP tool of its server) that names no
-/// conversation: the same call naming this one (`thread`, as the hooks' own start does), so the server answers with
-/// the session already open for it rather than a second one.
-fn own_start_in_thread(input: &Value, harness: Harness) -> Option<String> {
+/// Whether this Claude Code tool call is AmpUp Memory's own `tool` (an MCP tool of its server, under one of the
+/// names it is installed under: the plugin's, and the entry `setup` writes, new and old). Another server's tool of
+/// the same name isn't.
+fn own_tool(input: &Value, harness: Harness, tool: &str) -> bool {
     if harness != Harness::ClaudeCode {
-        return None;
+        return false;
     }
-    let tool = field(input, &["tool_name", "toolName"])?;
-    let server = tool
-        .strip_prefix("mcp__")?
-        .strip_suffix("__start_session")?;
-    // Only the names AmpUp Memory's server is installed under: the plugin's, and the entry `setup` writes (new and
-    // old). Another server's tool is left as it is.
-    let ours = server == format!("plugin_{0}_{0}", crate::naming::MCP_SERVER)
+    let Some(server) = field(input, &["tool_name", "toolName"])
+        .and_then(|t| t.strip_prefix("mcp__"))
+        .and_then(|t| t.strip_suffix(&format!("__{tool}")))
+    else {
+        return false;
+    };
+    server == format!("plugin_{0}_{0}", crate::naming::MCP_SERVER)
         || server == crate::naming::MCP_SERVER
-        || crate::naming::OLD_MCP_SERVERS.contains(&server);
-    if !ours {
+        || crate::naming::OLD_MCP_SERVERS.contains(&server)
+}
+
+/// The PreToolUse answer to the agent's own call of AmpUp Memory's session tools in a conversation the hooks run,
+/// so one conversation stays one session:
+/// - `start_session` naming no conversation names this one (`thread`, as the hooks' own start does), so the server
+///   answers with the session already open for it rather than a second one. Its input changes, its permission
+///   doesn't: the person's own rules still decide whether it runs.
+/// - `end_session` while the hooks have a session open for it is refused, with why: the hooks end it with the whole
+///   conversation when it ends. Ended now, the conversation's next hook would find it gone and open another, whose
+///   end records the conversation a second time.
+fn own_session_call(input: &Value, harness: Harness) -> Option<String> {
+    if own_tool(input, harness, "end_session") && session_id(input).is_some() {
+        let why = "AmpUp Memory's hooks end this session themselves, with the whole conversation, when it ends: \
+                   there is nothing to end now.";
+        return Some(
+            json!({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                    "permissionDecision": "deny", "permissionDecisionReason": why}})
+            .to_string(),
+        );
+    }
+    if !own_tool(input, harness, "start_session") {
         return None;
     }
     let session = session_of(input);
@@ -2952,7 +3020,6 @@ fn own_start_in_thread(input: &Value, harness: Harness) -> Option<String> {
         return None;
     }
     args["thread"] = json!(session);
-    // The input changes, the permission doesn't: the person's own rules still decide whether it runs.
     Some(
         json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": args}})
             .to_string(),
@@ -3788,16 +3855,29 @@ async fn end_session(client: &Client, input: &Value, harness: Harness) -> Result
     }
     let args = kept_unless_off(args);
     let call = tool_call("end_session", &args);
-    let ended = client.tool("end_session", args).await;
-    let ended = queue_if_unreached(
-        client,
-        "end",
-        input,
-        "/mcp",
-        call,
-        Some("end_session"),
-        ended,
-    );
+    let ended = match client.tool("end_session", args).await {
+        // Signed out: the end waits in the outbox for the person to sign in again, and goes with the drain after.
+        Err(e) if signed_out(&e) => {
+            client.queue(
+                "end",
+                session_of(input),
+                "/mcp",
+                call,
+                Some("end_session"),
+                None,
+            );
+            Err(e.context("kept in the outbox until you sign in again"))
+        }
+        ended => queue_if_unreached(
+            client,
+            "end",
+            input,
+            "/mcp",
+            call,
+            Some("end_session"),
+            ended,
+        ),
+    };
     // Gone whether or not the end landed: a session the server refuses to end (ended already) is no longer this
     // harness session's, and a stale marker would hold up the next one's. Its id stays, for a rating typed after the
     // conversation resumes ([`rated_session`]).
@@ -4409,7 +4489,8 @@ fn segment(entries: &[Value], harness: Harness) -> Segment {
             }
             Step::Call { line, result, .. } => {
                 seg.calls += 1;
-                let pr = pr_call(&line);
+                // A PR's call links the PR; a skill's says which skill the session used: both are kept whole.
+                let pr = pr_call(&line) || skill_call(&line);
                 lines.push((
                     match result {
                         Some(r) => format!("  tool {line}\n    -> {r}"),
@@ -4481,6 +4562,13 @@ fn pr_call(call: &str) -> bool {
     PR_MARKS.iter().any(|m| call.contains(m))
 }
 
+/// Whether a step is a Claude Code `Skill` call (`Skill {"skill":"name"}`), which the server grades the skill by.
+fn skill_call(call: &str) -> bool {
+    call.trim_start()
+        .trim_start_matches("tool ")
+        .starts_with("Skill {")
+}
+
 /// `text` on one line, at most `n` characters: its start and end when longer.
 fn ends(text: &str, n: usize) -> String {
     let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -4515,8 +4603,10 @@ fn fit(lines: &[(String, bool)], max: usize, head: usize) -> String {
         for (cap, answers) in [(300, true), (150, false), (80, false)] {
             let only: Vec<String> = lines
                 .iter()
-                .filter(|(l, k)| *k && (answers || pr_call(l) || l.starts_with("User: ")))
-                .map(|(l, _)| match pr_call(l) {
+                .filter(|(l, k)| {
+                    *k && (answers || pr_call(l) || skill_call(l) || l.starts_with("User: "))
+                })
+                .map(|(l, _)| match pr_call(l) || skill_call(l) {
                     true => l.clone(),
                     false => clip(l, cap),
                 })

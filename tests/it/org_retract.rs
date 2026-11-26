@@ -110,7 +110,8 @@ async fn post(url: &str, bearer: &str, headers: &[(&str, &str)], body: &Value) -
     (r.status().as_u16(), r.json().await.unwrap_or_default())
 }
 
-/// Every file under `root` whose path doesn't hold `besides` and whose bytes hold `tag`.
+/// Every file under `root` whose path doesn't hold `besides` and whose bytes hold `tag` (a data file's rows
+/// uncompressed: [`crate::stored_bytes`]).
 fn files_with(root: &Path, besides: &str, tag: &str) -> Vec<PathBuf> {
     let mut out = vec![];
     let mut stack = vec![root.to_path_buf()];
@@ -123,7 +124,7 @@ fn files_with(root: &Path, besides: &str, tag: &str) -> Vec<PathBuf> {
             if p.is_dir() {
                 stack.push(p);
             } else if !p.to_string_lossy().contains(besides)
-                && let Ok(bytes) = std::fs::read(&p)
+                && let Some(bytes) = crate::stored_bytes(&p)
                 && bytes.windows(tag.len()).any(|w| w == tag.as_bytes())
             {
                 out.push(p);
@@ -960,4 +961,214 @@ async fn an_org_retracts_its_own_episodes_and_nobody_elses() {
     assert_eq!(status, 200, "{v}");
     assert_eq!(&v["deleted"]["episodes"], &json!(1), "{v}");
     assert!(!live().await.contains(&travel));
+}
+
+/// A skill's proposed revision (`/skills/review`) goes with what it rests on. It is the engine's own record, read by
+/// nobody directly: served only to whoever may read its skill now, so a narrower audience on the skill applies to it
+/// at once; hidden the moment the skill's source is deleted (the connector's prefix delete when a repository is
+/// removed); and erased from storage, its bytes with it, by the purge that erases the skill.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skill_s_proposal_goes_with_its_skill() {
+    if !crate::own_process("org_retract::a_skill_s_proposal_goes_with_its_skill") {
+        return;
+    }
+    // The learning model a review asks: a revision that holds a tag, so what is left of it on disk can be looked for.
+    let tag = "zzproposaltag";
+    let (url, asked) = crate::access_flow::stand_in_model(move |_| {
+        json!({"verdict": "revise", "summary": "Add the missing check.",
+               "changes": [{"what": "a check", "why": "a session failed without it"}],
+               "skill_md": format!("---\nname: ship\n---\n\n# Ship\n\n1. Build.\n2. Check {tag} first.\n")})
+        .to_string()
+    })
+    .await;
+    unsafe {
+        std::env::set_var("AMPUP_MEMORY_MODEL_CACHE", "off");
+        std::env::set_var("AMPUP_MEMORY_EXTRACT", "off");
+        std::env::set_var("AMPUP_MEMORY_ADVICE", "openai");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_URL", &url);
+        std::env::set_var("AMPUP_MEMORY_ADVICE_KEY", "stand-in");
+        std::env::set_var("AMPUP_MEMORY_ADVICE_MODEL", "stand-in");
+    }
+    let issuer = start_idp().await;
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = platform::local(&format!("file://{}", dir.path().display()))
+        .await
+        .unwrap();
+    let store =
+        Store::new(catalog.clone()).with_index_base(dir.path().join("index").display().to_string());
+    store.ensure_scope(&Scope::Org).await.unwrap();
+    let keys = json!([{"id": "platform", "sha256": auth::hex(&sha2::Sha256::digest(ADMIN_KEY.as_bytes())),
+                       "user": "svc:platform", "admin": true}]);
+    let auth = TokenAuth::new(Some(&keys.to_string()), None)
+        .unwrap()
+        .allow_local_issuers()
+        .with_oidc(
+            OidcConfig::discover(&issuer, vec![CLIENT_ID.into()])
+                .await
+                .unwrap(),
+        );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(serve_with(
+        port,
+        Scope::Org,
+        vec![],
+        Options {
+            listener: Some(listener),
+            catalog: Some(catalog.clone()),
+            index_base: Some(store.index_base().to_string()),
+            token_auth: Some(auth),
+            directory_only: true,
+            ..Default::default()
+        },
+    ));
+    let s = format!("http://127.0.0.1:{port}");
+    let up = Instant::now();
+    while reqwest::get(&s).await.is_err() {
+        assert!(
+            up.elapsed() < Duration::from_secs(30),
+            "server never came up"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let feed = format!("msk_{}feed", uuid::Uuid::new_v4().simple());
+    for change in [
+        json!({"op": "create_org", "org": "acme", "admin": "alice@acme.com"}),
+        json!({"op": "invite", "org": "acme", "members": [{"user": "bob@acme.com"}]}),
+        json!({"op": "create_key", "org": "acme", "name": "feed", "role": "ingest", "key": feed}),
+    ] {
+        let (status, body) = post(&format!("{s}/admin"), ADMIN_KEY, &[], &change).await;
+        assert_eq!(status, 200, "{change}: {body}");
+    }
+    let (alice, bob) = (
+        id_token(&issuer, "alice@acme.com"),
+        id_token(&issuer, "bob@acme.com"),
+    );
+    let in_acme = [("x-memstore-org", "acme")];
+    // The repository's skill, as its connector writes it: under the repository's own source prefix.
+    let source = "github:acme/app#skill/.claude/skills/ship/SKILL.md";
+    let key = "repo-skills/acme/app/.claude/skills/ship/SKILL.md";
+    let skill = json!({"episodes": [{"source": source, "occurred_at": 1_760_000_000_000_000i64,
+        "acl": ["group:acme.all"], "document": key,
+        "body": "---\nname: ship\ndescription: Ship a release.\n---\n\n# Ship\n\n1. Build.\n"}]});
+    let (status, v) = post(&format!("{s}/ingest"), &feed, &[], &skill).await;
+    assert_eq!(status, 200, "{v}");
+    let review = |who: &str| {
+        let who = who.to_string();
+        let s = s.clone();
+        async move {
+            post(
+                &format!("{s}/skills/review"),
+                &who,
+                &[("x-memstore-org", "acme")],
+                &json!({"op": "review", "skill": "ship"}),
+            )
+            .await
+        }
+    };
+    let (status, v) = review(&alice).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["proposal"]["verdict"], "revise", "{v}");
+    assert_eq!(asked.lock().unwrap().len(), 1);
+    let get = async |who: &str| {
+        post(
+            &format!("{s}/skills/review"),
+            who,
+            &in_acme,
+            &json!({"op": "get", "skill": "ship"}),
+        )
+        .await
+    };
+    // Both read the skill, so both are served its proposal (once a read is served the state holding it: a write that
+    // only adds may be read a moment behind).
+    for who in [&alice, &bob] {
+        let t = Instant::now();
+        let v = loop {
+            let (status, v) = get(who).await;
+            assert_eq!(status, 200, "{v}");
+            if !v["proposal"].is_null() || t.elapsed() > Duration::from_secs(15) {
+                break v;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        assert!(
+            v["proposal"]["skill_md"]
+                .as_str()
+                .is_some_and(|m| m.contains(tag)),
+            "{v}"
+        );
+        assert!(v["proposal"].get("rests_on").is_none(), "{v}");
+    }
+    // Nobody reads it directly, not even the admin who asked for it: no document, no listing, no episode.
+    let proposal_key = "skill-proposals/repo/acme/app/.claude/skills/ship/SKILL.md";
+    for who in [&alice, &bob] {
+        for body in [
+            json!({"calls": [[proposal_key]]}),
+            json!({"calls": [["skill-proposals/"]]}),
+        ] {
+            let (status, v) = post(&format!("{s}/document"), who, &in_acme, &body).await;
+            assert_eq!(status, 200, "{v}");
+            assert!(
+                !v.to_string().contains(tag) && !v.to_string().contains("skill-proposals/"),
+                "{v}"
+            );
+        }
+        let (status, v) = post(
+            &format!("{s}/search"),
+            who,
+            &in_acme,
+            &json!({"calls": [[tag, 10, -1]]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{v}");
+        assert!(!v.to_string().contains(tag), "{v}");
+    }
+    // The repository's readers narrowed to Alice: Bob loses the proposal with the skill.
+    let (status, v) = post(
+        &format!("{s}/acl"),
+        ADMIN_KEY,
+        &in_acme,
+        &json!({"source": source, "acl": ["user:alice@acme.com"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+    let (status, v) = get(&bob).await;
+    assert_eq!(status, 400, "{v}");
+    assert!(!v.to_string().contains(tag), "{v}");
+    let (status, v) = get(&alice).await;
+    assert_eq!(status, 200, "{v}");
+    assert!(
+        v["proposal"]["skill_md"].as_str().unwrap().contains(tag),
+        "{v}"
+    );
+    // The repository removed: its connector deletes everything under its prefix, the skill with it. The proposal is
+    // served to nobody from then on.
+    let (status, v) = post(
+        &format!("{s}/retract"),
+        &feed,
+        &[],
+        &json!({"source_prefix": "github:acme/app#"}),
+    )
+    .await;
+    assert_eq!((status, v), (200, json!({"retracted": 1})));
+    let (status, v) = get(&alice).await;
+    assert_eq!(status, 400, "{v}");
+    let (status, v) = post(
+        &format!("{s}/skills/review"),
+        &alice,
+        &in_acme,
+        &json!({"op": "list"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+    assert!(!v.to_string().contains(tag), "{v}");
+    // The purge erases the skill and the proposal resting on it: nothing of either is left on disk.
+    let ns = Scope::org("acme").unwrap().namespace();
+    assert!(
+        !files_with(dir.path(), "index", tag).is_empty(),
+        "the proposal was never stored"
+    );
+    store.purge_retracted_in(&ns).await.unwrap();
+    let left = files_with(dir.path(), "\u{0}", tag);
+    assert!(left.is_empty(), "the proposal is still on disk: {left:?}");
 }

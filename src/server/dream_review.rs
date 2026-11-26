@@ -57,6 +57,7 @@ pub(super) async fn handle(
         true => Directory::behind(store).await?,
         false => Directory::load(store).await?,
     };
+    crate::phases::mark("dream directory");
     if !dir.is_admin(who.user(), via, org) {
         return Err(Refused(format!(
             "{} may not review org {org}'s dream (only its admins may)",
@@ -202,19 +203,36 @@ static LISTED: LazyLock<crate::kept_answers::Kept<Listed>> =
     LazyLock::new(|| crate::kept_answers::Kept::new(200));
 
 async fn listed(store: &Store, scope: &Scope, reader: &Principal) -> Result<Listed> {
+    let started = std::time::Instant::now();
     let read = decisions(store, scope, reader, false).await?;
+    let decided = started.elapsed();
     let last_run = dream::last_run(store, scope, &read.vis, &read.eps).await?;
+    let ran = started.elapsed();
     let decisions: Vec<Decision> = read.decisions.into_iter().filter(|d| d.readable).collect();
     let ids: HashSet<&str> = decisions.iter().map(|d| d.id.as_str()).collect();
-    // Through the last visibility state, as the decisions were read: a reason goes with what it cites.
-    let reasons: HashMap<String, String> = crate::qa_log::list(store, scope, None)
-        .await?
-        .into_iter()
-        .filter(|l| {
-            l.kind.as_deref() == Some(dream::REASON_KIND) && ids.contains(l.answer_id.as_str())
-        })
-        .filter_map(|l| l.answer.map(|a| (l.answer_id, a)))
-        .collect();
+    // Through the last visibility state, as the decisions were read: a reason goes with what it cites. Only the
+    // reasons are copied out of the log, never the rest of it (a GB in a large org).
+    let reasons: HashMap<String, String> = crate::qa_log::list_where(store, scope, None, |l| {
+        l.kind.as_deref() == Some(dream::REASON_KIND) && ids.contains(l.answer_id.as_str())
+    })
+    .await?
+    .into_iter()
+    .filter_map(|l| l.answer.map(|a| (l.answer_id, a)))
+    .collect();
+    // Worked out away from the request that asked (a kept answer's work), so its steps are said here when slow.
+    if started.elapsed() > std::time::Duration::from_secs(1) {
+        let ms = |d: std::time::Duration| d.as_millis();
+        eprintln!(
+            "slow dream list: {scope} in {} ms ({} decisions; episodes {}, bodies {}, facts {}, last run {}, reasons {})",
+            ms(started.elapsed()),
+            decisions.len(),
+            ms(read.took[0]),
+            ms(read.took[1]),
+            ms(read.took[2]),
+            ms(ran - decided),
+            ms(started.elapsed() - ran)
+        );
+    }
     Ok(Listed {
         decisions,
         last_run,
@@ -279,44 +297,31 @@ fn rows_wanted(
     (mask.true_count() > 0).then_some(mask)
 }
 
-/// What one read of the decisions found, with the state it read them in.
-struct Read {
-    decisions: Vec<Decision>,
-    vis: Arc<crate::Vis>,
-    eps: HashMap<String, Episode>,
+/// The team's shares: a note enough people said, and a fact enough people's own memories showed.
+fn is_share(source: &str) -> bool {
+    source
+        .strip_prefix(crate::REMEMBER_SOURCE)
+        .and_then(|s| s.strip_prefix(':'))
+        == Some(crate::origin::SHARED)
+        || crate::facts_share::is_source(source)
 }
 
-/// Every decision of `scope`, newest first, read for `reader`: dream records of an ending, a link or a name (the
-/// newest version of each), and the notes the server shared with the team ([`crate::keep::share`]). `fresh`: read
-/// from the tables as they are now, for an undo, apply or dismiss, which acts on what it finds. Otherwise, for the
-/// page's list, main's last visibility state while the next is built ([`Store::lagging_visibility`]: never one
-/// holding what was taken away since) and the tables as this server holds them: the list never waits for another
-/// server's write, nor makes every reader here read the tables again. A share's words aren't read here
-/// ([`share_texts`]).
-async fn decisions(store: &Store, scope: &Scope, reader: &Principal, fresh: bool) -> Result<Read> {
-    let ns = scope.namespace();
-    let (vis, eps) = match fresh {
-        true => {
-            store.invalidate(&ns, EPISODES);
-            store.invalidate(&ns, FACTS);
-            let eps = store.current_episodes(scope).await?;
-            (store.visibility(scope, MAIN).await?, eps)
-        }
-        false => {
-            let vis = store.lagging_visibility(scope, MAIN).await?;
-            let eps = store.current_episodes_seen(scope, &vis).await?;
-            (vis, eps)
-        }
-    };
-    let shared_source = format!("{}:{}", crate::REMEMBER_SOURCE, crate::origin::SHARED);
-    // The team's shares: a note enough people said, and a fact enough people's own memories showed.
-    let is_share = |source: &str| source == shared_source || crate::facts_share::is_source(source);
-    let decided = |e: &Episode| {
-        e.document.as_deref().is_some_and(|d| {
-            d.starts_with(ENDS) || d.starts_with(DREAM_SAME) || d.starts_with(ALIASES)
-        }) && e.source.starts_with(dream::SOURCE)
-            && e.source != REVIEW_SOURCE
-    };
+/// Whether an episode is a dream's record of a decision: an ending, a link or a name.
+fn decided(e: &Episode) -> bool {
+    e.document
+        .as_deref()
+        .is_some_and(|d| d.starts_with(ENDS) || d.starts_with(DREAM_SAME) || d.starts_with(ALIASES))
+        && e.source.starts_with(dream::SOURCE)
+        && e.source != REVIEW_SOURCE
+}
+
+/// Of a scope's current episodes, the decisions' records (the newest [`MAX_READ`], each document's newest
+/// version), the newest review of each decision (by what it reviewed: when, and its episode), and the episodes
+/// whose bodies a list reads ([`record_bodies`]: every record's but a share's, and every review's). Whoever reads.
+#[allow(clippy::type_complexity)]
+fn records_of(
+    eps: &HashMap<String, Episode>,
+) -> (Vec<&Episode>, HashMap<String, (i64, String)>, Vec<String>) {
     let mut records: Vec<&Episode> = eps
         .values()
         .filter(|e| decided(e) || is_share(&e.source))
@@ -344,7 +349,77 @@ async fn decisions(store: &Store, scope: &Scope, reader: &Principal, fresh: bool
         .map(|e| e.episode_id.clone())
         .collect();
     want.extend(reviews.values().map(|(_, id)| id.clone()));
+    (records, reviews, want)
+}
+
+/// Read what the first list of `scope`'s decisions would read from storage whoever asks (Studio's Home asks for one
+/// at every open): the bodies of the dream's records and of the reviews of them, each a read of its own. How many.
+pub(super) async fn warm(store: &Store, scope: &Scope) -> Result<usize> {
+    let vis = store.lagging_visibility(scope, MAIN).await?;
+    let eps = store
+        .current_episodes_seen_where(scope, &vis, dream_episode)
+        .await?;
+    let (_, _, want) = records_of(&eps);
+    Ok(record_bodies(store, scope, &want).await?.len())
+}
+
+/// What one read of the decisions found, with the state it read them in, and how long it took to read the episodes,
+/// the bodies and the facts.
+struct Read {
+    decisions: Vec<Decision>,
+    vis: Arc<crate::Vis>,
+    /// The dream's own episodes ([`dream_episode`]): its records, the reviews of them and its weighed records.
+    eps: HashMap<String, Episode>,
+    took: [std::time::Duration; 3],
+}
+
+/// Whether an episode is one a list of the decisions reads, by its source and document: a decision's record
+/// ([`decided`]) or a team share's, a review of one, or a pass's weighed record (what [`dream::last_run`] reads).
+fn dream_episode(source: &str, document: Option<&str>) -> bool {
+    let doc = document.unwrap_or_default();
+    (source.starts_with(dream::SOURCE)
+        && source != REVIEW_SOURCE
+        && [ENDS, DREAM_SAME, ALIASES]
+            .iter()
+            .any(|p| doc.starts_with(p)))
+        || is_share(source)
+        || source == REVIEW_SOURCE
+        || (dream::pass_actor(source) && doc.starts_with(dream::WEIGHED))
+}
+
+/// Every decision of `scope`, newest first, read for `reader`: dream records of an ending, a link or a name (the
+/// newest version of each), and the notes the server shared with the team ([`crate::keep::share`]). `fresh`: read
+/// from the tables as they are now, for an undo, apply or dismiss, which acts on what it finds. Otherwise, for the
+/// page's list, main's last visibility state while the next is built ([`Store::lagging_visibility`]: never one
+/// holding what was taken away since) and the tables as this server holds them: the list never waits for another
+/// server's write, nor makes every reader here read the tables again. A share's words aren't read here
+/// ([`share_texts`]).
+async fn decisions(store: &Store, scope: &Scope, reader: &Principal, fresh: bool) -> Result<Read> {
+    let ns = scope.namespace();
+    let started = std::time::Instant::now();
+    let (vis, eps) = match fresh {
+        true => {
+            store.invalidate(&ns, EPISODES);
+            store.invalidate(&ns, FACTS);
+            let eps = store.current_episodes(scope).await?;
+            (store.visibility(scope, MAIN).await?, eps)
+        }
+        // Only the dream's episodes decoded: the rest of a large scope's (hundreds of thousands) were decoded and
+        // dropped on every list.
+        false => {
+            let vis = store.lagging_visibility(scope, MAIN).await?;
+            let eps = store
+                .current_episodes_seen_where(scope, &vis, dream_episode)
+                .await?;
+            (vis, eps)
+        }
+    };
+    crate::phases::mark("dream episodes");
+    let episodes_took = started.elapsed();
+    let (records, reviews, want) = records_of(&eps);
     let bodies = record_bodies(store, scope, &want).await?;
+    crate::phases::mark("dream bodies");
+    let bodies_took = started.elapsed() - episodes_took;
     let json_of = |id: &str| -> Value {
         bodies
             .get(id)
@@ -381,6 +456,8 @@ async fn decisions(store: &Store, scope: &Scope, reader: &Principal, fresh: bool
             }
         }
     }
+    crate::phases::mark("dream facts");
+    let facts_took = started.elapsed() - episodes_took - bodies_took;
     // A fact the caller may read: committed, not retracted, and every episode it comes from theirs to read (a
     // dream's record aside: it is the decision, not its evidence).
     let readable = |c: &str, f: &Fact| {
@@ -484,6 +561,7 @@ async fn decisions(store: &Store, scope: &Scope, reader: &Principal, fresh: bool
         decisions: out,
         vis,
         eps,
+        took: [episodes_took, bodies_took, facts_took],
     })
 }
 
@@ -643,6 +721,7 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
     let limit = req["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
     let mark = crate::kept_answers::Mark::read(store, scope).await?;
     let vis = store.lagging_visibility(scope, MAIN).await?;
+    crate::phases::mark("dream state");
     let kept = LISTED
         .get(
             &scope.namespace(),
@@ -655,6 +734,7 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
             },
         )
         .await?;
+    crate::phases::mark("dream decisions kept");
     let all = &kept.decisions;
     // The newest pass that decided something, for the banner: the decisions that name it. Records from before
     // passes were named name none: theirs are those decided within an hour of the newest of them (the gate keeps
@@ -726,6 +806,7 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
     let next = (start + limit < shown.len()).then(|| page.last().map(|d| d.id.clone()));
     let total = shown.len();
     let mut texts = share_texts(store, scope, page).await?;
+    crate::phases::mark("dream shares read");
     let page: Vec<Decision> = page
         .iter()
         .map(|d| Decision {
@@ -735,12 +816,7 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
         .collect();
     let reasons = &kept.reasons;
     let shared_at = crate::keep::people_in(store, scope).await;
-    let key = scope.to_string();
-    let available = dream::internal_scheduler().unwrap_or(false)
-        && crate::extract::Extractor::dream_from_env()
-            .ok()
-            .flatten()
-            .is_some();
+    crate::phases::mark("dream people");
     Ok(json!({
         "decisions": page.iter().map(|d| view(d, reasons.get(&d.id), shared_at)).collect::<Vec<_>>(),
         "next_page": next.flatten(),
@@ -748,14 +824,41 @@ async fn list(store: &Store, scope: &Scope, reader: &Principal, req: &Value) -> 
         "counts": counts,
         "last_pass": in_last,
         "last_run": ran,
-        "scope": key,
-        "dreaming": {
-            "available": available,
-            "running": RUNNING.lock().unwrap().contains(&key),
-            "last": here.map(|(at, counts)| json!({"at": at, "counts": counts})),
-            "failed": FAILED.lock().unwrap().get(&key).map(|(at, e)| json!({"at": at, "error": e})),
-        },
+        "scope": scope.to_string(),
+        "dreaming": dreaming(scope, here),
     }))
+}
+
+/// What this process knows of `scope`'s dream, not its memory: whether it can dream, whether a pass runs here, the
+/// last pass here (`here`, [`dream::last_pass`]) and the last that failed here.
+fn dreaming(scope: &Scope, here: Option<(i64, Value)>) -> Value {
+    let key = scope.to_string();
+    let available = dream::internal_scheduler().unwrap_or(false)
+        && crate::extract::Extractor::dream_from_env()
+            .ok()
+            .flatten()
+            .is_some();
+    json!({
+        "available": available,
+        "running": RUNNING.lock().unwrap().contains(&key),
+        "last": here.map(|(at, counts)| json!({"at": at, "counts": counts})),
+        "failed": FAILED.lock().unwrap().get(&key).map(|(at, e)| json!({"at": at, "error": e})),
+    })
+}
+
+/// A decisions list `list` worked out by another server ([`crate::shared_answers`]) as this one would answer it:
+/// its `dreaming` this process's, and its last run this process's last pass where that is newer.
+pub(super) fn as_here(scope: &Scope, list: &mut Value) {
+    if !list.is_object() {
+        return;
+    }
+    let here = dream::last_pass(scope);
+    if let Some((t, _)) = &here
+        && list["last_run"]["at"].as_i64().is_none_or(|at| *t > at)
+    {
+        list["last_run"] = json!({"at": t, "pass": null});
+    }
+    list["dreaming"] = dreaming(scope, here);
 }
 
 /// Apply, undo or dismiss one decision: its record's ACL to its audience or to no one, and a review recorded beside
@@ -772,7 +875,8 @@ async fn review(
     if id.is_empty() {
         return Err(Invalid("id names the decision".into()).into());
     }
-    let all = decisions(store, scope, reader, true).await?.decisions;
+    let read = decisions(store, scope, reader, true).await?;
+    let all = read.decisions;
     let Some(d) = all.iter().find(|d| d.id == id && d.readable) else {
         return Err(Refused(format!(
             "no decision {id:?} in {scope} whose facts you may read"
@@ -835,10 +939,32 @@ async fn review(
             .commit_derived(scope, who.user(), &[mark], &[], &[], &[])
             .await
     };
+    // A record no one reads (waiting, or taken back) that its audience may read only once the owners of what it
+    // rests on approve stays as it is: taking it from no one would leave it under `FORGOTTEN` alone with no review
+    // to say why, which reads as `released`.
+    let unread = read.eps.get(&d.id).is_some_and(|e| {
+        !e.acl.is_empty() && e.acl.iter().all(|a| a == WAITING_ACL || a == FORGOTTEN)
+    });
     let changed = async {
-        store
-            .change_acl_all(scope, who.user(), &[AclTarget::Episode(d.id.clone())], &acl)
-            .await
+        let targets = [AclTarget::Episode(d.id.clone())];
+        if !unread {
+            return store
+                .change_acl_all(scope, who.user(), &targets, &acl)
+                .await
+                .map(drop);
+        }
+        let (_, held) = store
+            .change_acl_or_hold(scope, who.user(), &targets, &acl)
+            .await?;
+        match held.is_empty() {
+            true => Ok(()),
+            false => Err(
+                anyhow::Error::new(crate::governance::OwnerApprovalRequired).context(format!(
+                    "the owners of what it rests on must approve its audience reading it: it is still {}",
+                    d.status
+                )),
+            ),
+        }
     };
     if action == Action::Apply {
         changed.await?;

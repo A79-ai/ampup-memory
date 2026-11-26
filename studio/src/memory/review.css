@@ -413,17 +413,44 @@
   .rv-entity {
     margin-bottom: var(--s5);
   }
+  /* One line: the label, who owns it (or that no one does), and the inbox at the end. */
   .rv-entity-head {
     display: flex;
-    justify-content: space-between;
     align-items: baseline;
+    gap: var(--s3);
+    min-width: 0;
   }
-  .rv-entity .h-section:first-child {
-    margin-bottom: var(--s2);
+  .rv-entity-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+    font-size: var(--t-sm);
+    font-weight: 650;
+    color: var(--ink-2);
+  }
+  .rv-entity-label .icon {
+    align-self: center;
   }
   .rv-owner-line {
+    flex: 1;
+    min-width: 0;
     margin: 0;
     font-size: var(--t-sm);
+  }
+  .rv-inbox {
+    flex: none;
+  }
+  /* Nothing under the owner's line: no card, a hairline under it instead. */
+  .rv-entity-quiet {
+    padding: 0 0 var(--s3);
+    border-bottom: 1px solid var(--line);
+  }
+  .rv-entity .rv-assign {
+    margin-top: var(--s3);
+  }
+  .rv-entity:not(.rv-entity-quiet) > .rv-entity-head {
+    margin-bottom: var(--s2);
   }
   .rv-done summary {
     cursor: pointer;
@@ -926,6 +953,24 @@
   }
   .rv-more {
     justify-self: center;
+  }
+  /* A conflict as a list's row; opened, its card below it. */
+  .rv-conflict-row + .rv-conflict-row {
+    border-top: 1px solid var(--line);
+  }
+  .rv-conflict-row .list-row .icon {
+    color: var(--faint);
+    flex: none;
+  }
+  .rv-conflict-values b {
+    font-weight: 600;
+    color: var(--ink-2);
+  }
+  .rv-conflict-open {
+    padding: 0 var(--s4) var(--s3);
+  }
+  .rv-conflict-open .rv-conflict {
+    box-shadow: none;
   }
   .rv-conflict {
     padding: var(--s3) var(--s4);

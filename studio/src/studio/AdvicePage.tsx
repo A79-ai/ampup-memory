@@ -6,15 +6,17 @@ import { when } from "../memory/format";
 import { useOption } from "../memory/hashOptions";
 import { Markdown } from "../memory/markdown";
 import { LessonsFor } from "./Learned";
-import { RangeSeg, scopeText, useAdviceScope } from "./adviceScope";
+import { EVERYONE, RangeSeg, WhoseSeg, scopeText, useAdviceScope } from "./adviceScope";
 import type { Selection } from "../memory/types";
 
 // Studio's Advice page: each team note agents were given, how often and to how many people, how those sessions
 // went, and the sessions themselves (memstore's `/browse {op: "advice_usage"}`). Everyone sees the org's counts;
-// the sessions are the reader's own, or everyone's for the org's admins. Admins ratify a note for the whole team
+// the sessions are the reader's own, or everyone's for the org's admins. The list reads the counts alone; a note's
+// sessions are read when it is opened (`note`). Admins ratify a note for the whole team
 // (`/admin {op: "ratify_advice"}`), and find the evidence and lookup tables under "Details". The note picked
-// is in the link (`#/advice?note=<key>`); where a note was learned from, run by run, is on the Learned page.
+// is in the link (`#/advice?note=<key>`); where a note was learned from, run by run, is on the Advice tab (Learned.tsx).
 // Every total here is counted as Learned counts it (adviceScope.tsx): the window and whose own notes, in the link.
+// The platform's operator may count every person's own notes at once (`person=*`), each named by whose it is.
 
 interface Session {
   id: string;
@@ -54,7 +56,11 @@ interface Advice {
   owner?: string;
   /** Of `used`, the sessions handed only its learned preferences, at their start. */
   recalled?: number;
-  sessions: Session[];
+  /** The sessions listed for the reader (theirs, or everyone's for an admin), newest first: read with `note`. An
+   * engine before `note` sends every note's with the list. */
+  sessions?: Session[];
+  /** How many sessions `sessions` lists, sent with the list without them. */
+  sessions_count?: number;
 }
 interface Usage {
   advice: Advice[];
@@ -64,7 +70,15 @@ interface Usage {
   since?: number;
   /** Whose own notes stand in for the reader's (an engine that takes `person` echoes it). */
   person?: string | null;
+  /** Every person's own notes are counted (`person: "*"`, the operator's view), each with its `owner`. */
+  everyone?: boolean;
 }
+
+/**
+ * A note's id on this page (the link's `note`, the list's key): its key, and for a person's own, whose it is too, as
+ * two people's own notes for the same kind of task share a key.
+ */
+const noteId = (a: Advice) => (a.mine && a.owner ? `${a.key}@${a.owner}` : a.key);
 
 /** Waiting for an admin: used, and neither ratified nor held back. */
 const waiting = (a: Advice) => !a.mine && a.used > 0 && !a.ratified && !a.held;
@@ -131,21 +145,24 @@ function Outcome({ s }: { s: Session }) {
 export function AdvicePage({
   sel,
   admin,
+  everyone = false,
   onTrace,
   onLearned,
   diagnostics,
 }: {
   sel: Selection;
   admin: boolean;
+  /** The platform's operator: may count every person's own notes at once (`person=*`). */
+  everyone?: boolean;
   /** Opens a session's transcript. */
   onTrace: (id: string) => void;
-  /** Opens a lesson on Advice's Learned tab (every lesson, by whose): `key`, or `key@owner` for a person's own. */
+  /** Opens a lesson on the Advice tab (every lesson, by whose): `key`, or `key@owner` for a person's own. */
   onLearned?: (key: string) => void;
   /** The evidence and lookup tables, for admins. */
   diagnostics?: React.ReactNode;
 }) {
   // In the link, so Home's "this week" opens it at 7 days, and Learned beside it counts the same window and notes.
-  const { range, setRange, days, person } = useAdviceScope(admin);
+  const { range, setRange, days, person, setPerson } = useAdviceScope(admin, everyone);
   const [n, setN] = useState(0);
   const [got, setGot] = useState<{ key: string; data?: Usage; error?: unknown } | null>(null);
   const key = JSON.stringify([sel.org, sel.team, sel.branch, days, person, n]);
@@ -171,11 +188,15 @@ export function AdvicePage({
   const [went, setWent] = useState<"all" | "well" | "wrong">("all");
   const [showDiag, setShowDiag] = useState(false);
 
+  // Whose notes the All / Mine / Team pill above the tabs shows (`show` in the link; none: all of them).
+  const [show] = useOption("show");
   // A person's own notes name them; the reader's own are "yours" (the engine names their owner either way).
   const all = useMemo(
     () =>
-      (data?.advice ?? []).map((a) => (a.mine && !data?.person ? { ...a, owner: undefined } : a)),
-    [data],
+      (data?.advice ?? [])
+        .filter((a) => (show === "mine" ? a.mine : show === "team" ? !a.mine : true))
+        .map((a) => (a.mine && !data?.person ? { ...a, owner: undefined } : a)),
+    [data, show],
   );
   const queue = all.filter(waiting);
   const list = useMemo(() => {
@@ -187,7 +208,10 @@ export function AdvicePage({
     );
   }, [all, filter, query]);
   // The note the link names, opened on a page of its own; none: the list.
-  const chosen = picked ? all.find((a) => a.key === picked) : undefined;
+  // By its id, or by its key alone for a link from before owners were in it.
+  const chosen = picked
+    ? (all.find((a) => noteId(a) === picked) ?? all.find((a) => a.key === picked))
+    : undefined;
   const totals = all.reduce(
     (t, a) => ({
       used: t.used + a.used,
@@ -199,23 +223,30 @@ export function AdvicePage({
   );
   const tooOld =
     cur?.error instanceof ApiError && /unknown op/.test(errorText(cur.error))
-      ? "This deployment's engine predates the Advice page: it shows once the engine is updated."
+      ? "This deployment's engine predates the Serving tab: it shows once the engine is updated."
       : null;
 
   return (
     <div className="studio ap">
       <header className="ap-head">
-        <h1>Advice</h1>
+        <h1>Serving</h1>
         <span className="ap-muted">
           What agents were given, how often, and how it went
           {data && !data.every ? " · the sessions listed are yours" : ""}
         </span>
+        {everyone && (!person || person === EVERYONE) && (
+          <WhoseSeg person={person} setPerson={setPerson} />
+        )}
         <RangeSeg range={range} setRange={setRange} />
       </header>
       {data && (
         <p className="ap-scope ap-muted ap-small">
-          {/* The window the server applied (`since`), and whose notes it read (`person`, echoed). */}
-          {scopeText(data.person ?? "", data.since ? days : null, "sessions")}
+          {/* The window the server applied (`since`), and whose notes it read (`person`, echoed; `everyone`). */}
+          {scopeText(
+            data.everyone ? EVERYONE : data.person === EVERYONE ? "" : (data.person ?? ""),
+            data.since ? days : null,
+            "sessions",
+          )}
         </p>
       )}
 
@@ -230,6 +261,10 @@ export function AdvicePage({
         </p>
       ) : !cur ? (
         <p className="ap-pad ap-muted">Reading the advice…</p>
+      ) : all.length === 0 && data?.advice?.length ? (
+        <p className="ap-pad ap-muted">
+          None of this advice is {show === "mine" ? "your own" : "the team's"}.
+        </p>
       ) : all.length === 0 ? (
         <p className="ap-pad ap-muted">
           No advice learned here yet, or none you may read. Advice is learned from sessions whose outcome is
@@ -247,6 +282,8 @@ export function AdvicePage({
               admin={admin}
               every={!!data?.every}
               days={days}
+              person={person}
+              reread={n}
               tab={tab}
               setTab={setTab}
               went={went}
@@ -320,10 +357,10 @@ export function AdvicePage({
             )}
             {list.map((a) => (
               <button
-                key={a.key}
+                key={noteId(a)}
                 className="ap-item"
                 onClick={() => {
-                  setPicked(a.key);
+                  setPicked(noteId(a));
                   setTab("advice");
                   setWent("all");
                 }}
@@ -373,6 +410,8 @@ function Detail({
   admin,
   every,
   days,
+  person,
+  reread,
   tab,
   setTab,
   went,
@@ -387,6 +426,10 @@ function Detail({
   every: boolean;
   /** The window the page counts (null: all), so the note's trails count what its tiles do. */
   days: number | null;
+  /** Whose own notes the list read in place of the reader's, so the note's sessions are read the same way. */
+  person: string;
+  /** Bumped to read the note's sessions again (after ratifying it, say). */
+  reread: number;
   tab: DetailTab;
   setTab: (t: DetailTab) => void;
   went: "all" | "well" | "wrong";
@@ -397,7 +440,38 @@ function Detail({
 }) {
   const [busy, setBusy] = useState(false);
   const [said, setSaid] = useState<{ key: string; text: string; error?: boolean } | null>(null);
-  const sessions = a.sessions.filter(
+  // The note's sessions, read on their own (`note`): the list sends only counts. Already in the list from an engine
+  // before `note`, which also answers the read with the whole list (its note picked out by key).
+  const [retry, setRetry] = useState(0);
+  const [read, setRead] = useState<{ key: string; sessions?: Session[]; error?: unknown } | null>(null);
+  const listed = a.sessions;
+  const readKey = JSON.stringify([sel.org, sel.team, sel.branch, days, person, noteId(a), reread, retry, !listed]);
+  useEffect(() => {
+    if (listed) return;
+    let live = true;
+    browse<Usage>(
+      { op: "advice_usage", note: a.key, ...(days ? { days } : {}), ...(person ? { person } : {}) },
+      sel,
+    ).then(
+      (u) =>
+        live &&
+        setRead({
+          key: readKey,
+          // Everyone's own notes may share its key: the one whose owner it is.
+          sessions:
+            u.advice.find((x) => x.key === a.key && (person !== EVERYONE || x.owner === a.owner))
+              ?.sessions ?? [],
+        }),
+      (error: unknown) => live && setRead({ key: readKey, error }),
+    );
+    return () => {
+      live = false;
+    };
+  }, [readKey]);
+  const got = read?.key === readKey ? read : null;
+  const all = listed ?? got?.sessions;
+  const count = a.sessions_count ?? all?.length;
+  const sessions = (all ?? []).filter(
     (s) => went === "all" || (went === "well" ? s.went_well === true : s.went_well === false),
   );
   const ratify = async (on: boolean) => {
@@ -504,7 +578,8 @@ function Detail({
           className={tab === "sessions" ? "on" : ""}
           onClick={() => setTab("sessions")}
         >
-          {every ? "Sessions" : "Your sessions"} ({a.sessions.length})
+          {every ? "Sessions" : "Your sessions"}
+          {count === undefined ? "" : ` (${count})`}
         </button>
         <button
           role="tab"
@@ -546,9 +621,18 @@ function Detail({
               </button>
             ))}
           </div>
-          {sessions.length === 0 ? (
+          {got?.error ? (
+            <p className="ap-pad-y ap-error" role="alert">
+              {errorText(got.error)}{" "}
+              <button className="ap-btn2" onClick={() => setRetry((x) => x + 1)}>
+                Try again
+              </button>
+            </p>
+          ) : !all ? (
+            <p className="ap-muted ap-pad-y">Reading its sessions…</p>
+          ) : sessions.length === 0 ? (
             <p className="ap-muted ap-pad-y">
-              {a.sessions.length === 0
+              {all.length === 0
                 ? every
                   ? "No session used it in this range."
                   : `It was used ${a.used} times in this range, none of them in your sessions.`

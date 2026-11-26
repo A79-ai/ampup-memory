@@ -85,6 +85,12 @@ where the server runs, else the file `AMPUP_MEMORY_SENTRY_TOKEN_FILE` names, els
 `~/.sentryclirc`. A server a session starts gets `SENTRY_AUTH_TOKEN` from that session. The service carries no token, but it carries `AMPUP_MEMORY_SENTRY_TOKEN_FILE` and reads
 `~/.sentryclirc`. `SENTRY_URL` points it at a self-hosted Sentry (default `https://sentry.io`).
 
+`ampup-memory sources add skills OWNER/REPO` reads a repository's own skills: every `SKILL.md` on its default branch
+(`.claude/skills/<name>/SKILL.md`, a plugin's `skills/<name>/SKILL.md`), with the same token as `github`. Studio's
+Repo skills page grades each by the sessions that loaded it (a Claude Code `Skill` call in their transcript) and what
+came of them, and its admins can have the learning model propose a revision (`POST /skills/review`). Nothing is
+written to the repository.
+
 `ampup-memory sources add slack CHANNEL` (a channel's name without `#`, or its id) reads a Slack channel's messages
 and its threads' replies every 10 minutes, with `SLACK_BOT_TOKEN` (a bot token from a Slack app you make in your
 workspace) where the server runs. The service doesn't carry it into its unit file; `launchctl setenv` (macOS) or

@@ -205,7 +205,20 @@ async fn read_more(
         .episodes(store, who, &todo)
         .await?
         .into_iter()
-        .map(|(id, (_, ep))| (id, Source::of(&ep)))
+        .map(|(id, (i, ep))| {
+            let mut source = Source::of(&ep);
+            // What its sayer forgot is shown from none of their words: a unit, title or subject holding it is left
+            // out, as a passage holding it is (`Vis::holds_forgotten`).
+            let vis = reads.session_at(i).vis();
+            let forgot = |t: &str| vis.holds_forgotten(&ep.source, t);
+            source.units.retain(|u| !forgot(&u.text));
+            for h in [&mut source.header.title, &mut source.header.subject] {
+                if h.as_deref().is_some_and(forgot) {
+                    *h = None;
+                }
+            }
+            (id, source)
+        })
         .collect())
 }
 

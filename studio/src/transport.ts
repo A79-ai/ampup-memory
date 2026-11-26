@@ -55,6 +55,8 @@ export function retryable(e: unknown): boolean {
  * - `review`  `{op, …}`: owner review and the entity graph (memstore's `/admin` governance ops), for any member.
  * - `learn`   `{op: "add", items, for?}`: add files, pasted text or an answer to the memory (memstore's `/learn`);
  *             `{op: "status", episode_ids}`: what it learned from them so far (memstore's `/learn/status`).
+ * - `skills`  `{op: "list" | "get" | "review", skill?, origin?}`: the skills (a repository's and the compiled ones), how the sessions that
+ *             loaded them went, and the revisions proposed from that (memstore's `/skills/review`).
  *
  * The selection's team and branch go along (`?team=`, `?branch=`); its org is the transport's to place (a
  * console names it in its own path; the local server serves one memory and names none).
@@ -68,7 +70,8 @@ export type Area =
   | "agent"
   | "admin"
   | "review"
-  | "learn";
+  | "learn"
+  | "skills";
 
 /**
  * Whether a transport reaches what a group of sections needs: `true`, `false` (the sections are hidden), or
@@ -95,6 +98,14 @@ export interface Capabilities {
   settings?: boolean;
   /** Adding to the memory by hand and reading back what it learned (`learn`): Add to memory, Remember this. */
   learn?: boolean;
+  /** A connected repository's skills, graded and reviewed (`skills`): Repo skills. */
+  repoSkills?: boolean;
+  /**
+   * Changing the memory: adding to it, deciding a review, resolving a conflict, handing an entity on, running a tool
+   * that writes. Left out, it is probed: `/me` says whether the org holds the caller as a viewer, who only reads.
+   * The controls that change something are hidden or disabled for a viewer (the server refuses them anyway).
+   */
+  write?: Capability;
 }
 
 /** A set of tools an agent answers with, a model and a cap on its tool calls (Ask). */
@@ -161,6 +172,11 @@ export interface Transport {
   owners?: AreaOwnerStore;
   /** The org's members, for the admin's "by person" facet beside who was active. */
   members?(sel: Selection): Promise<string[]>;
+  /**
+   * Where the host connects a repository whose skills Repo skills reads (a console's GitHub connector), for its
+   * empty state. Without one, the page says how a local server reads one (`sources add skills`).
+   */
+  connectRepos?(sel: Selection): string | undefined;
   /** An error as the pages say it. A host may act on one first (sign in again on a 401). */
   errorText?(e: unknown): string;
 }
@@ -200,57 +216,89 @@ const PROBES: Record<"admin" | "review" | "lessons", [Area, Record<string, unkno
 /** Each capability resolved to yes or no (a probed one once its probe answers; until then, no). */
 export type Resolved = {
   admin: boolean;
+  /**
+   * Reads every person's own advice at once (`advice_usage` with `person: "*"`): the platform's operator, signed in as
+   * themselves, for support. Only `/me` says it (`advice_everyone`); no probe asks.
+   */
+  everyone: boolean;
   review: boolean;
   agent: boolean;
   lessons: boolean;
   teams: boolean;
   settings: boolean;
+  repoSkills: boolean;
+  /** May change the memory: false for a viewer of the org. */
+  write: boolean;
 };
 
 /**
- * What memstore's `/me` says the caller may do in each org they belong to (`capabilities`), and the org the request
- * was in (`org`). A server before it says neither.
+ * What memstore's `/me` says the caller may do in each org they belong to (`capabilities`), their role in each
+ * (`memberships`), and the org the request was in (`org`). A server before them says none.
  */
 interface MeCapabilities {
   org?: string | null;
+  memberships?: Record<string, { role?: string } | null>;
   capabilities?: Record<
     string,
-    { admin?: boolean; activity?: boolean; review?: boolean; lessons?: boolean }
+    {
+      admin?: boolean;
+      activity?: boolean;
+      review?: boolean;
+      lessons?: boolean;
+      advice_everyone?: boolean;
+    }
   >;
 }
 
 /**
- * The probed capabilities as `/me` says them, or undefined where it doesn't (a server before it, or `/me` failed):
- * then each is probed. The selection's org, else the one the request was in (a local server's, which the pages
- * name as they like). Each answers as its probe did: `admin` only where the org shows its people's activity, which
- * the admin probe (`advice_trail`) needs too.
+ * What `/me` says, or undefined where it failed. `can`: the probed capabilities as it says them, or undefined where
+ * it doesn't (a server before them): then each is probed. `write`: false only where the org holds the caller as a
+ * viewer. The selection's org, else the one the request was in (a local server's, which the pages name as they
+ * like). Each answers as its probe did: `admin` only where the org shows its people's activity, which the admin
+ * probe (`advice_trail`) needs too.
  */
-async function told(t: Transport, sel: Selection): Promise<Record<keyof typeof PROBES, boolean> | undefined> {
+async function told(
+  t: Transport,
+  sel: Selection,
+): Promise<
+  { can?: Record<keyof typeof PROBES, boolean>; write: boolean; everyone: boolean } | undefined
+> {
   let me: MeCapabilities;
   try {
     me = await t.call<MeCapabilities>(sel, "me");
   } catch {
     return undefined;
   }
-  const all = me?.capabilities;
-  if (!all || typeof all !== "object") return undefined;
-  const c = all[sel.org] ?? (me.org ? all[me.org] : undefined);
+  const inOrg = <T>(all: Record<string, T> | undefined): T | undefined =>
+    all && typeof all === "object" ? (all[sel.org] ?? (me.org ? all[me.org] : undefined)) : undefined;
+  const write = inOrg(me?.memberships)?.role !== "viewer";
+  const c = inOrg(me?.capabilities);
+  if (!me?.capabilities || typeof me.capabilities !== "object") return { write, everyone: false };
   return {
-    admin: c?.admin === true && c.activity !== false,
-    review: c?.review === true,
-    lessons: c?.lessons === true,
+    everyone: c?.advice_everyone === true,
+    can: {
+      admin: c?.admin === true && c.activity !== false,
+      review: c?.review === true,
+      lessons: c?.lessons === true,
+    },
+    write,
   };
 }
 
-/** Asks the server about each capability given as `"probe"`: `/me` once, else a call per capability. */
+/**
+ * Asks the server about each capability given as `"probe"`: `/me` once, else a call per capability. Whether the
+ * caller may write is `/me`'s to say (unless the transport says): where it can't, they may, and the server decides.
+ */
 export async function probe(t: Transport, sel: Selection): Promise<Resolved> {
   const caps = t.capabilities;
   const keys = Object.keys(PROBES) as (keyof typeof PROBES)[];
-  const said = keys.some((k) => caps[k] === "probe") ? await told(t, sel) : undefined;
+  const write = caps.write ?? "probe";
+  const said =
+    write === "probe" || keys.some((k) => caps[k] === "probe") ? await told(t, sel) : undefined;
   const one = async (k: keyof typeof PROBES): Promise<boolean> => {
     const c = caps[k];
     if (c !== "probe") return c ?? false;
-    if (said) return said[k];
+    if (said?.can) return said.can[k];
     const [area, body] = PROBES[k];
     return t.call(sel, area, body).then(
       () => true,
@@ -260,23 +308,32 @@ export async function probe(t: Transport, sel: Selection): Promise<Resolved> {
   const [admin, review, lessons] = await Promise.all([one("admin"), one("review"), one("lessons")]);
   return {
     admin,
+    everyone: said?.everyone ?? false,
     review,
     agent: caps.agent ?? false,
     lessons,
     teams: caps.teams ?? false,
     settings: caps.settings ?? false,
+    repoSkills: caps.repoSkills ?? false,
+    write: write === "probe" ? (said?.write ?? true) : write,
   };
 }
 
-/** What is known before any probe answers: what is given as true. */
+/** What is known before any probe answers: what is given as true; writing, unless given as false. */
 export function given(t: Transport): Resolved {
   const c = t.capabilities;
   return {
     admin: c.admin === true,
+    everyone: false,
     review: c.review === true,
     agent: c.agent === true,
     lessons: c.lessons === true,
     teams: c.teams ?? false,
     settings: c.settings ?? false,
+    repoSkills: c.repoSkills ?? false,
+    write: c.write !== false,
   };
 }
+
+/** Why a control that changes the memory is off: the caller is a viewer of the org. */
+export const READS_ONLY = "Viewers can't change this memory";

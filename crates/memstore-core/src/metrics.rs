@@ -107,6 +107,8 @@ pub struct Metrics {
     pub requests: IntCounterVec,
     /// Seconds from a request's headers being read to its response, by route template.
     pub request_seconds: prometheus::HistogramVec,
+    /// Seconds the Studio's reads (`/browse` and its lists) took, by op and org: `/browse` alone lumps every page.
+    pub studio_read_seconds: prometheus::HistogramVec,
     /// Seconds an MCP `tools/call` took to answer, by tool (one the server knows, else `other`) and outcome
     /// (`ok`, `error`, `tool-error`): the route histogram lumps every tool under `/mcp`.
     pub mcp_tool_seconds: prometheus::HistogramVec,
@@ -149,6 +151,20 @@ impl Metrics {
         .unwrap();
         registry
             .register(Box::new(request_seconds.clone()))
+            .unwrap();
+        let studio_read_seconds = prometheus::HistogramVec::new(
+            HistogramOpts::new(
+                "memstore_studio_read_seconds",
+                "Seconds from a Studio read's headers being read to its response, by op and org",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+            ]),
+            &["op", "org"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(studio_read_seconds.clone()))
             .unwrap();
         let mcp_tool_seconds = prometheus::HistogramVec::new(
             HistogramOpts::new(
@@ -195,6 +211,7 @@ impl Metrics {
             registry,
             requests,
             request_seconds,
+            studio_read_seconds,
             mcp_tool_seconds,
             refusals,
             key_uses,
@@ -534,6 +551,32 @@ pub static PROPOSAL_READ_DIVERGENCE: std::sync::LazyLock<IntCounter> = std::sync
         .unwrap()
     },
 );
+
+/// Seconds working out what main sees in a scope's held ledger for a fold of its governance table, by how: `full` (a
+/// walk of main's whole graph) or `incremental` (what main saw in the last ledger, with the rows appended since).
+pub static MAIN_VISIBLE_SECONDS: std::sync::LazyLock<prometheus::HistogramVec> =
+    std::sync::LazyLock::new(|| {
+        prometheus::HistogramVec::new(
+            HistogramOpts::new(
+                "memstore_main_visible_seconds",
+                "Seconds working out what main sees in a held ledger for a governance fold, by how: full (a walk of main's graph) or incremental (the last ledger's, with the rows appended since)",
+            )
+            .buckets(vec![0.0001, 0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0]),
+            &["how"],
+        )
+        .unwrap()
+    });
+
+/// What main sees in a held ledger, carried from the last one, that a full walk showed differ
+/// (`AMPUP_MEMORY_OWNERS_ORACLE`): never more than 0.
+pub static MAIN_VISIBLE_ORACLE_DIVERGENCE: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        IntCounter::new(
+            "memstore_main_visible_oracle_divergence_total",
+            "Held ledgers whose main commits, carried from the last ledger, differed from a full walk (checked when AMPUP_MEMORY_OWNERS_ORACLE is on)",
+        )
+        .unwrap()
+    });
 
 /// Bytes of decoded table rows the store's cache holds, the system tables aside: what `AMPUP_MEMORY_CACHE_BYTES`
 /// caps. Set after each cold load of a table.

@@ -1678,9 +1678,9 @@ pub enum Tidy {
 /// partitions (no training, unlike a rebuild) and compaction runs one task at a time, so neither needs the
 /// memory a rebuild does.
 ///
-/// An update's tidy leaves each index's oldest segment, which the last night's merged everything into, and
-/// the files it covers alone: it merges the newer deltas into one beside it and compacts only files no oldest
-/// segment covers. Merging the oldest segment too rewrote the whole index every few updates (a production deployment's vector
+/// An update's tidy leaves each index's settled segment ([`settled_segments`]: the largest, which the last night's
+/// merged everything into) and the files it covers alone: it merges the newer deltas into one beside it and
+/// compacts only files no settled segment covers. Merging the settled segment too rewrote the whole index every few updates (a production deployment's vector
 /// index of 405k facts: 1.2 GB, of its passages 1.4 GB, for a dozen new rows), and compaction then took every
 /// file the merged index covered, rows and indexes rewritten again (8 GB of passages). The nightly window's
 /// tidy ([`tidy_night`]) merges every index into one and compacts all its files once there are too many.
@@ -1689,15 +1689,16 @@ pub(crate) async fn tidy(ds: &mut Dataset, how: Tidy) -> Result<(usize, bool)> {
     let uri = ds.uri().to_string();
     let most_files = index_knob("MAX_FRAGMENTS", 32);
     let mut compacted = false;
+    let settled_at = settled_segments(ds).await?;
     let indices = ds.load_indices().await?;
-    // Each index's oldest segment (segments are listed oldest first, and a merge takes the newest).
-    let mut oldest = HashMap::new();
-    for i in indices.iter() {
-        oldest.entry(i.name.as_str()).or_insert(i);
-    }
     let settled: HashSet<u32> = match how {
-        Tidy::Update => oldest
-            .values()
+        Tidy::Update => indices
+            .iter()
+            .filter(|i| {
+                settled_at
+                    .get(&i.name)
+                    .is_some_and(|(_, uuid)| *uuid == i.uuid)
+            })
             .filter_map(|i| i.fragment_bitmap.as_ref())
             .flat_map(|b| b.iter())
             .collect(),
@@ -1719,16 +1720,11 @@ pub(crate) async fn tidy(ds: &mut Dataset, how: Tidy) -> Result<(usize, bool)> {
                 .unwrap_or(0);
             f.physical_rows.is_some_and(|n| n > 0 && gone * 10 > n)
         });
-    // Of an index's `n` segments, the newest this many are merged.
-    let take = |n: usize| match how {
-        Tidy::Update => n.saturating_sub(1),
-        Tidy::Night => n,
-    };
     // At night the merges come first: compaction can then join files every index covers alike.
     let mut merged = 0;
     if how == Tidy::Night {
         for (name, n) in segments(ds).await?.into_iter().filter(|(_, n)| *n > 1) {
-            merge(ds, &uri, &name, n, take(n)).await?;
+            merge(ds, &uri, &name, n, n).await?;
             merged += 1;
         }
     }
@@ -1761,12 +1757,68 @@ pub(crate) async fn tidy(ds: &mut Dataset, how: Tidy) -> Result<(usize, bool)> {
     }
     if how == Tidy::Update {
         let most = index_knob("MAX_DELTAS", 4);
-        for (name, n) in segments(ds).await?.into_iter().filter(|(_, n)| *n > most) {
-            merge(ds, &uri, &name, n, take(n)).await?;
+        let settled_at = settled_segments(ds).await?;
+        for (name, n) in segments(ds).await? {
+            // Lance merges only the newest segments. With the settled one first, the deltas after it once there are
+            // too many; with segments before it (theirs mostly rows cleared since), all of them, once.
+            match settled_at.get(&name).map_or(0, |(at, _)| *at) {
+                0 if n > most => merge(ds, &uri, &name, n, n - 1).await?,
+                0 => continue,
+                at => {
+                    eprintln!(
+                        "memstore: index {name} of {uri}: its largest segment is listed {} of {n}, after segments of \
+                         few live rows; merging all into one",
+                        at + 1
+                    );
+                    merge(ds, &uri, &name, n, n).await?
+                }
+            }
             merged += 1;
         }
     }
     Ok((merged, compacted))
+}
+
+/// Per index, the segment an update's tidy leaves alone, as (its place in the listing, its uuid): the one covering
+/// the most live rows, which the last night merged everything into. Not simply the first listed: when an index's
+/// rows are cleared and written again (its table's files rewritten), the old segment stays first, covering a few
+/// rows, and every row is in a delta after it. A production deployment's passages sat so a day: a 1.95 GB vector
+/// segment over 140 live rows that every search still loaded into the index cache beside the 2.2 GB live one, and
+/// each update's merge of "all but the first" rewrote the live one (2.2 GB of vectors and 0.2 GB of postings
+/// every 20 to 40 minutes, each copy loaded again by every server) while compaction took its files as loose.
+async fn settled_segments(ds: &Dataset) -> Result<HashMap<String, (usize, uuid::Uuid)>> {
+    let rows: HashMap<u32, u64> = ds
+        .fragments()
+        .iter()
+        .map(|f| {
+            let gone = f
+                .deletion_file
+                .as_ref()
+                .and_then(|d| d.num_deleted_rows)
+                .unwrap_or(0);
+            let n = f.physical_rows.unwrap_or(0).saturating_sub(gone);
+            (f.id as u32, n as u64)
+        })
+        .collect();
+    let mut place: HashMap<&str, usize> = HashMap::new();
+    let mut best: HashMap<String, (usize, uuid::Uuid, u64)> = HashMap::new();
+    let indices = ds.load_indices().await?;
+    for i in indices.iter() {
+        let at = place.entry(i.name.as_str()).or_default();
+        let covered: u64 = i
+            .fragment_bitmap
+            .as_ref()
+            .map_or(0, |b| b.iter().filter_map(|f| rows.get(&f)).sum());
+        let e = best.entry(i.name.clone()).or_insert((*at, i.uuid, covered));
+        if covered > e.2 {
+            *e = (*at, i.uuid, covered);
+        }
+        *at += 1;
+    }
+    Ok(best
+        .into_iter()
+        .map(|(name, (at, uuid, _))| (name, (at, uuid)))
+        .collect())
 }
 
 /// The nightly window's tidy of a scope's facts index: rows written twice dropped, every index merged into
@@ -3601,6 +3653,8 @@ pub async fn search(
 pub async fn warm(store: &Store, scope: &Scope) -> Result<()> {
     let running = crate::running::running(format!("warm {scope}: main's state"));
     store.pin(scope, crate::MAIN).await?;
+    // A loop's touch steps aside between its parts while an interactive read is under way (`crate::priority`).
+    crate::priority::pause_for_reads().await;
     running.step(format!("warm {scope}: fact index and tail"));
     let query = "warm up";
     // Without the embedding model (not fetched, and offline), the rest still warms: searches rank by keyword.
@@ -3638,6 +3692,7 @@ pub async fn warm(store: &Store, scope: &Scope) -> Result<()> {
             rows::ids(scan).await?;
         }
     }
+    crate::priority::pause_for_reads().await;
     running.step(format!("warm {scope}: passages"));
     passages::warm(store, scope, query, q.as_ref()).await?;
     // The parts' rows, held in memory in the background once the index files the first searches need are in, so

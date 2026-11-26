@@ -28,7 +28,7 @@ use crate::{
 /// Longest reason kept, in characters.
 const MAX_REASON: usize = 500;
 /// Most votes (changes included) one person may give in a scope in a day.
-pub(crate) const MAX_PER_DAY: usize = 100;
+pub(crate) const MAX_PER_DAY: usize = 2_000;
 /// The signals, best to worst.
 pub const SIGNALS: [&str; 3] = ["positive", "negative", "very_negative"];
 
@@ -103,6 +103,35 @@ pub async fn give(
             who.user()
         )));
     }
+    // A skill (`skill:<name>` or `skill:<key>`, [`crate::skill_review`]): only one the caller may read, voted on by its
+    // key, citing the version read (a skill no one may read any more takes its votes with it).
+    if fact_id.starts_with("skill:") {
+        let session = store.pin_lagging(scope, crate::MAIN).await?;
+        let skill = match crate::skill_review::find(&session, store, who, fact_id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Err(refuse(format!(
+                    "no skill {fact_id} you can read in {scope}"
+                )));
+            }
+            Err(e) => match e.downcast_ref::<crate::skill_review::Ambiguous>() {
+                Some(a) => return Err(refuse(a.to_string())),
+                None => return Err(e),
+            },
+        };
+        let target = crate::skill_review::target(&skill);
+        store
+            .write_feedback(
+                scope,
+                who.user(),
+                &target,
+                signal,
+                reason,
+                std::slice::from_ref(&skill.episode_id),
+            )
+            .await?;
+        return Ok(target);
+    }
     // Only a fact the caller may read; one that doesn't exist answers the same.
     let Some(fact) = store.fact_seen(scope, who, fact_id).await? else {
         return Err(refuse(format!("no fact {fact_id} you can read in {scope}")));
@@ -119,6 +148,9 @@ pub async fn give(
         .await?;
     Ok(fact_id.to_string())
 }
+
+/// A person's newest vote on a fact or skill: when, its signal, its reason, and the episodes it was given on.
+type Vote = (i64, String, Option<String>, Vec<String>);
 
 /// The feedback on `facts` as `who` may see it: for each fact they can read that has any, its tally. A fact
 /// whose episodes they can't all read shows none. `checks_count`: whether the flags served-fact checks gave count.
@@ -140,7 +172,7 @@ pub async fn tallies(
     let wanted: HashMap<&str, &Vec<String>> =
         facts.iter().map(|(f, eps)| (f.as_str(), eps)).collect();
     // The newest vote per (fact, giver).
-    let mut newest: BTreeMap<(String, String), (i64, String, Option<String>)> = BTreeMap::new();
+    let mut newest: BTreeMap<(String, String), Vote> = BTreeMap::new();
     for b in rows.iter() {
         let (commit, fact, giver, signal, episodes) = (
             strings(b, "commit_id"),
@@ -167,17 +199,27 @@ pub async fn tallies(
             }
             let t = at[i].unwrap_or_default();
             let key = (fact[i].clone(), crate::auth::norm_id(&giver[i]));
-            if newest.get(&key).is_some_and(|(seen, _, _)| *seen >= t) {
+            if newest.get(&key).is_some_and(|(seen, ..)| *seen >= t) {
                 continue;
             }
-            newest.insert(key, (t, signal[i].clone(), reason[i].clone()));
+            newest.insert(
+                key,
+                (
+                    t,
+                    signal[i].clone(),
+                    reason[i].clone(),
+                    split_list(&episodes[i]),
+                ),
+            );
         }
     }
     let mut out: HashMap<String, (Tally, Vec<(i64, String)>)> = HashMap::new();
-    for ((fact, _), (t, signal, reason)) in newest {
-        // Shown only with the fact itself: to a reader who may read every episode it cites.
+    for ((fact, _), (t, signal, reason, cited)) in newest {
+        // Shown only with the fact itself: to a reader who may read every episode it cites, and every one the vote
+        // was given on (a vote names what it was read on: never shown beside something else of the same id).
         let readable = wanted[fact.as_str()]
             .iter()
+            .chain(&cited)
             .all(|e| vis.can_see_episode(e, who));
         if !readable {
             continue;

@@ -5,7 +5,7 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const TABLE: &str = "governance";
+pub const TABLE: &str = "governance";
 
 /// The prefix of the branches main's extraction holds owned changes on ([`Store::stage_extracted`]).
 pub const HELD_PREFIX: &str = "held-";
@@ -176,6 +176,15 @@ pub struct Approval {
     pub kept: Option<String>,
     /// The facts it ended.
     pub ended: Vec<String>,
+}
+
+/// What waits for review, as one reader may see it ([`Store::proposals_waiting`]).
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct Waiting {
+    /// Proposals waiting for review.
+    pub pending: usize,
+    /// Of those, the ones waiting on the reader: a required owner who hasn't approved.
+    pub mine: usize,
 }
 
 /// An episode a proposal rests on, as the reader may know it. A proposal is shown only to someone
@@ -368,9 +377,19 @@ impl State {
 
     /// Why the proposal no longer describes what would publish, or None while it does.
     fn stale_reason(&self, ledger: &Ledger, p: &Proposal) -> Result<Option<&'static str>> {
-        Ok(if p.policy_revision != self.revision()? {
+        self.stale_reason_at(ledger, &MainNow::of(ledger, self)?, p)
+    }
+
+    /// [`State::stale_reason`], with what it reads of main worked out already.
+    fn stale_reason_at(
+        &self,
+        ledger: &Ledger,
+        now: &MainNow,
+        p: &Proposal,
+    ) -> Result<Option<&'static str>> {
+        Ok(if p.policy_revision != now.revision {
             Some("ownership_changed")
-        } else if p.base != self.memory_heads(ledger) && !self.clear.contains(&p.id) {
+        } else if p.base != now.memory_heads && !self.clear.contains(&p.id) {
             Some("base_changed")
         } else if p.heads != sorted(ledger.heads(&p.branch)) {
             Some("draft_changed")
@@ -393,6 +412,32 @@ impl State {
     fn auto_rejected(&self, p: &Proposal) -> bool {
         self.auto.get(&p.id) == Some(&false)
             && self.approvals.get(&p.id).is_none_or(|a| a.is_empty())
+    }
+}
+
+/// What where a proposal stands reads of main ([`Store::status_of`]): the same for every proposal, so a list works it
+/// out once, not once a proposal (each is a walk of the scope's whole ledger).
+struct MainNow {
+    /// Every commit main reaches.
+    visible: Arc<HashSet<String>>,
+    /// Main's heads, past the governance records ([`State::memory_heads`]).
+    memory_heads: Vec<String>,
+    /// The owners' revision ([`State::revision`]).
+    revision: String,
+}
+
+impl MainNow {
+    fn of(ledger: &Ledger, state: &State) -> Result<Self> {
+        Self::seen(ledger, state, Arc::new(ledger.visible(MAIN)))
+    }
+
+    /// Given what main sees in `ledger`.
+    fn seen(ledger: &Ledger, state: &State, visible: Arc<HashSet<String>>) -> Result<Self> {
+        Ok(Self {
+            visible,
+            memory_heads: state.memory_heads(ledger),
+            revision: state.revision()?,
+        })
     }
 }
 
@@ -693,10 +738,32 @@ impl Store {
     }
 
     async fn governance_state(&self, scope: &Scope, ledger: &Ledger) -> Result<State> {
+        self.governance_state_seen(scope, ledger, &ledger.visible(MAIN))
+            .await
+    }
+
+    /// [`Store::governance_state`], given what main sees in `ledger` (`visible`).
+    async fn governance_state_seen(
+        &self,
+        scope: &Scope,
+        ledger: &Ledger,
+        visible: &HashSet<String>,
+    ) -> Result<State> {
         let rows = self.governance_rows(scope, TABLE).await?;
-        let mut state = fold(&rows, ledger)?;
-        state.clear = self.moved_past(scope, ledger, &state).await?;
+        let mut state = fold_seen(&rows, ledger, visible)?;
+        state.clear = self.moved_past(scope, ledger, &state, visible).await?;
         Ok(state)
+    }
+
+    /// The governance state for a read that only shows it ([`HELD`]), with what its proposals' standing reads of
+    /// main: what main sees is the one kept with the held ledger ([`Store::main_visible_held`]), not a walk of main's
+    /// whole graph for each.
+    async fn governance_held(&self, scope: &Scope) -> Result<(Arc<Ledger>, State, MainNow)> {
+        let ledger = self.governance_ledger(scope).await?;
+        let visible = self.main_visible_held(&scope.namespace(), &ledger).await;
+        let state = self.governance_state_seen(scope, &ledger, &visible).await?;
+        let now = MainNow::seen(&ledger, &state, visible)?;
+        Ok((ledger, state, now))
     }
 
     /// The open proposals main has moved past since their base without touching what they change: no commit
@@ -709,9 +776,9 @@ impl Store {
         scope: &Scope,
         ledger: &Ledger,
         state: &State,
+        main: &HashSet<String>,
     ) -> Result<HashSet<String>> {
         let heads = state.memory_heads(ledger);
-        let main = ledger.visible(MAIN);
         let open: Vec<&Proposal> = state
             .proposals
             .values()
@@ -721,9 +788,8 @@ impl Store {
                     && !p.heads.iter().all(|h| main.contains(h))
             })
             .collect();
-        let mut out = HashSet::new();
         if open.is_empty() {
-            return Ok(out);
+            return Ok(HashSet::new());
         }
         let col = |b: &RecordBatch, name: &str, i: usize| -> Option<String> {
             b.column_by_name(name)
@@ -771,83 +837,155 @@ impl Store {
                 })
             })
             .collect::<Result<_>>()?;
-        for p in open {
-            let before = ledger.reachable(&p.base);
-            let since: HashSet<&String> = main
-                .iter()
-                .filter(|c| !before.contains(*c) && !state.metadata.contains(*c))
-                .collect();
-            let since_str: HashSet<&str> = since.iter().map(|c| c.as_str()).collect();
-            let keys: HashSet<(&str, &str)> = p
-                .changes
-                .iter()
-                .filter(|c| c["kind"] == "fact")
-                .filter_map(|c| Some((c["entity"].as_str()?, c["predicate"].as_str()?)))
-                .collect();
-            let ids: HashSet<&str> = p
-                .changes
-                .iter()
-                .filter_map(|c| c["id"].as_str().or(c["fact_id"].as_str()))
-                .collect();
-            let on_key = |f: &FactCols, i: usize| {
-                f.entity.is_valid(i)
-                    && f.predicate.is_valid(i)
-                    && keys.contains(&(f.entity.value(i), f.predicate.value(i)))
-            };
-            // Its evidence, and what the values on its keys cite (what its owners reviewed as "before"): an ACL
-            // change or a delete of one of those changes what they read.
-            let mut evidence: HashSet<&str> = p.evidence.iter().map(String::as_str).collect();
+        // Each open proposal: the commits main made since its base, its keys, the facts it names, and its evidence
+        // with what the values on its keys cite (what its owners reviewed as "before": an ACL change or a delete of
+        // one of those changes what they read).
+        struct Open<'a> {
+            since: HashSet<&'a str>,
+            keys: HashSet<(&'a str, &'a str)>,
+            ids: HashSet<&'a str>,
+            evidence: HashSet<&'a str>,
+            touched: bool,
+        }
+        let mut opens: Vec<Open> = open
+            .iter()
+            .map(|p| {
+                let before = ledger.reachable(&p.base);
+                Open {
+                    since: main
+                        .iter()
+                        .filter(|c| !before.contains(*c) && !state.metadata.contains(*c))
+                        .map(String::as_str)
+                        .collect(),
+                    keys: p
+                        .changes
+                        .iter()
+                        .filter(|c| c["kind"] == "fact")
+                        .filter_map(|c| Some((c["entity"].as_str()?, c["predicate"].as_str()?)))
+                        .collect(),
+                    ids: p
+                        .changes
+                        .iter()
+                        .filter_map(|c| c["id"].as_str().or(c["fact_id"].as_str()))
+                        .collect(),
+                    evidence: p.evidence.iter().map(String::as_str).collect(),
+                    touched: false,
+                }
+            })
+            .collect();
+        // One pass over the facts for every proposal at once (not a pass each): which proposals each key is one of,
+        // and which proposals each commit is since the base of. A row is looked at again only when its key is one
+        // a proposal changes, or its commit one main made since a proposal's base.
+        let mut by_key: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        let mut by_commit: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (n, o) in opens.iter().enumerate() {
+            for k in &o.keys {
+                by_key.entry(*k).or_default().push(n);
+            }
+            for c in &o.since {
+                by_commit.entry(*c).or_default().push(n);
+            }
+        }
+        fn key_of(f: &FactCols, i: usize) -> Option<(&str, &str)> {
+            (f.entity.is_valid(i) && f.predicate.is_valid(i))
+                .then(|| (f.entity.value(i), f.predicate.value(i)))
+        }
+        if !by_key.is_empty() {
             for f in &fact_cols {
-                for i in (0..f.entity.len()).filter(|i| on_key(f, *i)) {
+                for i in 0..f.entity.len() {
+                    let Some(of) = key_of(f, i).and_then(|k| by_key.get(&k)) else {
+                        continue;
+                    };
                     if let Some(s) = at(&f.sources, i) {
-                        evidence.extend(s.split(',').filter(|e| !e.is_empty()));
+                        for n in of {
+                            opens[*n]
+                                .evidence
+                                .extend(s.split(',').filter(|e| !e.is_empty()));
+                        }
                     }
                 }
             }
-            let touched_fact = fact_cols.iter().any(|f| {
-                (0..f.commit.len()).any(|i| {
-                    at(&f.commit, i).is_some_and(|c| since_str.contains(c))
-                        && (on_key(f, i)
-                            || at(&f.fact, i).is_some_and(|x| ids.contains(x))
-                            || at(&f.sources, i)
-                                .is_some_and(|s| s.split(',').any(|e| evidence.contains(e))))
-                })
-            });
-            let touched_side = side.iter().any(|(table, rows)| {
-                rows.iter().any(|b| {
-                    let Some(commits) = text(b, "commit_id") else {
-                        return false;
+        }
+        for f in &fact_cols {
+            for i in 0..f.commit.len() {
+                let Some(of) = at(&f.commit, i).and_then(|c| by_commit.get(c)) else {
+                    continue;
+                };
+                for n in of {
+                    let o = &mut opens[*n];
+                    if o.touched {
+                        continue;
+                    }
+                    o.touched = key_of(f, i).is_some_and(|k| o.keys.contains(&k))
+                        || at(&f.fact, i).is_some_and(|x| o.ids.contains(x))
+                        || at(&f.sources, i)
+                            .is_some_and(|s| s.split(',').any(|e| o.evidence.contains(e)));
+                }
+            }
+        }
+        for (table, rows) in &side {
+            for b in rows.iter() {
+                let Some(commits) = text(b, "commit_id") else {
+                    continue;
+                };
+                for i in 0..b.num_rows() {
+                    let Some(of) = at(&commits, i).and_then(|c| by_commit.get(c)) else {
+                        continue;
                     };
-                    (0..b.num_rows()).any(|i| {
-                        at(&commits, i).is_some_and(|c| since_str.contains(c))
-                            && match *table {
-                                SCHEMAS => true,
-                                EPISODES => col(b, "episode_id", i)
-                                    .is_some_and(|e| evidence.contains(e.as_str())),
-                                _ => {
-                                    col(b, "actor_prefix", i).is_some()
-                                        || col(b, "fact_id", i)
-                                            .is_some_and(|f| ids.contains(f.as_str()))
-                                        || col(b, "episode_id", i)
-                                            .is_some_and(|e| evidence.contains(e.as_str()))
-                                }
+                    for n in of {
+                        let o = &mut opens[*n];
+                        if o.touched {
+                            continue;
+                        }
+                        o.touched = match *table {
+                            SCHEMAS => true,
+                            EPISODES => col(b, "episode_id", i)
+                                .is_some_and(|e| o.evidence.contains(e.as_str())),
+                            _ => {
+                                col(b, "actor_prefix", i).is_some()
+                                    || col(b, "fact_id", i)
+                                        .is_some_and(|f| o.ids.contains(f.as_str()))
+                                    || col(b, "episode_id", i)
+                                        .is_some_and(|e| o.evidence.contains(e.as_str()))
                             }
-                    })
-                })
-            });
-            if !touched_fact && !touched_side {
+                        };
+                    }
+                }
+            }
+        }
+        let mut out = HashSet::new();
+        for (p, o) in open.iter().zip(&opens) {
+            if !o.touched {
                 out.insert(p.id.clone());
+            }
+        }
+        if governance_oracle() {
+            let was = moved_past_each(&open, main, ledger, state, &facts, &side)?;
+            if was != out {
+                eprintln!(
+                    "governance oracle: main moved past {out:?} of the open proposals in {scope} in one pass, {was:?} checked one by one"
+                );
+                anyhow::bail!(
+                    "governance oracle: the open proposals main moved past in {scope} differ from a check of each"
+                );
             }
         }
         Ok(out)
     }
 
-    async fn governance_ledger(&self, scope: &Scope) -> Result<Ledger> {
+    /// The scope's ledger: as this server holds it for a read that only shows governance ([`HELD`]), read once per
+    /// snapshot of the ledger table ([`Store::ledger_held`]); as the catalog holds it now otherwise.
+    async fn governance_ledger(&self, scope: &Scope) -> Result<Arc<Ledger>> {
         if HELD.try_with(|_| ()).is_ok() {
-            return self.ledger(scope).await;
+            let ledger = self.ledger_held(scope).await?;
+            // Let whoever waited on the ledger's read with this one run now (Home's other parts read it too): a
+            // reader the read woke would otherwise wait on this thread until the caller's walks and folds over it
+            // are done, seconds on a large memory.
+            tokio::task::yield_now().await;
+            return Ok(ledger);
         }
         let snap = self.ledger_now().await?;
-        Ok(Ledger::from_batches(&snap.rows, &scope.namespace()))
+        Ok(Arc::new(self.ledger_of(&snap.rows, &scope.namespace())))
     }
 
     /// Records `event` on main. With `expected`, only while main's heads are still those (an owner's change,
@@ -1029,10 +1167,27 @@ impl Store {
     /// for showing owners and filtering a list by them. What lets someone act (resolving a conflict, a review)
     /// reads them as they are now ([`Store::entity_owners`]). Forcing both reloads at every Studio page load
     /// spent the catalog's read quota, and a ledger reloaded for one reader is one every reader here waits on.
+    ///
+    /// Folded once per snapshot of the two tables as held ([`Store::ledger_held`]): Home's conflicts asked for them at
+    /// every open, two seconds on a busy deployment.
     pub async fn entity_owners_held(&self, scope: &Scope) -> Result<Vec<Owner>> {
-        let ledger = self.ledger(scope).await?;
-        let rows = self.side_rows(&scope.namespace(), TABLE).await?;
-        Ok(fold(&rows, &ledger)?.owners.into_values().collect())
+        let ns = scope.namespace();
+        let ledger = self.ledger_held(scope).await?;
+        crate::phases::mark("owners ledger");
+        let rows = self.side_rows(&ns, TABLE).await?;
+        if let Some(owners) = self.owners_held(&ns, &ledger, &rows) {
+            return Ok((*owners).clone());
+        }
+        // What main sees, kept with the held ledger and carried to the next: not a walk of main's whole graph.
+        let visible = self.main_visible_held(&ns, &ledger).await;
+        let owners: Arc<Vec<Owner>> = Arc::new(
+            fold_seen(&rows, &ledger, &visible)?
+                .owners
+                .into_values()
+                .collect(),
+        );
+        self.keep_owners(&ns, &ledger, rows, owners.clone());
+        Ok((*owners).clone())
     }
 
     pub(crate) async fn check_owned_subject_merge(
@@ -1779,7 +1934,7 @@ impl Store {
     async fn evidence_on_main(
         &self,
         scope: &Scope,
-        ledger: &Ledger,
+        ledger: &Arc<Ledger>,
         proposals: &[&Proposal],
     ) -> Result<HashMap<String, Vec<Option<Vec<String>>>>> {
         let mut told = HashMap::new();
@@ -1788,20 +1943,25 @@ impl Store {
         }
         let ns = scope.namespace();
         let vis = self.visibility(scope, MAIN).await?;
-        let (_, (ledger_rows, episodes, _, _, _, retractions, retention, _), _) =
+        crate::phases::mark("proposals main state");
+        let (_, (_, episodes, _, _, _, retractions, retention, _), _) =
             self.vis_tables(&ns).await?;
+        // The caller's ledger may be behind the state's: then the one this server holds now, read once per snapshot
+        // of the ledger table ([`Store::ledger_held`]), not out of the whole table again.
         let read;
         let ledger = match sorted(ledger.heads(MAIN)) == vis.heads() {
             true => ledger,
             false => {
-                read = Ledger::from_batches(&ledger_rows.rows, &ns);
+                read = self.ledger_held(scope).await?;
                 &read
             }
         };
         if sorted(ledger.heads(MAIN)) != vis.heads() {
             return Ok(told);
         }
-        let main = ledger.visible(MAIN);
+        crate::phases::mark("proposals main ledger");
+        // Kept with the held ledger ([`Store::main_visible_held`]): not a walk of main's whole graph.
+        let main = self.main_visible_held(&ns, ledger).await;
         // Each branch: what it reaches, and of that what main doesn't (its own commits), unless those delete, retire,
         // withdraw or set the retention.
         let mut branches: HashMap<&str, (HashSet<String>, HashSet<String>)> = HashMap::new();
@@ -1810,7 +1970,7 @@ impl Store {
                 continue;
             }
             let reach = ledger.visible(&p.branch);
-            let own: HashSet<String> = reach.difference(&main).cloned().collect();
+            let own: HashSet<String> = reach.difference(&*main).cloned().collect();
             let writes = |rows: &[RecordBatch]| {
                 rows.iter().any(|b| {
                     let c = b
@@ -1909,17 +2069,37 @@ impl Store {
     async fn proposals_readable(
         &self,
         scope: &Scope,
-        ledger: &Ledger,
+        ledger: &Arc<Ledger>,
         proposals: &[&Proposal],
         who: &Principal,
     ) -> Vec<bool> {
-        let told = self
-            .evidence_on_main(scope, ledger, proposals)
+        let told = self.told_on_main(scope, ledger, proposals).await;
+        self.readable_told(scope, proposals, who, &told).await
+    }
+
+    /// [`Store::evidence_on_main`], none told where it fails.
+    async fn told_on_main(
+        &self,
+        scope: &Scope,
+        ledger: &Arc<Ledger>,
+        proposals: &[&Proposal],
+    ) -> HashMap<String, Vec<Option<Vec<String>>>> {
+        self.evidence_on_main(scope, ledger, proposals)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("proposals in {scope} read from their branches: {e:#}");
                 HashMap::new()
-            });
+            })
+    }
+
+    /// [`Store::proposals_readable`], given what main's state `told` of their evidence.
+    async fn readable_told(
+        &self,
+        scope: &Scope,
+        proposals: &[&Proposal],
+        who: &Principal,
+        told: &HashMap<String, Vec<Option<Vec<String>>>>,
+    ) -> Vec<bool> {
         let shadow = proposals_shadow();
         let on_branch = futures::future::join_all(proposals.iter().map(|p| async {
             match shadow || !told.contains_key(&p.id) {
@@ -2069,10 +2249,15 @@ impl Store {
 
     /// Where a proposal stands, from the ledger and the stored events alone: no table is read.
     fn status_of(ledger: &Ledger, state: &State, p: &Proposal) -> Result<Standing> {
-        let main = ledger.visible(MAIN);
+        Self::status_at(ledger, state, &MainNow::of(ledger, state)?, p)
+    }
+
+    /// [`Store::status_of`], with what it reads of main worked out already: once for every proposal of a list.
+    fn status_at(ledger: &Ledger, state: &State, now: &MainNow, p: &Proposal) -> Result<Standing> {
+        let main = &now.visible;
         let published = p.heads.iter().all(|h| main.contains(h));
         let rejected = state.rejected.contains(&p.id) || state.auto_rejected(p);
-        let stale_reason = state.stale_reason(ledger, p)?;
+        let stale_reason = state.stale_reason_at(ledger, now, p)?;
         let status = if published {
             "published"
         } else if rejected {
@@ -2359,19 +2544,53 @@ impl Store {
             .collect())
     }
 
-    /// Whether a list of proposals builds no branch's visibility state: every proposal is read from main's
-    /// ([`Store::evidence_on_main`]), or its branch's state is built already, as [`Store::pin_if_built`] serves one.
-    /// Those not built are built in the background, one after another ([`Store::build_later`]), for a later ask.
-    pub async fn proposal_branches_built(&self, scope: &Scope) -> Result<bool> {
-        let ledger = self.governance_ledger(scope).await?;
-        let state = self.governance_state(scope, &ledger).await?;
-        let all: Vec<&Proposal> = state.proposals.values().collect();
-        // Not told (main's state failed to build): each branch's state, as a list would read it.
-        let told = self
-            .evidence_on_main(scope, &ledger, &all)
-            .await
-            .unwrap_or_default();
-        let branches: BTreeSet<String> = all
+    /// The heads of each branch a proposal is on, from the ledger and the governance table as this server holds them
+    /// (sorted): all of the other branches a list of proposals reads. Not every branch's: a busy memory opens a
+    /// branch a session, and a list kept by every branch's heads was worked out again at each.
+    pub async fn proposal_branch_heads_held(
+        &self,
+        scope: &Scope,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        let ns = scope.namespace();
+        let ledger = self.ledger_held(scope).await?;
+        let rows = self.side_rows(&ns, TABLE).await?;
+        let visible = self.main_visible_held(&ns, &ledger).await;
+        let state = fold_seen(&rows, &ledger, &visible)?;
+        let branches: BTreeSet<&str> = state
+            .proposals
+            .values()
+            .map(|p| p.branch.as_str())
+            .collect();
+        Ok(branches
+            .into_iter()
+            .map(|b| (b.to_string(), sorted(ledger.heads(b))))
+            .collect())
+    }
+
+    /// The proposals waiting for review that `who` may see, and of those the ones waiting on `who` (a required owner
+    /// who hasn't approved): what Studio's Home shows, as [`Store::list_proposals`] would list them. Where a proposal
+    /// stands is read from the ledger and the stored events alone, so only those waiting are checked for whether
+    /// `who` may see them (a list checks every proposal, each a pass over the episodes or a build of its branch's
+    /// state). None while one of those needs its branch's state built: built in the background meanwhile, one after
+    /// another ([`Store::build_later`]), for a later ask.
+    pub async fn proposals_waiting(
+        &self,
+        scope: &Scope,
+        who: &Principal,
+    ) -> Result<Option<Waiting>> {
+        let (ledger, state, now) = self.governance_held(scope).await?;
+        crate::phases::mark("proposals state");
+        let mut waiting = vec![];
+        for p in state.proposals.values() {
+            if Self::status_at(&ledger, &state, &now, p)?.status == "pending_review" {
+                waiting.push(p);
+            }
+        }
+        if waiting.is_empty() {
+            return Ok(Some(Waiting::default()));
+        }
+        let told = self.told_on_main(scope, &ledger, &waiting).await;
+        let branches: BTreeSet<String> = waiting
             .iter()
             .filter(|p| !told.contains_key(&p.id))
             .map(|p| p.branch.clone())
@@ -2382,9 +2601,28 @@ impl Store {
                 unbuilt.push(b);
             }
         }
-        let built = unbuilt.is_empty();
-        self.build_later(scope, unbuilt);
-        Ok(built)
+        if !unbuilt.is_empty() {
+            self.build_later(scope, unbuilt);
+            return Ok(None);
+        }
+        let readable = self.readable_told(scope, &waiting, who, &told).await;
+        crate::phases::mark("proposals readable");
+        let mut out = Waiting::default();
+        for (p, readable) in waiting.into_iter().zip(readable) {
+            if !readable {
+                continue;
+            }
+            out.pending += 1;
+            if p.required_owners.contains(who.user())
+                && !state
+                    .approvals
+                    .get(&p.id)
+                    .is_some_and(|a| a.contains(who.user()))
+            {
+                out.mine += 1;
+            }
+        }
+        Ok(Some(out))
     }
 
     /// The proposals this reader may see (all of whose evidence they may read), newest activity first;
@@ -2396,8 +2634,8 @@ impl Store {
         entity: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ProposalSummary>> {
-        let ledger = self.governance_ledger(scope).await?;
-        let state = self.governance_state(scope, &ledger).await?;
+        let (ledger, state, now) = self.governance_held(scope).await?;
+        crate::phases::mark("proposals state");
         let wanted: Vec<&Proposal> = state
             .proposals
             .values()
@@ -2405,13 +2643,14 @@ impl Store {
             .collect();
         // A proposal whose evidence the reader can't read is not theirs to know about.
         let readable = self.proposals_readable(scope, &ledger, &wanted, who).await;
+        crate::phases::mark("proposals readable");
         let mut out = Vec::new();
         for (p, readable) in wanted.into_iter().zip(readable) {
             if !readable {
                 continue;
             }
             let entities = entities_of(p);
-            let s = Self::status_of(&ledger, &state, p)?;
+            let s = Self::status_at(&ledger, &state, &now, p)?;
             out.push(ProposalSummary {
                 id: p.id.clone(),
                 branch: p.branch.clone(),
@@ -3669,7 +3908,11 @@ fn cell(c: Option<&StringArray>, i: usize) -> Option<&str> {
 
 /// The governance state main's ledger holds: its events folded in ledger order.
 fn fold(rows: &[RecordBatch], ledger: &Ledger) -> Result<State> {
-    let visible = ledger.visible(MAIN);
+    fold_seen(rows, ledger, &ledger.visible(MAIN))
+}
+
+/// [`fold`], given what main sees in `ledger` (`visible`).
+fn fold_seen(rows: &[RecordBatch], ledger: &Ledger, visible: &HashSet<String>) -> Result<State> {
     let mut events = HashMap::new();
     for b in rows.iter() {
         for (id, body) in strings(b, "commit_id").into_iter().zip(strings(b, "body")) {
@@ -3929,6 +4172,109 @@ fn grounded_or_insider(p: &Proposal, who: &Principal) -> bool {
     grounded
         || p.required_owners.contains(&auth::norm_id(who.user()))
         || auth::norm_id(&p.created_by) == auth::norm_id(who.user())
+}
+
+/// [`Store::moved_past`] as it was first written, a pass over every fact for each open proposal: the governance
+/// oracle's check of the one pass ([`governance_oracle`]).
+fn moved_past_each(
+    open: &[&Proposal],
+    main: &HashSet<String>,
+    ledger: &Ledger,
+    state: &State,
+    facts: &[RecordBatch],
+    side: &[(&str, Arc<Vec<RecordBatch>>)],
+) -> Result<HashSet<String>> {
+    let col = |b: &RecordBatch, name: &str, i: usize| -> Option<String> {
+        b.column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .filter(|c| !c.is_null(i))
+            .map(|c| c.value(i).to_string())
+    };
+    let text = |b: &RecordBatch, name: &str| -> Option<StringArray> {
+        b.column_by_name(name)
+            .and_then(|c| c.as_string_opt::<i32>())
+            .cloned()
+    };
+    fn at(c: &StringArray, i: usize) -> Option<&str> {
+        (!c.is_null(i)).then(|| c.value(i))
+    }
+    let fact_cols: Vec<[StringArray; 5]> = facts
+        .iter()
+        .map(|b| {
+            Ok([
+                text(b, "commit_id").context("facts: commit_id")?,
+                text(b, "entity").context("facts: entity")?,
+                text(b, "predicate").context("facts: predicate")?,
+                text(b, "fact_id").context("facts: fact_id")?,
+                text(b, "source_episodes").context("facts: source_episodes")?,
+            ])
+        })
+        .collect::<Result<_>>()?;
+    let mut out = HashSet::new();
+    for p in open {
+        let before = ledger.reachable(&p.base);
+        let since: HashSet<&str> = main
+            .iter()
+            .filter(|c| !before.contains(*c) && !state.metadata.contains(*c))
+            .map(String::as_str)
+            .collect();
+        let keys: HashSet<(&str, &str)> = p
+            .changes
+            .iter()
+            .filter(|c| c["kind"] == "fact")
+            .filter_map(|c| Some((c["entity"].as_str()?, c["predicate"].as_str()?)))
+            .collect();
+        let ids: HashSet<&str> = p
+            .changes
+            .iter()
+            .filter_map(|c| c["id"].as_str().or(c["fact_id"].as_str()))
+            .collect();
+        let on_key = |f: &[StringArray; 5], i: usize| {
+            f[1].is_valid(i) && f[2].is_valid(i) && keys.contains(&(f[1].value(i), f[2].value(i)))
+        };
+        let mut evidence: HashSet<&str> = p.evidence.iter().map(String::as_str).collect();
+        for f in &fact_cols {
+            for i in (0..f[1].len()).filter(|i| on_key(f, *i)) {
+                if let Some(s) = at(&f[4], i) {
+                    evidence.extend(s.split(',').filter(|e| !e.is_empty()));
+                }
+            }
+        }
+        let touched_fact = fact_cols.iter().any(|f| {
+            (0..f[0].len()).any(|i| {
+                at(&f[0], i).is_some_and(|c| since.contains(c))
+                    && (on_key(f, i)
+                        || at(&f[3], i).is_some_and(|x| ids.contains(x))
+                        || at(&f[4], i).is_some_and(|s| s.split(',').any(|e| evidence.contains(e))))
+            })
+        });
+        let touched_side = side.iter().any(|(table, rows)| {
+            rows.iter().any(|b| {
+                let Some(commits) = text(b, "commit_id") else {
+                    return false;
+                };
+                (0..b.num_rows()).any(|i| {
+                    at(&commits, i).is_some_and(|c| since.contains(c))
+                        && match *table {
+                            SCHEMAS => true,
+                            EPISODES => col(b, "episode_id", i)
+                                .is_some_and(|e| evidence.contains(e.as_str())),
+                            _ => {
+                                col(b, "actor_prefix", i).is_some()
+                                    || col(b, "fact_id", i)
+                                        .is_some_and(|f| ids.contains(f.as_str()))
+                                    || col(b, "episode_id", i)
+                                        .is_some_and(|e| evidence.contains(e.as_str()))
+                            }
+                        }
+                })
+            })
+        });
+        if !touched_fact && !touched_side {
+            out.insert(p.id.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// Whether a list of proposals also reads each from its branch's state and counts where that differs from what main's

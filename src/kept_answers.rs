@@ -10,7 +10,8 @@
 //!   has a commit's heads without its episodes.
 //! - Once main moved on, a reader's last answer is answered at once while the new state's is worked out in the
 //!   background for the next read, but only while memory lost nothing since it was worked out, and for at most
-//!   [`STALE`]. Lost nothing: main's [`crate::Vis::removals`] is the same, so is the scope's loss count
+//!   [`STALE`], or [`SUMMARY_STALE`] for a page's summary ([`Kept::summary`]: a return visit within the hour is
+//!   answered at once). Lost nothing: main's [`crate::Vis::removals`] is the same, so is the scope's loss count
 //!   ([`crate::losses`], counted by every forget, delete, retraction, narrowed ACL, retired version, retention
 //!   policy, purge and offboarding made here, and by every loss a build of main's state finds, what aged out
 //!   included), so is the facts table's generation (it moves when an erasure or a forget rewrites facts away),
@@ -18,15 +19,26 @@
 //!   never shows what was taken away.
 //! - The loss count and the facts table are read before the state the answer reads is pinned ([`Mark`]): a
 //!   removal that ends while an answer is worked out leaves that answer behind.
-//! - An answer is one reader's: its key names the reader exactly (who, and every group they read as), so no reader
-//!   is ever answered what was worked out for another, wider or narrower.
+//! - An answer kept here is one reader's: its key names the reader exactly (who, and every group they read as), so
+//!   no reader is ever answered what was worked out for another, wider or narrower. An answer shared between
+//!   servers ([`crate::shared_answers`]) is too, unless `AMPUP_MEMORY_SHARED_ANSWERS_CLASSES` is on: then a part
+//!   that reads its reader only through what the ACLs let them read is shared by the readers who hold the same of
+//!   the ACL entries the states it reads name, who read exactly the same of them, and a part that reads nothing of
+//!   its reader by every reader of the scope ([`crate::shared_answers::class_for`]). A part that reads who its reader
+//!   is (their sessions, their own advice, what they own, their standing) stays one reader's.
 //! - A change this server makes to what these read (a conflict resolved, a proposal decided, a dream decision
 //!   undone or applied, an owner set) drops the scope's answers ([`changed`]): its maker's next read is worked out
 //!   on it. Another server's change reaches this one's readers as any write does, within [`STALE`].
+//! - An answer over a window that ends now (the last 30 days, [`At::windowed`]) is answered as it is for
+//!   [`WINDOW_FRESH`] at the same state; past it, it is answered while the next is worked out in the background, as
+//!   when main moved on: its window never ends more than its kind's [`STALE`] (or [`SUMMARY_STALE`]) before now.
 //! - An answer is worked out once at a time: a read that finds the reader's being worked out waits for it rather
 //!   than working it out again, if it is at the same state, or (a read that may lag) at one an answer kept from
 //!   would be served at, as above. The work runs on its own, so a request that
 //!   stops waiting (a page closed, a read answered without it) doesn't stop it: the next read finds it kept.
+//! - An answer served from an earlier state than the one asked for (while the next is worked out) is noted
+//!   ([`not_sharable`]): an answer built from it is not one to share with other servers under the asked state's key
+//!   ([`crate::shared_answers`]), only to show.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -36,17 +48,45 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use tokio::sync::watch;
 
-/// How old a kept answer may be and still be answered while the memory moved on (it never is past a loss).
+/// `work`, run on a task of its own, with the asker's reads of main served as theirs are past quotes, closures and
+/// decisions ([`crate::lagging_past_endings`], Studio's Home), so the work doesn't wait for the build they skipped.
+fn past_endings<F: Future>(
+    work: F,
+) -> tokio::task::futures::TaskLocalFuture<std::cell::Cell<bool>, F> {
+    crate::lagging_past_endings(crate::lags_past_endings(), work)
+}
+
+/// How old a kept answer may be and still be answered while the memory moved on, its next worked out in the
+/// background meanwhile (it never is past a loss): a review list's or a listing's ([`Kept::new`]).
 pub const STALE: Duration = Duration::from_secs(600);
 
-/// The [`STALE`]-long span of time now falls in: in the key of an answer over a window that ends now (the last 30 days),
-/// so a kept one is never answered for a window that ended more than [`STALE`] ago.
-pub fn span() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        / STALE.as_secs()
+/// [`STALE`] for a page's summary ([`Kept::summary`]: Home's, Advice's and Learned's counts and lists), whose numbers
+/// may lag what was added since: a return visit within the hour is answered at once.
+pub const SUMMARY_STALE: Duration = Duration::from_secs(3600);
+
+/// How old a kept answer over a window that ends now ([`At::windowed`]) may be and still be answered as it is at the
+/// same state: past it, it is answered while the next is worked out in the background, up to its kind's [`STALE`].
+pub const WINDOW_FRESH: Duration = Duration::from_secs(600);
+
+tokio::task_local! {
+    /// Set within [`sharable`]: whether what the task worked out may be shared ([`not_sharable`]).
+    static SHARABLE: Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// `fut`'s output, and whether it may be shared with other servers under the key of the state it was asked at
+/// ([`crate::shared_answers`]): not when anything it read answered from an earlier state while the next was worked
+/// out, or failed ([`not_sharable`]).
+pub async fn sharable<F: Future>(fut: F) -> (F::Output, bool) {
+    let ok = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let out = SHARABLE.scope(ok.clone(), fut).await;
+    (out, ok.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// What this task is working out is not to be shared ([`sharable`]): it read an answer from an earlier state than
+/// the one asked for (a kept answer served while the next is worked out), or a read failed. Nothing outside
+/// [`sharable`].
+pub fn not_sharable() {
+    let _ = SHARABLE.try_with(|ok| ok.store(false, std::sync::atomic::Ordering::Relaxed));
 }
 
 /// What is read of a scope before the state an answer reads is pinned: its loss count and its facts table.
@@ -86,6 +126,8 @@ pub struct At {
     pub pinned: Vec<String>,
     /// The scope's answer log as read before the answer was worked out, for an answer that reads it ([`Log`]).
     log: Option<Log>,
+    /// Whether the answer is over a window that ends when it is worked out ([`At::windowed`]).
+    window: bool,
 }
 
 /// The rows of a scope's answer log (`qa_log`) as this server holds them, held so no batch of them is freed (and its
@@ -150,7 +192,23 @@ impl At {
             removals: vis.removals,
             pinned: vec![],
             log: None,
+            window: false,
         }
+    }
+
+    /// For an answer over a window that ends when it is worked out (the last 30 days): at the same state it is
+    /// answered as it is for [`WINDOW_FRESH`], then while the next is worked out, up to its kind's [`STALE`].
+    pub fn windowed(self) -> At {
+        At {
+            window: true,
+            ..self
+        }
+    }
+
+    /// Whether an answer worked out at `self` `age` ago is answered as it is at `now`: the same state, and for an
+    /// answer over a window, young enough.
+    fn current(&self, now: &At, age: Duration) -> bool {
+        self == now && (!now.window || age < WINDOW_FRESH)
     }
 
     /// As [`At::of`], for an answer that also reads the scope's answer log, `log` as read before it is worked out
@@ -165,7 +223,7 @@ impl At {
 
     /// Whether memory lost nothing between `self` and `now` (the same removals, loss count, facts generation and
     /// pins): only then may an answer worked out at `self` be answered at `now` while `now`'s is worked out.
-    fn lost_nothing(&self, now: &At) -> bool {
+    pub fn lost_nothing(&self, now: &At) -> bool {
         self.removals == now.removals
             && self.mark.losses == now.mark.losses
             && self.mark.facts.1 == now.mark.facts.1
@@ -191,7 +249,9 @@ struct Entry<T> {
 /// answered again.
 static GENERATIONS: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Default::default);
 
-fn generation(ns: &str) -> u64 {
+/// How many times this server changed scope namespace `ns`'s reviewed memory ([`changed`]): read before an answer
+/// kept with [`Kept::put`] is worked out.
+pub fn generation(ns: &str) -> u64 {
     GENERATIONS.lock().unwrap().get(ns).copied().unwrap_or(0)
 }
 
@@ -216,8 +276,10 @@ struct Running<T> {
 pub struct Kept<T> {
     entries: Mutex<HashMap<String, Entry<T>>>,
     running: Mutex<HashMap<String, Running<T>>>,
-    /// Answers kept at most; past it, those older than [`STALE`] go, then the oldest.
+    /// Answers kept at most; past it, those older than `stale` go, then the oldest.
     max: usize,
+    /// How old an answer may be and still be answered while the memory moved on: [`STALE`] or [`SUMMARY_STALE`].
+    stale: Duration,
     /// Whether an answer may be kept: one that isn't is still answered to the reads that waited for it.
     keepable: fn(&T) -> bool,
 }
@@ -227,12 +289,21 @@ impl<T: Send + Sync + 'static> Kept<T> {
         Self::new_if(max, |_| true)
     }
 
+    /// [`Kept::new`], for a page's summary: answered while the memory moved on for up to [`SUMMARY_STALE`].
+    pub fn summary(max: usize) -> Self {
+        Kept {
+            stale: SUMMARY_STALE,
+            ..Self::new(max)
+        }
+    }
+
     /// [`Kept::new`], keeping only the answers `keepable` passes (a search ranked without its vectors, say).
     pub fn new_if(max: usize, keepable: fn(&T) -> bool) -> Self {
         Kept {
             entries: Mutex::new(HashMap::new()),
             running: Mutex::new(HashMap::new()),
             max,
+            stale: STALE,
             keepable,
         }
     }
@@ -259,13 +330,16 @@ impl<T: Send + Sync + 'static> Kept<T> {
             if let Some(e) = kept.get_mut(&key)
                 && e.generation == generation
             {
-                if e.at == at {
+                let age = e.made.elapsed();
+                if e.at.current(&at, age) {
                     return Ok(e.answer.clone());
                 }
-                if lag && e.at.lost_nothing(&at) && e.made.elapsed() < STALE {
+                if (e.at == at || lag && e.at.lost_nothing(&at)) && age < self.stale {
+                    // Not this state's answer as it is now: shown while the next is worked out, never shared.
+                    not_sharable();
                     if !e.refreshing {
                         e.refreshing = true;
-                        let (job, ns) = (work(), ns.to_string());
+                        let (job, ns) = (past_endings(work()), ns.to_string());
                         tokio::spawn(async move {
                             match job.await {
                                 Ok(answer) => self.keep(&ns, key, at, generation, Arc::new(answer)),
@@ -307,6 +381,9 @@ impl<T: Send + Sync + 'static> Kept<T> {
                     if r.generation == generation
                         && (r.at == at || lag && r.at.lost_nothing(&at)) =>
                 {
+                    if r.at != at {
+                        not_sharable();
+                    }
                     r.done.clone()
                 }
                 _ => {
@@ -319,7 +396,7 @@ impl<T: Send + Sync + 'static> Kept<T> {
                             done: rx.clone(),
                         },
                     );
-                    let (job, ns) = (work(), ns.to_string());
+                    let (job, ns) = (past_endings(work()), ns.to_string());
                     tokio::spawn(async move {
                         let got = job.await.map(Arc::new);
                         if let Ok(answer) = &got {
@@ -354,12 +431,41 @@ impl<T: Send + Sync + 'static> Kept<T> {
     /// worked out or started here. With it, whether it was worked out at `at` itself (not only at a state it may be
     /// answered at while the next is worked out) and how old it is.
     pub fn peek(&self, ns: &str, reader: &str, at: &At) -> Option<(Arc<T>, bool, Duration)> {
+        self.peek_within(ns, reader, at, self.stale)
+    }
+
+    /// [`Kept::peek`], for an answer that may be up to `age` old while the memory moved on (a summary whose numbers
+    /// may lag): never past a loss, as any kept answer.
+    pub fn peek_within(
+        &self,
+        ns: &str,
+        reader: &str,
+        at: &At,
+        age: Duration,
+    ) -> Option<(Arc<T>, bool, Duration)> {
         let key = format!("{ns}\n{reader}");
         let kept = self.entries.lock().unwrap();
         let e = kept.get(&key).filter(|e| e.generation == generation(ns))?;
-        let exact = e.at == *at;
-        (exact || e.at.lost_nothing(at) && e.made.elapsed() < STALE)
-            .then(|| (e.answer.clone(), exact, e.made.elapsed()))
+        let made = e.made.elapsed();
+        let exact = e.at.current(at, made);
+        let found = exact || e.at.lost_nothing(at) && made < age;
+        if found && !exact {
+            not_sharable();
+        }
+        found.then(|| (e.answer.clone(), exact, made))
+    }
+
+    /// Keeps `answer` for `reader`, worked out at `at` (its mark read before the state it read was pinned) under the
+    /// scope's [`generation`] read before it was worked out: as an answer [`Kept::get`] worked out is kept (not when
+    /// the scope changed here or lost something since).
+    pub fn put(&self, ns: &str, reader: &str, at: At, generation: u64, answer: T) {
+        self.keep(
+            ns,
+            format!("{ns}\n{reader}"),
+            at,
+            generation,
+            Arc::new(answer),
+        );
     }
 
     /// The answer for `reader` at `at` worked out again by `work`, whatever is kept (one already being worked out at
@@ -395,7 +501,7 @@ impl<T: Send + Sync + 'static> Kept<T> {
         }
         let mut kept = self.entries.lock().unwrap();
         if kept.len() >= self.max && !kept.contains_key(&key) {
-            kept.retain(|_, e| e.made.elapsed() < STALE);
+            kept.retain(|_, e| e.made.elapsed() < self.stale);
             if kept.len() >= self.max
                 && let Some(oldest) = kept
                     .iter()

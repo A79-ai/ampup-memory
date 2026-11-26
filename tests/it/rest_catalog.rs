@@ -11,6 +11,9 @@
 //! - Isolation: every caller reads only the scope they are entitled to, through either process.
 //! - The catalog can rewrite a table (`Store::check_rewrites`), which forget and org delete need; one throttled
 //!   while they check (BigLake's 429) has them answered busy (503, the catalog's `Retry-After`), nothing changed.
+//! - Home's answers shared between servers (`AMPUP_MEMORY_SHARED_ANSWERS=object`): an episode forgotten through
+//!   one process (sharing or not), or aged out under a retention policy, is in no Home either process or a new
+//!   one answers, and in no shared answer left in the bucket.
 //!
 //! They need the fixture in `tests/fixtures/rest-catalog` (the Iceberg REST fixture and MinIO):
 //!
@@ -145,7 +148,8 @@ impl Rest {
             .to_string()
     }
 
-    /// Every object under `prefixes` (bucket keys) whose bytes hold `tag`.
+    /// Every object under `prefixes` (bucket keys) whose bytes hold `tag` (a data file's rows uncompressed:
+    /// [`crate::readable`]).
     async fn objects_with(&self, prefixes: &[String], tag: &str) -> Vec<String> {
         let op = self.s3();
         let mut out = vec![];
@@ -159,7 +163,7 @@ impl Rest {
                 if e.metadata().is_dir() {
                     continue;
                 }
-                let bytes = op.read(e.path()).await.unwrap().to_vec();
+                let bytes = crate::readable(op.read(e.path()).await.unwrap().to_vec(), e.path());
                 if bytes.windows(tag.len()).any(|w| w == tag.as_bytes()) {
                     out.push(e.path().to_string());
                 }
@@ -242,6 +246,17 @@ fn keys_file(dir: &Path) -> PathBuf {
 /// Start `memstore serve org <port>` on the REST catalog at `uri` (the fixture, or a stand-in in front of
 /// it), taking the operator's key and people's ID tokens from `issuer`.
 async fn serve(rest: &Rest, uri: &str, dir: &Path, issuer: &str) -> Server {
+    serve_env(rest, uri, dir, issuer, &[]).await
+}
+
+/// [`serve`], with `env` set too.
+async fn serve_env(
+    rest: &Rest,
+    uri: &str,
+    dir: &Path,
+    issuer: &str,
+    env: &[(&str, &str)],
+) -> Server {
     let port = free_port();
     let log = dir.join(format!("serve-{port}.log"));
     let out = std::fs::File::create(&log).unwrap();
@@ -268,6 +283,7 @@ async fn serve(rest: &Rest, uri: &str, dir: &Path, issuer: &str) -> Server {
         .env_remove("MEMSTORE_DISABLED_FILE")
         .env_remove("AMPUP_MEMORY_TEAM_CSV")
         .env_remove("MEMSTORE_TEAM_CSV")
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(out.try_clone().unwrap())
         .stderr(out)
@@ -1158,5 +1174,336 @@ async fn isolation_holds_across_two_server_processes_on_a_rest_catalog() {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
         }
+    }
+}
+
+/// What `bearer`'s Home through `s` (selection `sel`) answers, every part of it, as text.
+async fn home(s: &str, sel: &str, bearer: &str) -> String {
+    let parts = [
+        "counts",
+        "week",
+        "lessons",
+        "branches",
+        "activity",
+        "proposals",
+        "conflicts",
+        "dream",
+        "schema",
+    ];
+    let (status, text) = post(
+        &format!("{s}/browse{sel}"),
+        bearer,
+        &json!({"op": "home", "parts": parts}),
+    )
+    .await;
+    assert_eq!(status, 200, "home through {s}: {text}");
+    text
+}
+
+/// Home's count of the sources its reader reads (`counts.sources`), None while it is being counted.
+fn sources_count(home: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(home).ok()?["counts"]["sources"].as_u64()
+}
+
+/// Waits, at most `within`, until `check` holds of what `get` answers: what it last answered, and whether it did.
+async fn wait_until<T, F: std::future::Future<Output = T>>(
+    within: Duration,
+    mut get: impl FnMut() -> F,
+    check: impl Fn(&T) -> bool,
+) -> (T, bool) {
+    let t = Instant::now();
+    loop {
+        let got = get().await;
+        if check(&got) || t.elapsed() >= within {
+            let ok = check(&got);
+            return (got, ok);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_forgotten_or_aged_out_episode_leaves_no_shared_home_answer() {
+    let Some(rest) = Rest::from_env("a_forgotten_or_aged_out_episode_leaves_no_shared_home_answer")
+    else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let issuer = start_idp().await;
+    let store = Store::new(rest.catalog().await);
+    // Every server shares Home's answers in the bucket, beside the catalog's system tables, and reads what another
+    // server wrote at most 2 s late.
+    let sharing = [
+        ("AMPUP_MEMORY_SHARED_ANSWERS", "object"),
+        ("AMPUP_MEMORY_HARD_STALENESS_MS", "2000"),
+    ];
+    let sa = serve_env(&rest, &rest.uri, dir.path(), &issuer, &sharing).await;
+    let a = sa.url.as_str();
+    let answers = [rest.key_of(&format!("{}/memory_system/_answers", rest.warehouse))];
+    let org = fresh("shared");
+    admin(
+        a,
+        json!({"op": "create_org", "org": org, "admin": "alice@acme.com"}),
+    )
+    .await;
+    // A reader of their own for each case: a Home kept for a reader is answered past later additions until it is
+    // worked out again, so a reader who opened Home before an episode was written may not see it for a while. Each
+    // case's episode is the only one its reader reads (those before it are gone by then): Home counts 1 source
+    // while it is there, and never 1 once it is gone.
+    let reader = |n: &str| {
+        let (org, issuer) = (org.clone(), issuer.clone());
+        let user = format!("{n}@acme.com");
+        async move {
+            admin(
+                a,
+                json!({"op": "invite", "org": org, "members": [{"user": user}]}),
+            )
+            .await;
+            id_token(&issuer, &user)
+        }
+    };
+    let scope = Scope::org(&org).unwrap();
+    store.ensure_scope(&scope).await.unwrap();
+    let sel = format!("?org={org}");
+    let run = run_id();
+    // An episode shared with the whole org from a source of its own: Home's sources name it by the tag.
+    let write = |tag: String, occurred_at: Option<i64>| {
+        let (store, scope, org) = (store.clone(), scope.clone(), org.clone());
+        async move {
+            let all = format!("group:{org}.all");
+            let mut ep = Episode::new(
+                &format!("{tag}:note"),
+                format!("{tag} note").as_bytes(),
+                &[&all],
+            );
+            if let Some(at) = occurred_at {
+                ep.occurred_at = at;
+            }
+            store.commit(&scope, "test", &[ep], &[]).await.unwrap();
+        }
+    };
+    // The reader's first Home through `s`, once `s` reads the episode, shows `tag`, and an answer in the bucket
+    // holds it.
+    let shown_and_shared = |s: String, tag: String, bob: String| {
+        let (sel, answers) = (sel.clone(), answers.clone());
+        let rest = &rest;
+        async move {
+            let ls = json!({"op": "ls", "path": ["sources"]});
+            let url = format!("{s}/browse{sel}");
+            let (_, ok) = wait_until(
+                Duration::from_secs(30),
+                || post(&url, &bob, &ls),
+                |(_, t)| t.contains(&tag),
+            )
+            .await;
+            assert!(ok, "{s} never read {tag}");
+            let (_, ok) = wait_until(
+                Duration::from_secs(60),
+                || home(&s, &sel, &bob),
+                |h| h.contains(&tag),
+            )
+            .await;
+            assert!(ok, "{tag} never shown on {s}'s Home");
+            let (h, ok) = wait_until(
+                Duration::from_secs(60),
+                || home(&s, &sel, &bob),
+                |h| sources_count(h) == Some(1),
+            )
+            .await;
+            assert!(ok, "{s}'s Home never counted {tag}'s source: {h}");
+            let (_, ok) = wait_until(
+                Duration::from_secs(30),
+                || rest.objects_with(&answers, &tag),
+                |o| !o.is_empty(),
+            )
+            .await;
+            assert!(ok, "no shared answer of {s}'s holds {tag}");
+        }
+    };
+
+    // Forgotten (retracted) through server B, once with B sharing nothing (A finds the loss on its next build and
+    // A positive control: with only an answer logged since its answers were put, a new server's first Home is
+    // answered from them, whole. Without it, every check below could pass with nothing ever read from the store.
+    let tag = format!("xq{run}control");
+    let bob = reader("control").await;
+    write(tag.clone(), None).await;
+    shown_and_shared(a.to_string(), tag.clone(), bob.clone()).await;
+    // Every part's answer put: A's first Home worked each out, and puts land in the background.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (status, body) = post(
+        &format!("{a}/log_answer{sel}"),
+        &bob,
+        &json!({"question": format!("what is {tag}?"), "cited": []}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let sc = serve_env(&rest, &rest.uri, dir.path(), &issuer, &sharing).await;
+    let h = home(&sc.url, &sel, &bob).await;
+    let shared = serde_json::from_str::<Value>(&h)
+        .ok()
+        .map(|v| v["shared"] == true);
+    assert!(
+        shared == Some(true) && h.contains(&tag),
+        "a new server's first Home wasn't the stored answers, with only an answer logged since: {h}"
+    );
+    drop(sc);
+    // Gone before the cases below, each of whose readers must read its own episode alone.
+    let (status, body) = post(
+        &format!("{a}/retract{sel}"),
+        ADMIN_KEY,
+        &json!({"source": format!("{tag}:note")}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Forgotten (retracted) through server B, once with B sharing nothing (A finds the loss on its next build and
+    // purges) and once with B sharing too (B purges as it forgets); then hidden from its reader by a narrower ACL,
+    // through B sharing; then by a merge alone: a branch wrote the episode again under a narrower ACL before the
+    // answers were put, so the merge moves only the ledger.
+    for (variant, b_shares) in [("off", false), ("on", true), ("acl", true), ("merge", true)] {
+        let b_env = [
+            (
+                "AMPUP_MEMORY_SHARED_ANSWERS",
+                if b_shares { "object" } else { "off" },
+            ),
+            ("AMPUP_MEMORY_HARD_STALENESS_MS", "2000"),
+        ];
+        let sb = serve_env(&rest, &rest.uri, dir.path(), &issuer, &b_env).await;
+        let tag = format!("xq{run}forget{variant}");
+        let bob = reader(&format!("forget{variant}")).await;
+        write(tag.clone(), None).await;
+        let branch = format!("ws{run}");
+        if variant == "merge" {
+            store.create_branch(&scope, &branch, "test").await.unwrap();
+            let narrower = Episode::new(
+                &format!("{tag}:note"),
+                format!("{tag} note").as_bytes(),
+                &["user:alice@acme.com"],
+            );
+            store
+                .commit_on(&scope, &branch, "test", &[narrower], &[])
+                .await
+                .unwrap();
+        }
+        shown_and_shared(a.to_string(), tag.clone(), bob.clone()).await;
+        // The answers that hold it, as they were before it was lost: put back once purged, they must not be
+        // answered.
+        let op = rest.s3();
+        let mut held = vec![];
+        for key in rest.objects_with(&answers, &tag).await {
+            let bytes = op.read(&key).await.unwrap().to_vec();
+            held.push((key, bytes));
+        }
+        assert!(!held.is_empty(), "B {variant}: no shared answer held {tag}");
+        let (status, body) = match variant {
+            "merge" => {
+                store.merge(&scope, &branch, "test").await.unwrap();
+                (200, String::new())
+            }
+            "acl" => {
+                post(
+                    &format!("{}/acl{sel}", sb.url),
+                    ADMIN_KEY,
+                    &json!({"source": format!("{tag}:note"), "acl": ["user:alice@acme.com"]}),
+                )
+                .await
+            }
+            _ => {
+                post(
+                    &format!("{}/retract{sel}", sb.url),
+                    ADMIN_KEY,
+                    &json!({"source": format!("{tag}:note")}),
+                )
+                .await
+            }
+        };
+        assert_eq!(status, 200, "{body}");
+        // A stops showing it within its staleness window, and then never again.
+        let (h, ok) = wait_until(
+            Duration::from_secs(30),
+            || home(a, &sel, &bob),
+            |h| !h.contains(&tag),
+        )
+        .await;
+        assert!(
+            ok,
+            "B {variant}: A still shows {tag} after B forgot it: {h}"
+        );
+        // Nor counts it: not on the Home that stopped showing it, nor on any after.
+        assert_ne!(
+            sources_count(&h),
+            Some(1),
+            "B {variant}: A counts {tag}'s source after B forgot it: {h}"
+        );
+        // No shared answer holds it once A's purge (B's too, when it shares) is done.
+        let (left, ok) = wait_until(
+            Duration::from_secs(30),
+            || rest.objects_with(&answers, &tag),
+            |o| o.is_empty(),
+        )
+        .await;
+        assert!(
+            ok,
+            "B {variant}: shared answers outlived the forget of {tag}: {left:?}"
+        );
+        // The answers from before the loss put back, as a put that lost its race with the purge would leave them,
+        // and an answer logged since (a commit that only adds to the answer log).
+        for (key, bytes) in &held {
+            op.write(key, bytes.clone()).await.unwrap();
+        }
+        let (status, body) = post(
+            &format!("{a}/log_answer{sel}"),
+            &bob,
+            &json!({"question": format!("what is {tag}?"), "cited": []}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        // A new server's first Home (from the shared answers, or worked out) doesn't show it, nor A's next ones.
+        let sc = serve_env(&rest, &rest.uri, dir.path(), &issuer, &sharing).await;
+        for s in [sc.url.as_str(), a, sc.url.as_str(), a] {
+            let h = home(s, &sel, &bob).await;
+            assert!(
+                !h.contains(&tag) && sources_count(&h) != Some(1),
+                "B {variant}: {s} showed or counted {tag} after it was forgotten: {h}"
+            );
+        }
+        for (key, _) in &held {
+            op.delete(key).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let left = rest.objects_with(&answers, &tag).await;
+        assert!(
+            left.is_empty(),
+            "B {variant}: a shared answer holding {tag} was put after its forget: {left:?}"
+        );
+    }
+
+    // Aged out: a policy keeps the tag's source a day, and its episode turns a day old shortly. No table is written
+    // when it does, so the answers' key doesn't move: only their expiry keeps it from being answered.
+    let tag = format!("xq{run}ages");
+    let bob = reader("ages").await;
+    admin(
+        a,
+        json!({"op": "retention", "org": org, "rules": [format!("{tag}:=1d")]}),
+    )
+    .await;
+    let day = 86_400_000_000_i64;
+    let ages_out = chrono::Utc::now().timestamp_micros() + 40_000_000;
+    write(tag.clone(), Some(ages_out - day)).await;
+    shown_and_shared(a.to_string(), tag.clone(), bob.clone()).await;
+    let left = ages_out - chrono::Utc::now().timestamp_micros();
+    assert!(
+        left > 0,
+        "seeding took past the episode's ageing out: make it age out later"
+    );
+    tokio::time::sleep(Duration::from_micros(left as u64 + 200_000)).await;
+    // Answered at once (A's own kept answer, or the shared answers) and by a new server alike: not shown.
+    let sc = serve_env(&rest, &rest.uri, dir.path(), &issuer, &sharing).await;
+    for s in [a, sc.url.as_str(), a, sc.url.as_str()] {
+        let h = home(s, &sel, &bob).await;
+        assert!(
+            !h.contains(&tag) && sources_count(&h) != Some(1),
+            "{s} showed or counted {tag} after it aged out: {h}"
+        );
     }
 }

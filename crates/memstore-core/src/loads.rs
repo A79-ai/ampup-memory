@@ -67,20 +67,39 @@ async fn wait_turn() {
     }
 }
 
+/// The background loops whose work steps aside for interactive reads ([`crate::priority`]): what no one waits for,
+/// and that holds nothing a read waits on between its steps.
+const LOOPS: [&str; 5] = [
+    "keep_warm",
+    "dream",
+    "maintenance",
+    "maintenance_window",
+    "directory_compaction",
+];
+
+/// Whether this task is one of the background [`LOOPS`] (its name kept by what it spawned through [`later`]).
+pub fn is_loop() -> bool {
+    LOOPS.contains(&caller())
+}
+
 /// A loop's turn to read a table, within the rate: waited for (and out of any pause) before the table's load lock
-/// is taken. A request, or a starting server's `start` reads, go at once.
-pub async fn turn() {
+/// is taken. A request, or a starting server's `start` reads, go at once. A background loop's load also holds a
+/// permit of [`crate::priority::load_permit`]'s pool while it loads: the turn returned, dropped once the load is
+/// done.
+#[must_use]
+pub async fn turn() -> Option<tokio::sync::SemaphorePermit<'static>> {
     if is_request() || caller() == "start" {
-        return;
+        return None;
     }
     wait_turn().await;
     loop {
         let wait = RATE.lock().unwrap().take(Instant::now());
         match wait {
             Some(w) => tokio::time::sleep(w).await,
-            None => return,
+            None => break,
         }
     }
+    crate::priority::load_permit().await
 }
 
 /// Loops' loads a second ([`RATE`]), as a token bucket holding at most [`BURST_SECS`] of them.

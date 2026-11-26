@@ -4,6 +4,7 @@
 //! - `forget` of an episode, before any sweep: the export already leaves it out, and the sweep removes its calls;
 //! - an ACL narrowed until none of the episode's original readers can read it: the sweep removes its calls;
 //! - the immediate purge the server runs on `forget_memory` (`train_log::purge_ref`);
+//! - a team purged with its memory (`train_log::purge_scope`) takes the calls that read it and no other's;
 //! - an org's delete (`train_log::purge_org`) takes that org's prefix and no other's.
 //!
 //! The export keeps to episodes shared with `*` unless asked, and splits what it writes by episode.
@@ -165,6 +166,8 @@ async fn forgotten_memory_leaves_the_training_log() {
     let acme = Scope::parse("org:acme").unwrap();
     store.ensure_scope(&default).await.unwrap();
     store.ensure_scope(&acme).await.unwrap();
+    let t1 = Scope::team("acme", "t1").unwrap();
+    store.ensure_scope(&t1).await.unwrap();
 
     let body = |what: &str| {
         format!("The {what} export moved to Postgres after the migration review in March.")
@@ -184,8 +187,12 @@ async fn forgotten_memory_leaves_the_training_log() {
     let z = Episode::new("doc:z", body("acme").as_bytes(), &["*"]);
     let z_id = z.episode_id.clone();
     store.commit(&acme, "alice", &[z], &[]).await.unwrap();
+    let y = Episode::new("doc:y", body("team").as_bytes(), &["*"]);
+    let y_id = y.episode_id.clone();
+    store.commit(&t1, "alice", &[y], &[]).await.unwrap();
     extract::run(&store, &default, &ex, 100).await.unwrap();
     extract::run(&store, &acme, &ex, 100).await.unwrap();
+    extract::run(&store, &t1, &ex, 100).await.unwrap();
 
     // Every episode's extraction is logged, each under its own org's prefix and no other.
     let all: BTreeSet<String> = [&a_id, &b_id, &c_id].into_iter().cloned().collect();
@@ -225,6 +232,13 @@ async fn forgotten_memory_leaves_the_training_log() {
     assert_eq!(line["messages"][0]["role"], "user");
     assert_eq!(line["messages"][1]["role"], "assistant");
     assert!(["train", "dev", "test"].contains(&line["meta"]["split"].as_str().unwrap()));
+
+    // A team purged with its memory (`purge_team`) takes the calls that read it, and only those.
+    assert_eq!(logged(&t1).await, BTreeSet::from([y_id.clone()]));
+    assert!(train_log::purge_scope(&t1).await.unwrap() >= 1);
+    assert_eq!(logged(&t1).await, BTreeSet::new());
+    assert_eq!(logged(&acme).await, BTreeSet::from([z_id.clone()]));
+    assert_eq!(logged(&default).await, all);
 
     // Deleting an org takes its prefix, and leaves the others'.
     train_log::purge_org("acme").await.unwrap();

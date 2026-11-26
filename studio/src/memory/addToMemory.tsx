@@ -4,6 +4,7 @@ import { errorText, transport } from "../transport";
 import { Receipt, type ReceiptFact, type ReceiptItem } from "./receipt";
 import type { Focus, Selection } from "./types";
 import { Icon } from "./ui";
+import { useCanWrite } from "./writes";
 import "./learn.css";
 
 // Adding to the memory by hand: files dropped in or text pasted (and an Ask answer kept), each kept as an episode
@@ -117,6 +118,12 @@ export const canLearn = () => {
   } catch {
     return false;
   }
+};
+
+/** Whether adding to the memory is offered here: the transport can, and the reader isn't a viewer, who only reads. */
+const useLearns = () => {
+  const writes = useCanWrite();
+  return writes && canLearn();
 };
 
 /** Adds `items` to the memory (`whose`: the caller's alone, or everyone's who reads it). */
@@ -632,7 +639,8 @@ export function RememberThis({
   const [error, setError] = useState<string>();
   const [added, setAdded] = useState<Added | null>(null);
   const receipt = useReceipt(sel, added);
-  if (!canLearn() || !answer.trim()) return null;
+  const learns = useLearns();
+  if (!learns || !answer.trim()) return null;
   if (added && receipt)
     return (
       <div className="learn-inline">
@@ -671,7 +679,8 @@ export function RememberThis({
  * the start with `open`. */
 export function AddToMemoryButton({ open: openAtFirst = false, ...props }: AddToMemoryProps & { open?: boolean }) {
   const [open, setOpen] = useState(openAtFirst);
-  if (!canLearn()) return null;
+  const learns = useLearns();
+  if (!learns) return null;
   if (open) return <AddToMemory {...props} />;
   return (
     <div className="learn-inline learn-open">
@@ -696,7 +705,8 @@ export function AddToMemoryDialog({ compact, ...props }: AddToMemoryDialogProps)
     if (open && !d.open) d.showModal();
     if (!open && d.open) d.close();
   }, [open]);
-  if (!canLearn()) return null;
+  const learns = useLearns();
+  if (!learns) return null;
   return (
     <>
       {compact ? (

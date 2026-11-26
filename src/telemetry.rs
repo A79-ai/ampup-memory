@@ -1125,6 +1125,13 @@ pub fn schema() -> serde_json::Value {
 /// that leaves) and to the spool before any attempt to send it. The spool is sent in batches and
 /// keeps what the control plane hasn't taken, so an unreachable control plane loses nothing and stops
 /// nothing: the server goes on serving, and the spool drains when it's back.
+///
+/// The engine and the deployment agent (`drain_spool`) both send the spool. A sender claims a batch before sending
+/// it: under the spool's lock it moves the batch out of the spool into a claim file of its own beside it
+/// (`telemetry.spool.jsonl.claim-<claimed at, ms>-<pid>-<n>`), sends it without the lock, and deletes the claim once
+/// the control plane took it. So no two senders send the same payload. A send that fails puts what it didn't send
+/// back where it was in the spool, ahead of what was recorded since; a claim whose sender stopped (crashed, killed)
+/// is put back once it is [`CLAIM_STALE`] old, by the time in its name.
 use anyhow::Context as _;
 
 pub struct Outbox {
@@ -1147,6 +1154,14 @@ pub const SPOOL_MAX: usize = 1440;
 pub const BATCH_MAX: usize = 100;
 /// The mirror is rolled over to `.1` past this size.
 pub const MIRROR_MAX_BYTES: u64 = 10 << 20;
+/// Longest a sender spends on a claimed batch before it gives up and puts the rest back: a batch is one request,
+/// or, refused as malformed, up to [`BATCH_MAX`] one by one, each cut off at 15 s, so it rarely nears this.
+pub const CLAIM_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// A claim this old, by the time in its name, was left by a sender that stopped (crashed, killed) and is put back
+/// in the spool. Six times [`CLAIM_SEND_DEADLINE`], so a live sender's claim is never taken from it (which would
+/// send its payloads twice), even on a stalled machine or a clock a little off between the engine and the agent; a
+/// crashed sender's payloads wait at most this long, well inside the day the spool holds.
+pub const CLAIM_STALE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 impl Outbox {
     /// Exporting: on when `AMPUP_MEMORY_DEPLOYMENT_CREDENTIAL` is set, unless `AMPUP_MEMORY_TELEMETRY=off`.
@@ -1205,10 +1220,10 @@ impl Outbox {
             .with_context(|| format!("the telemetry spool {}", self.spool.display()))
     }
 
-    /// Held while the spool is read and written back: the engine records and sends it, and the deployment agent, a
-    /// process of its own, sends or clears the same file (`drain_spool`, `clear_spool`). Without it a payload
-    /// recorded between one's read and its write was lost. A lock file beside the spool, which is replaced on
-    /// every write; never held while sending.
+    /// Held while the spool or its claims are read and written back: the engine records and sends it, and the
+    /// deployment agent, a process of its own, sends or clears the same file (`drain_spool`, `clear_spool`). Without
+    /// it a payload recorded between one's read and its write was lost, and two senders claimed the same payloads. A
+    /// lock file beside the spool, which is replaced on every write; never held while sending.
     fn hold(&self) -> anyhow::Result<std::fs::File> {
         let path = self.spool.with_extension("jsonl.lock");
         let f = std::fs::OpenOptions::new()
@@ -1251,7 +1266,7 @@ impl Outbox {
         let cred = crate::deployment::Credential::load(&self.credential)?;
         let mut took = 0;
         for chunk in batch.chunks(BATCH_MAX) {
-            took += self.send(&cred, chunk).await?;
+            took += self.send(&cred, chunk, &mut 0).await?;
         }
         Ok(took)
     }
@@ -1320,53 +1335,157 @@ impl Outbox {
     }
 
     fn spooled(&self) -> anyhow::Result<Vec<String>> {
-        match std::fs::read_to_string(&self.spool) {
-            Ok(t) => Ok(t
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(String::from)
-                .collect()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
-            Err(e) => Err(e.into()),
-        }
+        read_lines(&self.spool)
     }
 
     /// Caller holds [`Outbox::hold`].
     fn write_spool(&self, lines: &[String]) -> anyhow::Result<()> {
-        let tmp = unique_tmp(&self.spool);
-        let mut text = lines.join("\n");
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &self.spool));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        Ok(written?)
+        Ok(write_lines(&self.spool, lines)?)
     }
 
-    /// Payloads waiting to be sent.
+    /// Payloads waiting to be sent: in the spool, and claimed by a sender and not yet taken by the control plane.
     pub fn pending(&self) -> anyhow::Result<usize> {
-        Ok(self.spooled()?.len())
-    }
-
-    /// Drop every payload waiting to be sent; how many there were. The mirror keeps its copy of each.
-    pub fn clear(&self) -> anyhow::Result<usize> {
-        let _held = self.hold()?;
-        let n = self.spooled()?.len();
-        if n > 0 {
-            self.write_spool(&[])?;
+        let mut n = self.spooled()?.len();
+        for (path, _) in self.claims()? {
+            n += read_lines(&path)?.len();
         }
         Ok(n)
     }
 
+    /// Drop every payload waiting to be sent, claimed ones too; how many there were. The mirror keeps its copy of
+    /// each. A batch already on its way when this runs may still arrive, but a sender whose send fails puts nothing
+    /// back once its claim is gone.
+    pub fn clear(&self) -> anyhow::Result<usize> {
+        let _held = self.hold()?;
+        let mut n = self.spooled()?.len();
+        if n > 0 {
+            self.write_spool(&[])?;
+        }
+        for (path, _) in self.claims()? {
+            n += read_lines(&path)?.len();
+            remove_if_there(&path)?;
+        }
+        Ok(n)
+    }
+
+    /// The claims beside the spool, oldest first, each with when it was claimed (Unix ms, from its name).
+    fn claims(&self) -> anyhow::Result<Vec<(std::path::PathBuf, i64)>> {
+        let prefix = self.claim_prefix();
+        let dir = self.spool.parent().unwrap_or(std::path::Path::new("."));
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+        };
+        let mut claims = vec![];
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(at) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix(&prefix))
+                .and_then(|rest| rest.split('-').next())
+                .and_then(|ms| ms.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            claims.push((entry.path(), at));
+        }
+        claims.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+        Ok(claims)
+    }
+
+    fn claim_prefix(&self) -> String {
+        let name = self.spool.file_name().unwrap_or_default().to_string_lossy();
+        format!("{name}.claim-")
+    }
+
+    /// Move the first `n` of `spooled` (the spool as just read) into a new claim file; its path. Caller holds
+    /// [`Outbox::hold`]. The claim is written before the spool, so a crash between the two leaves a payload twice,
+    /// never none.
+    fn claim(&self, spooled: &[String], n: usize) -> anyhow::Result<std::path::PathBuf> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let at = chrono::Utc::now().timestamp_millis();
+        let prefix = self.claim_prefix();
+        // The engine and the agent can each be pid 1 in their own container: the name is checked, not trusted.
+        let path = loop {
+            let k = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = self
+                .spool
+                .with_file_name(format!("{prefix}{at}-{}-{k}", std::process::id()));
+            if !p.exists() {
+                break p;
+            }
+        };
+        write_lines(&path, &spooled[..n])
+            .with_context(|| format!("the telemetry claim {}", path.display()))?;
+        if let Err(e) = self.write_spool(&spooled[n..]) {
+            let _ = std::fs::remove_file(&path);
+            return Err(e).with_context(|| format!("the telemetry spool {}", self.spool.display()));
+        }
+        Ok(path)
+    }
+
+    /// Put `lines` back in the spool, less any already there, where they were: just after `prev` (the last line of
+    /// the batch another sender had claimed before them) if it is spooled again, else just before `next` (the line
+    /// that followed them) if it still is, else at the head; ahead of what was recorded since, either way. So two
+    /// failed batches go back in the order they were claimed, whichever fails first. The oldest go first past
+    /// [`SPOOL_MAX`], as in [`Outbox::record`]. Caller holds [`Outbox::hold`].
+    fn put_back(
+        &self,
+        lines: Vec<String>,
+        prev: Option<&str>,
+        next: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut all = self.spooled()?;
+        let at = prev
+            .and_then(|p| all.iter().position(|l| l == p).map(|i| i + 1))
+            .or_else(|| next.and_then(|n| all.iter().position(|l| l == n)))
+            .unwrap_or(0);
+        let back: Vec<String> = lines.into_iter().filter(|l| !all.contains(l)).collect();
+        all.splice(at..at, back);
+        let keep = all.len().saturating_sub(SPOOL_MAX);
+        self.write_spool(&all[keep..])
+    }
+
+    /// Put back every claim [`CLAIM_STALE`] old, oldest first: its sender stopped before it finished. Caller holds
+    /// [`Outbox::hold`].
+    fn reclaim_stale(&self) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let stale: Vec<_> = self
+            .claims()?
+            .into_iter()
+            .filter(|(_, at)| now - at >= CLAIM_STALE.as_millis() as i64)
+            .map(|(p, _)| p)
+            .collect();
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let mut lines = vec![];
+        for p in &stale {
+            lines.extend(read_lines(p)?);
+        }
+        let n = lines.len();
+        self.put_back(lines, None, None)?;
+        for p in &stale {
+            remove_if_there(p)?;
+        }
+        eprintln!(
+            "telemetry: {n} payloads a stopped sender had claimed are spooled again ({} claims)",
+            stale.len()
+        );
+        Ok(())
+    }
+
     /// Send `batch`; the number the control plane took. A batch refused as malformed (400) is sent again
     /// one by one, so only the payloads it refuses are dropped; any other answer is an error, and
-    /// nothing is dropped.
+    /// nothing is dropped. `settled` counts the payloads, from the first, the control plane took or refused as it
+    /// goes: on an error, the rest are still to send.
     async fn send(
         &self,
         cred: &crate::deployment::Credential,
         batch: &[Envelope],
+        settled: &mut usize,
     ) -> anyhow::Result<usize> {
         let post = |b: &[Envelope]| {
             let v = serde_json::to_value(b);
@@ -1376,6 +1495,7 @@ impl Outbox {
         match status {
             200 => {
                 self.answered(&body);
+                *settled = batch.len();
                 return Ok(batch.len());
             }
             400 if batch.len() > 1 => {}
@@ -1384,6 +1504,7 @@ impl Outbox {
                     "telemetry: the control plane refused a payload ({}); dropped",
                     body["error"]
                 );
+                *settled = 1;
                 return Ok(0);
             }
             _ => anyhow::bail!("control plane answered {status}: {}", body["error"]),
@@ -1402,44 +1523,110 @@ impl Outbox {
                 ),
                 _ => anyhow::bail!("control plane answered {status}: {}", body["error"]),
             }
+            *settled += 1;
         }
         Ok(took)
     }
 
-    /// Send the spool, oldest first, in batches; the number sent. Anything but a payload the control
-    /// plane refuses as malformed stops the round and stays spooled.
+    /// Send the spool, oldest first, in batches; the number sent. Each batch is claimed first (see [`Outbox`]), so
+    /// another sender at the same time sends other payloads, never these. Anything but a payload the control plane
+    /// refuses as malformed stops the round, and what wasn't sent goes back where it was in the spool.
     pub async fn flush(&self) -> anyhow::Result<usize> {
         let cred = crate::deployment::Credential::load(&self.credential)?;
         let mut sent = 0;
         loop {
-            let lines = {
+            let (claim, lines, prev, next) = {
                 let _held = self.hold()?;
-                self.spooled()?
+                self.reclaim_stale()?;
+                let mut spooled = self.spooled()?;
+                if spooled.is_empty() {
+                    return Ok(sent);
+                }
+                // The last line of the newest batch still out with a sender: the one before this batch's first.
+                let prev = match self.claims()?.last() {
+                    Some((p, _)) => read_lines(p)?.pop(),
+                    None => None,
+                };
+                let n = spooled.len().min(BATCH_MAX);
+                let claim = self.claim(&spooled, n)?;
+                let next = spooled.get(n).cloned();
+                spooled.truncate(n);
+                (claim, spooled, prev, next)
             };
-            if lines.is_empty() {
-                return Ok(sent);
-            }
-            let n = lines.len().min(BATCH_MAX);
             // Only what holds to the contract leaves, whatever the spool file was made to hold.
-            let batch: Vec<Envelope> = lines[..n]
-                .iter()
-                .filter_map(|l| match serde_json::from_str(l) {
-                    Ok(e) => Some(e),
+            let (lines, batch): (Vec<String>, Vec<Envelope>) = lines
+                .into_iter()
+                .filter_map(|l| match serde_json::from_str(&l) {
+                    Ok(e) => Some((l, e)),
                     Err(err) => {
                         eprintln!("telemetry: a spooled line outside the contract, dropped: {err}");
                         None
                     }
                 })
-                .collect();
-            if !batch.is_empty() {
-                sent += self.send(&cred, &batch).await?;
+                .unzip();
+            let mut settled = 0;
+            let result = if batch.is_empty() {
+                Ok(0)
+            } else {
+                tokio::time::timeout(CLAIM_SEND_DEADLINE, self.send(&cred, &batch, &mut settled))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
+                            "no answer within {} s",
+                            CLAIM_SEND_DEADLINE.as_secs()
+                        ))
+                    })
+            };
+            match result {
+                Ok(took) => {
+                    sent += took;
+                    remove_if_there(&claim)?;
+                }
+                Err(e) => {
+                    // A claim that is gone was cleared: nothing goes back.
+                    let _held = self.hold()?;
+                    if claim.exists() {
+                        self.put_back(lines[settled..].to_vec(), prev.as_deref(), next.as_deref())?;
+                        remove_if_there(&claim)?;
+                    }
+                    return Err(e);
+                }
             }
-            // Re-read: a payload recorded while this batch was in flight stays.
-            let _held = self.hold()?;
-            let now = self.spooled()?;
-            let done = now.iter().take_while(|l| lines[..n].contains(l)).count();
-            self.write_spool(&now[done..])?;
         }
+    }
+}
+
+/// The non-empty lines of `path`; none when it is gone.
+fn read_lines(path: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(t
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(String::from)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write `lines` to `path` whole: through a temporary file renamed over it.
+fn write_lines(path: &std::path::Path, lines: &[String]) -> std::io::Result<()> {
+    let tmp = unique_tmp(path);
+    let mut text = lines.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn remove_if_there(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 

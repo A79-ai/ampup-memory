@@ -4,7 +4,7 @@
 //! what changed as episodes through the same path `/ingest` takes (redaction, the episode types' checks, and a
 //! record sent again as it was being taken without a write).
 //!
-//! Each kind is a module here ([`github`], [`github_prs`], [`git`], [`linear`], [`sentry`], [`slack`]): it makes
+//! Each kind is a module here ([`github`], [`github_prs`], [`git`], [`linear`], [`sentry`], [`skills`], [`slack`]): it makes
 //! its [`Source`] from the command line's target and reads it from its [`Progress`]. Adding one is that module,
 //! its variant of [`Source`], and a line each in [`KINDS`], [`add`] and the round's dispatch.
 //!
@@ -16,6 +16,7 @@ pub mod github;
 pub mod github_prs;
 pub mod linear;
 pub mod sentry;
+pub mod skills;
 pub mod slack;
 
 use std::collections::BTreeMap;
@@ -80,6 +81,8 @@ pub enum Source {
         /// RFC 3339: no issue whose last event is before it is read.
         since: String,
     },
+    /// A repository's `SKILL.md` files ([`skills`]).
+    Skills { repo: String },
     Slack {
         /// The channel's name (no `#`) or id, as `sources add` was given it.
         channel: String,
@@ -98,6 +101,7 @@ impl Source {
                 workspace, team, ..
             } => format!("linear:{workspace}/{team}"),
             Source::Sentry { project, .. } => format!("sentry:{project}"),
+            Source::Skills { repo } => format!("skills:{repo}"),
             Source::Slack { channel, .. } => format!("slack:{channel}"),
         }
     }
@@ -158,7 +162,15 @@ fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
 }
 
 /// The kinds `sources add` takes.
-pub const KINDS: &[&str] = &["github", "github-prs", "git", "linear", "sentry", "slack"];
+pub const KINDS: &[&str] = &[
+    "github",
+    "github-prs",
+    "git",
+    "linear",
+    "sentry",
+    "skills",
+    "slack",
+];
 
 /// `sources add KIND TARGET [--since DATE]`: kept in `dir`; a running server reads it within a minute.
 pub fn add(dir: &Path, kind: &str, target: &str, since: Option<&str>) -> Result<Source> {
@@ -173,6 +185,7 @@ pub fn add(dir: &Path, kind: &str, target: &str, since: Option<&str>) -> Result<
         "git" => git::source(target, since)?,
         "linear" => linear::source(target, since)?,
         "sentry" => sentry::source(target, since)?,
+        "skills" => skills::source(target)?,
         "slack" => slack::source(target, since)?,
         _ => bail!("{kind:?} isn't a kind of source ({})", KINDS.join(", ")),
     };
@@ -318,6 +331,7 @@ where
             Source::Sentry { project, since } => {
                 sentry::read(project, since, &mut p, acl, write).await
             }
+            Source::Skills { repo } => skills::read(repo, &mut p, acl, write).await,
             Source::Slack { channel, since } => {
                 slack::read(channel, since, &mut p, acl, write).await
             }

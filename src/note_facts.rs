@@ -55,7 +55,11 @@ fn still_theirs(
     if let Some(org) = scope.org_name()
         && (dir.purging.contains(org)
             || dir.purged.contains(org)
-            || dir.orgs.get(org).is_some_and(|o| at < o.cleared_at))
+            || dir.orgs.get(org).is_some_and(|o| at < o.cleared_at)
+            // A team since deleted (`purge_team`), or made again after `at`: not the same team's.
+            || dir.orgs.get(org).is_some_and(|o| {
+                matches!(scope, Scope::Team(_)) && o.since_in(scope).is_none_or(|since| at < since)
+            }))
     {
         return false;
     }

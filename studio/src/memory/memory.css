@@ -734,6 +734,29 @@
   .crumbs .icon-chevron {
     color: var(--faint);
   }
+  /* In the Explorer's bar the crumbs are its title: one line, the deepest part kept when it runs out of room. */
+  .explorer-bar .crumbs {
+    flex-wrap: nowrap;
+    margin: 0 0 0 -6px;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .explorer-bar .crumbs button {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .explorer-bar .crumbs .crumb-on {
+    flex-shrink: 0;
+  }
+  /* Short of room: Memory › the page, the folders between left to the tree. */
+  @media (max-width: 1100px) {
+    .explorer-bar .crumbs > span:not(:last-child) {
+      display: none !important;
+    }
+  }
   .head {
     display: flex;
     align-items: flex-start;
@@ -2211,23 +2234,24 @@
   .search-open[hidden] {
     display: none;
   }
-  /* The bar: the tabs, and the folders' toggle on its own line under them; no rule beneath. */
+  /* The bar: one line, the crumbs then the folders' toggle and the views, over a hairline rule. */
   .bar {
-    flex-wrap: wrap;
     height: auto;
-    row-gap: var(--s2);
-    padding-top: var(--s1);
-    padding-bottom: var(--s2);
-    border-bottom: 0;
-  }
-  .bar-title {
-    flex: 0 0 100%;
+    gap: var(--s2);
+    padding: 0 0 var(--s3);
+    margin-bottom: var(--s5);
+    background: none;
   }
   .menu-btn {
-    margin-left: -10px;
-    height: 30px;
+    height: 28px;
   }
-  /* Below 900px the tree is already a drawer over the page (above); wider, a column beside it. */
+  /* Below 900px the tree is already a drawer over the page (above); wider, a column beside it. The host's page
+     doesn't clip the Explorer, so a closed drawer is hidden rather than only slid out of its box. */
+  @media (max-width: 900px) {
+    &:not(.drawer-open) .main > .side {
+      visibility: hidden;
+    }
+  }
   @media (min-width: 901px) {
     .main {
       grid-template-columns: minmax(0, 1fr);

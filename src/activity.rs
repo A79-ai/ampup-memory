@@ -20,10 +20,55 @@ const ANSWER_PREVIEW: usize = 2_000;
 /// Longest transcript shown, in characters: its end, where a conversation went wrong.
 const TRANSCRIPT_MAX: usize = 200_000;
 
+/// Which of the window's entries a list reads, and from where (`/admin {op: "activity"}`'s `light`, `gaps_only` and
+/// `after`).
+#[derive(Default)]
+pub struct Listing {
+    /// A list's read: only the entries a row shows (no session opened with nothing asked yet), each one of several
+    /// parts of a conversation with its `part`, worked out over the whole window rather than the page.
+    pub light: bool,
+    /// Only the entries not answered well ([`gap`]), each with its `why`.
+    pub gaps_only: bool,
+    /// Where the page starts: after this entry (its time and id, a page's `next`).
+    pub after: Option<(i64, String)>,
+}
+
+impl Listing {
+    /// What a kept answer is kept by, of the listing.
+    pub fn key(&self) -> String {
+        format!(
+            "{} {} {}",
+            self.light,
+            self.gaps_only,
+            self.after
+                .as_ref()
+                .map_or_else(String::new, |(t, id)| format!("{t}:{id}"))
+        )
+    }
+}
+
+/// A page's `next`, read back: `<time>:<id>`.
+pub fn cursor_of(s: &str) -> Option<(i64, String)> {
+    let (t, id) = s.split_once(':')?;
+    Some((t.parse().ok()?, id.to_string()))
+}
+
+/// When an entry was last active: where the list orders it, newest first.
+fn active(l: &Logged) -> i64 {
+    l.updated_at.max(l.asked_at)
+}
+
 /// What `entries` (the log, newest first) says of each person active since `since` (µs), and, for `user`, their
-/// newest `limit` entries; for no `user`, everyone's. `gaps` counts the entries in the window not answered well, by
-/// why ([`gap`]), all of them, not only the `limit` listed.
-pub fn view(entries: &[Logged], user: Option<&str>, since: i64, limit: usize) -> Value {
+/// newest `limit` entries; for no `user`, everyone's (`how` narrows them, and says where the page starts: its `next`
+/// says where the one after starts). `gaps` counts the entries in the window not answered well, by why ([`gap`]),
+/// all of them, not only the `limit` listed.
+pub fn view(
+    entries: &[Logged],
+    user: Option<&str>,
+    since: i64,
+    limit: usize,
+    how: &Listing,
+) -> Value {
     #[derive(Default)]
     struct Person {
         sessions: usize,
@@ -79,26 +124,134 @@ pub fn view(entries: &[Logged], user: Option<&str>, since: i64, limit: usize) ->
         .iter()
         .filter(|l| user.is_none_or(|u| l.asker == u))
         .collect();
-    mine.sort_by_key(|l| std::cmp::Reverse(l.updated_at.max(l.asked_at)));
-    let shown: Vec<Value> = mine.iter().take(limit).map(|l| entry(l)).collect();
+    // Newest first, then by id: the order a page's `next` continues.
+    mine.sort_by(|a, b| {
+        active(b)
+            .cmp(&active(a))
+            .then_with(|| a.answer_id.cmp(&b.answer_id))
+    });
+    let listed: Vec<&Logged> = mine
+        .iter()
+        .map(|l| **l)
+        .filter(|l| !how.light || asked(l))
+        .filter(|l| !how.gaps_only || gap(l).is_some())
+        .filter(|l| {
+            how.after.as_ref().is_none_or(|(t, id)| {
+                active(l) < *t || active(l) == *t && l.answer_id.as_str() > id.as_str()
+            })
+        })
+        .collect();
+    let page = &listed[..listed.len().min(limit)];
+    let parts = if how.light {
+        parts(mine.iter().map(|l| **l).filter(|l| asked(l)), page)
+    } else {
+        BTreeMap::new()
+    };
+    let shown: Vec<Value> = page
+        .iter()
+        .map(|l| {
+            let mut v = entry(l);
+            if how.gaps_only
+                && let Some(why) = gap(l)
+            {
+                v["why"] = json!(why);
+            }
+            if let Some(p) = parts.get(l.answer_id.as_str()) {
+                v["part"] = p.clone();
+            }
+            v
+        })
+        .collect();
+    let more = listed.len() > limit;
+    let next = more
+        .then(|| {
+            page.last()
+                .map(|l| format!("{}:{}", active(l), l.answer_id))
+        })
+        .flatten();
     let serving = serving(mine.iter().map(|l| **l), since);
     let mut gaps = json!({"unhelpful": 0, "went_wrong": 0, "no_facts": 0});
     for g in mine.iter().filter_map(|l| gap(l)) {
         gaps[g] = json!(gaps[g].as_u64().unwrap_or(0) + 1);
     }
-    json!({"people": summary, "entries": shown, "more": mine.len() > limit, "serving": serving, "gaps": gaps,
-           "by_day": by_day(entries)})
+    let mut v = json!({"people": summary, "entries": shown, "more": more, "serving": serving, "gaps": gaps,
+           "by_day": by_day(entries)});
+    if how.light || how.gaps_only || how.after.is_some() {
+        // What a list's reader reads it by: where the next page starts, and how its entries were picked.
+        v["next"] = json!(next);
+        v["parts"] = json!(how.light);
+        v["gaps_only"] = json!(how.gaps_only);
+    }
+    v
+}
+
+/// Whether a row shows `l`: all but a session a harness opened before anything was asked, with nothing kept yet (the
+/// start hook opens one as the harness starts, and its first prompt names it).
+fn asked(l: &Logged) -> bool {
+    kind_of(l) != "session" || !l.question.trim().is_empty() || transcript_of(l).is_some()
+}
+
+/// Where each of `page`'s entries stands in its conversation, among `window`'s entries: its part and how many there
+/// are, and for a later part the conversation's first question (its start), for a session that is one of several
+/// (a harness ends one at a compaction or when idle, and opens the next for the same conversation).
+fn parts<'a>(
+    window: impl Iterator<Item = &'a Logged>,
+    page: &[&'a Logged],
+) -> BTreeMap<&'a str, Value> {
+    let wanted: BTreeSet<&str> = page
+        .iter()
+        .filter_map(|l| l.session.as_ref()?.thread.as_deref())
+        .collect();
+    let mut by: BTreeMap<&str, Vec<&Logged>> = BTreeMap::new();
+    for l in window {
+        if let Some(t) = l.session.as_ref().and_then(|s| s.thread.as_deref())
+            && wanted.contains(t)
+        {
+            by.entry(t).or_default().push(l);
+        }
+    }
+    let mut out = BTreeMap::new();
+    for mut same in by.into_values().filter(|p| p.len() > 1) {
+        same.sort_by(|a, b| {
+            a.asked_at
+                .cmp(&b.asked_at)
+                .then_with(|| a.answer_id.cmp(&b.answer_id))
+        });
+        let task = same
+            .iter()
+            .find_map(|p| {
+                p.goal
+                    .as_deref()
+                    .filter(|g| !g.is_empty())
+                    .or(Some(p.question.as_str()).filter(|q| !q.is_empty()))
+            })
+            .unwrap_or_default();
+        let task: String = task.chars().take(QUESTION_PREVIEW).collect();
+        for (i, p) in same.iter().enumerate() {
+            let mut v = json!({"k": i + 1, "n": same.len()});
+            if i > 0 {
+                v["task"] = json!(task);
+            }
+            out.insert(p.answer_id.as_str(), v);
+        }
+    }
+    out
 }
 
 /// The days [`by_day`] counts back over.
 pub const BY_DAY_DAYS: i64 = 30;
+
+/// The first of the days [`by_day`] counts (UTC midnight, µs): it counts no entry asked before it.
+pub fn by_day_from() -> i64 {
+    let today = chrono::Utc::now().timestamp_micros().div_euclid(DAY_MICROS) * DAY_MICROS;
+    today - (BY_DAY_DAYS - 1) * DAY_MICROS
+}
 const DAY_MICROS: i64 = 86_400_000_000;
 
 /// Sessions, runs and answers begun on each of the last [`BY_DAY_DAYS`] days (UTC), oldest first, a day with none
 /// included: Home's chart of the month. Counted as the window above counts them (no internal or discarded entry).
 fn by_day(entries: &[Logged]) -> Vec<Value> {
-    let today = chrono::Utc::now().timestamp_micros().div_euclid(DAY_MICROS) * DAY_MICROS;
-    let first = today - (BY_DAY_DAYS - 1) * DAY_MICROS;
+    let first = by_day_from();
     let mut n = vec![0u64; BY_DAY_DAYS as usize];
     for l in entries
         .iter()
@@ -333,6 +486,66 @@ pub(crate) fn entry(l: &Logged) -> Value {
         }
     }
     v
+}
+
+/// Longest question a light entry ([`light`]) carries, in characters: a row shows two lines of it.
+const QUESTION_PREVIEW: usize = 400;
+
+/// An activity page's entries as a list shows them (`light: true`), each marked `light`: the question's start
+/// (`question_cut` where more was asked), what a row shows, and none of what an opened entry shows (its answer, only
+/// `has_answer`; the reward's reason; its advice lookups and PRs; the judge's reasons): `/admin {op: "activity", id}`
+/// reads that entry whole. Of the judge's verdicts it keeps the outcome and whether each note served helped.
+pub fn light(v: &mut Value) {
+    // A list shows neither the window's serving nor its days: the Advice page and Home read those.
+    if let Some(o) = v.as_object_mut() {
+        o.remove("serving");
+        o.remove("by_day");
+    }
+    let Some(entries) = v["entries"].as_array_mut() else {
+        return;
+    };
+    for e in entries {
+        let Some(o) = e.as_object_mut() else {
+            continue;
+        };
+        for k in ["question", "goal"] {
+            if let Some(q) = o.get(k).and_then(Value::as_str)
+                && q.chars().count() > QUESTION_PREVIEW
+            {
+                let cut: String = q.chars().take(QUESTION_PREVIEW).collect();
+                o.insert(k.into(), json!(cut));
+                o.insert(format!("{k}_cut"), json!(true));
+            }
+        }
+        if o.remove("answer").is_some() {
+            o.insert("has_answer".into(), json!(true));
+        }
+        o.remove("answer_cut");
+        o.remove("reward_reason");
+        o.insert("light".into(), json!(true));
+        if let Some(s) = o.get_mut("session").and_then(Value::as_object_mut) {
+            for k in ["lookups", "prs", "fires", "served_versions"] {
+                s.remove(k);
+            }
+            if let Some(verdicts) = s.get("verdicts").filter(|v| v.is_object()) {
+                let notes: serde_json::Map<String, Value> = verdicts["notes"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(k, n)| (k.clone(), json!({"helped": n["helped"]})))
+                    .collect();
+                let kept = json!({"outcome": verdicts["outcome"], "notes": notes});
+                s.insert("verdicts".into(), kept);
+            }
+        }
+    }
+}
+
+/// `id`'s entry in `log` whole, as an activity page lists it ([`entry`]), unless it is the engine's own.
+pub fn one(log: &[Logged], id: &str) -> Option<Value> {
+    log.iter()
+        .find(|l| l.answer_id == id && !crate::qa_log::internal(l))
+        .map(entry)
 }
 
 /// The sessions of `l`'s conversation, oldest first, `l` among them: its asker's sessions with the same

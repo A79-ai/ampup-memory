@@ -95,12 +95,12 @@ impl Ask {
     }
 }
 
-/// Calls a person may make a day: `AMPUP_MEMORY_INDEX_NOTES_PER_DAY`, default 20.
+/// Calls a person may make a day: `AMPUP_MEMORY_INDEX_NOTES_PER_DAY`, default 500.
 fn max_per_day() -> usize {
     std::env::var("AMPUP_MEMORY_INDEX_NOTES_PER_DAY")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(20)
+        .unwrap_or(500)
 }
 
 /// Each person's calls in the last day (by person, in any scope → their times), in this server's memory.

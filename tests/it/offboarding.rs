@@ -16,6 +16,9 @@
 //! - the operator clears an org's memory (`clear_org`, its name repeated) and keeps the org: its admin and
 //!   another org's are refused and an unconfirmed clear changes nothing; after it nothing of the org's memory is
 //!   read or stored, and its admin still signs in and writes to it;
+//! - initech's admin deletes its team t1 and its memory (`purge_team`, the team's name repeated): a plain member and
+//!   another org's admin are refused and an unconfirmed purge changes nothing; after it t1 made again holds nothing
+//!   of the old t1, a session held from before the purge included, no file holds it, and initech's memory stays;
 //! - an org deleted only in the directory (a delete that stopped halfway) can't be created again until
 //!   `org delete` is run again, which finishes it;
 //! - `memstore org delete acme --confirm acme` (the operator): acme's key and people are refused, its
@@ -26,7 +29,7 @@
 //! - on a catalog that can't rename a table, put a second table at one location, or delete a purged table's
 //!   files (as some REST catalogs can't), a forget and a delete are refused before anything changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -355,7 +358,7 @@ async fn until(
     }
 }
 
-/// Every file under `root` whose bytes hold `tag`.
+/// Every file under `root` whose bytes hold `tag` (a data file's rows uncompressed: [`crate::stored_bytes`]).
 fn files_with(root: &Path, tag: &str) -> Vec<PathBuf> {
     let mut out = vec![];
     let mut stack = vec![root.to_path_buf()];
@@ -367,7 +370,7 @@ fn files_with(root: &Path, tag: &str) -> Vec<PathBuf> {
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
-            } else if let Ok(bytes) = std::fs::read(&p)
+            } else if let Some(bytes) = crate::stored_bytes(&p)
                 && bytes.windows(tag.len()).any(|w| w == tag.as_bytes())
             {
                 out.push(p);
@@ -375,6 +378,23 @@ fn files_with(root: &Path, tag: &str) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// An answer holding `tag` kept for `scope` in the answers servers share (as a server's Home keeps one), once
+/// the purges under way are done: the server's own store, the object store beside the catalog's tables.
+async fn share_answer(scope: &Scope, tag: &str) {
+    assert!(memstore::shared_answers::settled(Duration::from_secs(20)).await);
+    let answers = memstore::shared_answers::handle().expect("the server keeps shared answers");
+    let key = format!(
+        "{}home/counts/reader/{tag}",
+        memstore::shared_answers::namespace_prefix(&scope.namespace())
+    );
+    let answer = Bytes::from(format!("{{\"note\":\"{tag}\"}}"));
+    answers
+        .put(&key, answer.clone(), memstore::now_micros() + 3_600_000_000)
+        .await
+        .unwrap();
+    assert_eq!(answers.get(&key).await.unwrap(), Some(answer));
 }
 
 /// The hits `bearer` gets from `/search` for `query` in selection `sel`, by the value each fact holds.
@@ -499,6 +519,9 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     unsafe { std::env::set_var("AMPUP_MEMORY_MAINTAIN_WINDOW", "always") };
     unsafe { std::env::set_var("AMPUP_MEMORY_MAINTAIN_PACE", "0") };
     unsafe { std::env::set_var("AMPUP_MEMORY_LEDGER_COMPACT_FILES", "2") };
+    // The server keeps answers it shares with other servers in the object store, beside the catalog's tables in
+    // the warehouse: every file check below covers them too.
+    unsafe { std::env::set_var("AMPUP_MEMORY_SHARED_ANSWERS", "object") };
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =
         |tag: &str| -> Vec<PathBuf> { roots.iter().flat_map(|r| files_with(r, tag)).collect() };
@@ -1840,7 +1863,12 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     assert!(body.contains("forgot") && body.contains(&vault), "{body}");
     let drawn = [
         quoted("xqdana", &vault, gone),
-        quoted("xqgreen3", &vault, "xqvault runs on cluster xqgreen3"),
+        // Worded as extraction words it, not as the note does: search shows what the note said beside it.
+        quoted(
+            "hosted by xqgreen3",
+            &vault,
+            "xqvault runs on cluster xqgreen3",
+        ),
     ];
     store.commit(&acme, "extractor", &[], &drawn).await.unwrap();
     index(&store, std::slice::from_ref(&acme)).await;
@@ -1849,7 +1877,7 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     let t = Instant::now();
     loop {
         let found = values_served(s, "?org=acme", &carol, "xqvault xqpager dana cluster").await;
-        if found.iter().any(|f| f == "xqgreen3") {
+        if found.iter().any(|f| f == "hosted by xqgreen3") {
             break;
         }
         assert!(
@@ -1867,7 +1895,7 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
             "{who} is served the sentence Carol forgot before it was drawn on: {found:?}"
         );
         assert!(
-            found.iter().any(|f| f == "xqgreen3"),
+            found.iter().any(|f| f == "hosted by xqgreen3"),
             "{who} lost xqgreen3: {found:?}"
         );
         let (status, body) = post(&format!("{s}/query?org=acme"), who, &vault_passages).await;
@@ -1875,6 +1903,15 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         assert!(
             !body.contains(&vault[..16]),
             "{who} is served a passage holding the sentence Carol forgot: {body}"
+        );
+        // Nor is it shown as what was said where a fact of the same note is cited.
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "search_memory", "arguments": {"query": "xqvault cluster xqgreen3 xqpager"}}});
+        let (_, body) = post(&format!("{s}/mcp?org=acme"), who, &call).await;
+        assert!(body.contains("hosted by xqgreen3"), "{who}: {body}");
+        assert!(
+            !body.contains("Dana Kim"),
+            "{who}'s search shows the sentence Carol forgot: {body}"
         );
         assert!(
             !body.contains(&recap[..16]),
@@ -2035,6 +2072,10 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     let usage = json!({"op": "advice_usage", "days": 30});
     let (status, text) = post(&format!("{s}/browse?org=acme"), &alice, &usage).await;
     assert_eq!(status, 200, "{text}");
+    // Answers kept for acme and for globex in the answers servers share, each holding what it showed.
+    share_answer(&acme, "xqcarolanswer").await;
+    share_answer(&globex, "xqglobexanswer").await;
+    assert!(!in_files("xqcarolanswer").is_empty() && !in_files("xqglobexanswer").is_empty());
     // Acme's admin forgets Carol.
     let (status, body) = admin_as(
         s,
@@ -2043,6 +2084,17 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
+    // The answers acme's memory showed are purged with her; globex's are kept.
+    assert!(memstore::shared_answers::settled(Duration::from_secs(20)).await);
+    assert_eq!(
+        in_files("xqcarolanswer"),
+        Vec::<PathBuf>::new(),
+        "a shared answer outlived the forget"
+    );
+    assert!(
+        !in_files("xqglobexanswer").is_empty(),
+        "the forget purged another org's shared answers"
+    );
     // What was kept of her activity and of the advice page is never answered again: none of hers right after.
     let (status, text) = admin_as(s, &alice, activity.clone()).await;
     assert_eq!(status, 200, "{text}");
@@ -2561,6 +2613,141 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     )
     .await;
 
+    // Ivy, initech's admin, deletes its team t1 and all t1 remembered (`purge_team`, the team's name repeated):
+    // a plain member and another org's admin are refused, and an unconfirmed purge changes nothing. After it,
+    // a session held from before it (flushed once t1 is made again) and t1's note are in no read and no file, and
+    // initech's own memory stays.
+    for c in [
+        json!({"op": "create_team", "org": "initech", "team": "t1"}),
+        json!({"op": "add_to_team", "org": "initech", "team": "t1", "users": ["ike@initech.com"]}),
+    ] {
+        admin(s, c).await;
+    }
+    let ike = id_token(&issuer, "ike@initech.com");
+    let gone = remember(
+        s,
+        "?org=initech&team=t1",
+        &ike,
+        "xqteamgone the t1 owner note",
+    )
+    .await;
+    until(
+        s,
+        "?org=initech&team=t1",
+        &ike,
+        &[&gone],
+        "t1's note read",
+        |r| r.as_ref().is_some_and(|r| r.contains("xqteamgone")),
+    )
+    .await;
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "start_session",
+        "arguments": {"context": "xqheldteam deploy the t1 api"}}});
+    let (status, held) = post(&format!("{s}/mcp?org=initech&team=t1"), &ike, &call).await;
+    assert_eq!(status, 200, "{held}");
+    let t1 = Scope::team("initech", "t1").unwrap();
+    let old_commits: HashSet<String> = store
+        .ledger_rows(&t1)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.0)
+        .collect();
+    assert!(!old_commits.is_empty(), "t1's note committed nothing");
+    for who in [&ike, &alice] {
+        let (status, body) = admin_as(
+            s,
+            who,
+            json!({"op": "purge_team", "org": "initech", "team": "t1", "confirm": "t1"}),
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "purge_team by someone not initech's admin: {body}"
+        );
+    }
+    let (status, body) = admin_as(
+        s,
+        &ivy,
+        json!({"op": "purge_team", "org": "initech", "team": "t1", "confirm": "initech"}),
+    )
+    .await;
+    assert_eq!(status, 400, "purge_team unconfirmed: {body}");
+    assert!(
+        reads(s, "?org=initech&team=t1", &ike, &[&gone])
+            .await
+            .is_some_and(|r| r.contains("xqteamgone")),
+        "a refused purge took t1's memory"
+    );
+    let (status, body) = admin_as(
+        s,
+        &ivy,
+        json!({"op": "purge_team", "org": "initech", "team": "t1", "confirm": "t1"}),
+    )
+    .await;
+    assert_eq!(status, 200, "purge_team by initech's admin: {body}");
+    // t1 made again is a new team: ike, back in it, reads nothing of the old one, nor does the session held
+    // from before the purge come back when it is flushed now.
+    for c in [
+        json!({"op": "create_team", "org": "initech", "team": "t1"}),
+        json!({"op": "add_to_team", "org": "initech", "team": "t1", "users": ["ike@initech.com"]}),
+    ] {
+        admin(s, c).await;
+    }
+    // Its ledger rows wait for the ledger's next compaction, but the t1 made again starts from none of them: no
+    // branch, head or owner of the old t1 is its.
+    memstore::people::directory::Directory::fresh(&store)
+        .await
+        .unwrap();
+    let carried: Vec<String> = store
+        .ledger_rows(&t1)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.0)
+        .filter(|c| old_commits.contains(c))
+        .collect();
+    assert_eq!(
+        carried,
+        Vec::<String>::new(),
+        "t1 made again reads the old t1's ledger"
+    );
+    memstore::sessions::flush().await.unwrap();
+    until(
+        s,
+        "?org=initech&team=t1",
+        &ike,
+        &[&gone],
+        "t1 made again",
+        |r| {
+            r.as_ref()
+                .is_some_and(|r| !r.contains("xqteamgone") && !r.contains("xqheldteam"))
+        },
+    )
+    .await;
+    for t in ["xqteamgone", "xqheldteam"] {
+        assert!(in_files(t).is_empty(), "{t}: {:?}", in_files(t));
+    }
+    // The new t1 remembers from here, and keeps it through the ledger's compaction below.
+    let kept = remember(s, "?org=initech&team=t1", &ike, "xqteamnew the new t1 note").await;
+    until(
+        s,
+        "?org=initech&team=t1",
+        &ike,
+        &[&kept],
+        "the new t1's note read",
+        |r| r.as_ref().is_some_and(|r| r.contains("xqteamnew")),
+    )
+    .await;
+    assert!(
+        reads(s, "?org=initech", &ivy, &[&again])
+            .await
+            .is_some_and(|r| r.contains("xqafterclear")),
+        "purging t1 took initech's own memory"
+    );
+
+    // Answers kept for acme and its team in the answers servers share.
+    share_answer(&acme, "xqacmeanswer").await;
+    share_answer(&a1, "xqteamanswer").await;
     // Acme is deleted by the operator: only with its name repeated. Its commits are in the ledger until then.
     assert!(
         !ledger_with("memory_org_acme").is_empty(),
@@ -2605,8 +2792,14 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         })
         .await;
     }
-    // Its tags are in no file under the warehouse or the index.
-    for t in acme_tags.iter().chain(&carol_tags) {
+    // Its tags are in no file under the warehouse or the index, its answers and its team's in none of the
+    // answers servers share.
+    assert!(memstore::shared_answers::settled(Duration::from_secs(20)).await);
+    for t in acme_tags
+        .iter()
+        .chain(&carol_tags)
+        .chain(&["xqacmeanswer", "xqteamanswer"])
+    {
         assert!(
             in_files(t).is_empty(),
             "{t} still stored: {:?}",
@@ -2649,7 +2842,7 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         r.as_ref().is_some_and(|r| r.contains("xqorgbeta"))
     })
     .await;
-    for t in globex_tags {
+    for t in globex_tags.iter().chain(&["xqglobexanswer"]) {
         assert!(!in_files(t).is_empty(), "{t} lost deleting acme");
     }
     // The window compacts the ledger again after the delete (globex's commits since give it files to merge), and
@@ -2681,6 +2874,23 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     }
     assert_eq!(ledger_with("memory_org_acme"), Vec::<PathBuf>::new());
     assert!(!ledger_with("memory_org_globex").is_empty());
+    // The same compaction took the old t1's ledger rows and kept the new t1's: its note is read still.
+    for c in &old_commits {
+        assert_eq!(ledger_with(c), Vec::<PathBuf>::new(), "the old t1's {c}");
+    }
+    assert!(
+        !ledger_with("memory_org_initech__team_t1").is_empty(),
+        "the compaction took the new t1's commits with the old t1's"
+    );
+    until(
+        s,
+        "?org=initech&team=t1",
+        &ike,
+        &[&kept],
+        "the new t1 after the compaction",
+        |r| r.as_ref().is_some_and(|r| r.contains("xqteamnew")),
+    )
+    .await;
     // The name is free again, and a new acme reads nothing of the old one.
     admin(
         s,

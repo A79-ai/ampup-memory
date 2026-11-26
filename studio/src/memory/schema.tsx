@@ -135,13 +135,19 @@ export function useOrgSchema(sel: Selection, enabled: boolean): [SchemaState | n
   useEffect(() => {
     if (!enabled) return;
     let live = true;
-    type Read = { schema: Schema | null; history?: Schema[] };
+    type Read = { schema: Schema | null; versions?: number; history?: Schema[] };
     const show = (r: Read) =>
-      setS({ schema: r.schema, versions: r.history?.length, types: schemaTypes(r.schema) });
+      setS({
+        schema: r.schema,
+        versions: r.versions ?? r.history?.length,
+        types: schemaTypes(r.schema),
+      });
+    // Only how many versions there are, not each one's types.
+    const req = { op: "schema", history: false };
     // What it last answered on this page shows while it is read again.
-    const kept = keptBrowse<Read>({ op: "schema" }, sel);
+    const kept = keptBrowse<Read>(req, sel);
     if (kept) show(kept);
-    browse<Read>({ op: "schema" }, sel).then(
+    browse<Read>(req, sel).then(
       (r) => live && show(r),
       (e: Error) => live && setS({ error: e.message }),
     );
@@ -239,7 +245,7 @@ export function SchemaView({
               </span>
             )}
             {schema.versions != null && schema.versions > 1 && (
-              <span>{schema.versions} versions on this branch</span>
+              <span>{schema.versions} versions</span>
             )}
             {base?.extract?.sources?.prefixes?.length ? (
               <span>

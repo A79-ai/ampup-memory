@@ -609,10 +609,9 @@ impl Credentials {
             *self = disk;
         }
         if self.expires_at <= now() + 60 {
-            let refresh = self
-                .refresh_token
-                .clone()
-                .with_context(|| format!("signed-in token expired: run {}", sign_in_hint()))?;
+            let refresh = self.refresh_token.clone().ok_or_else(|| {
+                SignedOut(format!("signed-in token expired: run {}", sign_in_hint()))
+            })?;
             let mut form = vec![
                 ("grant_type", "refresh_token".to_string()),
                 ("refresh_token", refresh),
@@ -621,15 +620,17 @@ impl Credentials {
             if let Some(s) = &self.client_secret {
                 form.push(("client_secret", s.clone()));
             }
-            // Offline, signing in again would not help: the renewal works once the provider answers.
+            // Offline, signing in again would not help: the renewal works once the provider answers. Refused, only
+            // signing in again does.
             let t = token_request(&self.token_endpoint, &form)
                 .await
                 .map_err(|e| match e.is::<Unreached>() {
                     true => e.context("the sign-in couldn't be renewed now"),
-                    false => e.context(format!(
-                        "renewing the sign-in failed: run {}",
+                    false => SignedOut(format!(
+                        "renewing the sign-in failed: run {}: {e:#}",
                         sign_in_hint()
-                    )),
+                    ))
+                    .into(),
                 })?;
             self.take(&t)?;
             self.save()?;
@@ -647,7 +648,8 @@ impl Credentials {
 
 /// A failure worth sending again: the memory unreachable, slow, down, busy or the sign-in stale, or the sign-in's
 /// provider unreachable, down or busy while renewing it. A refusal (bad arguments, a session that isn't the
-/// caller's, a renewal the provider refused) never is. With the seconds it said to wait first, when it said.
+/// caller's) never is, and a renewal the provider refused is [`SignedOut`]. With the seconds it said to wait first,
+/// when it said.
 #[derive(Debug)]
 pub(crate) struct Unreached(pub(crate) String, pub(crate) Option<u64>);
 
@@ -658,6 +660,20 @@ impl std::fmt::Display for Unreached {
 }
 
 impl std::error::Error for Unreached {}
+
+/// The sign-in can't be renewed: its provider refused the renewal (a refresh token revoked or past its life), or
+/// there is nothing to renew it with. Nothing gets through until the person signs in again, and then it does: a
+/// hook's session end waits in the outbox for that rather than being lost.
+#[derive(Debug)]
+pub(crate) struct SignedOut(pub(crate) String);
+
+impl std::fmt::Display for SignedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SignedOut {}
 
 /// Why a request never got its answer, with what reqwest keeps under its own message ("error sending request"):
 /// a timeout and how long it waited, or the connection's, TLS's or DNS's own error.

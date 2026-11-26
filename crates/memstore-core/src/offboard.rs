@@ -479,8 +479,58 @@ impl Store {
     /// manifest, and a cold read (each server's first, at boot) reads them all. One commit swaps the files, so
     /// writers and readers never wait: a ledger commit landing meanwhile is carried over (the compaction's
     /// commit is the one retried). None if there is no ledger.
+    ///
+    /// Rows of a purged team (`purge_team`) recorded before its purge go on the way: none of its memory is left
+    /// for them to name, and a team made again under its name starts with none of them.
     pub async fn compact_ledger(&self, progress: Progress<'_>) -> Result<Option<Compacted>> {
-        self.compact_table(SYSTEM_NS, LEDGER, progress).await
+        match self.purged_teams_keep().await? {
+            None => self.compact_table(SYSTEM_NS, LEDGER, progress).await,
+            Some(mut keep) => {
+                self.compact_table_keeping(SYSTEM_NS, LEDGER, &mut keep, progress)
+                    .await
+            }
+        }
+    }
+
+    /// The ledger rows a compaction keeps of purged teams' (`purge_team`): those of [`Org::ledger_since`] on (a
+    /// team made again under the name: from its making). Of one still gone, those recorded after the directory was
+    /// read here, so a team made again while the compaction runs keeps its first commits (a write that lagged the
+    /// purge past that goes at the next compaction). None when no team was purged.
+    ///
+    /// [`Org::ledger_since`]: crate::people::directory::Org::ledger_since
+    async fn purged_teams_keep(
+        &self,
+    ) -> Result<Option<impl FnMut(&RecordBatch) -> Result<BooleanArray> + Send + use<>>> {
+        let read_at = crate::now_micros();
+        let dir = Directory::fresh(self).await?;
+        let purged: HashMap<String, i64> = dir
+            .orgs
+            .iter()
+            .flat_map(|(org, o)| {
+                o.team_purged.keys().filter_map(move |t| {
+                    Scope::team(org, t)
+                        .ok()
+                        .map(|s| (s.namespace(), o.ledger_since(t).min(read_at)))
+                })
+            })
+            .collect();
+        if purged.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(move |b: &RecordBatch| -> Result<BooleanArray> {
+            let at = timestamps(b, "recorded_at");
+            Ok(strings(b, "scope")
+                .iter()
+                .zip(at)
+                .map(|(s, at)| {
+                    Some(
+                        purged
+                            .get(s.as_str())
+                            .is_none_or(|since| at.is_some_and(|at| at >= *since)),
+                    )
+                })
+                .collect())
+        }))
     }
 
     /// Compact a scope's summaries ([`Store::compact_table`]), as [`Store::compact_ledger`] does the ledger: a
@@ -515,7 +565,7 @@ impl Store {
             self.rows(SYSTEM_NS, LEDGER),
             self.side_rows(&ns, AGGREGATES)
         )?;
-        let ledger = Ledger::from_batches(&ledger.rows, &ns);
+        let ledger = self.ledger_of(&ledger.rows, &ns);
         let mut views: Vec<HashSet<String>> = ledger
             .branches()
             .into_iter()
@@ -2270,9 +2320,10 @@ impl Store {
     }
 
     /// The records among the episodes of `ns` that name what an erasure takes: that an episode stated a fact again
-    /// ([`crate::corroboration`]), naming an episode `gone` holds or a fact `dropped` holds; and of what a note's
+    /// ([`crate::corroboration`]), naming an episode `gone` holds or a fact `dropped` holds; of what a note's
     /// writer was served ([`crate::is_served_source`]), naming an episode `gone` holds as their note
-    /// (`served/<note>`) or among what was served, which only the body says. One of the latter whose body is gone is
+    /// (`served/<note>`) or among what was served, which only the body says; and a skill's proposed revision
+    /// ([`crate::SKILL_REVIEW_SOURCE`]) naming an episode it rests on that `gone` holds, which only its body says. One of the latter whose body is gone is
     /// one an erasure stopped before its rows went: it goes too.
     async fn records_naming(
         &self,
@@ -2307,6 +2358,10 @@ impl Store {
                     continue;
                 }
                 if !crate::is_served_source(&source) {
+                    // A skill's proposed revision names what it rests on in its body alone.
+                    if source == crate::SKILL_REVIEW_SOURCE {
+                        records.push(id);
+                    }
                     continue;
                 }
                 let note = document
@@ -2514,9 +2569,17 @@ impl Store {
         if !compact && erased.is_none() {
             return Ok(None);
         }
+        // The ledger's compaction takes purged teams' rows on the way (`purge_team` leaves them to it).
+        let mut purged_teams = match compact && ns == SYSTEM_NS && name == LEDGER {
+            true => self.purged_teams_keep().await?,
+            false => None,
+        };
         let mut keep = |b: &RecordBatch| -> Result<BooleanArray> {
             let mut k = keep_all(b)?;
             if let Some(f) = older_runs.as_mut() {
+                k = arrow_arith::boolean::and(&k, &f(b)?)?;
+            }
+            if let Some(f) = purged_teams.as_mut() {
                 k = arrow_arith::boolean::and(&k, &f(b)?)?;
             }
             if let Some(f) = erased.as_mut() {
@@ -3168,6 +3231,110 @@ pub async fn clear_org(
         serde_json::json!({"org": org, "cleared": true, "namespaces": namespaces, "tables": tables,
                           "ledger_rows": ledger_rows, "teams": teams}),
     )
+}
+
+/// A team's namespace with its search index, and its rows in the ledger: `purge_team`, and again when a purged
+/// team is made again (whatever a lagging server wrote for the old team after its purge goes first). Returns the
+/// tables and ledger rows removed.
+pub async fn purge_team_memory(store: &Store, org: &str, team: &str) -> Result<usize> {
+    // Its rows in the shared ledger (commit ids, branches, actors: none of its memory) go at the ledger's next
+    // compaction ([`Store::compact_ledger`]), not here: rewriting the whole ledger for one team took most of a
+    // minute on a busy production-sized catalog.
+    store
+        .purge_namespace(&Scope::team(org, team)?.namespace())
+        .await
+}
+
+/// `purge_team`: delete team `team` of `org` and everything it remembered, for good: the team goes from the
+/// directory first (with its keys and settings, as `delete_team` takes them), so nobody reads or writes it from then
+/// on, then its namespace with its search indexes, and its rows in the ledger. The org's own memory and its other
+/// teams are untouched. An org's admins in their own org and the operator, with the team's name in `confirm`; a key
+/// may not. A team made again under the same name is a new, empty team: a session or note from before the purge
+/// writes nothing into it ([`crate::people::directory::Org::since_in`]). Recorded in the org's audit. Run again
+/// after it stopped partway (the team already gone from the directory), it purges what is left.
+pub async fn purge_team(
+    store: &Store,
+    actor: &Actor,
+    org: &str,
+    team: &str,
+    confirm: Option<&str>,
+) -> Result<Value> {
+    if crate::check_name("org", org).is_err() {
+        return Err(Invalid(format!("invalid org name {org:?}")).into());
+    }
+    if crate::check_name("team", team).is_err() {
+        return Err(Invalid(format!("invalid team name {team:?}")).into());
+    }
+    if org == DEFAULT_ORG {
+        return Err(Invalid("the default org's teams aren't purged this way".into()).into());
+    }
+    // Another cell's org: refused here, never purged halfway from a server that doesn't hold it.
+    crate::cell::check_org(org)?;
+    // As the directory is now, not as this server last folded it: a demotion, or the team made again
+    // elsewhere, counts.
+    let dir = Directory::fresh(store).await?;
+    may_manage(
+        &dir,
+        actor,
+        org,
+        &format!("delete team {team} and its memory"),
+    )?;
+    let Some(entry) = dir.orgs.get(org) else {
+        return Err(refused(format!("no org {org}")));
+    };
+    if confirm != Some(team) {
+        return Err(Invalid(format!(
+            "this deletes team {org}/{team} and all of its memory for good: confirm with \"confirm\": \"{team}\""
+        ))
+        .into());
+    }
+    let had_team = entry.teams.contains_key(team);
+    if had_team {
+        let change = crate::people::directory::Change::DeleteTeam {
+            org: org.to_string(),
+            team: team.to_string(),
+        };
+        crate::people::directory::apply(store, actor, &change).await?;
+    }
+    // Then the purge, in the directory: written at the version an engine from before it stops at (rather than
+    // folding the delete and writing on for the team), and what a team made again under the name starts from.
+    let me = actor.user.clone();
+    store
+        .append_directory_with(|dir| match dir.orgs.contains_key(org) {
+            true => {
+                let mut e = Event::new(&me, "team.purged", org).team(team);
+                e.version = crate::people::directory::OPS_VERSION;
+                Ok(vec![e])
+            }
+            false => Err(refused(format!("no org {org}"))),
+        })
+        .await?;
+    let tables = purge_team_memory(store, org, team).await?;
+    let detail = format!(
+        "purge team {org}/{team}: {tables} tables purged; its ledger rows go at the ledger's next compaction{}",
+        if had_team {
+            ""
+        } else {
+            " (the team was already gone from the directory)"
+        }
+    );
+    store
+        .append_audit(&[crate::audit::Entry {
+            at: chrono::Utc::now().timestamp_micros(),
+            kind: crate::audit::Kind::Change,
+            org: Some(org.to_string()),
+            actor: crate::audit::clean(&actor.user),
+            scope: None,
+            path: None,
+            detail: Some(detail),
+            status: None,
+            count: 1,
+            reads: 0,
+            writes: 0,
+            incarnation: None,
+        }])
+        .await?;
+    Ok(json!({"org": org, "team": team, "purged": true, "tables": tables}))
 }
 
 /// `memstore org delete`, after the directory change: purge the org's namespaces and its search indexes,

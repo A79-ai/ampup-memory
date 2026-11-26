@@ -519,3 +519,278 @@
   padding: 0 16px 8px;
   font-size: 12px;
 }
+
+/* Repo skills: a connected repository's SKILL.md files, graded, and the revision proposed for one. */
+.memory {
+  .rs-page {
+    max-width: 980px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+  }
+  .rs-back {
+    align-self: flex-start;
+  }
+  .rs-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: var(--s4);
+  }
+  .rs-head > .btn {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .rs-head h2 {
+    margin: 0;
+  }
+  .rs-where {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--t-sm);
+    margin-top: 2px;
+  }
+  .rs-desc {
+    margin: var(--s2) 0 0;
+    font-size: var(--t-sm);
+    color: var(--ink-2);
+  }
+  .rs-note {
+    font-size: var(--t-sm);
+    margin: 0;
+  }
+  .rs-error {
+    color: var(--error);
+    font-size: var(--t-sm);
+  }
+  .rs-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s2);
+  }
+  .rs-stat {
+    display: flex;
+    flex-direction: column;
+    min-width: 88px;
+    padding: var(--s2) var(--s3);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    background: var(--surface);
+  }
+  .rs-stat strong {
+    font-size: var(--t-lg, 20px);
+  }
+  .rs-stat span {
+    font-size: var(--t-xs, 12px);
+  }
+  .rs-stat.is-ok strong,
+  .rs-row-nums .is-ok {
+    color: var(--ok);
+  }
+  .rs-stat.is-bad strong,
+  .rs-row-nums .is-bad {
+    color: var(--error);
+  }
+  .rs-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: var(--t-xs, 12px);
+    font-weight: 500;
+    background: var(--warn-soft);
+    color: var(--warn);
+    vertical-align: middle;
+  }
+  .rs-badge.is-revise {
+    background: var(--accent-soft);
+    color: var(--accent-text);
+  }
+  .rs-badge.is-keep {
+    background: var(--ok-soft);
+    color: var(--ok);
+  }
+  .rs-proposal {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+    padding: var(--s4);
+  }
+  .rs-proposal p {
+    margin: 0;
+  }
+  .rs-proposal-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--s2);
+    font-size: var(--t-sm);
+  }
+  .rs-proposal-head .rs-badge {
+    margin-left: 0;
+  }
+  .rs-changes {
+    margin: 0;
+    padding-left: 1.3em;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    font-size: var(--t-sm);
+  }
+  .rs-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    border-bottom: 1px solid var(--line);
+  }
+  .rs-tab {
+    padding: 6px 10px;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    background: none;
+    color: var(--ink-2);
+    font: inherit;
+    font-size: var(--t-sm);
+    cursor: pointer;
+  }
+  .rs-tab.is-on {
+    color: var(--ink);
+    border-bottom-color: var(--accent);
+  }
+  .rs-grow {
+    flex: 1;
+  }
+  .rs-diff {
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 12px;
+    line-height: 1.55;
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    background: var(--code-bg);
+    overflow-x: auto;
+    padding: var(--s2) 0;
+  }
+  .rs-line {
+    white-space: pre-wrap;
+    padding: 0 var(--s3);
+  }
+  .rs-line.is-add {
+    background: var(--ok-soft);
+  }
+  .rs-line.is-del {
+    background: var(--error-soft);
+  }
+  .rs-sign {
+    display: inline-block;
+    width: 1.4em;
+    color: var(--muted);
+    user-select: none;
+  }
+  .rs-fold {
+    padding: 2px var(--s3);
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .rs-md {
+    font-size: var(--t-sm);
+    max-height: 520px;
+    overflow: auto;
+  }
+  .rs-repo {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+  }
+  .rs-repo-name {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 600;
+    font-size: var(--t-sm);
+    color: var(--ink-2);
+  }
+  .rs-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+  }
+  .rs-row {
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--s3);
+    padding: var(--s3) var(--s4);
+    text-align: left;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+  .rs-row:hover {
+    border-color: var(--accent);
+  }
+  .rs-row-name {
+    font-weight: 600;
+  }
+  .rs-row-path {
+    font-size: var(--t-xs, 12px);
+  }
+  .rs-row-nums {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--s3);
+    font-size: var(--t-sm);
+    white-space: nowrap;
+  }
+  .rs-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--s1);
+    padding: var(--s5);
+    text-align: center;
+  }
+  @media (max-width: 640px) {
+    .rs-head,
+    .rs-row {
+      flex-direction: column;
+      align-items: stretch;
+    }
+    .rs-row-nums {
+      justify-content: flex-start;
+    }
+  }
+}
+
+.memory {
+  .rs-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s3);
+    flex-wrap: wrap;
+    padding: var(--s2) var(--s3);
+    margin-bottom: var(--s3);
+  }
+  .rs-card-nums {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--s3);
+    font-size: var(--t-sm);
+  }
+  .rs-card-nums .is-ok {
+    color: var(--ok);
+  }
+  .rs-card-nums .is-bad {
+    color: var(--error);
+  }
+  .rs-card-nums .rs-badge {
+    margin-left: 0;
+  }
+}

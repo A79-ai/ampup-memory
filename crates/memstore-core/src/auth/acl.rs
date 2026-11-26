@@ -200,6 +200,18 @@ impl AclIndex {
         seen
     }
 
+    /// Which of a closure's sorted [`tokens_of`] this index reads: those that grant an episode here, and
+    /// [`READS_ALL`]. [`AclIndex::visible`] of the tokens is the same as of these alone (a token that grants
+    /// nothing adds nothing to the OR, and [`READS_ALL`] adds every entry but the engine's own whatever else is
+    /// held), so two closures with the same ones read the same episodes here.
+    pub fn matched(&self, tokens: &[String]) -> Vec<String> {
+        tokens
+            .iter()
+            .filter(|t| *t == READS_ALL || self.by_entry.get(*t).is_some_and(|b| !b.is_empty()))
+            .cloned()
+            .collect()
+    }
+
     /// The ids of the episodes in `seen`, when there are at most `max` of them: a narrow reader's whole
     /// visible set, small enough to hand to the search index as a prefilter. `None` for a wide one.
     pub fn ids_if_narrow(&self, seen: &RoaringBitmap, max: usize) -> Option<Vec<String>> {

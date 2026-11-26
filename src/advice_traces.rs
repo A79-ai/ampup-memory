@@ -14,7 +14,7 @@
 //! Each part is an episode of its author's own (source `<signature>advice-trace:<session>`), readable by them alone,
 //! left out of passage search and never extracted; nothing is sent or kept twice (a part sent again is the same
 //! episode), and the export merges a session's parts into its one trace ([`merged`]). One person sends at most
-//! `AMPUP_MEMORY_ADVICE_TRACES_PER_DAY` (10,000) parts a day; past that the server answers 429 and the client sends again
+//! `AMPUP_MEMORY_ADVICE_TRACES_PER_DAY` (100,000) parts a day; past that the server answers 429 and the client sends again
 //! later. Forgetting them, a retention policy, offboarding their author and deleting the org remove them as any of
 //! their episodes. Only the org's admins (and the operator) read them all: `/admin {op: "advice_traces"}` answers one
 //! training example per call, the conversation up to and including the call (its `parentUuid` chain), the advice (an
@@ -313,12 +313,12 @@ async fn sent_today(store: &Store, scope: &Scope, prefix: &str) -> Result<usize>
 }
 
 /// Most parts of advice traces one person may send in a scope in a day: `AMPUP_MEMORY_ADVICE_TRACES_PER_DAY`, default
-/// 10,000. Each Stop that finds a new ask sends a part, so it counts sends, not sessions.
+/// 100,000. Each Stop that finds a new ask sends a part, so it counts sends, not sessions.
 fn max_per_day() -> usize {
     std::env::var("AMPUP_MEMORY_ADVICE_TRACES_PER_DAY")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(10_000)
+        .unwrap_or(100_000)
 }
 
 /// The lines on the `parentUuid` chain ending at `end`, in order.

@@ -60,7 +60,7 @@ Details of advice, runs and sessions: [advice.md](advice.md).
 | `POST /lessons` | `{space?, person?, key?, since?, limit?, days?, as_usage?}` | What it learned: each lesson with the runs it came from and the sessions it was served in, and how each went |
 | `POST /brief` | `{subject, refresh?}` | Where a subject stands (needs `extract.aggregates`) |
 | `POST /pin` | `{ttl_secs?}`, `{renew}`, `{release}` | A leased pin; read through it with `x-memstore-at: pin_…` or `?at=` |
-| `GET /me` | | The caller, their groups, selected scope and its `org`, memberships, the org's memory profile, and `capabilities`: for each org they belong to, `{admin, activity, review, lessons}`, what the `/admin` reads of its admins, owner review and `/lessons` would answer them (from the directory, so an org whose cell is down still says) |
+| `GET /me` | | The caller, their groups, selected scope and its `org`, memberships, the org's memory profile, and `capabilities`: for each org they belong to, `{admin, activity, review, lessons, advice_everyone}`, what the `/admin` reads of its admins, owner review, `/lessons` and `advice_usage` with `"person": "*"` would answer them (from the directory, so an org whose cell is down still says) |
 | `GET /doctor` | | What the memory runs for this caller: extraction, compiling, advice and its evidence bar |
 | `GET /ready` | | 503 until warm-up is done, then 200 |
 
@@ -82,7 +82,14 @@ the root's counts, the week's facts, lessons and advice served, the reviews wait
 counts and short lists, each part null where the caller may not read it; parts not worked out within a second are
 named in `pending`, to ask for again with `"parts": [...]`). The root's folders carry a `count` once the
 caller's counts are worked out, in the background: a first listing may show every folder without one, and after the
-memory moves on a listing answers the last counts while newer ones are counted. A path is a JSON array of segments:
+memory moves on a listing answers the last counts while newer ones are counted. `advice_usage` (the Advice page)
+lists each advice note the caller may read with how often it was used and how those sessions went, over the last
+`days` (all when absent) and with `person`'s own notes in place of the caller's (as `/lessons` below); the list
+carries each note's counts and `sessions_count`, not its sessions. `"person": "*"` lists every person's own notes
+beside the team's, each with its `owner`, and answers `"everyone": true`: only for a caller who reads all of the org's
+memory (the platform's operator, or a super admin, signed in as themselves), refused with a 400 to anyone else. `"note":
+"<key>"` reads that one note with its `sessions` (the caller's own, or everyone's for those who read everyone's), and
+lists nothing for a note the caller may not read; with `"person": "*"`, each person's own note by that key. A path is a JSON array of segments:
 
 ```bash
 curl -s localhost:8080/browse -d '{"op": "ls", "path": ["sources"]}'

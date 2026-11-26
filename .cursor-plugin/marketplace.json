@@ -10,7 +10,7 @@
     {
       "name": "ampup-memory-grok",
       "source": "plugins/ampup-memory-grok",
-      "description": "AmpUp Memory, team memory for Grok Bot and Cursor cloud agents: advice at each prompt, recall at a session's start, sessions recorded as runs to learn from, and the memory's tools over its hosted MCP server"
+      "description": "AmpUp Memory, team memory for Grok Bot: the memory's tools over its hosted MCP server, and skills that run each task as a session, search the memory and remember what lasts"
     }
   ]
 }

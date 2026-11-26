@@ -606,6 +606,42 @@ pub async fn purge_ref(scope: &Scope, kind: &str, id: &str) -> Result<usize> {
     Ok(n)
 }
 
+/// Removes every call that read anything in `scope` (a team purged with its memory): its markers are one prefix,
+/// so this lists the scope's calls, never the org's. Returns how many calls went. Without a log, nothing.
+pub async fn purge_scope(scope: &Scope) -> Result<usize> {
+    if !enabled() {
+        return Ok(0);
+    }
+    let Some(org) = org_of(scope) else {
+        return Ok(0);
+    };
+    let sink = sink()?;
+    let prefix = format!("{RECIPE}/{org}/{BY}/{}/", scope_dir(&scope.to_string()));
+    let mut n = 0;
+    for path in list(sink, &prefix).await? {
+        // <kind>/<ref>/<role>.<call> under the scope's prefix
+        let p: Vec<&str> = path[prefix.len().min(path.len())..].split('/').collect();
+        let [kind, id, file] = p[..] else {
+            continue;
+        };
+        let Some((role, call)) = file.split_once('.') else {
+            continue;
+        };
+        let m = Marker {
+            org: org.clone(),
+            scope: scope.clone(),
+            kind: kind.into(),
+            id: id.into(),
+            role: role.into(),
+            call: call.into(),
+            acl: vec![],
+        };
+        purge_call(&m).await?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Removes everything an org's calls logged: one prefix. Without a log, nothing.
 pub async fn purge_org(org: &str) -> Result<()> {
     if !enabled() {

@@ -20,7 +20,8 @@ import {
   type Change,
   type Conflict,
   type ConflictCheck,
-  type ConflictPage,
+  type ConflictRow,
+  type ConflictRowPage,
   type ConflictSide,
   type DreamDecision,
   type DreamKind,
@@ -37,6 +38,8 @@ import {
 import { closedValues, ValueField } from "./schema";
 import type { Focus, OrgType, Selection } from "./types";
 import { CopyId, EmptyState, ErrorState, Icon, Skeleton } from "./ui";
+import { useCanWrite } from "./writes";
+import { READS_ONLY } from "../transport";
 import "./review.css";
 
 const errorOf = (e: unknown) =>
@@ -115,13 +118,7 @@ function BranchLabel({ branch }: { branch: string }) {
       : branch.startsWith("held-")
         ? "Held from extraction for its owners"
         : null;
-  return said ? (
-    <span title={`Its draft branch: ${branch}`}>{said}</span>
-  ) : (
-    <span className="mono" title="Its draft branch">
-      {branch}
-    </span>
-  );
+  return <span>{said ?? "A proposed change"}</span>;
 }
 
 const STALE_TEXT: Record<string, string> = {
@@ -192,13 +189,17 @@ function Inbox({
 }) {
   const key = JSON.stringify([sel.org, sel.team]);
   const ps = useRead(() => review.proposals(sel), [key]);
-  // Every conflict the reader may see, for the tab: only its total.
-  const cs = useRead(() => review.conflicts(sel, { limit: 1 }), [key]);
-  // The conflicts on what the reader owns: Needs you lists a page of them and counts them all, as Home does.
-  const own = useRead(() => review.conflicts(sel, { mine: true, limit: CONFLICT_PAGE }), [key]);
-  // The dream's decisions are its builders' (an org admin's): counts and the last pass, for the tabs and banner.
+  // Every conflict the reader may see, for the tab: only how many.
+  const cs = useRead(() => review.conflictCount(sel), [key]);
+  // The conflicts on what the reader owns: Needs you lists a page of them as rows and counts them all, as Home does.
+  const own = useRead(() => review.conflictRows(sel, { mine: true, limit: CONFLICT_PAGE }), [key]);
+  // The dream's decisions are its builders' (an org admin's): counts and the last pass, for the tabs and banner, and
+  // the first page of those waiting (Needs you reads the rest a page at a time).
   const ds = useRead(
-    () => (admin ? review.dream(sel, { status: "waiting", limit: 200 }) : Promise.resolve(null)),
+    () =>
+      admin
+        ? review.dream(sel, { status: "waiting", limit: WAITING_PAGE })
+        : Promise.resolve(null),
     [key, admin],
   );
   const [view, setView] = useChoice(
@@ -286,9 +287,7 @@ function Inbox({
         onClick={() => setView("conflicts")}
       >
         Conflicts
-        {cs.data && cs.data.total > 0 && (
-          <span className="rv-n">{cs.data.total.toLocaleString()}</span>
-        )}
+        {cs.data ? <span className="rv-n">{cs.data.toLocaleString()}</span> : null}
       </button>
     </div>
   );
@@ -333,7 +332,7 @@ function Inbox({
             proposalsLoading={!ps.data}
             dream={ds}
             conflicts={own}
-            allConflicts={cs.data?.total}
+            allConflicts={cs.data}
             schema={schema}
             onSeeConflicts={(mine) => {
               setView("conflicts");
@@ -527,8 +526,8 @@ function NeedsYou({
   mine: ProposalSummary[];
   proposalsLoading: boolean;
   dream: Read<DreamList | null>;
-  /** A page of the conflicts on what the reader owns, with how many there are in all. */
-  conflicts: Read<ConflictPage>;
+  /** A page of the conflicts on what the reader owns, as rows, with how many there are in all. */
+  conflicts: Read<ConflictRowPage>;
   /** How many conflicts the reader may see in all, theirs or not. */
   allConflicts?: number;
   schema?: Map<string, OrgType>;
@@ -539,10 +538,30 @@ function NeedsYou({
 }) {
   // What you decided here stays in view, as decided, until you leave: the list read again holds only what waits.
   const [decided, setDecided] = useState<DreamDecision[]>([]);
-  const fresh = dream.data?.decisions ?? [];
+  // The pages read after the first (Show more), and where the next starts; a first page read again starts over.
+  const [more, setMore] = useState<{ pages: DreamDecision[]; next: string | null; loading: boolean }>({
+    pages: [],
+    next: null,
+    loading: false,
+  });
+  useEffect(
+    () => setMore({ pages: [], next: dream.data?.next_page ?? null, loading: false }),
+    [dream.data],
+  );
+  const first = dream.data?.decisions ?? [];
+  const fresh = [...first, ...more.pages.filter((d) => !first.some((w) => w.id === d.id))];
   const waiting = [...fresh, ...decided.filter((d) => !fresh.some((w) => w.id === d.id))];
   const waitingN = Math.max(dream.data?.counts.waiting ?? 0, fresh.length);
-  const mineToSettle = conflicts.data?.conflicts ?? [];
+  const showMore = () => {
+    if (!more.next) return;
+    setMore((m) => ({ ...m, loading: true }));
+    review.dream(sel, { status: "waiting", limit: WAITING_PAGE, after: more.next }).then(
+      (r) =>
+        setMore((m) => ({ pages: [...m.pages, ...r.decisions], next: r.next_page, loading: false })),
+      () => setMore((m) => ({ ...m, loading: false })),
+    );
+  };
+  const mineToSettle = conflicts.data?.rows ?? [];
   const ownN = conflicts.data?.total ?? 0;
   // The conflicts on things others own (or no one does): not the reader's to do, though an admin may settle them.
   const othersN = Math.max(0, (allConflicts ?? 0) - ownN);
@@ -610,6 +629,11 @@ function NeedsYou({
                   onFocus={onFocus}
                 />
               ))}
+              {more.next && (
+                <button className="btn rv-more" disabled={more.loading} onClick={showMore}>
+                  {more.loading ? "Loading…" : "Show more"}
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -628,14 +652,14 @@ function NeedsYou({
           {!conflicts.data ? (
             <Skeleton rows={2} title={false} />
           ) : (
-            <div className="rv-conflicts">
+            <div className="card rv-rows rv-conflict-rows">
               {mineToSettle.map((c) => (
-                <ConflictCard
-                  key={`${c.facts[0].fact_id}:${c.facts[1].fact_id}`}
+                <ConflictRowView
+                  key={`${c.entity}\u001f${c.predicate}`}
                   sel={sel}
-                  c={c}
+                  row={c}
                   me={me}
-                  values={closedValues(schema, c.entity, c.predicate)}
+                  schema={schema}
                   onFocus={onFocus}
                 />
               ))}
@@ -1166,7 +1190,9 @@ export function ProposalRow({
 type Read<T> = ReturnType<typeof useRead<T>>;
 
 /** How many conflicts one page shows. */
-const CONFLICT_PAGE = 50;
+const CONFLICT_PAGE = 20;
+/** The dream's decisions waiting for a builder that Needs you reads at a time. */
+const WAITING_PAGE = 30;
 
 function Conflicts({
   sel,
@@ -1180,7 +1206,7 @@ function Conflicts({
   me?: string;
   admin: boolean;
   /** How many conflicts the reader may see in all, read by the inbox for its tab. */
-  count: Read<ConflictPage>;
+  count: Read<number>;
   schema?: Map<string, OrgType>;
   onFocus: (f: Focus) => void;
 }) {
@@ -1189,23 +1215,23 @@ function Conflicts({
   const [mine, setMine] = useFlag("mine");
   // The first page; "Show more" adds the next ones after it, and a reload starts again from the first.
   const r = useRead(
-    () => review.conflicts(sel, { mine: mine || undefined, limit: CONFLICT_PAGE }),
+    () => review.conflictRows(sel, { mine: mine || undefined, limit: CONFLICT_PAGE }),
     [key, mine],
   );
   const [more, setMore] = useState<{
-    of?: ConflictPage;
-    pages: ConflictPage[];
+    of?: ConflictRowPage;
+    pages: ConflictRowPage[];
     busy: boolean;
     error?: string;
   }>({ pages: [], busy: false });
   const pages = r.data ? [r.data, ...(more.of === r.data ? more.pages : [])] : [];
   const last = pages[pages.length - 1];
-  const list = r.data ? pages.flatMap((p) => p.conflicts) : undefined;
+  const list = r.data ? pages.flatMap((p) => p.rows) : undefined;
   const showMore = () => {
     if (!r.data || !last?.next) return;
     const of = r.data;
     setMore((m) => ({ ...m, busy: true, error: undefined }));
-    review.conflicts(sel, { mine: mine || undefined, limit: CONFLICT_PAGE, after: last.next }).then(
+    review.conflictRows(sel, { mine: mine || undefined, limit: CONFLICT_PAGE, after: last.next }).then(
       (p) =>
         setMore((m) => ({
           of,
@@ -1249,9 +1275,7 @@ function Conflicts({
                 onClick={() => setMine(m)}
               >
                 {label}
-                {!m && count.data && count.data.total > 0 && (
-                  <span className="rv-n">{count.data.total}</span>
-                )}
+                {!m && count.data ? <span className="rv-n">{count.data}</span> : null}
               </button>
             ))}
           </div>
@@ -1269,16 +1293,18 @@ function Conflicts({
           </EmptyState>
         ) : (
           <div className="rv-conflicts">
-            {list.map((c) => (
-              <ConflictCard
-                key={`${c.facts[0].fact_id}:${c.facts[1].fact_id}`}
-                sel={sel}
-                c={c}
-                me={me}
-                values={closedValues(schema, c.entity, c.predicate)}
-                onFocus={onFocus}
-              />
-            ))}
+            <div className="card rv-rows rv-conflict-rows">
+              {list.map((c) => (
+                <ConflictRowView
+                  key={`${c.entity}\u001f${c.predicate}`}
+                  sel={sel}
+                  row={c}
+                  me={me}
+                  schema={schema}
+                  onFocus={onFocus}
+                />
+              ))}
+            </div>
             {last?.next && (
               <button className="btn rv-more" onClick={showMore} disabled={more.busy}>
                 {more.busy
@@ -1314,6 +1340,98 @@ function Conflicts({
   );
 }
 
+/**
+ * One conflict as a list shows it: the thing, the attribute and its first two values. Opened, it reads the conflict in
+ * full (each side's source and quote, who may settle it) and settles it there.
+ */
+function ConflictRowView({
+  sel,
+  row,
+  me,
+  schema,
+  onFocus,
+}: {
+  sel: Selection;
+  row: ConflictRow;
+  me?: string;
+  schema?: Map<string, OrgType>;
+  onFocus: (f: Focus) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [full, setFull] = useState<{ c?: Conflict | null; error?: string }>({});
+  useEffect(() => {
+    if (!open || full.c !== undefined) return;
+    let live = true;
+    review.conflict(sel, row.entity, row.predicate).then(
+      (c) => live && setFull({ c }),
+      (e: unknown) => live && setFull({ error: errorOf(e) }),
+    );
+    return () => {
+      live = false;
+    };
+  }, [open, full.c, sel, row.entity, row.predicate]);
+  const more = row.count - row.values.length;
+  return (
+    <div className={`rv-conflict-row ${open ? "rv-conflict-row-open" : ""}`}>
+      <button
+        className="list-row rv-row"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <Icon name={open ? "down" : "chevron"} size={13} />
+        <div className="list-main">
+          <div className="list-title">
+            <span className="mono" title={row.entity}>
+              {row.entity}
+            </span>{" "}
+            <span className="rv-pred" title={row.predicate}>
+              {humanize(row.predicate)}
+            </span>
+          </div>
+          <div className="list-sub rv-conflict-values">
+            {row.values.map((v, i) => (
+              <span key={i}>
+                {i > 0 && <span className="muted"> vs </span>}
+                <b>{v}</b>
+              </span>
+            ))}
+            {more > 0 && (
+              <span className="muted">
+                {" "}
+                and {more} more {more === 1 ? "value" : "values"}
+              </span>
+            )}
+          </div>
+        </div>
+      </button>
+      {open &&
+        (full.error ? (
+          <p className="error-text rv-small rv-conflict-open" role="alert">
+            {full.error}
+          </p>
+        ) : full.c === undefined ? (
+          <div className="rv-conflict-open">
+            <Skeleton rows={2} title={false} />
+          </div>
+        ) : full.c === null ? (
+          <p className="muted rv-small rv-conflict-open">
+            Already settled: the list shows it until it's read again.
+          </p>
+        ) : (
+          <div className="rv-conflict-open">
+            <ConflictCard
+              sel={sel}
+              c={full.c}
+              me={me}
+              values={closedValues(schema, full.c.entity, full.c.predicate)}
+              onFocus={onFocus}
+            />
+          </div>
+        ))}
+    </div>
+  );
+}
+
 function ConflictCard({
   sel,
   c,
@@ -1333,6 +1451,7 @@ function ConflictCard({
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [done, setDone] = useState<Resolution | null>(null);
+  const writes = useCanWrite();
   const ids: [string, string] = [c.facts[0].fact_id, c.facts[1].fact_id];
 
   const resolve = (how: { keep: string } | { value: string }) => {
@@ -1349,7 +1468,8 @@ function ConflictCard({
       },
     );
   };
-  const live = c.can_resolve && !done;
+  // A viewer resolves nothing, not even a conflict on an entity they own.
+  const live = c.can_resolve && !done && writes;
   return (
     <div className={`card rv-conflict ${done ? "rv-resolved" : ""}`}>
       <div className="rv-change-head rv-conflict-head">
@@ -1434,6 +1554,8 @@ function ConflictCard({
             </button>
           )}
         </div>
+      ) : c.can_resolve && !writes ? (
+        <p className="muted rv-small rv-resolve">{READS_ONLY}: you read this conflict, and resolve none.</p>
       ) : (
         <p className="muted rv-small rv-resolve">
           {c.owner ? `Only ${c.owner === me ? "you" : c.owner}` : "Only an org admin"}
@@ -1927,6 +2049,8 @@ function TransferButton({
   const [open, setOpen] = useState(false);
   const [to, setTo] = useState("");
   const [busy, setBusy] = useState(false);
+  const writes = useCanWrite();
+  if (!writes) return null;
   if (!open)
     return (
       <button className="link rv-small" onClick={() => setOpen(true)}>
@@ -2042,6 +2166,7 @@ function ProposalPane({
   const [rejecting, setRejecting] = useState(false);
   const [note, setNote] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  const writes = useCanWrite();
 
   if (r.error && !v) return <ErrorState message={r.error} onRetry={r.reload} />;
   if (!v) return <Skeleton rows={6} />;
@@ -2056,7 +2181,9 @@ function ProposalPane({
   const last = required && !mine && waiting.length === 1;
   // An org admin who isn't an owner may decide too: their approval publishes for every owner.
   const asAdmin = admin && !required;
-  const canDecide = (required || asAdmin) && v.status === "pending_review" && !mine;
+  const mayDecide = (required || asAdmin) && v.status === "pending_review" && !mine;
+  // A viewer decides nothing, not even on an entity they own.
+  const canDecide = mayDecide && writes;
   const decisions = v.decisions ?? [];
   const rejection = decisions.find((d) => !d.approve);
   const byAdmin = decisions.find((d) => d.approve && d.admin);
@@ -2134,7 +2261,8 @@ function ProposalPane({
               </span>
               <button
                 className="btn"
-                disabled={busy !== null}
+                disabled={busy !== null || !writes}
+                title={writes ? undefined : READS_ONLY}
                 onClick={() => {
                   setBusy("repropose");
                   review.repropose(sel, p.branch).then(
@@ -2322,6 +2450,8 @@ function ProposalPane({
                   </form>
                 )}
               </div>
+            ) : mayDecide ? (
+              <p className="rv-small muted">{READS_ONLY}: you read this review, and decide none.</p>
             ) : required && mine && v.status === "pending_review" ? (
               <p className="rv-small muted">
                 You approved. Waiting on {waiting.map((o) => o).join(", ")}.
@@ -2515,6 +2645,7 @@ export function EntityOwnership({
   const ow = useRead(() => review.owners(sel), [key]);
   const ps = useRead(() => review.proposals(sel, entity), [key]);
   const [err, setErr] = useState<string | null>(null);
+  const [assigning, setAssigning] = useState(false);
   // A memstore without owner review: say nothing on the entity's page.
   if (ow.error && /unknown op|not supported|unexpected op/i.test(ow.error)) return null;
   const owner = ow.data?.find((o) => o.entity === entity) ?? null;
@@ -2522,42 +2653,60 @@ export function EntityOwnership({
     (p) => p.status === "pending_review" || p.status === "approved" || p.status === "stale",
   );
   const done = (ps.data ?? []).filter((p) => p.status === "published" || p.status === "rejected");
+  // A panel only when there is something under the owner's line (changes waiting or reviewed, the assign form);
+  // otherwise the owner is one quiet line.
+  const quiet = !open.length && !done.length && !assigning;
   return (
-    <div className="card card-pad rv-entity">
+    <div className={`rv-entity ${quiet ? "rv-entity-quiet" : "card card-pad"}`}>
       <div className="rv-entity-head">
-        <div className="h-section">
-          <Icon name="lock" size={14} /> Owner
-        </div>
-        <button className="link rv-small" onClick={() => onFocus({ kind: "review" })}>
+        <span className="rv-entity-label">
+          <Icon name="lock" size={13} /> Owner
+        </span>
+        {!ow.data && !ow.error ? (
+          <span className="muted rv-owner-line">…</span>
+        ) : owner ? (
+          <p className="rv-owner-line">
+            <Who user={owner.user} me={me} />
+            {owner.since ? <span className="muted"> since {when(owner.since)}</span> : null}
+            <span className="muted">
+              {" "}
+              · changes wait for {owner.user === me ? "you" : "them"}
+              {open.length ? `; ${open.length} waiting now` : ""}
+            </span>
+            {owner.user === me && (
+              <>
+                {" "}
+                <TransferButton sel={sel} owner={owner} onDone={ow.reload} onError={setErr} />
+              </>
+            )}
+          </p>
+        ) : (
+          <p className="rv-owner-line muted">
+            None · changes publish without review
+            {admin && !assigning && (
+              <>
+                {" · "}
+                <button className="link" onClick={() => setAssigning(true)}>
+                  Assign an owner
+                </button>
+              </>
+            )}
+          </p>
+        )}
+        <button className="link rv-small rv-inbox" onClick={() => onFocus({ kind: "review" })}>
           Review inbox
         </button>
       </div>
-      {!ow.data && !ow.error ? (
-        <Skeleton rows={1} title={false} />
-      ) : owner ? (
-        <p className="rv-owner-line">
-          <Who user={owner.user} me={me} />
-          {owner.since ? <span className="muted"> since {when(owner.since)}</span> : null}
-          <span className="muted">
-            {" "}
-            · every change to this entity waits for {owner.user === me ? "you" : "them"}
-            {open.length ? `; ${open.length} ${open.length === 1 ? "is" : "are"} waiting now` : ""}.
-          </span>
-          {owner.user === me && (
-            <>
-              {" "}
-              <TransferButton sel={sel} owner={owner} onDone={ow.reload} onError={setErr} />
-            </>
-          )}
-        </p>
-      ) : (
-        <>
-          <p className="muted rv-small">
-            No owner: changes publish without review.
-            {admin ? " Assign one to protect what is recorded here from now on." : ""}
-          </p>
-          {admin && <AssignOwner sel={sel} taken={[]} preset={entity} onDone={ow.reload} />}
-        </>
+      {!owner && admin && assigning && (
+        <AssignOwner
+          sel={sel}
+          taken={[]}
+          preset={entity}
+          onDone={() => {
+            setAssigning(false);
+            ow.reload();
+          }}
+        />
       )}
       {err && (
         <p className="error-text rv-small" role="alert">

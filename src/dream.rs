@@ -763,7 +763,7 @@ pub async fn last_run(
 
 /// A fact dreamer's pass commits as this actor (and its records have it as their source): `dream:<model>@<version>`,
 /// not a release, a review or the notes' dream.
-fn pass_actor(a: &str) -> bool {
+pub(crate) fn pass_actor(a: &str) -> bool {
     a.starts_with(SOURCE)
         && a != REVIEW_SOURCE
         && !a.starts_with(crate::notes_dream::ACTOR)

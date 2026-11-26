@@ -43,12 +43,12 @@ const MAX_ANSWER: usize = 20_000;
 /// Most fact ids one answer may cite.
 const MAX_CITED: usize = 100;
 /// Most entries (answers, runs, ratings and rewards) one person may log in a scope in a day:
-/// `AMPUP_MEMORY_LOG_PER_DAY`, default 1000.
+/// `AMPUP_MEMORY_LOG_PER_DAY`, default 50,000.
 fn max_per_day() -> usize {
     std::env::var("AMPUP_MEMORY_LOG_PER_DAY")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(1_000)
+        .unwrap_or(50_000)
 }
 
 /// A caller's mistake, said back to them as is.
@@ -146,6 +146,10 @@ pub struct SessionPart {
     /// gives, or `test`, which reads advice and teaches nothing ([`crate::sessions::split`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split: Option<String>,
+    /// The skills its agent loaded itself (a Claude Code `Skill` call), by name, read from its transcript as it
+    /// ended ([`crate::skill_review::uses_in`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
 }
 
 impl SessionPart {
@@ -612,7 +616,8 @@ pub(crate) fn recount_later(store: &Store, scope: &Scope, user: &str) {
     }
 }
 
-/// Refused once `who` has added a day's most rows to the scope's log (answers, runs, sessions and their steps).
+/// Refused once `who` has added a day's most entries to the scope's log (answers, runs and sessions; a session's
+/// steps are part of its one entry and never checked against this).
 pub(crate) async fn daily_cap(store: &Store, scope: &Scope, who: &Principal) -> Result<()> {
     entries_cap(store, scope, who, 1).await
 }
@@ -717,13 +722,13 @@ pub async fn imports_cap(store: &Store, scope: &Scope, adding: usize) -> Result<
     Ok(())
 }
 
-/// Most runs one person may record in a scope in a day: `AMPUP_MEMORY_RUNS_PER_DAY`, default 100. An agent that
-/// records every run it makes, for advice to learn from (`crate::advice`), needs more.
+/// Most runs one person may record in a scope in a day: `AMPUP_MEMORY_RUNS_PER_DAY`, default 10,000, so an agent
+/// that records every run it makes, for advice to learn from (`crate::advice`), isn't stopped.
 fn max_runs_per_day() -> usize {
     std::env::var("AMPUP_MEMORY_RUNS_PER_DAY")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(100)
+        .unwrap_or(10_000)
 }
 
 /// A run to log ([`log_runs`]).
@@ -1205,7 +1210,7 @@ fn decode(rows: &[arrow_array::RecordBatch]) -> Vec<Row> {
         let (conversation, verdicts, acl) = (oo("conversation"), oo("verdicts"), oo("acl"));
         let (ended_by, fires, branch) = (oo("ended_by"), oo("fires"), oo("branch"));
         let (served_versions, lookups, prs) = (oo("served_versions"), oo("lookups"), oo("prs"));
-        let (thread, split) = (oo("thread"), oo("split"));
+        let (thread, split, skills) = (oo("thread"), oo("split"), oo("skills"));
         let ended = if has("ended_at") {
             timestamps(b, "ended_at")
         } else {
@@ -1272,6 +1277,10 @@ fn decode(rows: &[arrow_array::RecordBatch]) -> Vec<Row> {
                             .unwrap_or_default(),
                         thread: thread[i].clone(),
                         split: split[i].clone(),
+                        skills: skills[i]
+                            .as_deref()
+                            .and_then(|v| serde_json::from_str(v).ok())
+                            .unwrap_or_default(),
                     }),
                 },
             });
@@ -1354,8 +1363,9 @@ pub(crate) trait StoreQaLog {
 }
 
 impl StoreQaLog for Store {
-    /// When each row `asker` added to the log since `since` (µs) was recorded, oldest first, ratings included; not
-    /// the one row ending a session `empty` (an admin's `clear_empty_sessions` writes one per session it clears, in
+    /// When each entry `asker` added to the log since `since` (µs) was first recorded, oldest first, ratings
+    /// included: an entry counts once, however many rows it has (a session rewrites its row at every step, and a
+    /// long session is one session, not hundreds of entries). Not the one row ending a session `empty` (an admin's `clear_empty_sessions` writes one per session it clears, in
     /// the asker's name). Its start was a row of its own, which counts, as does any other row of it. Nor an ended
     /// backfilled session's rows (`crate::sessions::BACKFILL`: past sessions sent long after they ran), which have a
     /// day's most of their own, so sending them never refuses what the person does now. One left open (its end
@@ -1363,7 +1373,7 @@ impl StoreQaLog for Store {
     async fn qa_row_times_since(&self, scope: &Scope, asker: &str, since: i64) -> Result<Vec<i64>> {
         let rows = self.side_rows(&scope.namespace(), QA_LOG).await?;
         let mut ended_empty = std::collections::HashSet::new();
-        let mut n = vec![];
+        let mut first: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         for b in rows.iter() {
             let ended_by = optional_strings(b, "ended_by");
             let harness = optional_strings(b, "harness");
@@ -1387,13 +1397,17 @@ impl StoreQaLog for Store {
                     continue;
                 }
                 if e.as_deref().and_then(Ended::parse) == Some(Ended::Empty)
-                    && ended_empty.insert(id)
+                    && ended_empty.insert(id.clone())
                 {
                     continue;
                 }
-                n.extend(t);
+                if let Some(t) = t {
+                    let at = first.entry(id).or_insert(t);
+                    *at = (*at).min(t);
+                }
             }
         }
+        let mut n: Vec<i64> = first.into_values().collect();
         n.sort_unstable();
         Ok(n)
     }
@@ -1503,6 +1517,15 @@ impl StoreQaLog for Store {
                 ),
                 ("thread", opt(&|l| sp(l, &|s| s.thread.clone()))),
                 ("split", opt(&|l| sp(l, &|s| s.split.clone()))),
+                (
+                    "skills",
+                    opt(&|l| {
+                        sp(l, &|s| {
+                            (!s.skills.is_empty())
+                                .then(|| serde_json::to_string(&s.skills).unwrap_or_default())
+                        })
+                    }),
+                ),
             ],
             OnConflict::Recommit,
         )

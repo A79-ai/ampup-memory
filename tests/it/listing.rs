@@ -331,11 +331,18 @@ async fn advice_lists_a_persons_own_and_every_team_note() {
     assert_eq!(team["evidence"]["served"], 0, "{a}");
     assert!(team["note_chars"].as_u64().unwrap() > 0);
 
-    // Bob: the team's note, and none of alice's; asking for his own space gives his own (none), never hers.
+    // Bob: the team's note, and none of alice's; asking for his own space gives his own (none), never hers, though
+    // her answers for both are kept (`crate::kept_answers`): a kept answer is its reader's alone.
+    let a = list(&alice, json!({"space": "mine"})).await;
+    assert_eq!(spaces(&a), ["mine mine:work/do-it"], "{a}");
     let b = list(&bob, json!({})).await;
     assert_eq!(spaces(&b), ["team work/do-it"], "{b}");
     let b = list(&bob, json!({"space": "mine"})).await;
     assert!(spaces(&b).is_empty(), "{b}");
+    // Nor a reader of everything under her own name: an operator reading as everyone is a reader of their own.
+    let as_operator = Principal::new("alice", &["org.all"]).reading_all();
+    let o = list(&as_operator, json!({"space": "team"})).await;
+    assert_eq!(spaces(&o), ["team work/do-it"], "{o}");
 
     // Filters, as alice, who sees both.
     let only = |req: Value, want: &[&str]| {
@@ -407,8 +414,15 @@ async fn advice_lists_a_persons_own_and_every_team_note() {
     paged.sort();
     assert_eq!(paged, ["mine mine:work/do-it", "team work/do-it"]);
 
-    // Forgetting alice takes her own notes out of the list, and leaves the team's.
+    // Forgetting alice takes her own notes out of the list at once, though her list was kept just before it, and
+    // leaves the team's: to her and to bob, whose kept list never held hers.
+    let before = list(&alice, json!({})).await;
+    assert_eq!(spaces(&before).len(), 2, "{before}");
     store.forget_in(&scope.namespace(), "alice").await.unwrap();
     let after = list(&alice, json!({})).await;
     assert_eq!(spaces(&after), ["team work/do-it"], "{after}");
+    let after = list(&alice, json!({"space": "mine"})).await;
+    assert!(spaces(&after).is_empty(), "{after}");
+    let b = list(&bob, json!({})).await;
+    assert_eq!(spaces(&b), ["team work/do-it"], "{b}");
 }

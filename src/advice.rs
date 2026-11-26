@@ -853,6 +853,23 @@ struct Written {
     /// The [`NOTE_FORMAT`] it was written as; empty before there was one.
     #[serde(default)]
     format: String,
+    /// When the note was first written (µs), kept through rewrites; 0 for notes written before it was recorded. A
+    /// note is updated as its runs come in for its first [`edit_idle_days`], used or not ([`young`]).
+    #[serde(default, skip_serializing_if = "unrecorded")]
+    first: i64,
+}
+
+fn unrecorded(n: &i64) -> bool {
+    *n == 0
+}
+
+/// Whether a note first written at `first` (µs) is still in its first `idle_days`: updated as its runs come in
+/// whether or not anyone was served it yet. A history imported at once (a person's last weeks of sessions) is judged
+/// and learned over many rounds, while nothing is served, so without this each note stayed as its first round wrote
+/// it, from the 2 runs that first crossed the bar: a note on fixing defects learned from 2 of 11 such runs named only
+/// the app those 2 fixed, and the fit check rightly refused it for every other defect.
+fn young(first: i64, idle_days: i64, now: i64) -> bool {
+    first > 0 && now - first < idle_days * 86_400_000_000
 }
 
 /// Days a note may go unserved and unrouted before learning stops updating it (`AMPUP_MEMORY_ADVICE_EDIT_IDLE_DAYS`,
@@ -2062,12 +2079,19 @@ pub async fn categories(store: &Store, scope: &Scope, who: &Principal) -> Result
     Ok(json!({"categories": names}))
 }
 
+/// The trail (see above). `light` is what a page lists and opens: the whole trail carries no runs or sessions, only
+/// how many (`learned_from_count`, `served_in_count`, …, absent at none), and no note text or items, only `has_note`
+/// and `harmed_items` (the items that harmed more than helped); one note (`key`) carries its [`TRAIL_SHOWN`] newest
+/// of each, with the counts.
 pub async fn trail(
     store: &Store,
     scope: &Scope,
     who: &Principal,
     only: Option<&str>,
+    light: bool,
 ) -> Result<Value> {
+    // A light list only counts each note's runs and sessions: they make most of a full trail's bytes.
+    let counted = light && only.is_none();
     // A page of what advice did: the last visibility state serves, never waiting for a build of what was just
     // written (it never holds what was taken away).
     let session = store.pin_lagging(scope, crate::MAIN).await?;
@@ -2084,20 +2108,35 @@ pub async fn trail(
     fn slot<'a>(
         notes: &'a mut BTreeMap<String, Value>,
         only: Option<&str>,
+        counted: bool,
         k: &str,
         (c, s): (&str, &str),
     ) -> Option<&'a mut Value> {
         if only.is_some_and(|o| o != k) {
             return None;
         }
-        Some(notes.entry(k.to_string()).or_insert_with(|| {
-            json!({"key": k, "category": c, "situation": s, "learned_from": [], "served_in": [],
-                   "validated_in": [], "withheld_in": []})
+        Some(notes.entry(k.to_string()).or_insert_with(|| match counted {
+            true => json!({"key": k, "category": c, "situation": s}),
+            false => {
+                json!({"key": k, "category": c, "situation": s, "learned_from": [], "served_in": [],
+                       "validated_in": [], "withheld_in": []})
+            }
         }))
     }
+    // One more run or session on a note's list: the entry itself, or (`counted`) only its count.
+    fn add(v: &mut Value, list: &str, counted: bool, entry: impl FnOnce() -> Value) {
+        if counted {
+            let n = format!("{list}_count");
+            v[&n] = json!(v[&n].as_u64().unwrap_or(0) + 1);
+        } else {
+            v[list].as_array_mut().expect("a list").push(entry());
+        }
+    }
+    // Who each note was served to.
+    let mut served_to: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
     for (c, cat) in &m.categories {
         for (s, sit) in &cat.situations {
-            if let Some(v) = slot(&mut notes, only, &key(c, s), (c, s))
+            if let Some(v) = slot(&mut notes, only, counted, &key(c, s), (c, s))
                 && sit.conversation == Some(true)
             {
                 // Its task is the conversation itself: the team serves it no note.
@@ -2107,17 +2146,16 @@ pub async fn trail(
     }
     for (run, (c, s)) in &m.assign {
         let k = key(c, s);
-        if let Some(v) = slot(&mut notes, only, &k, (c, s)) {
-            // A request's run is `<session>#<offset>` ([`task_runs`]): its session's entry.
-            let l = by_id.get(run.split('#').next().unwrap_or(run));
-            v["learned_from"]
-                .as_array_mut()
-                .expect("a list")
-                .push(json!({
+        if let Some(v) = slot(&mut notes, only, counted, &k, (c, s)) {
+            add(v, "learned_from", counted, || {
+                // A request's run is `<session>#<offset>` ([`task_runs`]): its session's entry.
+                let l = by_id.get(run.split('#').next().unwrap_or(run));
+                json!({
                     "id": run, "user": l.map(|l| &l.asker),
                     "question": l.map(|l| &l.question),
                     "at": l.map(|l| l.asked_at), "reward": l.and_then(|l| l.reward),
-                }));
+                })
+            });
         }
     }
     // Each item's tally by its id ([`curate::item_id`]), per note: the judged sessions whose served version held it,
@@ -2142,11 +2180,11 @@ pub async fn trail(
         // The holdout: the sessions a note was withheld from, to compare with those it was served in.
         for k in &s.withheld {
             if let Some(v) = notes.get_mut(k) {
-                v["withheld_in"].as_array_mut().expect("a list").push(
+                add(v, "withheld_in", counted, || {
                     json!({"id": l.answer_id, "user": l.asker, "question": &l.question,
-                                 "at": l.asked_at, "checked": checked,
-                                 "outcome": verdicts.as_ref().and_then(|v| v["outcome"].as_str())}),
-                );
+                           "at": l.asked_at, "checked": checked,
+                           "outcome": verdicts.as_ref().and_then(|v| v["outcome"].as_str())})
+                });
             }
         }
         for k in &s.served {
@@ -2156,19 +2194,23 @@ pub async fn trail(
             };
             let n = verdicts.as_ref().map(|v| &v["notes"][k]);
             let helped = n.and_then(|n| n["helped"].as_bool());
-            let e = json!({"id": l.answer_id, "user": l.asker,
-                           "question": &l.question, "at": l.asked_at,
-                           "applied": n.and_then(|n| n["applied"].as_bool()), "helped": helped,
-                           "redundant": n.and_then(|n| n["redundant"].as_bool()),
-                           "checked": checked,
-                           "outcome": verdicts.as_ref().and_then(|v| v["outcome"].as_str())});
+            let e = || {
+                json!({"id": l.answer_id, "user": l.asker,
+                       "question": &l.question, "at": l.asked_at,
+                       "applied": n.and_then(|n| n["applied"].as_bool()), "helped": helped,
+                       "redundant": n.and_then(|n| n["redundant"].as_bool()),
+                       "checked": checked,
+                       "outcome": verdicts.as_ref().and_then(|v| v["outcome"].as_str())})
+            };
             if helped == Some(true) {
-                v["validated_in"]
-                    .as_array_mut()
-                    .expect("a list")
-                    .push(e.clone());
+                add(v, "validated_in", counted, e);
             }
-            v["served_in"].as_array_mut().expect("a list").push(e);
+            add(v, "served_in", counted, e);
+            if counted {
+                // The newest session it was served in (the plain table's "Last served").
+                v["last_served"] = json!(v["last_served"].as_i64().unwrap_or(0).max(l.asked_at));
+            }
+            served_to.entry(k.clone()).or_default().insert(&l.asker);
         }
     }
     // Each note's text, as `who` may read it, and what it was last written from: an admin reads what is served.
@@ -2194,15 +2236,28 @@ pub async fn trail(
                 }
                 Some(item.to_string())
             });
-            v["items"] = json!(items.into_inner());
-            v["note"] = json!(text);
+            let items = items.into_inner();
+            if light && only.is_none() {
+                // What a list shows of them: that there is a note, and whether an item of it hurts.
+                v["has_note"] = json!(true);
+                let harmed = items
+                    .iter()
+                    .filter(|i| i["harmed"].as_u64() > i["helped"].as_u64())
+                    .count();
+                if harmed > 0 {
+                    v["harmed_items"] = json!(harmed);
+                }
+            } else {
+                v["items"] = json!(items);
+                v["note"] = json!(text);
+            }
             if let Some(w) = m.written.get(k) {
                 v["written"] = json!({"runs": w.runs, "wrong": w.wrong});
             }
             if m.held.contains(k) {
                 v["held"] = json!(true);
             }
-            if let Some(why) = m.unbacked(k) {
+            if let Some(why) = m.unbacked(k).filter(|_| !counted) {
                 v["needs_backing"] = json!(why);
             }
             if m.ratified.contains_key(k) {
@@ -2228,26 +2283,31 @@ pub async fn trail(
             v["evidence"] = e;
         }
     }
-    for v in notes.values_mut() {
-        for k in ["learned_from", "served_in", "validated_in", "withheld_in"] {
-            if let Some(a) = v[k].as_array_mut() {
+    for (k, v) in notes.iter_mut() {
+        for list in ["learned_from", "served_in", "validated_in", "withheld_in"] {
+            if let Some(a) = v[list].as_array_mut() {
                 a.sort_by_key(|e| std::cmp::Reverse(e["at"].as_i64()));
+                if light {
+                    // One note opened: how many, and the newest few.
+                    let n = a.len();
+                    a.truncate(TRAIL_SHOWN);
+                    v[format!("{list}_count")] = json!(n);
+                }
             }
         }
-        let users: BTreeSet<&str> = v["served_in"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e["user"].as_str())
-            .collect();
-        let n = users.len();
-        v["people"] = json!(n);
+        let n = served_to.get(k).map_or(0, BTreeSet::len);
+        if !counted || n > 0 {
+            v["people"] = json!(n);
+        }
     }
     Ok(
         json!({"notes": notes.into_values().collect::<Vec<_>>(), "map": true, "evidence_bar": bar,
               "proof_sessions": crate::sessions::proof_sessions()}),
     )
 }
+
+/// The runs and sessions of each kind a light trail of one note lists, newest first (what its page shows).
+const TRAIL_SHOWN: usize = 20;
 
 /// The most sessions [`usage`] lists for one note.
 const USAGE_SESSIONS: usize = 500;
@@ -2268,13 +2328,21 @@ fn session_outcome(l: &crate::qa_log::Logged) -> (Option<bool>, Option<&'static 
     }
 }
 
+/// What `/browse {op: "advice_usage"}` takes as `person` for every person's own notes at once ([`usage`]): only the
+/// platform's operator asks for it, as its support (the server checks).
+pub const EVERYONE: &str = "*";
+
 /// The advice as the advice page reads it (`/browse {op: "advice_usage"}`): each team note `who` may read and each of
 /// `who`'s own (`mine: true`, its key `mine:`-tagged, used in their sessions only: served, or handed its preferences
 /// at a session's start, `recalled`), how many people's sessions since `since` (µs) it was used in across the scope, how many of them went well or wrong
-/// ([`session_outcome`]), whether it is ratified (by its evidence, or by an admin: [`ratify`]), and the sessions
-/// themselves: everyone's where `every` (the org's admins, where the org shows people's activity), else only
-/// `who`'s own. With `person`, that person's own notes stand in for `who`'s (an admin's view of someone, as
-/// `/lessons` reads them; the caller checks `every`), each with its `owner`. Counts are the scope's for everyone; no one else's session, question or name is in them. Programs'
+/// ([`session_outcome`]), whether it is ratified (by its evidence, or by an admin: [`ratify`]), and how many sessions
+/// it lists (`sessions_count`): everyone's where `every` (the org's admins, where the org shows people's activity),
+/// else only `who`'s own. The sessions themselves only with `note`, the key of the one note listed then (none: no
+/// note by that key that `who` may read): every note's would make the list megabytes. With `person`, that person's
+/// own notes stand in for `who`'s (an admin's view of someone, as `/lessons` reads them; the caller checks `every`),
+/// each with its `owner`; with [`EVERYONE`], every person's own notes the scope holds do, each with its `owner` (the
+/// operator's view, for support; the caller checks that too), and a `note` names each person's own note by that key.
+/// Counts are the scope's for everyone; no one else's session, question or name is in them. Programs'
 /// sessions ([`crate::sessions::automated`]) are left out.
 pub async fn usage(
     store: &Store,
@@ -2283,26 +2351,37 @@ pub async fn usage(
     every: bool,
     since: i64,
     person: Option<&str>,
+    note: Option<&str>,
 ) -> Result<Value> {
     // A page of how advice is used: the last visibility state serves (see [`trail`]).
     let session = store.pin_lagging(scope, crate::MAIN).await?;
     let bar = crate::sessions::evidence_bar(store, scope).await?;
     let tallies = crate::sessions::evidence(store, scope).await?;
     let log = crate::qa_log::list(store, scope, None).await?;
-    let owner = person.unwrap_or(who.user());
-    let me = crate::auth::acl::norm_id(owner);
+    let everyone = person == Some(EVERYONE);
+    // Whose own notes are read beside the team's, each as its `owner` is said: the reader's, the person's named, or
+    // every person's whose own space the scope holds ([`own_spaces`]).
+    let owners: Vec<String> = match person {
+        _ if everyone => own_spaces(&session, who),
+        Some(p) => vec![p.to_string()],
+        None => vec![who.user().to_string()],
+    };
+    let reader = crate::auth::acl::norm_id(who.user());
     let mut out = vec![];
-    // The team's notes, then the reader's own (`mine:`): written for them alone and served to them at once, so
+    // The team's notes, then each owner's own (`mine:`): written for them alone and served to them at once, so
     // never ratified, and used where a session was served one or was handed its preferences ([`recalled`]).
     // Someone else's own notes are written for them alone: read as them (as `/lessons` reads them for an admin).
-    let as_owner = crate::Principal::from_parts(me.clone(), vec![]);
-    for space in [Space::team(), Space::mine(owner)] {
-        let mine = space.owner.is_some();
-        let reading = if mine && me != crate::auth::acl::norm_id(who.user()) {
-            &as_owner
-        } else {
-            who
-        };
+    let spaces = std::iter::once((Space::team(), None))
+        .chain(owners.iter().map(|o| (Space::mine(o), Some(o.as_str()))));
+    for (space, owner) in spaces {
+        let mine = owner.is_some();
+        // One note is in the space its key is tagged for.
+        if note.is_some_and(|n| n.starts_with(MINE_KEY) != mine) {
+            continue;
+        }
+        let me = owner.map(crate::auth::acl::norm_id).unwrap_or_default();
+        let as_owner = crate::Principal::from_parts(me.clone(), vec![]);
+        let reading = if mine && me != reader { &as_owner } else { who };
         let Some(m) = read_map(&session, store, reading, &space).await? else {
             continue;
         };
@@ -2311,21 +2390,27 @@ pub async fn usage(
             .notes
             .keys()
             .filter(|k| !conversation.contains(*k))
+            .filter(|k| note.is_none_or(|n| n.strip_prefix(space.tag()) == Some(k.as_str())))
             .cloned();
         let mut notes = notes_of(&session, store, reading, &space, wanted).await?;
         for (c, cat) in &m.categories {
             for (s, sit) in &cat.situations {
                 let bare = key(c, s);
-                if !m.notes.contains_key(&bare) || conversation.contains(&bare) {
+                // As sessions and their evidence name it.
+                let k = format!("{}{bare}", space.tag());
+                if !m.notes.contains_key(&bare)
+                    || conversation.contains(&bare)
+                    || note.is_some_and(|n| n != k)
+                {
                     continue;
                 }
                 let Some((note_id, learned_at, body)) = notes.remove(&bare).flatten() else {
                     continue;
                 };
-                // As sessions and their evidence name it.
-                let k = format!("{}{bare}", space.tag());
                 let (mut used, mut ok, mut bad, mut last, mut recalled) =
                     (0usize, 0usize, 0usize, None::<i64>, 0usize);
+                // The sessions listed for the reader, and how many (at most [`USAGE_SESSIONS`]).
+                let mut listed = 0usize;
                 let mut people: BTreeSet<&str> = BTreeSet::new();
                 let mut sessions = vec![];
                 for l in &log {
@@ -2359,16 +2444,19 @@ pub async fn usage(
                         Some(false) => bad += 1,
                         None => {}
                     }
-                    if (every || l.asker == who.user()) && sessions.len() < USAGE_SESSIONS {
-                        let mut e = json!({"id": l.answer_id, "question": l.question, "at": l.asked_at,
-                                           "went_well": went, "by": by});
-                        if !served {
-                            e["recalled"] = json!(true);
+                    if (every || l.asker == who.user()) && listed < USAGE_SESSIONS {
+                        listed += 1;
+                        if note.is_some() {
+                            let mut e = json!({"id": l.answer_id, "question": l.question,
+                                               "at": l.asked_at, "went_well": went, "by": by});
+                            if !served {
+                                e["recalled"] = json!(true);
+                            }
+                            if every {
+                                e["user"] = json!(l.asker);
+                            }
+                            sessions.push(e);
                         }
-                        if every {
-                            e["user"] = json!(l.asker);
-                        }
-                        sessions.push(e);
                     }
                 }
                 sessions.sort_by_key(|e| std::cmp::Reverse(e["at"].as_i64()));
@@ -2381,10 +2469,13 @@ pub async fn usage(
                     "used": used, "recalled": recalled, "people": people.len(), "went_well": ok,
                     "went_wrong": bad, "no_outcome": used - ok - bad, "last_used_at": last,
                     "ratified": !mine && team_ratified(approved, unbacked.is_some(), earned),
-                    "approved": approved, "sessions": sessions});
-                if mine {
+                    "approved": approved, "sessions_count": listed});
+                if note.is_some() {
+                    v["sessions"] = json!(sessions);
+                }
+                if let Some(o) = owner {
                     v["mine"] = json!(true);
-                    v["owner"] = json!(owner);
+                    v["owner"] = json!(o);
                 }
                 if m.held.contains(&bare) {
                     v["held"] = json!(true);
@@ -2396,13 +2487,46 @@ pub async fn usage(
             }
         }
     }
+    // Two people's own notes may share a key (`mine:<situation>`): their owners tell them apart.
     out.sort_by(|a, b| {
         b["used"]
             .as_u64()
             .cmp(&a["used"].as_u64())
             .then_with(|| a["key"].as_str().cmp(&b["key"].as_str()))
+            .then_with(|| a["owner"].as_str().cmp(&b["owner"].as_str()))
     });
-    Ok(json!({"advice": out, "every": every, "since": since, "person": person}))
+    let mut v = json!({"advice": out, "every": every, "since": since, "person": person});
+    if everyone {
+        v["everyone"] = json!(true);
+    }
+    Ok(v)
+}
+
+/// Every person whose own advice space (`advice-mine/<hash>/`, [`Space::mine`]) `session` holds a map in that `who`
+/// may read, each by the id its map is written for (its `user:<id>` audience): the people [`EVERYONE`] reads, read
+/// from the memory state alone, without reading a document. Someone who left took their space with them.
+fn own_spaces(session: &Session, who: &Principal) -> Vec<String> {
+    let vis = session.vis();
+    let mut owners = BTreeSet::new();
+    for key in session.documents(who, MINE, None) {
+        if !key.ends_with("/map") {
+            continue;
+        }
+        let Some((_, id)) = vis.version_at(&key, who, None) else {
+            continue;
+        };
+        // The audience names the owner; their space's map is this one (its prefix is a hash of their id).
+        for entry in vis.acls.get(id).into_iter().flatten() {
+            if let Some(user) = entry.strip_prefix("user:")
+                && let space = Space::mine(user)
+                && space.map() == key
+                && let Some(owner) = space.owner
+            {
+                owners.insert(owner);
+            }
+        }
+    }
+    owners.into_iter().collect()
 }
 
 /// How many advice notes are read from the object store at once: one at a time, a map of a few hundred notes
@@ -5154,8 +5278,17 @@ async fn learn_space(
         }
         // A note nobody was served or routed to lately isn't updated: an edit costs a strong model's read of its
         // runs (most of what learning spends), and what it would change reaches no one. Its new runs stay new to it,
-        // so the update it gets once it is used again takes them in. `force` updates every note.
-        if map.notes.contains_key(&k) && !rewriting && !just_written && !pass.force && idle_days > 0
+        // so the update it gets once it is used again takes them in. `force` updates every note, and a note in its
+        // first days ([`young`]) is updated as its runs come in.
+        if map.notes.contains_key(&k)
+            && !rewriting
+            && !just_written
+            && !pass.force
+            && idle_days > 0
+            && !map
+                .written
+                .get(&k)
+                .is_some_and(|w| young(w.first, idle_days, crate::now_micros()))
         {
             if used.is_none() {
                 let since = crate::now_micros() - idle_days * 86_400_000_000;
@@ -5231,6 +5364,12 @@ async fn learn_space(
             context,
             shown: note_runs(rs).iter().map(|r| run_tag(&r.id)).collect(),
             format: NOTE_FORMAT.to_string(),
+            first: map
+                .written
+                .get(&k)
+                .map(|w| w.first)
+                .filter(|f| *f > 0)
+                .unwrap_or_else(crate::now_micros),
         };
         jobs.push((
             k,

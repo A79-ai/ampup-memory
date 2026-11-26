@@ -31,6 +31,18 @@ pub(super) async fn handle(
     )?;
     let reader = as_member(who, org);
     let admin = dir.is_admin(who.user(), via, org);
+    // A viewer reads the review lists and the graph, and changes nothing: no owner, proposal, decision or fact.
+    let reads = matches!(
+        field("op"),
+        "entity_owners" | "list_proposals" | "entity_graph" | "get_proposal" | "list_conflicts"
+    );
+    if !reads && dir.reads_only(who.user(), via, &scope) {
+        return Err(crate::people::directory::Refused(format!(
+            "{} only reads: they are a viewer of org {org}",
+            who.user()
+        ))
+        .into());
+    }
     let result = match field("op") {
         "add_fact" | "check_conflicts" | "list_conflicts" | "resolve_conflict" => {
             Ok(super::conflict_ops::handle(store, &reader, admin, &scope, req).await?)
@@ -57,16 +69,26 @@ pub(super) async fn handle(
         "list_proposals" => {
             let limit = req["limit"].as_u64().unwrap_or(200).clamp(1, 500) as usize;
             let entity = req["entity"].as_str().filter(|e| !e.is_empty());
-            // `built: true` (Studio's Home): listed only once the list builds no branch's state (each proposal read
-            // from main's, or its branch's built already); until then `proposals` is null, and those branches are
-            // built in the background.
-            // Governance read as this server holds it, as the list itself is: Home asks again while they build.
-            if req["built"] == true && !store.held(store.proposal_branches_built(&scope)).await? {
-                crate::phases::mark("proposals building");
+            // `count: true` (Studio's Home): how many wait for review, and how many of those on the caller, as the
+            // list would list them ([`Store::proposals_waiting`]), from governance as this server holds it. Null
+            // while one of those needs its branch's state built (built in the background): Home asks again.
+            if req["count"] == true {
+                let waiting = store.held(store.proposals_waiting(&scope, &reader)).await?;
+                crate::phases::mark("proposals counted");
+                // The proposals page is most often opened from Home: once counted, its list is worked out meanwhile
+                // and kept for it ([`proposals_kept`]), never on this request.
+                if waiting.is_some() {
+                    let ahead = (store.clone(), scope.clone(), reader.clone());
+                    tokio::spawn(crate::loads::later(async move {
+                        let (store, scope, reader) = ahead;
+                        if let Err(e) = proposals_kept(&store, &scope, &reader).await {
+                            eprintln!("proposals in {scope} not listed ahead of the page: {e:#}");
+                        }
+                    }));
+                }
                 return Ok(json!({"org": org, "scope": scope.to_string(),
-                    "result": {"proposals": null, "building": true}}));
+                    "result": {"waiting": waiting, "building": waiting.is_none()}}));
             }
-            crate::phases::mark("proposals built");
             let all = proposals_kept(store, &scope, &reader).await?;
             crate::phases::mark("proposals read");
             let listed: Vec<&crate::governance::ProposalSummary> = all
@@ -138,8 +160,9 @@ static PROPOSALS: std::sync::LazyLock<
 
 /// Every proposal `reader` may see, newest activity first ([`Store::list_proposals`]), kept by memory state: each
 /// list reads the governance tables and builds the visibility of every proposal's branch. Kept by main's state and
-/// every other branch's heads, and only main may have moved on for a kept list to answer while the next is made: a
-/// branch's change (a draft changed, evidence forgotten there) is listed on the read that follows it.
+/// the heads of every branch a proposal is on (the only others a list reads), and only main may have moved on for a
+/// kept list to answer while the next is made: a proposal's branch's change (a draft changed, evidence forgotten
+/// there) is listed on the read that follows it.
 async fn proposals_kept(
     store: &Store,
     scope: &Scope,
@@ -149,7 +172,7 @@ async fn proposals_kept(
     let vis = store.lagging_visibility(scope, crate::MAIN).await?;
     let mut at = crate::kept_answers::At::of(mark, &vis);
     at.pinned = store
-        .branch_heads_held(scope)
+        .proposal_branch_heads_held(scope)
         .await?
         .into_iter()
         .filter(|(b, _)| b != crate::MAIN)
@@ -164,9 +187,24 @@ async fn proposals_kept(
             || {
                 let (store, scope, reader) = (store.clone(), scope.clone(), reader.clone());
                 async move {
-                    store
-                        .held(store.list_proposals(&scope, &reader, None, usize::MAX))
-                        .await
+                    // Worked out apart from the request that asked for it, which may stop waiting: its own line when
+                    // slow, with its steps.
+                    let started = std::time::Instant::now();
+                    let (list, timed) = crate::phases::timed(store.held(store.list_proposals(
+                        &scope,
+                        &reader,
+                        None,
+                        usize::MAX,
+                    )))
+                    .await;
+                    if started.elapsed() >= Duration::from_secs(1) {
+                        eprintln!(
+                            "slow proposals list: {scope} in {} ms ({})",
+                            started.elapsed().as_millis(),
+                            timed.marks
+                        );
+                    }
+                    list
                 }
             },
         )

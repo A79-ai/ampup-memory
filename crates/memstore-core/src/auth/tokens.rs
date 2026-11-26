@@ -367,6 +367,9 @@ pub struct Caller {
     pub mfa: bool,
     /// Signed in through the platform's Auth0 tenant for the operators' Organization.
     pub operator: bool,
+    /// Signed in through the platform's Auth0 tenant, by one of its own connections with a verified email, as a
+    /// person the server lists as a super admin ([`listed_super_admin`]).
+    pub super_admin: bool,
     /// Signed in through the platform's Auth0 tenant with a password account (`auth0|…`) whose email it
     /// hasn't verified, for an Organization: that account's `sub`. It reaches only an org whose admins
     /// approved that account ([`crate::people::directory::Directory::access`]).
@@ -633,6 +636,9 @@ impl Auth0 {
         // connection's holder stays bound to the Organization the token names (the CLI's `--sso`), like
         // any other Auth0 sign-in: such a connection asserts whatever email it likes.
         let by_directory = org_id.is_none() && platform;
+        // A super admin's email is the tenant's own to vouch for: one of its connections, verified. An
+        // Organization's enterprise connection asserts whatever email it likes, so it never makes one.
+        let super_admin = platform && unverified.is_none() && listed_super_admin(&user);
         Ok(Caller {
             aliases: vec![user.clone()],
             user,
@@ -643,6 +649,7 @@ impl Auth0 {
             auth0_org: org_id,
             mfa: passed_mfa(&claims),
             operator,
+            super_admin,
             unverified,
             ..Default::default()
         })
@@ -1222,4 +1229,25 @@ pub fn hex(b: &[u8]) -> String {
 
 fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The people the server makes super admins (`AMPUP_MEMORY_SUPER_ADMINS`, comma-separated emails): the platform's own
+/// engineers, for debugging. Signed in as themselves through the platform's Auth0 tenant (one of its own connections,
+/// the email verified), each is an admin of every org and reads all of the memory of an org they select, what its
+/// people keep to themselves too, while staying the member they are where they are one (their teams, their own
+/// memory). Never a key made from that sign-in. Empty by default.
+pub fn listed_super_admin(email: &str) -> bool {
+    static LISTED: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        super_admins_in(&std::env::var("AMPUP_MEMORY_SUPER_ADMINS").unwrap_or_default())
+    });
+    let email = email.trim().to_ascii_lowercase();
+    !email.is_empty() && LISTED.contains(&email)
+}
+
+/// The emails a `AMPUP_MEMORY_SUPER_ADMINS` value lists, lowercased.
+fn super_admins_in(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| e.contains('@'))
+        .collect()
 }

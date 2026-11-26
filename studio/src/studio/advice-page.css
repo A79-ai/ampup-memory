@@ -447,14 +447,8 @@
   }
 }
 
-/* What every total in Advice is counted over (adviceScope.tsx): a line under the header, and for the org's admins
-   whose own notes are counted beside the team's, above both tabs. */
+/* What every total in Advice is counted over (adviceScope.tsx): a line under the header. */
 .ap-scope {
   margin: 0;
   padding: 8px 20px 0;
-}
-.ap-person {
-  align-items: center;
-  margin: 0;
-  padding: 10px 20px 0;
 }

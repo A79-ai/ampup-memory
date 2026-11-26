@@ -20,7 +20,7 @@ gives, skip step 1, and leave step 4 to the hooks.
 
 1. **Start.** Before your first answer, call `start_session` with `context`: what the user asked, with
    anything that came with it (policy, constraints, the record they named). Pass `harness` if you know your
-   client (`claude-ai`, `chatgpt`, `codex`, `cursor`, `copilot`). Keep the `session_id` it returns for the whole conversation.
+   client (`claude-ai`, `chatgpt`, `codex`, `cursor`, `copilot`, `grok`). Keep the `session_id` it returns for the whole conversation.
 2. **Follow the advice.** If it returns advice, follow its steps and avoid its pitfalls, unless the data or the
    user says otherwise. When you deviate, say why in your answer. If it returns none, carry on as usual. Its
    `Skill:` line names the skill it served: learned from past runs (how many, right and wrong) or compiled from

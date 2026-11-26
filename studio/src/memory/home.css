@@ -423,6 +423,12 @@
     height: 28px;
     width: 55%;
   }
+  .hm-chart-sk {
+    height: 180px;
+  }
+  .hm-source-sk {
+    height: 28px;
+  }
 }
 
 /* A host that draws the sections has its own search box: Home doesn't offer a second. */

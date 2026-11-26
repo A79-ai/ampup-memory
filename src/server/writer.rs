@@ -605,7 +605,7 @@ enum Located {
 /// now: where the lease would be found, with `leaf` in place of the lease's own directory. An error: not
 /// known yet (try again); none: it can't be kept on this catalog. With it, when its credentials are to be taken
 /// again ([`credentials_until`]).
-pub(super) async fn beside(
+pub(crate) async fn beside(
     store: &Store,
     leaf: &str,
 ) -> Result<Option<(opendal::Operator, Instant)>> {

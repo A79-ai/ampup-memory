@@ -1,12 +1,5 @@
 /* Studio's Learned page (Learned.tsx): one column of lesson cards, each its text then its two trails. It sits on
    the Advice page's header, tiles, chips and badges (advice-page.css); these are its cards. */
-.lr-chips {
-  padding: 0 20px;
-  margin: 0 0 4px;
-}
-.lr-chips .ap-num {
-  font-size: 11px;
-}
 .lr-list {
   display: flex;
   flex-direction: column;

@@ -692,6 +692,21 @@ async fn changed_bases_require_a_new_review_and_private_evidence_none_until_shar
         )
         .await
         .unwrap();
+    // Widening it while taking nothing away (a caller whose episode no one reads yet) is held the same: nothing
+    // changes, Bob still doesn't read it, and the note stays Carol's.
+    let (changed, held) = e
+        .store
+        .change_acl_or_hold(
+            &e.scope,
+            "source",
+            &[memstore::AclTarget::Episode(private_id.clone())],
+            &["group:acme.all".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!((changed, held.len()), (0, 1));
+    assert!(!read(e.bob.clone()).await.contains("xprivate-value"));
+    assert!(read(e.carol.clone()).await.contains("xprivate-value"));
     // Letting everyone read the note would publish that fact to them: it waits for Bob, refused here.
     let widen = e
         .store

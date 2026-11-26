@@ -236,8 +236,8 @@ They never include text.
 |---|---|
 | `restart` | Sets the `kubectl.kubernetes.io/restartedAt` annotation on the pod template |
 | `reindex {scope}` | Refused, code `unsupported`: the engine has no admin endpoint for it yet |
-| `drain_spool` | Sends the telemetry spool now (counts `sent`, `pending`). This needs `MEMSTORE_TELEMETRY_MIRROR`; without it the action is refused as `unsupported` |
-| `clear_spool` | Drops what the spool holds; the mirror keeps its copy (count `cleared`). Same requirement |
+| `drain_spool` | Sends the telemetry spool now, never a batch the engine is sending at the same time (counts `sent`, `pending`, which includes batches claimed and not yet taken). This needs `MEMSTORE_TELEMETRY_MIRROR`; without it the action is refused as `unsupported` |
+| `clear_spool` | Drops what the spool holds, batches the engine has claimed to send too; the mirror keeps its copy (count `cleared`). A batch already on its way may still arrive. Same requirement |
 | `rotate_key` | `memstore deployment rotate` on the credential. It needs a writable credential that the engine reads too. With a read-only Secret it fails with code `rotate_failed`; rotate by hand and update the Secret |
 | `diagnostics` | Counts only: generation, health, remembered actions, replicas wanted, updated and available, and spool size |
 

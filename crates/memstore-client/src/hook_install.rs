@@ -534,8 +534,8 @@ pub fn apply_with(
              /plugin install {PLUGIN}, in Claude Code"
         ),
         Harness::Grok => bail!(
-            "Grok Bot installs AmpUp Memory as a plugin: add {MARKETPLACE_REPO} to its plugins (Cursor's format) and \
-             install ampup-memory-grok; its MCP entry signs in with OAuth"
+            "Grok Bot runs no hooks that see the conversation: add the memory's MCP server as a custom connector \
+             (<server>/mcp, signed in with OAuth) and the skills of ampup-memory-grok from {MARKETPLACE_REPO}"
         ),
         Harness::Droid => {
             // Its hooks.json is the map of events itself.

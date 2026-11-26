@@ -32,6 +32,7 @@ futures.workspace = true
 iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-storage-opendal.workspace = true
+parquet.workspace = true
 opendal.workspace = true
 lance.workspace = true
 datafusion.workspace = true

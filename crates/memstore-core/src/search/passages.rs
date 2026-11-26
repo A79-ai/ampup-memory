@@ -958,6 +958,7 @@ pub async fn warm(
             crate::log_org::with(scope.org_name(), search::embed_tail_or_none(&texts)).await;
         }
     }
+    crate::priority::pause_for_reads().await;
     let Some(ds) = &index.passages else {
         return Ok(());
     };

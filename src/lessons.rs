@@ -29,6 +29,9 @@
 //! `"after"?: <next>` starts after the last page's, whose `next` says where (null on the last page). `count` is how
 //! many `show` keeps, and `groups` how many there are of each whose (the team's, `owner` null, and each person's),
 //! with the runs they were learned from, the sessions they were served in and how many it helped, summed.
+//! `"trail"?: <entries>` lists at most that many of each lesson's trail entries per side (1 to 200), of the `limit`
+//! read, each trail counting the rest it left out in `cut`: a list shows the newest few, and a read of the lesson
+//! (`key`) the rest, from the same kept answer.
 //!
 //! Counted as the Advice page counts (`/browse {op: "advice_usage"}`): `"days"?: <1 to 3650>` counts only the runs
 //! and sessions asked in the last that many days (all of them when absent), by the same cut `advice_usage` makes, so
@@ -136,6 +139,15 @@ pub async fn run(
         Value::String(a) => Some(cursor_of(a).ok_or_else(|| bad("after is a page's next"))?),
         _ => return Err(bad("after is a page's next")),
     };
+    let trail = match &req["trail"] {
+        Value::Null => None,
+        v => Some(
+            v.as_u64()
+                .filter(|n| (1..=MAX_LIMIT as u64).contains(n))
+                .ok_or_else(|| bad(format!("trail is a whole number from 1 to {MAX_LIMIT}")))?
+                as usize,
+        ),
+    };
     let full = full_kept(store, session, reader, &want, limit, days).await?;
     crate::phases::mark("lessons read");
     let matching: Vec<&Value> = full
@@ -154,16 +166,38 @@ pub async fn run(
     let from = after.map_or(0, |a| shown.partition_point(|v| order(v) <= a));
     let to = page.map_or(shown.len(), |n| (from + n).min(shown.len()));
     let next = (to < shown.len()).then(|| cursor(shown[to - 1]));
+    let lessons: Vec<Value> = shown[from..to]
+        .iter()
+        .map(|v| match trail {
+            Some(n) => cut_trails(v, n),
+            None => (*v).clone(),
+        })
+        .collect();
     Ok(json!({
         "reader": {"user": reader.who.user(), "everyone": reader.every_session},
         "people": full.owners,
         "count": shown.len(),
         "groups": groups,
-        "lessons": &shown[from..to],
+        "lessons": lessons,
         "next": next,
         "days": days,
         "as_usage": as_usage,
     }))
+}
+
+/// `v` with at most `n` of each trail's entries, the newest, and how many it left out (`cut`).
+fn cut_trails(v: &Value, n: usize) -> Value {
+    let mut v = v.clone();
+    for side in ["learned_from", "served_in"] {
+        if let Some(t) = v[side]["trail"].as_array_mut()
+            && t.len() > n
+        {
+            let cut = t.len() - n;
+            t.truncate(n);
+            v[side]["cut"] = json!(cut);
+        }
+    }
+    v
 }
 
 /// Whose lessons a request reads: `space`, `person`'s (only an admin names someone else), and whether as
@@ -270,7 +304,7 @@ struct Full {
 }
 
 static FULL: std::sync::LazyLock<crate::kept_answers::Kept<Full>> =
-    std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(200));
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(200));
 
 /// [`full`], kept by memory state ([`crate::kept_answers`]) for main as it is now: it reads every person's advice
 /// map and notes, and the sessions log. Kept by the reader, what they read (`space`, `person`, `limit`) and the
@@ -286,7 +320,7 @@ async fn full_kept(
     limit: usize,
     days: Option<u64>,
 ) -> Result<std::sync::Arc<Full>> {
-    // The window ends when the answer is worked out: kept by the span of time it was asked in, as `advice_usage`.
+    // The window ends when the answer is worked out ([`crate::kept_answers::At::windowed`]), as `advice_usage`.
     let since = move || days.map_or(0, |d| crate::now_micros() - d as i64 * 86_400_000_000);
     let at = match session.on_main_now() {
         true => {
@@ -300,7 +334,10 @@ async fn full_kept(
                     let mut at = crate::kept_answers::At::with_log(mark, &now, log);
                     let (held, newest) = crate::sessions::held_mark(store, session.scope());
                     at.heads.push(format!("held sessions {held} {newest}"));
-                    Some(at)
+                    Some(match days {
+                        Some(_) => at.windowed(),
+                        None => at,
+                    })
                 }
                 false => None,
             }
@@ -320,10 +357,7 @@ async fn full_kept(
         crate::kept_answers::reader_key(reader.who),
         reader.every_session,
         want.key(),
-        days.map_or_else(
-            || "all".to_string(),
-            |d| format!("{d} in {}", crate::kept_answers::span())
-        )
+        days.map_or_else(|| "all".to_string(), |d| d.to_string())
     );
     let (store2, session2, who, every, want2) = (
         store.clone(),
@@ -560,7 +594,7 @@ fn people_of(log: &[Logged], me: &str, every_session: bool, want: &Want) -> BTre
 type Noted = Vec<(Option<String>, String, i64)>;
 
 static NOTED: std::sync::LazyLock<crate::kept_answers::Kept<Noted>> =
-    std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(500));
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500));
 
 /// `"count": true`: how many lessons there are, of `only` and learned at `since` or later, and whose.
 async fn count(

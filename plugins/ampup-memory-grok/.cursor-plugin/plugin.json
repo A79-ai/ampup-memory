@@ -1,13 +1,21 @@
 {
   "name": "ampup-memory-grok",
   "displayName": "AmpUp Memory for Grok Bot",
-  "version": "0.1.0",
-  "description": "AmpUp Memory, team memory for Grok Bot and Cursor cloud agents: advice from the org's memory at each prompt, what it knows recalled at a session's start, each session recorded as a run to learn from, and skills to search the memory, follow its advice, see where things stand and remember what lasts.",
-  "author": { "name": "AmpUp" },
+  "version": "0.2.0",
+  "description": "AmpUp Memory, team memory for Grok Bot: its MCP tools, and skills that run each task as a session (advice from the org's memory, what the user said kept), search the memory with sources and remember what lasts.",
+  "author": {
+    "name": "AmpUp"
+  },
+  "homepage": "https://github.com/A79-ai/ampup-memory/tree/main/plugins/ampup-memory-grok",
   "repository": "https://github.com/A79-ai/ampup-memory",
-  "keywords": ["memory", "team memory", "mcp", "grok"],
+  "license": "Apache-2.0",
+  "keywords": [
+    "memory",
+    "team memory",
+    "mcp",
+    "grok"
+  ],
   "skills": "./skills/",
-  "commands": "./commands/",
-  "hooks": "./hooks/hooks.json",
-  "mcpServers": "./mcp.json"
+  "mcpServers": "./mcp.json",
+  "logo": "assets/logo.svg"
 }

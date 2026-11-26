@@ -2442,3 +2442,205 @@ async fn a_server_serves_the_directory_its_log_says_and_no_further() {
         assert_eq!(ready["directory_blocked"], true, "{ready}");
     }
 }
+
+/// A repository's skill (`/skills/review`, `skill:<name>` feedback) reaches only its own readers: a member it isn't
+/// shared with neither sees it nor its grading, nor can vote on it; one who reads it still can't ask for a review,
+/// which only the memory's admins do.
+#[tokio::test]
+async fn a_repo_skill_reaches_only_its_readers_and_only_admins_review_it() {
+    let (s, issuer, _dir) = start_with(false).await;
+    let (alice, bob) = (
+        id_token(&issuer, "alice@acme.com"),
+        id_token(&issuer, "bob@acme.com"),
+    );
+    for who in [&alice, &bob] {
+        let (status, body) = post(&s, "/me", who, &json!({})).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let now = chrono::Utc::now().timestamp_micros();
+    let skill = |name: &str, acl: &str| {
+        json!({
+            "source": format!("github:acme/app#skill/.claude/skills/{name}/SKILL.md"),
+            "occurred_at": now,
+            "acl": [acl],
+            "document": format!("repo-skills/acme/app/.claude/skills/{name}/SKILL.md"),
+            "body": format!("---\nname: {name}\ndescription: How to {name}.\n---\n\n# {name}\n\n1. Do the thing.\n"),
+        })
+    };
+    let (status, body) = post(
+        &s,
+        "/ingest?org=acme",
+        ADMIN_KEY,
+        &json!({"episodes": [
+            skill("rotate-keys", "user:alice@acme.com"),
+            skill("ship-release", "group:acme.all"),
+        ]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let names = |b: &Value| -> Vec<String> {
+        b["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let list = json!({"op": "list"});
+    let (status, body) = post(&s, "/skills/review?org=acme", &alice, &list).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(names(&body), ["rotate-keys", "ship-release"], "{body}");
+    assert_eq!(body["may_review"], true, "{body}");
+    // Bob reads only the one shared with everyone, and isn't offered a review.
+    let (status, body) = post(&s, "/skills/review?org=acme", &bob, &list).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(names(&body), ["ship-release"], "{body}");
+    assert_eq!(body["may_review"], false, "{body}");
+    // Alice's, by name or by key, answers him as a skill that doesn't exist; nor can he vote on it.
+    for wanted in [
+        "rotate-keys",
+        "repo-skills/acme/app/.claude/skills/rotate-keys/SKILL.md",
+    ] {
+        let (status, body) = post(
+            &s,
+            "/skills/review?org=acme",
+            &bob,
+            &json!({"op": "get", "skill": wanted}),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert!(!body.to_string().contains("Do the thing"), "{body}");
+    }
+    let (status, body) = post(
+        &s,
+        "/feedback?org=acme",
+        &bob,
+        &json!({"fact_id": "skill:rotate-keys", "signal": "negative", "reason": "x"}),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = post(
+        &s,
+        "/feedback?org=acme",
+        &bob,
+        &json!({"fact_id": "skill:ship-release", "signal": "positive"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // Another repository holds a skill of the same name, Alice's alone. Its votes and its uses are its own: none of
+    // them reaches the shared one's readers, by name or by count.
+    let other = "repo-skills/acme/other/.claude/skills/ship-release/SKILL.md";
+    let (status, body) = post(
+        &s,
+        "/ingest?org=acme",
+        ADMIN_KEY,
+        &json!({"episodes": [{
+            "source": "github:acme/other#skill/.claude/skills/ship-release/SKILL.md",
+            "occurred_at": now, "acl": ["user:alice@acme.com"], "document": other,
+            "body": "---\nname: ship-release\ndescription: The other one.\n---\n\n# Other\n",
+        }]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // Two she reads go by the name: she names one by its key.
+    let (status, body) = post(
+        &s,
+        "/feedback?org=acme",
+        &alice,
+        &json!({"fact_id": "skill:ship-release", "signal": "negative"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains(other), "{body}");
+    let (status, body) = post(
+        &s,
+        "/feedback?org=acme",
+        &alice,
+        &json!({"fact_id": format!("skill:{other}"), "signal": "very_negative", "reason": "zzotherreason"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // A session in the other repository that loads it.
+    let (status, started) = post(
+        &s,
+        "/sessions?org=acme",
+        &alice,
+        &json!({"harness": "claude-code"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{started}");
+    let (status, body) = post(
+        &s,
+        "/sessions/end?org=acme",
+        &alice,
+        &json!({"session_id": started["session_id"], "repo": "acme/other", "task": "Ship it",
+                "transcript": "User: Ship it\n  tool Skill {\"skill\":\"ship-release\"}\n    -> ok\nClaude: Shipped."}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let get = |who: String, skill: &str| {
+        let (s, skill) = (s.clone(), skill.to_string());
+        async move {
+            post(
+                &s,
+                "/skills/review?org=acme",
+                &who,
+                &json!({"op": "get", "skill": skill}),
+            )
+            .await
+        }
+    };
+    let shared = "repo-skills/acme/app/.claude/skills/ship-release/SKILL.md";
+    // The shared one: Bob's vote alone, and no use; the other: Alice's vote and the session's use.
+    let t = std::time::Instant::now();
+    loop {
+        let (status, mine) = get(alice.clone(), other).await;
+        assert_eq!(status, 200, "{mine}");
+        if mine["graded"]["uses"] == 1 || t.elapsed() > Duration::from_secs(15) {
+            assert_eq!(mine["graded"]["uses"], 1, "{mine}");
+            assert_eq!(mine["feedback"]["very_negative"], 1, "{mine}");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for who in [&alice, &bob] {
+        let (status, theirs) = get(who.clone(), shared).await;
+        assert_eq!(status, 200, "{theirs}");
+        assert_eq!(theirs["graded"]["uses"], 0, "{theirs}");
+        assert_eq!(theirs["feedback"]["very_negative"], 0, "{theirs}");
+        assert_eq!(theirs["feedback"]["positive"], 1, "{theirs}");
+        assert!(!theirs.to_string().contains("zzotherreason"), "{theirs}");
+    }
+    // He reads the shared one, but a review is the admins'.
+    let (status, body) = post(
+        &s,
+        "/skills/review?org=acme",
+        &bob,
+        &json!({"op": "review", "skill": "ship-release"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("admins"), "{body}");
+    // Nor can the org's own ingest key write a proposal: they are the engine's.
+    let feed = "msk_acme_feed_for_repo_skills_review_0001";
+    let (status, body) = post(
+        &s,
+        "/admin",
+        ADMIN_KEY,
+        &json!({"op": "create_key", "org": "acme", "name": "feed", "role": "ingest", "key": feed}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(
+        &s,
+        "/ingest",
+        feed,
+        &json!({"episodes": [{
+            "source": "doc:fake", "occurred_at": now, "acl": ["group:acme.all"],
+            "document": "skill-proposals/acme/app/.claude/skills/ship-release/SKILL.md", "body": "{}",
+        }]}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("server's own"), "{body}");
+}

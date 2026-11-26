@@ -54,7 +54,7 @@ pub const MAX_TOTAL: usize = 600 * 1024;
 /// New pull requests (or commit batches) that have the notes written again when no doc changed.
 pub const REWRITE_HISTORY: usize = 5;
 /// Calls that keep something new, per person a day, on one server: each may cost a learning-model call.
-pub const SEEDS_PER_DAY: usize = 20;
+pub const SEEDS_PER_DAY: usize = 200;
 
 /// A request this route refuses (400), with the reason.
 pub struct Refused(pub String);

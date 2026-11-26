@@ -170,7 +170,7 @@ pub struct InviteArgs {
     team: Option<String>,
     #[arg(long)]
     org: Option<String>,
-    /// admin or member
+    /// admin, member or viewer (reads only)
     #[arg(long, default_value = "member")]
     role: String,
 }
@@ -422,6 +422,10 @@ pub enum OrgCmd {
         /// recorded for the owners to review, who may still approve what it rejected (default true)
         #[arg(long)]
         auto_review: Option<bool>,
+        /// Whether the org's skills are reviewed by the learning model on their own: a skill with new evidence since
+        /// its last review gets a revision proposed, for its readers to take or leave (default true)
+        #[arg(long)]
+        skill_review: Option<bool>,
         /// Whether the schema grows with what extraction meets: where several episodes hold things of a kind it has
         /// no type or predicate for, a model drafts an additive change for the entity owners to review (default
         /// false)
@@ -1272,6 +1276,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
             activity,
             session_branches,
             auto_review,
+            skill_review,
             schema_growth,
             pii,
             digest,
@@ -1337,6 +1342,7 @@ pub async fn run(cmd: &PeopleCmd, store: Option<&Store>) -> Result<()> {
                 activity: *activity,
                 session_branches: *session_branches,
                 auto_review: *auto_review,
+                skill_review: *skill_review,
                 schema_growth: *schema_growth,
                 pii: *pii,
                 digest: *digest,

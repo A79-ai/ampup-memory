@@ -388,6 +388,24 @@ fn entitled(kind: &Kind, org: Option<&str>, team: Option<&str>) -> Result<Scope,
     }
 }
 
+/// What a person of acme's not in a1 opens while acme reads a1 (`Settings::reads`) where [`entitled`] refuses
+/// them: a1, read only. Nothing for anyone else (a key reads the scope it is for; another org's people, nothing).
+fn through_reads(kind: &Kind, org: Option<&str>, team: Option<&str>) -> Option<Scope> {
+    let org = org.map(|o| if o == ACME_ALIAS { "acme" } else { o });
+    match kind {
+        Kind::Person(orgs) => {
+            let org = match org {
+                Some(o) => o,
+                None if orgs.len() == 1 => orgs[0].0,
+                None => return None,
+            };
+            (org == "acme" && team == Some("a1") && orgs.iter().any(|(o, _)| *o == "acme"))
+                .then(|| Scope::team("acme", "a1").unwrap())
+        }
+        _ => None,
+    }
+}
+
 /// Every tag in the store, by the scope (or org profile) it belongs to.
 struct Tags {
     /// Memory tags per scope: in facts and episodes, or episodes only (written by `remember_memory`).
@@ -1016,6 +1034,35 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
         raw.contains("carol_cli") && !raw.contains("alice_cli") && !raw.contains("bob@acme.com"),
         "carol's directory fields: {raw}"
     );
+    // In a team with dan, carol sees dan in it (who she shares a memory with), and still no one else: not bob,
+    // nor the org's other teams.
+    for c in [
+        json!({"op": "create_team", "org": "acme", "team": "a4"}),
+        json!({"op": "add_to_team", "org": "acme", "team": "a4", "users": ["carol@acme.com", "dan@acme.com"]}),
+    ] {
+        admin(s, c).await;
+    }
+    let (_, raw) = post(
+        &format!("{s}/admin"),
+        &carol,
+        &json!({"op": "show", "org": "acme", "fields": ["members", "teams"]}),
+    )
+    .await;
+    let view: Value = serde_json::from_str(&raw).unwrap();
+    let view = if view.get("view").is_some() {
+        &view["view"]
+    } else {
+        &view
+    };
+    assert!(
+        view["teams"]["a4"].to_string().contains("dan@acme.com")
+            && view["members"].get("dan@acme.com").is_some()
+            && view["members"].get("bob@acme.com").is_none()
+            && view["members"].get("alice@acme.com").is_none()
+            && view["teams"].get("a2").is_none(),
+        "carol's view with a teammate: {raw}"
+    );
+    admin(s, json!({"op": "delete_team", "org": "acme", "team": "a4"})).await;
     let (status, raw) = post(
         &format!("{s}/admin"),
         &carol,
@@ -1270,6 +1317,12 @@ async fn no_read_path_returns_memory_from_outside_the_callers_scope() {
                     json!({"op": "ls", "path": ["entities", "deal"], "from": "note:"}),
                     Want::Facts,
                 ),
+                (
+                    "/browse",
+                    json!({"op": "sources", "top": 20}),
+                    Want::Facts,
+                ),
+                // Again, answered from what was kept for this caller: never another's.
                 (
                     "/browse",
                     json!({"op": "sources", "top": 20}),
@@ -2009,6 +2062,54 @@ async fn cross_scope_reads(
     )
     .await;
     assert!(!body.contains("\"reads\""), "{body}");
+    // An org's admin may let a team of theirs read the org's own memory (and stop it), and nothing wider: not
+    // another team, not the org reading a team. A member and another org's admin may not.
+    let team_set = |settings: Value| json!({"op": "set_settings", "org": "acme", "team": "a1", "settings": settings});
+    for (bearer, settings, want) in [
+        (person("bob@acme.com"), json!({"reads": ["org:acme"]}), 403),
+        (
+            person("gary@globex.com"),
+            json!({"reads": ["org:acme"]}),
+            403,
+        ),
+        (alice.clone(), json!({"reads": ["team:acme/a2"]}), 403),
+        (
+            alice.clone(),
+            json!({"reads": ["org:acme", "team:acme/a2"]}),
+            403,
+        ),
+    ] {
+        let (status, body) =
+            post(&format!("{s}/admin"), &bearer, &team_set(settings.clone())).await;
+        assert_eq!(status, want, "{settings}: {body}");
+        checked += 1;
+    }
+    let (status, body) = post(
+        &format!("{s}/admin"),
+        &alice,
+        &team_set(json!({"reads": ["org:acme"]})),
+    )
+    .await;
+    assert_eq!(status, 200, "alice letting a1 read acme: {body}");
+    let a1_reads = memstore::people::directory::Directory::fresh(store)
+        .await
+        .unwrap()
+        .reads(&Scope::team("acme", "a1").unwrap());
+    assert_eq!(a1_reads, vec![Scope::org("acme").unwrap()]);
+    let (status, body) = post(
+        &format!("{s}/admin"),
+        &alice,
+        &team_set(json!({"reads": []})),
+    )
+    .await;
+    assert_eq!(status, 200, "alice unsetting a1's reads: {body}");
+    assert!(
+        memstore::people::directory::Directory::fresh(store)
+            .await
+            .unwrap()
+            .reads(&Scope::team("acme", "a1").unwrap())
+            .is_empty()
+    );
 
     // An episode both acme and a1 hold (the same id), and one source each holds a version of: each found once.
     let mut tags = Tags {
@@ -2147,7 +2248,8 @@ async fn cross_scope_reads(
                 true => String::new(),
                 false => format!("?{}", q.join("&")),
             };
-            let scope = entitled(&c.kind, org, team).ok();
+            // A person of acme's not in a1 opens a1 too while acme reads it, read only (`resolve_reading`).
+            let scope = entitled(&c.kind, org, team).ok().or_else(|| through_reads(&c.kind, org, team));
             // As in the first sweep: a person in several orgs or none, naming none, gets the lobby.
             let lobby = scope.is_none()
                 && org.is_none()
@@ -2335,8 +2437,59 @@ async fn cross_scope_reads(
         .into_iter()
         .sum::<usize>();
 
-    // Unset, acme reads itself alone again.
+    // Opened through acme's reads, a1 only reads: bob, signed in, reads its memory there and writes none, and a key
+    // of acme's (which reads the scope it is for) doesn't open it at all.
+    let bob = person("bob@acme.com");
+    let (status, body) = post(
+        &format!("{s}/search?org=acme&team=a1"),
+        &bob,
+        &json!({"calls": [["owner", 50]]}),
+    )
+    .await;
+    assert_eq!(status, 200, "bob reading a1 through acme's reads: {body}");
+    assert!(body.contains("xteamalpha1"), "bob reading a1: {body}");
+    for (path, write) in [
+        (
+            "/remember",
+            json!({"source": "note", "body": "xbobwrote into a1"}),
+        ),
+        (
+            "/facts",
+            json!({"facts": [{"entity": "deal:x", "predicate": "owner", "value": "x", "quote": "xbobwrote into a1 here", "source_episodes": ["e"]}]}),
+        ),
+    ] {
+        let (status, body) = post(&format!("{s}{path}?org=acme&team=a1"), &bob, &write).await;
+        assert_eq!(status, 403, "bob wrote into a1 through {path}: {body}");
+        checked += 1;
+    }
+    let (status, body) = post(
+        &format!("{s}/search?org=acme&team=a1"),
+        a_reader,
+        &json!({"calls": [["owner", 50]]}),
+    )
+    .await;
+    assert_eq!(status, 403, "acme's reader key opened a1: {body}");
+    checked += 2;
+
+    // Unset, acme reads itself alone again, and a1 is its members' alone.
     admin(s, set(json!({"reads": []}))).await;
+    let t = Instant::now();
+    loop {
+        let (status, body) = post(
+            &format!("{s}/search?org=acme&team=a1"),
+            &bob,
+            &json!({"calls": [["owner", 50]]}),
+        )
+        .await;
+        if status == 403 {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "bob still reads a1 once acme no longer does: {status} {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     let (_, body) = post(
         &format!("{s}/search"),
         a_reader,
@@ -3363,6 +3516,65 @@ async fn asking_to_join_grants_nothing_until_an_admin_approves() {
             "the admin key read bob's profile or own advice on {path}: {text}"
         );
     }
+    // Every person's own advice at once (`advice_usage` with `"person": "*"`) is the operator's support view: its own
+    // sign-in reads bob's own note, with him as its owner. Acme's admin, bob himself and the admin key are refused it,
+    // and read none of his note from the refusal.
+    let everyone = json!({"op": "advice_usage", "person": "*"});
+    for (who, bearer) in [
+        ("acme's admin", ann_in_acme.as_str()),
+        ("bob", bob_google.as_str()),
+        ("the admin key", ADMIN_KEY),
+    ] {
+        let (status, text) = post(&format!("{s}/browse?org=acme"), bearer, &everyone).await;
+        assert!(
+            status == 400 && !bob_tags.iter().any(|t| text.contains(t)),
+            "{who} read everyone's own advice in acme: {status} {text}"
+        );
+    }
+    let t = Instant::now();
+    loop {
+        let (status, text) = post(&format!("{s}/browse?org=acme"), &operator, &everyone).await;
+        assert_eq!(
+            status, 200,
+            "the operator's view of everyone's advice: {text}"
+        );
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let bobs = v["advice"].as_array().unwrap().iter().any(|a| {
+            a["owner"] == "bob@acme.com"
+                && a["mine"] == true
+                && a["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("xopsminebob"))
+        });
+        if bobs {
+            assert_eq!(v["everyone"], true, "{text}");
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "the operator never read bob's own advice in everyone's: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // One note of everyone's, with its sessions: bob's, under the key his own note has.
+    let (status, text) = post(
+        &format!("{s}/browse?org=acme"),
+        &operator,
+        &json!({"op": "advice_usage", "person": "*", "note": "mine:team/ship"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        v["advice"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["owner"] == "bob@acme.com"
+                && a["key"] == "mine:team/ship"
+                && a["sessions"].is_array()),
+        "the operator's read of bob's own note: {text}"
+    );
     let (status, body) = post(
         &format!("{s}/remember?org=acme"),
         ADMIN_KEY,
@@ -4320,6 +4532,24 @@ async fn an_approved_value_reaches_only_its_readers() {
             .map(|p| &p["id"])
             .collect();
         assert_eq!(ids.contains(&&p["proposal"]["id"]), shown, "{listed}");
+    }
+    // Home counts what waits for review as the list shows it: Carol's to decide; nothing for Dave, not even that
+    // something waits.
+    for (token, waiting) in [
+        (&carol, json!({"mine": 1, "pending": 1})),
+        (&dave, json!({"mine": 0, "pending": 0})),
+    ] {
+        let counted = call(token, json!({"op":"list_proposals","count":true})).await;
+        assert_eq!(counted["waiting"], waiting, "{counted}");
+        let (status, body) = post(
+            &format!("{url}/browse"),
+            token,
+            &json!({"org":"acme","op":"home","parts":["proposals"]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let home: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(home["proposals"], waiting, "{home}");
     }
     assert_eq!(memstore::metrics::PROPOSAL_READ_DIVERGENCE.get(), 0);
     let r = call(&carol, json!({"op":"review_proposal","proposal":p["proposal"]["id"],"digest":p["proposal"]["digest"],"decision":"approve","expires_days":30})).await;

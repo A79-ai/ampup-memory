@@ -8,20 +8,22 @@ import { Inspector } from "./inspector";
 import { SchemaView, useOrgSchema } from "./schema";
 import { Tools } from "./tools";
 import { Tree } from "./tree";
-import type { Branch, Focus, Me, Selection } from "./types";
+import type { Focus, Me, Selection } from "./types";
 import { Icon } from "./ui";
 import { ReviewSection } from "./review";
 import { GraphSection } from "./graph";
 import { Home, type HomeSummary } from "./home";
 import { AddToMemory, AddToMemoryDialog } from "./addToMemory";
 import { ImportActivity } from "./importActivity";
-import { Advice, AdviceServing, Branches, NotAnswered, Owners, People } from "../studio/Admin";
+import { RepoSkills, SkillReviewCard, useProposedCount } from "./repoSkills";
+import { Advice, AdviceServing, NotAnswered, Owners, People } from "../studio/Admin";
 import { AdvicePage } from "../studio/AdvicePage";
-import { PersonPicker, SCOPE_OPTIONS } from "../studio/adviceScope";
+import { SCOPE_OPTIONS } from "../studio/adviceScope";
 import { Learned } from "../studio/Learned";
 import { Trace } from "../studio/Trace";
-import { NAVIGATE, optionsOf, setOptions, subscribe, viewOf } from "./hashOptions";
+import { NAVIGATE, optionsOf, setOptions, subscribe, useOption, viewOf } from "./hashOptions";
 import { given, probe, setTransport, type Resolved, type Transport } from "../transport";
+import { CanWrite } from "./writes";
 import "../base.css";
 import "./memory.css";
 import "../theme.css";
@@ -30,6 +32,7 @@ import "../theme.css";
 // glance and survives a reload:
 //   #/home                      Home (what changed, what it answered, what needs you)
 //   #/import                    Import (add files or text to the memory: Add to memory as a page)
+//   #/repo-skills[/<key>]       Repo skills (a connected repository's SKILL.md files, graded; one, and its proposal)
 //   #/explorer/sources/slack/C09  a folder    #/entity/entities/deal/42  an entity
 //   #/sessions/…                the reader's sessions     #/skills/<goal>/<slug>  compiled skills (a folder)
 //   #/episode/<episode id>      an episode    #/search/<text>  a search (Search › Facts)
@@ -88,6 +91,9 @@ function toHash(f: Focus | null): string {
       return at("home");
     case "import":
       return at("import");
+    case "repo-skills":
+    case "skill-proposals":
+      return at(f.kind, f.skill ? encodeURIComponent(f.skill) : "");
     case "folder":
       // Sessions and Skills are pages of their own: their folders are linked by their names.
       if (f.path[0] === "sessions" || f.path[0] === "skills")
@@ -177,6 +183,9 @@ function fromHash(hash: string): Focus | null {
       return { kind: "branches" };
     case "import":
       return { kind: "import" };
+    case "repo-skills":
+    case "skill-proposals":
+      return { kind: name, skill: rest ? decodeURIComponent(rest) : undefined };
     case "owners":
       return { kind: "owners" };
     case "not-answered":
@@ -237,15 +246,12 @@ type Section =
   | "sessions"
   | "schema"
   | "skills"
+  | "repo-skills"
+  | "skill-proposals"
   | "tools"
   | "goals";
 /** The sections only the org's admins see. Advice is everyone's: a member sees the counts and their own sessions. */
 const ADMIN: Section[] = ["people", "gaps", "branches", "owners"];
-
-/** The branches the server makes for a change while it waits on its owners' review: what extraction holds for them
- * (`held-`), a fact an admin added (`fact-`) or a conflict they settled (`resolve-`). Nobody reads one: the branch
- * picker leaves them out, and Branches lists them for the admin who settles one. */
-const WORKING_BRANCH = /^(held|fact|resolve)-/;
 
 /** The sections that need more of the transport than reading the memory: each hidden where it lacks it. */
 const NEEDS: Partial<Record<Section, keyof Resolved>> = {
@@ -257,6 +263,8 @@ const NEEDS: Partial<Record<Section, keyof Resolved>> = {
   graph: "review",
   ask: "agent",
   learned: "lessons",
+  "repo-skills": "repoSkills",
+  "skill-proposals": "repoSkills",
 };
 function sectionOf(f: Focus | null, start: Section): Section {
   if (!f) return start;
@@ -265,6 +273,9 @@ function sectionOf(f: Focus | null, start: Section): Section {
       return "home";
     case "import":
       return "import";
+    case "repo-skills":
+    case "skill-proposals":
+      return f.kind;
     case "tools":
       return "tools";
     case "search":
@@ -333,8 +344,8 @@ const SECTIONS: { group: string; items: Item[] }[] = [
         reads: true,
       },
       { id: "ask", label: "Ask", icon: "chat", to: { kind: "agent" }, reads: true },
-      // What the memory answered: the reader's own sessions, and (the org's admins) the team's, a tab of the same
-      // section with each conversation's trace.
+      // What the memory answered: the reader's own sessions, and for the org's admins everyone's (where Traces opens
+      // for them) and the team's person by person, tabs of the same section with each conversation's trace.
       {
         id: "sessions",
         label: "Traces",
@@ -356,9 +367,10 @@ const SECTIONS: { group: string; items: Item[] }[] = [
   {
     group: "Impact",
     items: [
-      { id: "advice", label: "Advice", icon: "skill", to: { kind: "advice" }, reads: true },
+      // Advice opens on its first tab, the lessons (`#/learned`); `#/advice` is its Serving tab.
+      { id: "advice", label: "Advice", icon: "skill", to: { kind: "learned" }, reads: true },
       // What it learned: every lesson the person may read (their own and the team's; an admin's, everyone's). The
-      // second tab of Advice, lit as it.
+      // first tab of Advice, lit as it.
       {
         id: "learned",
         label: "Learned",
@@ -379,7 +391,7 @@ const SECTIONS: { group: string; items: Item[] }[] = [
       { id: "people", label: "Team traces", icon: "user", to: { kind: "people" }, reads: true, hide: true },
     ],
   },
-  // What shapes what it learns: the types, the goals, the compiled skills, the branches, the tools agents call.
+  // What shapes what it learns: the types, the goals, the compiled skills, the tools agents call.
   {
     group: "Build",
     items: [
@@ -392,12 +404,23 @@ const SECTIONS: { group: string; items: Item[] }[] = [
         to: { kind: "folder", path: ["skills"] },
         reads: true,
       },
+      // A connected repository's own skills, graded and reviewed: Skills' second tab, lit as Skills.
       {
-        id: "branches",
-        label: "Branches",
-        icon: "branch",
-        to: { kind: "branches" },
+        id: "repo-skills",
+        label: "Repo skills",
+        icon: "code",
+        to: { kind: "repo-skills" },
         reads: true,
+        hide: true,
+      },
+      // Every skill whose newest review proposes a change: Skills' third tab, lit as Skills.
+      {
+        id: "skill-proposals",
+        label: "Revisions proposed",
+        icon: "refresh",
+        to: { kind: "skill-proposals" },
+        reads: true,
+        hide: true,
       },
       // The memory's tools, called one at a time: not listed, as the Playground runs them for a question.
       { id: "tools", label: "Tools", icon: "tools", to: { kind: "tools" }, reads: true, hide: true },
@@ -466,6 +489,23 @@ export interface StudioNavigation {
   groups: StudioNavGroup[];
 }
 
+/** The pages' outer box, telling every page below whether the reader may change the memory (`CanWrite`). */
+function Frame({
+  root,
+  write,
+  children,
+}: {
+  root: React.HTMLAttributes<HTMLDivElement> & Record<string, unknown>;
+  write: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <CanWrite.Provider value={write}>
+      <div {...root}>{children}</div>
+    </CanWrite.Provider>
+  );
+}
+
 /**
  * An org's memory, laid out like OpenViking Studio. A sidebar of sections (Home, then the memory, its review, what
  * it answered, its impact and what builds it, as the transport and the host allow) beside the one picked. The
@@ -500,6 +540,8 @@ export function MemoryStudio({
   }, [transport, org]);
   const can: Resolved = caps?.of === transport && caps.org === org ? caps.caps : given(transport);
   const admin = (isAdmin ?? true) && can.admin;
+  // Adding to the memory: where the transport can, and not for a viewer, who only reads.
+  const learns = transport.capabilities.learn === true && can.write;
   const root = {
     className: "memory-studio",
     "data-studio-theme": theme,
@@ -517,12 +559,15 @@ export function MemoryStudio({
       : sectionOf(focus, canBrowse || start === "handover" ? start : "goals");
   const visible = SECTIONS.map((g) => ({
     ...g,
-    items: g.items.filter(
+    items: g.items
+      // An admin's Traces opens on everyone's sessions (All); anyone else's, on their own.
+      .map((i) => (i.id === "sessions" && admin ? { ...i, to: { kind: "people" } as Focus } : i))
+      .filter(
       (i) =>
         (canBrowse || !i.reads) &&
         (i.id !== "goals" || goals) &&
         (i.id !== "handover" || handover) &&
-        (i.id !== "import" || transport.capabilities.learn === true) &&
+        (i.id !== "import" || learns) &&
         (!ADMIN.includes(i.id) || admin) &&
         (!NEEDS[i.id] || can[NEEDS[i.id]!]),
     ),
@@ -541,61 +586,30 @@ export function MemoryStudio({
         ? "sessions"
         : section === "learned"
           ? "advice"
-          : section;
+          : section === "repo-skills" || section === "skill-proposals"
+            ? "skills"
+            : section;
   const sel = useMemo<Selection>(() => {
     const q = new URLSearchParams(search);
-    return { org, team: q.get("team") ?? undefined, branch: q.get("branch") ?? undefined };
+    // Studio reads main only: it names no branch, and a link's `branch` is not followed.
+    return { org, team: q.get("team") ?? undefined };
   }, [org, search]);
   const [who, setWho] = useState<{ key: string; me?: Me; error?: ApiError | Error } | null>(null);
   const [query, setQuery] = useState("");
   // Bumped when Import adds something, so its Processing panel reads again at once.
   const [imported, setImported] = useState(0);
-  // The memory's branches with their skills (null: a memstore that can't name them).
-  const [branches, setBranches] = useState<{
-    key: string;
-    list: Branch[] | null | undefined;
-  } | null>(null);
   const memoryKey = JSON.stringify([sel.org, sel.team]);
   const selKey = JSON.stringify([sel.org, sel.team, sel.branch]);
-  // On Home (main read), its one read names the branches and counts the schema's types: neither is read here
-  // while it is out, nor after it answered them. undefined: not answered yet; null: a server with no such read.
+  // On Home, its Home read counts the schema's types: it isn't read here while that is out, nor after it answered. undefined: not answered yet; null: a server with no such read.
   const [homeSaid, setHomeSaid] = useState<{ key: string; h: HomeSummary | null } | null>(null);
-  const onHome = section === "home" && (sel.branch ?? "main") === "main";
+  const onHome = section === "home";
   const said = homeSaid?.key === selKey ? homeSaid.h : undefined;
-  const homeNames = onHome && (said === undefined || (said !== null && said.branches !== null));
   const [schema, retrySchema] = useOrgSchema(sel, canBrowse && !(onHome && said !== null));
-  // The memory whose branches were named: not read again for it.
-  const named = useRef<string | null>(null);
   const onSummary = useCallback(
-    (h: HomeSummary | null) => {
-      setHomeSaid({ key: selKey, h });
-      if (h?.branches && (sel.branch ?? "main") === "main") {
-        named.current = memoryKey;
-        setBranches({ key: memoryKey, list: h.branches });
-      }
-    },
-    [selKey, memoryKey],
+    (h: HomeSummary | null) => setHomeSaid({ key: selKey, h }),
+    [selKey],
   );
 
-  useEffect(() => {
-    if (!canBrowse || homeNames || named.current === memoryKey) return;
-    let live = true;
-    browse<{ branches: Branch[] | null }>(
-      { op: "branches" },
-      { org: sel.org, team: sel.team },
-    ).then(
-      (r) => {
-        if (!live) return;
-        named.current = memoryKey;
-        setBranches({ key: memoryKey, list: r.branches });
-      },
-      // Unreachable is not "can't name them": pick nothing until it answers.
-      () => live && setBranches({ key: memoryKey, list: undefined }),
-    );
-    return () => {
-      live = false;
-    };
-  }, [memoryKey, canBrowse, homeNames]);
 
   useEffect(() => {
     if (!canBrowse) return;
@@ -670,16 +684,6 @@ export function MemoryStudio({
     focus && (focus.kind === "folder" || focus.kind === "entity" || focus.kind === "skill")
       ? focus.path
       : null;
-  const branchList = branches?.key === memoryKey ? branches.list : undefined;
-  // What a person reads: not the branches a change waits on for its owners (Branches lists those, to settle).
-  const readable = branchList && branchList.filter((b) => !WORKING_BRANCH.test(b.name));
-  const branch = sel.branch ?? "main";
-  // Skills usually live on a goal's branch: say where, when there are none on the one read.
-  const elsewhere =
-    readable && !readable.some((b) => b.name === branch && (b.skills ?? 0) > 0)
-      ? readable.filter((b) => b.name !== branch && (b.skills ?? 0) > 0)
-      : [];
-  const pickBranch = (b: string) => choose({ team: sel.team, branch: b || undefined });
 
   const pickers = canBrowse && (
     <div className="studio-pickers">
@@ -704,32 +708,6 @@ export function MemoryStudio({
         <div className="context-label mono" title="The memory you are reading">
           {me?.scope ?? `org:${org}`}
         </div>
-      )}
-      {readable === undefined ? null : readable ? (
-        readable.length > 1 || branch !== "main" ? (
-          <select
-            className="field mono"
-            aria-label="Branch"
-            title="The branch you are reading: compiled skills usually live on their goal's branch"
-            value={branch}
-            onChange={(e) => pickBranch(e.target.value)}
-          >
-            {!readable.some((b) => b.name === branch) && <option value={branch}>{branch}</option>}
-            {readable.map((b) => (
-              <option key={b.name} value={b.name}>
-                {b.name}
-                {b.skills ? ` (${b.skills} skills)` : ""}
-              </option>
-            ))}
-          </select>
-        ) : hostNav ? null : (
-          <div className="context-label" title="The branch you are reading">
-            <Icon name="branch" size={14} />
-            main
-          </div>
-        )
-      ) : (
-        <BranchInput key={branch} branch={branch} onPick={pickBranch} />
       )}
     </div>
   );
@@ -802,17 +780,17 @@ export function MemoryStudio({
 
   if (section === "handover") {
     return (
-      <div {...root}>
+      <Frame root={root} write={can.write}>
         {nav}
         <section className="studio-goals">{handover}</section>
-      </div>
+      </Frame>
     );
   }
 
   // Owner review and the graph: any member's, read as them (memstore decides who may decide).
   if (section === "review" || section === "graph") {
     return (
-      <div {...root}>
+      <Frame root={root} write={can.write}>
         {nav}
         <section className="memory studio-goals rv-shell">
           {section === "review" ? (
@@ -838,7 +816,7 @@ export function MemoryStudio({
             </>
           )}
         </section>
-      </div>
+      </Frame>
     );
   }
 
@@ -848,7 +826,6 @@ export function MemoryStudio({
     section === "advice" ||
     section === "learned" ||
     section === "serving" ||
-    section === "branches" ||
     section === "owners" ||
     section === "gaps"
   ) {
@@ -867,7 +844,7 @@ export function MemoryStudio({
       setOptions({ ...scope, ...keep });
     };
     return (
-      <div {...root}>
+      <Frame root={root} write={can.write}>
         {nav}
         <section className="studio-goals">
           {focus?.kind === "conversation" ? (
@@ -880,10 +857,11 @@ export function MemoryStudio({
             />
           ) : section === "people" ? (
             <>
-            <TracesTabs on="team" go={go} team />
+            <TracesTabs on={optionsOf(hash).get("show") === "team" ? "team" : "all"} go={go} team />
             <People
               sel={sel}
               user={focus?.kind === "people" ? focus.user : undefined}
+              everyone={optionsOf(hash).get("show") !== "team"}
               onUser={toPerson}
               onEpisode={(id) => go({ kind: "episode", id })}
               onTrace={(id) => go({ kind: "conversation", id })}
@@ -892,7 +870,7 @@ export function MemoryStudio({
           ) : section === "learned" ? (
             <>
             <AdviceTabs on="learned" go={inAdvice} admin={admin} />
-            <PersonPicker sel={sel} admin={admin} />
+            <ShowTabs />
             <Learned
               key={memoryKey}
               sel={sel}
@@ -908,7 +886,7 @@ export function MemoryStudio({
             />
             </>
           ) : section === "advice" || section === "serving" ? (
-            // Advice's tabs: Served (each note), and for the org's admins Impact (`#/serving`): whether advice
+            // Advice's tabs: Serving (each team note), and for the org's admins Impact (`#/serving`): whether advice
             // helps, and when it is given.
             focus?.kind === "serving" && admin ? (
               <>
@@ -920,10 +898,11 @@ export function MemoryStudio({
             ) : (
               <>
                 <AdviceTabs on="served" go={inAdvice} admin={admin} />
-                <PersonPicker sel={sel} admin={admin} />
+                <ShowTabs />
                 <AdvicePage
                   sel={sel}
                   admin={admin}
+                  everyone={can.everyone}
                   onTrace={(id) => go({ kind: "conversation", id })}
                   onLearned={(lesson) => inAdvice({ kind: "learned", lesson })}
                 />
@@ -936,22 +915,20 @@ export function MemoryStudio({
               onEpisode={(id) => go({ kind: "episode", id })}
               onTrace={(id) => go({ kind: "conversation", id })}
             />
-          ) : section === "owners" ? (
-            <Owners sel={sel} />
           ) : (
-            <Branches sel={sel} branches={branchList} />
+            <Owners sel={sel} />
           )}
         </section>
-      </div>
+      </Frame>
     );
   }
 
   if (section === "goals") {
     return (
-      <div {...root}>
+      <Frame root={root} write={can.write}>
         {nav}
         <section className="panel studio-goals">{goals}</section>
-      </div>
+      </Frame>
     );
   }
 
@@ -962,22 +939,6 @@ export function MemoryStudio({
       {(error || refused) && (
         <div className="banner banner-error" role="alert">
           <Icon name="alert" size={14} /> {error?.message ?? refused}
-        </div>
-      )}
-      {elsewhere.length > 0 && (section === "explorer" || section === "skills") && (
-        <div className="banner banner-note">
-          <Icon name="branch" size={14} /> No compiled skills on{" "}
-          <span className="mono">{branch}</span>. They are on{" "}
-          {elsewhere.map((b, i) => (
-            <span key={b.name}>
-              {i > 0 && ", "}
-              <button className="link mono" onClick={() => pickBranch(b.name)}>
-                {b.name}
-              </button>{" "}
-              ({b.skills})
-            </span>
-          ))}
-          .
         </div>
       )}
     </div>
@@ -1012,9 +973,16 @@ export function MemoryStudio({
   if (section === "explorer") {
     body = (
       <div className={`app ${hostNav ? "hosted" : ""} ${drawer ? "drawer-open" : ""}`}>
-        <header className="bar">
+        {/* One line: where you are (the crumbs), then the search, the folders' toggle and the two views. */}
+        <header className="bar explorer-bar">
           <div className="bar-title">
-            <ExplorerTabs on="tree" go={go} />
+            {crumbs || (
+              <nav className="crumbs" aria-label="Location">
+                <button className="crumb-on" onClick={() => go({ kind: "folder", path: [] })}>
+                  Memory
+                </button>
+              </nav>
+            )}
           </div>
           <button
             className="search-box search-open"
@@ -1028,7 +996,7 @@ export function MemoryStudio({
             <span>Search facts</span>
             <span className="kbd">⌘K</span>
           </button>
-          {/* The folders' drawer, after the tabs: a quiet toggle at the bar's end. */}
+          {/* The folders' drawer: a quiet toggle before the views. */}
           <button
             className="icon-btn menu-btn"
             aria-label={drawer ? "Hide the folders" : "Show the folders"}
@@ -1038,6 +1006,7 @@ export function MemoryStudio({
             <Icon name={drawer ? "close" : "menu"} size={16} />
             {hostNav && <span className="menu-label">{drawer ? "Hide folders" : "Folders"}</span>}
           </button>
+          <ExplorerTabs on="tree" go={go} />
         </header>
         {banners}
         <main className="main">
@@ -1057,7 +1026,6 @@ export function MemoryStudio({
           <div className="scrim" onClick={() => setDrawer(false)} />
           <section className="pane">
             <div className="pane-inner">
-              {crumbs}
               <Inspector
                 focus={focus}
                 sel={sel}
@@ -1094,7 +1062,23 @@ export function MemoryStudio({
           <div
             className={`pane-inner ${section === "ask" ? "pane-fill" : section === "import" ? "pane-hold" : ""}`}
           >
-            {section === "import" ? (
+            {section === "repo-skills" || section === "skill-proposals" ? (
+              <>
+                <SkillsTabs
+                  on={section === "repo-skills" ? "repo" : "proposed"}
+                  go={go}
+                  repo={can.repoSkills}
+                  sel={sel}
+                />
+                <RepoSkills
+                  key={`${selKey}:${section}`}
+                  sel={sel}
+                  skill={focus?.kind === section ? focus.skill : undefined}
+                  proposed={section === "skill-proposals"}
+                  onOpen={go}
+                />
+              </>
+            ) : section === "import" ? (
               <div className="import-page">
                 <h2>Import</h2>
                 <p className="muted">
@@ -1126,16 +1110,21 @@ export function MemoryStudio({
                 }}
                 connect={connect}
                 onSummary={onSummary}
-                // The "Add to memory" control, where the transport can learn. The dream's summary is Home's own
-                // read (an admin's).
-                addToMemory={transport.capabilities.learn ? <AddToMemoryDialog sel={sel} /> : undefined}
+                // The "Add to memory" control, where the transport can learn and the reader may write. The dream's
+                // summary is Home's own read (an admin's).
+                addToMemory={learns ? <AddToMemoryDialog sel={sel} /> : undefined}
               />
             ) : section === "ask" ? (
               <Agent
                 sel={sel}
                 onFocus={go}
+                teams={can.teams ? teams : []}
+                onScope={(team, then) => {
+                  choose({ team, branch: sel.branch });
+                  if (then) go(then);
+                }}
                 connect={connect}
-                addToMemory={transport.capabilities.learn ? <AddToMemoryDialog sel={sel} /> : undefined}
+                addToMemory={learns ? <AddToMemoryDialog sel={sel} /> : undefined}
               />
             ) : section === "search" ? (
               <>
@@ -1239,8 +1228,19 @@ export function MemoryStudio({
             ) : (
               // Skills and Sessions: the Explorer's own folder, on a page of its own.
               <>
-                {section === "sessions" && <TracesTabs on="yours" go={go} team={admin} />}
+                {section === "sessions" && <TracesTabs on="mine" go={go} team={admin} />}
+                {section === "skills" && (
+                  <SkillsTabs on="compiled" go={go} repo={can.repoSkills} sel={sel} />
+                )}
                 {crumbs}
+                {focus?.kind === "skill" && can.repoSkills && focus.path[0] === "skills" && (
+                  <SkillReviewCard
+                    key={`${selKey}:${focus.path.join("/")}`}
+                    sel={sel}
+                    skillKey={focus.path.join("/")}
+                    onOpen={go}
+                  />
+                )}
                 <Inspector
                   focus={
                     focus?.kind === "skill" || focus?.kind === "folder"
@@ -1260,10 +1260,10 @@ export function MemoryStudio({
   }
 
   return (
-    <div {...root}>
+    <Frame root={root} write={can.write}>
       {nav}
       <div className="memory">{body}</div>
-    </div>
+    </Frame>
   );
 }
 
@@ -1279,28 +1279,6 @@ function partsOf(letters: string | undefined): AskParts {
 const lettersOf = (p: AskParts) =>
   `${p.facts ? "f" : ""}${p.advice ? "a" : ""}${p.episodes ? "e" : ""}`;
 
-/** The branch to read, by name, for a memstore that can't list its branches. */
-function BranchInput({ branch, onPick }: { branch: string; onPick: (b: string) => void }) {
-  const [v, setV] = useState(branch);
-  return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        onPick(v.trim());
-      }}
-    >
-      <input
-        className="field mono"
-        aria-label="Branch"
-        title="The branch you are reading (this server can't list them): compiled skills usually live on their goal's branch"
-        placeholder="branch: main"
-        value={v}
-        onChange={(e) => setV(e.target.value)}
-        onBlur={() => v.trim() !== branch && onPick(v.trim())}
-      />
-    </form>
-  );
-}
 
 /** Whether a media query matches, kept up to date as the window changes. */
 function useMedia(query: string): boolean {
@@ -1367,24 +1345,96 @@ function PageTabs({
   );
 }
 
-/** Traces' two views: the reader's own sessions, and (the org's admins) the team's, person by person. */
-function TracesTabs({ on, go, team }: { on: "yours" | "team"; go: (f: Focus) => void; team: boolean }) {
-  if (!team) return null;
+/** Whose a page shows, as one pill: everyone's (the default), the reader's own, or the team's. */
+const WHOSE = [
+  { id: "all", label: "All", icon: "explorer" },
+  { id: "mine", label: "Mine", icon: "notes" },
+  { id: "team", label: "Team", icon: "user" },
+] as const;
+type Whose = (typeof WHOSE)[number]["id"];
+
+function WhoseTabs({ on, pick }: { on: Whose; pick: (w: Whose) => void }) {
+  return (
+    <div className="memory traces-bar">
+      <div className="explorer-tabs" role="group" aria-label="Whose">
+        {WHOSE.map((w) => (
+          <button
+            key={w.id}
+            aria-pressed={on === w.id}
+            className={`explorer-tab ${on === w.id ? "on" : ""}`}
+            onClick={() => on !== w.id && pick(w.id)}
+          >
+            <Icon name={w.icon} size={14} /> {w.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Advice's and Learned's pill: `show` in the link (none: all), kept as the reader moves between the tabs. */
+function ShowTabs() {
+  const [show, setShow] = useOption("show");
+  const on: Whose = show === "mine" || show === "team" ? show : "all";
+  return <WhoseTabs on={on} pick={(w) => setShow(w === "all" ? null : w)} />;
+}
+
+/**
+ * Skills' views: the skills the memory compiled (the Explorer's `skills` folder) and a connected repository's own
+ * (Repo skills), where the host reaches them.
+ */
+function SkillsTabs({
+  on,
+  go,
+  repo,
+  sel,
+}: {
+  on: "compiled" | "repo" | "proposed";
+  go: (f: Focus) => void;
+  repo: boolean;
+  sel: Selection;
+}) {
+  const proposed = useProposedCount(sel, repo);
+  if (!repo) return null;
   return (
     <PageTabs
-      label="Traces"
+      label="Skills"
       on={on}
       go={go}
       tabs={[
-        { id: "yours", label: "Yours", icon: "notes", to: { kind: "folder", path: ["sessions"] } },
-        { id: "team", label: "Team", icon: "user", to: { kind: "people" } },
+        { id: "compiled", label: "Compiled", icon: "skill", to: { kind: "folder", path: ["skills"] } },
+        { id: "repo", label: "From repos", icon: "code", to: { kind: "repo-skills" } },
+        {
+          id: "proposed",
+          label: proposed ? `Revisions proposed (${proposed})` : "Revisions proposed",
+          icon: "refresh",
+          to: { kind: "skill-proposals" },
+        },
       ]}
     />
   );
 }
 
 /**
- * What Impact counts, which isn't what Served and Learned count: whether advice helps reads every judged session of
+ * Traces' views: every session the answer log holds (the default), the reader's own sessions, and the team's,
+ * person by person. Only the org's admins read anyone else's: anyone else gets their own, with no pill.
+ */
+function TracesTabs({ on, go, team }: { on: Whose; go: (f: Focus) => void; team: boolean }) {
+  if (!team) return null;
+  return (
+    <WhoseTabs
+      on={on}
+      pick={(w) => {
+        if (w === "mine") return go({ kind: "folder", path: ["sessions"] });
+        go({ kind: "people" });
+        if (w === "team") setOptions({ show: "team" });
+      }}
+    />
+  );
+}
+
+/**
+ * What Impact counts, which isn't what Advice and Serving count: whether advice helps reads every judged session of
  * the team's notes, and when advice is given reads every lookup in its own window (7, 30 or 90 days; 30 for a link
  * that names all of them).
  */
@@ -1393,15 +1443,16 @@ function ImpactScope() {
   const span = days === "7" || days === "90" ? days : "30";
   return (
     <p className="ap-scope ap-muted ap-small">
-      Counted apart from Served and Learned: &ldquo;Does advice help&rdquo; reads the team&apos;s notes and every
+      Counted apart from Advice and Serving: &ldquo;Does advice help&rdquo; reads the team&apos;s notes and every
       judged session; &ldquo;When advice is given&rdquo; reads every lookup in the last {span} days.
     </p>
   );
 }
 
 /**
- * Advice's views: each note and how it was served, every lesson with the runs it was learned from, and for the org's
- * admins its impact (whether advice helps, and when it is given).
+ * Advice's views, in this order: Advice (every lesson with the runs it was learned from, `#/learned`), Serving (each
+ * team note and how it was served, `#/advice`), and for the org's admins Impact (whether advice helps, and when it is
+ * given, `#/serving`).
  */
 function AdviceTabs({
   on,
@@ -1418,8 +1469,8 @@ function AdviceTabs({
       on={on}
       go={go}
       tabs={[
-        { id: "served", label: "Served", icon: "skill", to: { kind: "advice" } },
-        { id: "learned", label: "Learned", icon: "history", to: { kind: "learned" } },
+        { id: "learned", label: "Advice", icon: "history", to: { kind: "learned" } },
+        { id: "served", label: "Serving", icon: "skill", to: { kind: "advice" } },
         ...(admin
           ? [{ id: "impact", label: "Impact", icon: "goal", to: { kind: "serving" } as Focus }]
           : []),

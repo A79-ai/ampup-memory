@@ -345,7 +345,7 @@ pub async fn advice(
 
     let mut entries: Vec<(i64, Value)> = vec![];
     let mut add = |space: &str,
-                   l: crate::advice::Listed,
+                   l: &crate::advice::Listed,
                    evidence: Option<&crate::sessions::Tally>,
                    ratified_now: bool| {
         let at = l.note.as_ref().map_or(0, |(_, at, _)| *at);
@@ -401,35 +401,31 @@ pub async fn advice(
         }
         entries.push((at, v));
     };
-    if space != "team" {
-        let mine = crate::advice::Space::mine(who.user());
-        let listed = crate::advice::listed(session, store, who, &mine).await?;
-        crate::phases::mark("advice mine");
-        for l in listed {
-            // A person's own: served to them at once, and nobody else's tally is theirs to see.
-            if min_helped == 0 && min_served == 0 {
-                add("mine", l, None, true);
-            }
+    // The scope's settings, as the directory the request was signed in by has them (`Store::directory_behind`: never
+    // more than its lag behind other servers, and never a catalog read of its own on a hot path): the evidence bar,
+    // applied here to the team's kept tallies, and whether the scope curates advice, which the kept entries were read
+    // under (a note withheld by reward says so only where it does).
+    let dir = store.directory_behind().await?;
+    let scope = session.scope();
+    let bar = crate::sessions::min_evidence(Some(&dir.dir), scope);
+    let curates = dir
+        .dir
+        .curates_advice(scope, crate::advice_curate::from_env());
+    let read = read_kept(store, session, who, space, curates).await?;
+    for l in &read.mine {
+        // A person's own: served to them at once, and nobody else's tally is theirs to see.
+        if min_helped == 0 && min_served == 0 {
+            add("mine", l, None, true);
         }
     }
-    if space != "mine" {
-        let scope = session.scope();
-        let bar = crate::sessions::evidence_bar(store, scope).await?;
-        let tallies = crate::sessions::evidence(store, scope).await?;
-        crate::phases::mark("advice evidence");
-        let listed =
-            crate::advice::listed(session, store, who, &crate::advice::Space::team()).await?;
-        crate::phases::mark("advice team");
-        for l in listed {
-            let tally = tallies.get(&l.key).cloned().unwrap_or_default();
-            // Everyone reads what the team serves, and it serves every note: ratifying is reported only.
-            let past = crate::advice::team_ratified(
-                l.approved,
-                l.needs_backing.is_some(),
-                tally.ratified(bar),
-            );
-            add("team", l, Some(&tally), past);
-        }
+    for (l, tally) in &read.team {
+        // Everyone reads what the team serves, and it serves every note: ratifying is reported only.
+        let past = crate::advice::team_ratified(
+            l.approved,
+            l.needs_backing.is_some(),
+            tally.ratified(bar),
+        );
+        add("team", l, Some(tally), past);
     }
     entries.sort_by(|(a, av), (b, bv)| {
         Reverse(a)
@@ -466,4 +462,104 @@ pub async fn advice(
         json!({"advice": entries.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
               "count": total, "cursor": next}),
     )
+}
+
+/// What [`advice`] reads of `space` before it narrows and pages: the reader's own entries (`mine`, `all`) and the
+/// team's with each one's tally (`team`, `all`).
+struct Read {
+    mine: Vec<crate::advice::Listed>,
+    team: Vec<(crate::advice::Listed, crate::sessions::Tally)>,
+}
+
+/// Each reader's [`Read`], by memory state and the scope's sessions ([`crate::kept_answers`]): a page's summary,
+/// kept for a return visit within the hour, as the Advice page's.
+static KEPT: std::sync::LazyLock<crate::kept_answers::Kept<Read>> =
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500));
+
+/// [`read`], kept by memory state for main as it is now: it reads every note the reader may read of the advice maps,
+/// and every session logged (the team's tallies). Kept by the reader (who, and every group they read as: an operator
+/// reading as everyone is a reader of their own, and a person's own advice is only ever theirs), the spaces asked
+/// for and whether the scope curates advice (`curates`), and by the sessions as well as main's
+/// state, as the lessons are (`crate::lessons`): a session logged or judged since (in the answer log, or held here
+/// for its next flush) is a newer state, answered as main moving on is (the last answer while the next is worked
+/// out), and a session or note forgotten or retracted is a loss, never answered from what was kept before it. Every
+/// argument but `space` narrows and pages what is read, so it is applied to the kept answer, never kept. A read of a
+/// branch or of a past state reads it itself.
+async fn read_kept(
+    store: &Store,
+    session: &Session,
+    who: &Principal,
+    space: &str,
+    curates: bool,
+) -> Result<Arc<Read>> {
+    let at = match session.on_main_now() {
+        true => {
+            let mark = crate::kept_answers::Mark::read(store, session.scope()).await?;
+            let now = store
+                .lagging_visibility(session.scope(), crate::MAIN)
+                .await?;
+            match std::ptr::eq(session.vis(), &*now) {
+                true => {
+                    let log = crate::kept_answers::Log::read(store, session.scope()).await?;
+                    let mut at = crate::kept_answers::At::with_log(mark, &now, log);
+                    let (held, newest) = crate::sessions::held_mark(store, session.scope());
+                    at.heads.push(format!("held sessions {held} {newest}"));
+                    Some(at)
+                }
+                false => None,
+            }
+        }
+        false => None,
+    };
+    crate::phases::mark("advice state");
+    let Some(at) = at else {
+        return Ok(Arc::new(read(store, session, who, space).await?));
+    };
+    let key = format!(
+        "{}\n{space}\n{}",
+        crate::kept_answers::reader_key(who),
+        if curates { "curated" } else { "uncurated" }
+    );
+    let (store2, session2, who2, space2) = (
+        store.clone(),
+        session.clone(),
+        who.clone(),
+        space.to_string(),
+    );
+    KEPT.get(
+        &session.scope().namespace(),
+        &key,
+        at,
+        true,
+        || async move { read(&store2, &session2, &who2, &space2).await },
+    )
+    .await
+}
+
+/// What `who` reads of `space` for [`advice`]: their own entries and the team's, each with its tally.
+async fn read(store: &Store, session: &Session, who: &Principal, space: &str) -> Result<Read> {
+    let mut out = Read {
+        mine: vec![],
+        team: vec![],
+    };
+    if space != "team" {
+        let mine = crate::advice::Space::mine(who.user());
+        out.mine = crate::advice::listed(session, store, who, &mine).await?;
+        crate::phases::mark("advice mine");
+    }
+    if space != "mine" {
+        let tallies = crate::sessions::evidence(store, session.scope()).await?;
+        crate::phases::mark("advice evidence");
+        let listed =
+            crate::advice::listed(session, store, who, &crate::advice::Space::team()).await?;
+        crate::phases::mark("advice team");
+        out.team = listed
+            .into_iter()
+            .map(|l| {
+                let tally = tallies.get(&l.key).cloned().unwrap_or_default();
+                (l, tally)
+            })
+            .collect();
+    }
+    Ok(out)
 }

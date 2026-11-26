@@ -418,6 +418,28 @@
     margin-left: auto;
     color: var(--muted);
   }
+  /* The namespace a question is asked in, picked in place: reads as the scope's text until hovered. */
+  .pg-scope-pick {
+    appearance: none;
+    max-width: 32ch;
+    margin: -3px 0;
+    padding: 2px 20px 2px 6px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 4l3 3 3-3' fill='none' stroke='%23888' stroke-width='1.4'/%3E%3C/svg%3E")
+      no-repeat right 5px center;
+    color: inherit;
+    font: inherit;
+    font-family: var(--mono);
+    text-overflow: ellipsis;
+    cursor: pointer;
+  }
+  .pg-scope-pick:hover,
+  .pg-scope-pick:focus-visible {
+    border-color: var(--line);
+    background-color: var(--surface-2);
+  }
 
   /* The model and memory picker, and its menu. */
   .pg-menu-root {
@@ -583,6 +605,37 @@
   .pg-md .md {
     font-size: var(--t-base);
     line-height: 1.65;
+  }
+  /* A citation in an answer: a small pill per subject, opening it. */
+  .pg-cite {
+    display: inline-flex;
+    align-items: center;
+    max-width: 22ch;
+    margin: 0 2px;
+    padding: 0 7px;
+    height: 18px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--surface-2);
+    color: var(--ink-2);
+    font: 500 11px / 1 var(--font);
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    vertical-align: 1px;
+    cursor: pointer;
+  }
+  .pg-cite.mono {
+    font-family: var(--mono);
+  }
+  button.pg-cite:hover {
+    border-color: var(--line-strong);
+    background: var(--accent-soft);
+    color: var(--accent-text);
+  }
+  .pg-cite-unknown {
+    cursor: default;
+    color: var(--muted);
   }
   .pg-stopped {
     color: var(--warn);

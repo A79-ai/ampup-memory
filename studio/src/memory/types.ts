@@ -138,6 +138,10 @@ export type Focus =
   | { kind: "home" }
   /** Import: add files (text, PDF, Word, recordings) or pasted text to the memory. */
   | { kind: "import" }
+  /** Repo skills: a connected repository's own skills, how they did, and the revisions proposed for them. */
+  | { kind: "repo-skills"; skill?: string }
+  /** Revisions proposed: every skill whose newest review proposes a change. */
+  | { kind: "skill-proposals"; skill?: string }
   | { kind: "folder"; path: string[] }
   | { kind: "entity"; path: string[] }
   | { kind: "skill"; path: string[] }

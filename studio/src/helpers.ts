@@ -1,7 +1,16 @@
 // The pages' pure helpers, without React or styles: what a host's own tests and pages read the memory with
 // (`ampup-memory-studio/helpers`). Its imports name their `.js`, as the files they import do, so a host whose
 // tests type-check with NodeNext (the console's) can read this file from source as well as the built one.
-export { readSearch, type Found } from "./memory/searchText.js";
+export {
+  citeIndex,
+  citeParts,
+  readSearch,
+  resultTeam,
+  searchTexts,
+  type Cited,
+  type ContextMessage,
+  type Found,
+} from "./memory/searchText.js";
 export {
   adviceQuestion,
   adviceStarters,

@@ -77,12 +77,12 @@ fn relay(e: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// Most sessions one person may start in a scope in a day: `AMPUP_MEMORY_SESSIONS_PER_DAY`, default 1000.
+/// Most sessions one person may start in a scope in a day: `AMPUP_MEMORY_SESSIONS_PER_DAY`, default 10,000.
 fn max_per_day() -> usize {
     std::env::var("AMPUP_MEMORY_SESSIONS_PER_DAY")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(1000)
+        .unwrap_or(10_000)
 }
 
 /// The share of new sessions in the holdout arm: `AMPUP_MEMORY_ADVICE_HOLDOUT`, 0 to 1, default 0.
@@ -106,7 +106,11 @@ async fn several_people(store: &Store, scope: &Scope) -> bool {
     d.dir.orgs.get(org).is_some_and(|o| {
         o.members
             .keys()
-            .filter(|u| d.dir.holds_member(u, org, None))
+            // A viewer records no runs, so no team note is learned from them.
+            .filter(|u| {
+                d.dir.holds_member(u, org, None)
+                    && o.members.get(*u) != Some(&crate::people::directory::Role::Viewer)
+            })
             .take(2)
             .count()
             > 1
@@ -1549,9 +1553,9 @@ pub(crate) fn still_theirs(dir: &Directory, scope: &Scope, l: &Logged) -> bool {
     if dir.purging.contains(org) || dir.purged.contains(org) {
         return false;
     }
-    dir.orgs
-        .get(org)
-        .is_some_and(|o| !o.removed(&id) && l.asked_at >= o.since())
+    dir.orgs.get(org).is_some_and(|o| {
+        !o.removed(&id) && o.since_in(scope).is_some_and(|since| l.asked_at >= since)
+    })
 }
 
 /// The messages each session's keep read already, by session, in this process ([`keep_later`]), as their words
@@ -2129,16 +2133,15 @@ pub async fn advise(
     }
     let before = s.conversation.clone();
     // The advice routed for this step goes to the agent even when its conversation can't be kept now (a write main
-    // refused): a later step or the session's end keeps it. A refusal of the person (their day's cap) still stops it.
+    // refused): a later step or the session's end keeps it.
     let kept = match keep_conversation(store, scope, who, signed, &id, s, conversation).await {
         Ok(kept) => kept,
-        Err(e) if e.downcast_ref::<Refused>().is_none() => {
+        Err(e) => {
             eprintln!(
                 "sessions {scope}: session {id}'s conversation wasn't kept, its advice still is: {e:#}"
             );
             false
         }
-        Err(e) => return Err(e),
     };
     let (served, changed) = serve(store, scope, s, found).await?;
     let lookup = looked_up(&served);
@@ -2155,9 +2158,7 @@ pub async fn advise(
     if !(kept || changed || lookup.is_some()) {
         return Ok(served);
     }
-    crate::qa_log::daily_cap(store, scope, who)
-        .await
-        .map_err(relay)?;
+    // A step of a session already started adds no entry to the day's count: never capped.
     // Written onto the row as it stands now, not the one this step read before routing (seconds): a harness's Stop
     // keeps the conversation while its step routes (the hook sends both at once), and the row read before would
     // undo that, leaving a session that then ends idle with no transcript to judge. This step's changes go on top.
@@ -2388,9 +2389,6 @@ async fn keep_conversation(
     let Some(c) = conversation.map(str::trim).filter(|c| !c.is_empty()) else {
         return Ok(false);
     };
-    crate::qa_log::daily_cap(store, scope, who)
-        .await
-        .map_err(relay)?;
     let body = crate::hook::redact(&tail(c, MAX_TRANSCRIPT));
     let acl: Vec<&str> = s.acl.iter().map(String::as_str).collect();
     let ep = Episode::sourced(
@@ -3633,9 +3631,6 @@ async fn fire_now(
     if s.fires.len() >= MAX_FIRES {
         return Ok(none);
     }
-    crate::qa_log::daily_cap(store, scope, who)
-        .await
-        .map_err(relay)?;
     let lines = |h: &str| crate::advice::section_body(&note, h).unwrap_or_else(|| "(none)".into());
     let body = match (&event.args, &event.result) {
         (Some(a), Some(r)) => format!("Arguments: {a}\nResult: {r}"),
@@ -4135,6 +4130,12 @@ pub async fn end(
     // The PRs it opened or pushed to, which what becomes of them grades ([`pr_event`]).
     if let Some(t) = &transcript {
         crate::session_prs::merge(&mut s.prs, crate::session_prs::links_in(t));
+        // The skills its agent loaded, which a repository's skills are graded by (`crate::skill_review`).
+        let repo = repo_arg(args);
+        s.skills = crate::skill_review::uses_in(t)
+            .iter()
+            .map(|n| crate::skill_review::use_in_repo(n, repo.as_deref()))
+            .collect();
     }
     // A session opened before anything was asked (a harness's start hook) takes the task its end names (the
     // first prompt), so its transcript says what it was for.

@@ -1,10 +1,11 @@
 import "./why.css";
 import { useEffect, useState } from "react";
-import { errorText } from "../transport";
+import { errorText, READS_ONLY } from "../transport";
 import { call } from "./api";
 import { entityName, humanize, sourceTitle, when } from "./format";
 import { entityFocus, review } from "./review-api";
 import type { Selection } from "./types";
+import { useCanWrite } from "./writes";
 
 // "Why this answer": what a memory read found, explained. A search is run again with `explain` (memstore's
 // `search_memory` in its JSON form, as the person viewing, so only what they may read is ever shown): the facts that
@@ -332,6 +333,8 @@ function Provenance({ f }: { f: WhyFact }) {
 
 function Winner({ sel, f, rank, top }: { sel: Selection; f: WhyFact; rank: number; top: number }) {
   const [fixing, setFixing] = useState(false);
+  // Correcting a fact adds one: not for a viewer, who only reads.
+  const writes = useCanWrite();
   const stale = typeof f.freshness?.state === "string" ? f.freshness.state : null;
   return (
     <li className="why-item">
@@ -345,6 +348,8 @@ function Winner({ sel, f, rank, top }: { sel: Selection; f: WhyFact; rank: numbe
             className="why-btn why-wrong"
             type="button"
             aria-expanded={fixing}
+            disabled={!writes}
+            title={writes ? undefined : READS_ONLY}
             onClick={() => setFixing(!fixing)}
           >
             {fixing ? "Cancel" : "This is wrong"}
@@ -365,7 +370,7 @@ function Winner({ sel, f, rank, top }: { sel: Selection; f: WhyFact; rank: numbe
             </ul>
           </details>
         )}
-        {fixing && <Correct sel={sel} f={f} />}
+        {fixing && writes && <Correct sel={sel} f={f} />}
       </div>
     </li>
   );

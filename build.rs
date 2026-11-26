@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     studio();
+    build_id();
     // The `dylib` feature (dev builds) links the dependencies, and with them Rust's std, dynamically. Cargo puts
     // std's directory on the library path for `cargo run` and `cargo test`; this rpath lets the binaries run outside
     // cargo too.
@@ -16,6 +17,74 @@ fn main() {
         .expect("rustc --print target-libdir");
     let dir = String::from_utf8(out.stdout).expect("target-libdir is UTF-8");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.trim());
+}
+
+/// `AMPUP_MEMORY_BUILD_ID`: a hash of the sources this binary is built from (`src`, `crates`, the manifest and the
+/// lock file: paths and contents). Two binaries built from different code differ, so what one worked out and stored
+/// for others (a shared Home answer, `memstore::shared_answers::Last`) is never taken by the other: a deploy that
+/// changes what readers may see doesn't serve the answers of the build before it. Without git, which an image build
+/// may not have.
+fn build_id() {
+    use std::hash::{Hash, Hasher};
+    let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for top in ["src", "crates"] {
+        let dir = root.join(top);
+        if dir.is_dir() {
+            println!("cargo:rerun-if-changed={top}");
+            sources(&dir, &mut files);
+        }
+    }
+    for f in ["Cargo.toml", "Cargo.lock"] {
+        if root.join(f).is_file() {
+            println!("cargo:rerun-if-changed={f}");
+            files.push(root.join(f));
+        }
+    }
+    files.sort();
+    // Two hashers keyed apart: 128 bits.
+    let (mut a, mut b) = (
+        std::collections::hash_map::DefaultHasher::new(),
+        std::collections::hash_map::DefaultHasher::new(),
+    );
+    b.write_u8(1);
+    for f in &files {
+        let rel = f
+            .strip_prefix(&root)
+            .unwrap_or(f)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bytes = std::fs::read(f).unwrap_or_default();
+        for h in [&mut a, &mut b] {
+            rel.hash(h);
+            bytes.hash(h);
+        }
+    }
+    println!(
+        "cargo:rustc-env=AMPUP_MEMORY_BUILD_ID={:016x}{:016x}",
+        a.finish(),
+        b.finish()
+    );
+}
+
+/// Every file under `dir` but build output (`target`) and dotfiles.
+fn sources(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "target" || name == "node_modules" {
+            continue;
+        }
+        if path.is_dir() {
+            sources(&path, files);
+        } else {
+            files.push(path);
+        }
+    }
 }
 
 /// The Studio (`studio/`, a web app built with Node into `studio/dist`), embedded in the binary: OUT_DIR/studio.rs

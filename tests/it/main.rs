@@ -81,6 +81,36 @@ pub fn own_process(test: &str) -> bool {
     false
 }
 
+/// The bytes of the stored file `path`, as a search for a value left behind reads them ([`readable`]). None if it
+/// can't be read.
+pub fn stored_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(readable(bytes, &path.display().to_string()))
+}
+
+/// The bytes of a stored object (`name`) as a search for a value left behind reads them: a Parquet data file's rows
+/// written out again uncompressed (data files are zstd-compressed, where a value's bytes don't appear as they
+/// are), anything else as stored.
+pub fn readable(bytes: Vec<u8>, name: &str) -> Vec<u8> {
+    if !(bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1")) {
+        return bytes;
+    }
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::from(bytes),
+    )
+    .unwrap_or_else(|e| panic!("{name} is not a readable Parquet file: {e}"));
+    let mut out = vec![];
+    let mut writer = parquet::arrow::ArrowWriter::try_new(&mut out, reader.schema().clone(), None)
+        .expect("an uncompressed writer");
+    for batch in reader.build().unwrap() {
+        writer
+            .write(&batch.unwrap_or_else(|e| panic!("{name}: {e}")))
+            .unwrap();
+    }
+    writer.close().unwrap();
+    out
+}
+
 /// The store `memstore serve --local dir` serves, read in-process: its catalog, and its index (`dir/index`)
 /// rather than the default location (`~/.cache/memstore/index`), which every test here without one of its
 /// own would share, mid-write, with this one.

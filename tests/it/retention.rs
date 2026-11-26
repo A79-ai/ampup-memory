@@ -177,16 +177,19 @@ async fn reads(s: &str, sel: &str, bearer: &str, ids: &[&str]) -> Option<String>
         assert_eq!(status, 200, "{path}{sel}: {text}");
         out.push_str(&text);
     }
-    // The Explorer's deals, kept per reader by memory state (twice: the second from what was kept): a deal whose
-    // facts went is gone from them.
+    // The Explorer's deals, and what each source taught (the things it said the most about), kept per reader by
+    // memory state (twice: the second from what was kept): a deal whose facts went is gone from them.
     for _ in 0..2 {
         let ls = json!({"op": "ls", "path": ["entities", "deal"]});
-        let (status, text) = post(&format!("{s}/browse{sel}"), bearer, &ls).await;
-        if status == 401 || status == 403 {
-            return None;
+        let sources = json!({"op": "sources", "top": 20});
+        for req in [ls, sources] {
+            let (status, text) = post(&format!("{s}/browse{sel}"), bearer, &req).await;
+            if status == 401 || status == 403 {
+                return None;
+            }
+            assert!(status == 200 || status == 404, "/browse{sel}: {text}");
+            out.push_str(&text);
         }
-        assert!(status == 200 || status == 404, "/browse{sel}: {text}");
-        out.push_str(&text);
     }
     let call = |name: &str, args: Value| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
     let mut tools = vec![call("search_memory", json!({"query": "owner note deal"}))];
@@ -262,7 +265,7 @@ async fn until(
     }
 }
 
-/// Every file under `root` whose bytes hold `tag`.
+/// Every file under `root` whose bytes hold `tag` (a data file's rows uncompressed: [`crate::stored_bytes`]).
 fn files_with(root: &Path, tag: &str) -> Vec<PathBuf> {
     let mut out = vec![];
     let mut stack = vec![root.to_path_buf()];
@@ -274,7 +277,7 @@ fn files_with(root: &Path, tag: &str) -> Vec<PathBuf> {
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
-            } else if let Ok(bytes) = std::fs::read(&p)
+            } else if let Some(bytes) = crate::stored_bytes(&p)
                 && bytes.windows(tag.len()).any(|w| w == tag.as_bytes())
             {
                 out.push(p);

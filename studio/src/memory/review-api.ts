@@ -137,6 +137,23 @@ export interface ConflictPage {
   next: string | null;
 }
 
+/** A conflict as a list's row shows it (`view: "rows"`): opening it reads it in full (`review.conflict`). */
+export interface ConflictRow {
+  entity: string;
+  predicate: string;
+  /** Its first two values, the older first, cut short. */
+  values: string[];
+  /** How many values disagree. */
+  count: number;
+}
+
+/** A page of conflict rows, how many there are in all, and where the next page starts (none: the last). */
+export interface ConflictRowPage {
+  rows: ConflictRow[];
+  total: number;
+  next: string | null;
+}
+
 /** `check_conflicts`: what it looked at and what it recorded. */
 export interface ConflictCheck {
   checked: number;
@@ -300,6 +317,51 @@ export const review = {
         next: r.next ?? null,
       }),
     ),
+  /**
+   * A page of conflicts as a list shows them: only what a row shows. A server before `view` answers them in full,
+   * which is read the same way.
+   */
+  conflictRows: (
+    sel: Selection,
+    opts: { mine?: boolean; limit?: number; after?: string } = {},
+  ) =>
+    op<{
+      conflicts: (ConflictRow | Conflict)[];
+      total?: number;
+      next?: string | null;
+    }>(sel, { op: "list_conflicts", view: "rows", ...opts }).then(
+      (r): ConflictRowPage => ({
+        rows: r.conflicts.map((c) =>
+          "values" in c
+            ? c
+            : {
+                entity: c.entity,
+                predicate: c.predicate,
+                values: c.facts.slice(0, 2).map((f) => f.value),
+                count: c.facts.length,
+              },
+        ),
+        total: r.total ?? r.conflicts.length,
+        next: r.next ?? null,
+      }),
+    ),
+  /** How many conflicts there are (only those on what the caller owns, with `mine`). */
+  conflictCount: (sel: Selection, opts: { mine?: boolean } = {}) =>
+    op<{ total?: number; conflicts?: unknown[] }>(sel, {
+      op: "list_conflicts",
+      view: "count",
+      // A server before `view` answers one conflict in full beside the total.
+      limit: 1,
+      ...opts,
+    }).then((r) => r.total ?? r.conflicts?.length ?? 0),
+  /** One thing's conflict over one attribute, in full: what a row opens to. None once it is settled. */
+  conflict: (sel: Selection, entity: string, predicate: string) =>
+    op<{ conflicts: Conflict[] }>(sel, {
+      op: "list_conflicts",
+      entity,
+      predicate,
+      limit: 200,
+    }).then((r) => r.conflicts.find((c) => c.predicate === predicate) ?? null),
   /** Keep one of the two facts, or state the right value: exactly one of `keep` and `value`. */
   resolve: (sel: Selection, facts: [string, string], how: { keep: string } | { value: string }) =>
     op<Resolution>(sel, { op: "resolve_conflict", facts, ...how }),

@@ -26,7 +26,7 @@ A session is one conversation, start to end.
 - A session nobody ends is ended after `AMPUP_MEMORY_SESSION_IDLE_SECS` (1800) without a step, with the last
   conversation it was sent as its transcript.
 - The opening context, transcript and conversation are the caller's own episodes, readable by them alone, with
-  secret-looking words redacted. At most `AMPUP_MEMORY_SESSIONS_PER_DAY` (1000) sessions a person a day; past sessions `index` sends have no
+  secret-looking words redacted. At most `AMPUP_MEMORY_SESSIONS_PER_DAY` (10,000) sessions a person a day; past sessions `index` sends have no
   daily most and never count toward it.
 
 ### Judging
@@ -96,12 +96,12 @@ curl -s localhost:8080/runs/reward -d '{"run_id": "…", "reward": 1, "reason": 
   `POST /runs/reward {"rewards": [...]}` rewards up to 1,000 runs at once.
 - **From a file.** `ampup-memory runs load <scope> runs.jsonl --as <user>` records one run a line as one batch.
   With `--local <dir>` (server stopped) it writes a `serve --local` store.
-- Limits: `AMPUP_MEMORY_RUNS_PER_DAY` (100) runs and `AMPUP_MEMORY_LOG_PER_DAY` (1000) answer-log entries per person a day.
+- Limits: `AMPUP_MEMORY_RUNS_PER_DAY` (10,000) runs and `AMPUP_MEMORY_LOG_PER_DAY` (50,000) answer-log entries per person a day.
 - **Imports.** An org's admin (or the operator) imports runs graded elsewhere as the org's:
   `POST /runs {"import": "ci-nightly", "runs": [...], "acl"?: [...]}`, or `ampup-memory runs load <scope> runs.jsonl
   --import ci-nightly`. Each run carries its `reward`. They are recorded as `import:ci-nightly`, not as a person;
   their traces are the org's admins' (or the `acl` named: members or `group:<org>.all`, never `*`). Importing the
-  same runs again records nothing new. Imports have their own `AMPUP_MEMORY_IMPORT_RUNS_PER_DAY` (5000) per scope and
+  same runs again records nothing new. Imports have their own `AMPUP_MEMORY_IMPORT_RUNS_PER_DAY` (100,000) per scope and
   never count toward a person's caps. An imported run its grader rewarded counts as evidence of an outcome, so an
   import alone can teach a team note; one person's own runs still need a second person.
 - Unrewarded runs older than `AMPUP_MEMORY_ADVICE_JUDGE_AFTER_SECS` (1800) are judged by a model (1, -1 or "can't

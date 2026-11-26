@@ -175,8 +175,9 @@ config.
 | kilo (Kilo Code) | the same plugin as `~/.config/kilo/plugin/ampup-memory.ts`, `mcp` in `~/.config/kilo/kilo.json` | the same |
 | amp | the plugin `~/.config/amp/plugins/ampup-memory.ts`, `amp.mcpServers` in `~/.config/amp/settings.json` | session start; advice and facts at the first prompt, as a hidden message |
 
-Grok Bot takes the Cursor-format plugin `plugins/ampup-memory-grok` instead: a user-level `~/.cursor/hooks.json` on
-its computer doesn't fire, so there is no `--harness grok` install. OpenCode, Kilo Code and Amp get the plugins in
+Grok Bot runs no hooks that see the conversation (only those around its shell commands), so there is no
+`--harness grok` install: it takes the MCP server and the skills of `plugins/ampup-memory-grok`, which open and close
+each task's session from the agent. OpenCode, Kilo Code and Amp get the plugins in
 `plugins/integrations/`, which the client carries (a build without them says so); they find the client as
 `AMPUP_MEMORY_CLIENT`, else `~/.local/bin/ampup-memory-client`, else on the PATH.
 

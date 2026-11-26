@@ -31,12 +31,13 @@ function admin<T>(sel: Selection, body: Record<string, unknown>): Promise<T> {
   return call<T>({ org: sel.org, team }, "admin", body);
 }
 
-/** One read, refreshed when its key changes. */
-function useAdmin<T>(sel: Selection, body: Record<string, unknown>) {
+/** One read, refreshed when its key changes; none while `body` is null. */
+function useAdmin<T>(sel: Selection, body: Record<string, unknown> | null) {
   const key = JSON.stringify([sel.org, sel.team, body]);
   const [got, setGot] = useState<{ key: string; data?: T; error?: unknown } | null>(null);
   const [n, setN] = useState(0);
   useEffect(() => {
+    if (!body) return;
     let live = true;
     admin<T>(sel, body).then(
       (data) => live && setGot({ key, data }),
@@ -424,6 +425,11 @@ interface Entry {
   /** A session or run that kept a transcript (`/admin {op: "conversation"}` reads it). */
   transcript?: boolean;
   question?: string;
+  /** A light entry's (read with `light: true`): its question and goal are their start, and its answer is left out. */
+  light?: boolean;
+  question_cut?: boolean;
+  goal_cut?: boolean;
+  has_answer?: boolean;
   answer?: string;
   answer_cut?: boolean;
   goal?: string;
@@ -442,11 +448,27 @@ interface Entry {
     /** What each advice lookup in it came to (absent from sessions kept before lookups were). */
     lookups?: Lookup[];
   };
+  /** Why it wasn't answered well (a `gaps_only` read's). */
+  why?: "unhelpful" | "went_wrong" | "no_facts";
+  /** Its place in its conversation, one of several parts, over the whole window (a light read's, `parts`). */
+  part?: Part;
+}
+/** An entry's place in its conversation: its part, how many, and (for a later part) the conversation's start. */
+interface Part {
+  k: number;
+  n: number;
+  task?: string;
 }
 interface Activity {
   people: Person[];
   entries: Entry[];
   more: boolean;
+  /** Where the next page starts (`after`); null on the last (an engine that pages the activity says it). */
+  next?: string | null;
+  /** The entries carry their `part`, worked out over the window (an engine that does says it). */
+  parts?: boolean;
+  /** Only the entries not answered well were listed (an engine that can echoes it). */
+  gaps_only?: boolean;
   /** When advice was served and when it wasn't, over the window (absent from older engines). */
   serving?: Serving;
   /** The entries in the window not answered well, all of them, by why (absent from older engines). */
@@ -454,8 +476,11 @@ interface Activity {
 }
 
 const WINDOWS = [7, 30, 90] as const;
-/** Most entries one activity read lists (the server's cap). */
+/** Most entries one activity read lists (the server's cap): Not answered's read where the engine can't list only
+ * the gaps. */
 const READ_AT_MOST = 500;
+/** Entries a page of Traces or Not answered lists at a time; "Show more" reads the next. */
+const PAGE = 40;
 
 /** A session a harness opened before anything was asked, with nothing kept yet: the start hook opens one as the
  * harness starts, and its first prompt names it. Most end empty, out of the activity; until then they'd show as rows
@@ -463,19 +488,30 @@ const READ_AT_MOST = 500;
 const unasked = (e: Entry) =>
   e.kind === "session" && !e.withheld && !e.question?.trim() && !e.transcript;
 
+
+/**
+ * An opened row's entry: read whole (`activity` with its `id`) where the list sent it light, without what an opened
+ * row shows (its answer, the reward's reason, its advice lookups); else as listed.
+ */
+function useWhole(sel: Selection, e: Entry): { e?: Entry; error?: unknown; reload: () => void } {
+  const got = useAdmin<{ entries: Entry[] }>(sel, e.light ? { op: "activity", id: e.id } : null);
+  if (!e.light) return { e, reload: got.reload };
+  return { e: got.data?.entries.find((x) => x.id === e.id), error: got.error, reload: got.reload };
+}
+
 /** The entries worth a row: all but the [unasked] sessions. */
 const asked = (entries: Entry[]) => entries.filter((e) => !unasked(e));
 
 /** Where each entry stands in its conversation, among the entries read: its part and the conversation's first
  * question, for a session that is one of several (a harness ends one at a compaction or when idle, and opens the
  * next for the same conversation). */
-function threads(entries: Entry[]): Map<string, { k: number; n: number; task: string }> {
+function threads(entries: Entry[]): Map<string, Part> {
   const by = new Map<string, Entry[]>();
   for (const e of entries) {
     const t = e.session?.thread;
     if (t) by.set(t, [...(by.get(t) ?? []), e]);
   }
-  const out = new Map<string, { k: number; n: number; task: string }>();
+  const out = new Map<string, Part>();
   for (const parts of by.values()) {
     if (parts.length < 2) continue;
     parts.sort((a, b) => a.asked_at - b.asked_at);
@@ -487,10 +523,113 @@ function threads(entries: Entry[]): Map<string, { k: number; n: number; task: st
   return out;
 }
 
+/** Where each entry stands in its conversation: as the engine worked it out over the window where it says so
+ * (`parts`), else among the entries read. */
+function partsOf(data: Activity | undefined, entries: Entry[]): Map<string, Part> {
+  if (!data?.parts) return threads(entries);
+  return new Map(entries.flatMap((e) => (e.part ? [[e.id, e.part] as [string, Part]] : [])));
+}
+
+/**
+ * An activity list read a page at a time: the first page as `body` asks, then each next one on demand (`after` the
+ * last page's `next`), appended. An entry already listed (a live session that moved up while paging) is kept once.
+ */
+function usePages(sel: Selection, body: Record<string, unknown> | null) {
+  const first = useAdmin<Activity>(sel, body);
+  const [more, setMore] = useState<{
+    base: Activity;
+    entries: Entry[];
+    next: string | null;
+    busy: boolean;
+    error?: unknown;
+  } | null>(null);
+  const base = first.data;
+  const cur = base && more?.base === base ? more : null;
+  const next = cur ? cur.next : (base?.next ?? null);
+  const entries = (() => {
+    const all = [...(base?.entries ?? []), ...(cur?.entries ?? [])];
+    const seen = new Set<string>();
+    return all.filter((e) => !seen.has(e.id) && (seen.add(e.id), true));
+  })();
+  const loadMore = () => {
+    if (!base || !body || !next || cur?.busy) return;
+    setMore({ base, entries: cur?.entries ?? [], next, busy: true });
+    admin<Activity>(sel, { ...body, after: next }).then(
+      (page) =>
+        setMore((m) =>
+          m?.base === base
+            ? { base, entries: [...m.entries, ...page.entries], next: page.next ?? null, busy: false }
+            : m,
+        ),
+      (error: unknown) =>
+        setMore((m) => (m?.base === base ? { ...m, busy: false, error } : m)),
+    );
+  };
+  return { ...first, entries, next, loadMore, busy: !!cur?.busy, moreError: cur?.error };
+}
+
+/** "Show more", under a paged list: how many are left where that is known. */
+function ShowMore({
+  pages,
+  left,
+}: {
+  pages: { next: string | null; loadMore: () => void; busy: boolean; moreError?: unknown };
+  left?: number;
+}) {
+  if (!pages.next) return null;
+  return (
+    <p className="st-pad">
+      {!!pages.moreError && (
+        <span className="st-out" role="alert">
+          {errorText(pages.moreError)}{" "}
+        </span>
+      )}
+      <button className="st-btn" disabled={pages.busy} onClick={pages.loadMore}>
+        {pages.busy ? "Reading more…" : left ? `Show more (${fig(left)} left)` : "Show more"}
+      </button>
+    </p>
+  );
+}
+
+/** The entry a link opens (`open`) that isn't among the rows read yet: read whole, above the list. */
+function Linked({
+  sel,
+  id,
+  children,
+}: {
+  sel: Selection;
+  id: string;
+  children: (e: Entry) => React.ReactNode;
+}) {
+  const got = useAdmin<{ entries: Entry[] }>(sel, { op: "activity", id });
+  const e = got.data?.entries.find((x) => x.id === id);
+  return (
+    <div className="st-detail st-pad-x">
+      {got.error ? (
+        <Failed error={got.error} onRetry={got.reload} />
+      ) : !e ? (
+        <p className="st-quiet">{got.loading ? "Reading it…" : "This link's entry isn't in the answer log."}</p>
+      ) : (
+        <>
+          <p>
+            <b>
+              <QuestionText e={e} />
+            </b>{" "}
+            <span className="st-quiet">
+              {e.user} · {ago(e.updated_at || e.asked_at)}
+            </span>
+          </p>
+          {children(e)}
+        </>
+      )}
+    </div>
+  );
+}
+
 /** An entry's place in its conversation, under its question. */
-function PartOf({ part }: { part?: { k: number; n: number; task: string } }) {
+function PartOf({ part }: { part?: Part }) {
   if (!part) return null;
-  const task = plainQuestion(part.task);
+  const task = plainQuestion(part.task ?? "");
   return (
     <div className="st-small st-quiet">
       Part {part.k} of {part.n} of one conversation
@@ -502,23 +641,29 @@ function PartOf({ part }: { part?: { k: number; n: number; task: string } }) {
 export function People({
   sel,
   user,
+  everyone,
   onUser,
   onEpisode,
   onTrace,
 }: {
   sel: Selection;
   user?: string;
+  /** With no `user`: every session the log holds, newest first, in place of the table of people. */
+  everyone?: boolean;
   onUser: (u: string | undefined) => void;
   onEpisode: (id: string) => void;
   onTrace: (id: string) => void;
 }) {
   const [days, setDays] = useChoice("days", WINDOWS, 30);
-  const { data, error, loading, reload } = useAdmin<Activity>(sel, {
+  // A page at a time, each entry as its row shows it: an opened row reads the rest.
+  const pages = usePages(sel, {
     op: "activity",
     sinceDays: days,
     ...(user ? { user } : {}),
-    limit: 100,
+    limit: PAGE,
+    light: true,
   });
+  const { data, error, loading, reload } = pages;
   const [busy, setBusy] = useState(false);
   const off = error instanceof ApiError && error.status === 403 && /activity/i.test(error.message);
 
@@ -673,7 +818,7 @@ export function People({
         <Failed error={error} onRetry={reload} />
       ) : loading ? (
         <p className="st-quiet st-pad">Reading the answer log…</p>
-      ) : !user ? (
+      ) : !user && !everyone ? (
         people.length === 0 ? (
           <p className="st-quiet st-pad">No one used the memory in the last {days} days.</p>
         ) : (
@@ -725,8 +870,10 @@ export function People({
         )
       ) : (
         <Entries
-          entries={asked(data?.entries ?? [])}
-          more={Boolean(data?.more)}
+          sel={sel}
+          data={data}
+          entries={asked(pages.entries)}
+          pages={pages}
           onEpisode={onEpisode}
           onTrace={onTrace}
         />
@@ -764,21 +911,38 @@ function AdviceCell({ e }: { e: Entry }) {
 }
 
 function Entries({
+  sel,
+  data,
   entries,
-  more,
+  pages,
   onEpisode,
   onTrace,
 }: {
+  sel: Selection;
+  data?: Activity;
   entries: Entry[];
-  more: boolean;
+  pages: { next: string | null; loadMore: () => void; busy: boolean; moreError?: unknown };
   onEpisode: (id: string) => void;
   onTrace: (id: string) => void;
 }) {
   const [open, setOpen] = useOption("open");
-  const parts = threads(entries);
-  if (!entries.length) return <p className="st-quiet st-pad">Nothing in this window.</p>;
+  const parts = partsOf(data, entries);
+  const linked = open && !entries.some((e) => e.id === open) ? open : null;
+  const opened = linked && (
+    <Linked key={linked} sel={sel} id={linked}>
+      {(e) => <EntryOpened sel={sel} entry={e} onEpisode={onEpisode} />}
+    </Linked>
+  );
+  if (!entries.length)
+    return (
+      <>
+        {opened}
+        <p className="st-quiet st-pad">Nothing in this window.</p>
+      </>
+    );
   return (
     <div className="st-table-wrap st-pad-x">
+      {opened}
       <table className="st-table">
         <thead>
           <tr>
@@ -856,49 +1020,7 @@ function Entries({
                 {isOpen && (
                   <tr className="st-detail">
                     <td colSpan={7}>
-                      <div className="st-detail-in">
-                        {e.goal && (
-                          <p>
-                            <b>Goal</b> {e.goal}
-                          </p>
-                        )}
-                        {e.answer && (
-                          <p className="st-answer">
-                            {e.answer}
-                            {e.answer_cut ? "…" : ""}
-                          </p>
-                        )}
-                        {e.session?.served?.length ? (
-                          <p>
-                            <b>Advice served</b> {e.session.served.join(", ")}
-                          </p>
-                        ) : null}
-                        {e.kind === "session" && (
-                          <>
-                            <p>
-                              <b>Advice lookups</b>{" "}
-                              <span className="st-quiet">
-                                each time its agent asked, and what it came to
-                              </span>
-                            </p>
-                            <LookupList lookups={e.session?.lookups ?? []} />
-                          </>
-                        )}
-                        {e.episodes.length > 0 && (
-                          <p className="st-chips">
-                            <b>Episodes</b>
-                            {e.episodes.map((id) => (
-                              <button
-                                key={id}
-                                className="st-chip mono"
-                                onClick={() => onEpisode(id)}
-                              >
-                                {id.slice(0, 12)}
-                              </button>
-                            ))}
-                          </p>
-                        )}
-                      </div>
+                      <EntryOpened sel={sel} entry={e} onEpisode={onEpisode} />
                     </td>
                   </tr>
                 )}
@@ -907,7 +1029,67 @@ function Entries({
           })}
         </tbody>
       </table>
-      {more && <p className="st-quiet st-pad">Showing the newest 100.</p>}
+      {pages.next ? (
+        <ShowMore pages={pages} />
+      ) : (
+        data?.more &&
+        !data.next && <p className="st-quiet st-pad">Showing the newest {fig(entries.length)}.</p>
+      )}
+    </div>
+  );
+}
+
+/** An opened row of People: the entry's goal, answer, advice and episodes. */
+function EntryOpened({
+  sel,
+  entry,
+  onEpisode,
+}: {
+  sel: Selection;
+  entry: Entry;
+  onEpisode: (id: string) => void;
+}) {
+  const whole = useWhole(sel, entry);
+  if (whole.error) return <Failed error={whole.error} onRetry={whole.reload} />;
+  const e = whole.e;
+  if (!e) return <p className="st-detail-in st-quiet">Reading it…</p>;
+  return (
+    <div className="st-detail-in">
+      {e.goal && (
+        <p>
+          <b>Goal</b> {e.goal}
+        </p>
+      )}
+      {e.answer && (
+        <p className="st-answer">
+          {e.answer}
+          {e.answer_cut ? "…" : ""}
+        </p>
+      )}
+      {e.session?.served?.length ? (
+        <p>
+          <b>Advice served</b> {e.session.served.join(", ")}
+        </p>
+      ) : null}
+      {e.kind === "session" && (
+        <>
+          <p>
+            <b>Advice lookups</b>{" "}
+            <span className="st-quiet">each time its agent asked, and what it came to</span>
+          </p>
+          <LookupList lookups={e.session?.lookups ?? []} />
+        </>
+      )}
+      {e.episodes.length > 0 && (
+        <p className="st-chips">
+          <b>Episodes</b>
+          {e.episodes.map((id) => (
+            <button key={id} className="st-chip mono" onClick={() => onEpisode(id)}>
+              {id.slice(0, 12)}
+            </button>
+          ))}
+        </p>
+      )}
     </div>
   );
 }
@@ -1307,20 +1489,35 @@ export function NotAnswered({
   onTrace: (id: string) => void;
 }) {
   const [days, setDays] = useChoice("days", WINDOWS, 30);
-  const { data, error, loading, reload } = useAdmin<Activity>(sel, {
+  // Only the gaps, a page at a time, each entry as its row shows it: an opened row reads the rest.
+  const pages = usePages(sel, {
     op: "activity",
     sinceDays: days,
-    limit: READ_AT_MOST,
+    limit: PAGE,
+    light: true,
+    gaps_only: true,
   });
+  // An engine that can't list only the gaps (it doesn't echo `gaps_only`): its newest entries, the gaps among them.
+  const fallback = useAdmin<Activity>(
+    sel,
+    pages.data && !pages.data.gaps_only
+      ? { op: "activity", sinceDays: days, limit: READ_AT_MOST, light: true }
+      : null,
+  );
+  const onlyGaps = !!pages.data?.gaps_only;
+  const { data, error, loading, reload } = onlyGaps || !pages.data ? pages : fallback;
   const [open, setOpen] = useOption("open");
   // The window's totals: `people` counts every entry in it, however few the read lists.
   const people = data?.people ?? [];
   const sessions = people.reduce((n, p) => n + p.sessions + p.runs, 0);
   const answers = people.reduce((n, p) => n + p.answers, 0);
   const read = data?.entries.length ?? 0;
-  const all = asked(data?.entries ?? []);
-  const gaps = all.map((e) => ({ e, why: gapOf(e) })).filter((g) => g.why);
-  const parts = threads(all);
+  const all = asked(onlyGaps ? pages.entries : (data?.entries ?? []));
+  const gaps = all
+    .map((e) => ({ e, why: onlyGaps && e.why ? WHY[e.why] : gapOf(e) }))
+    .filter((g) => g.why);
+  const parts = partsOf(data, all);
+  const linked = open && !gaps.some((g) => g.e.id === open) ? open : null;
   // What wasn't answered well in all, where the engine counts it over the window; else among the entries read,
   // which are all of the window's unless `more`.
   const counted = data?.gaps;
@@ -1383,7 +1580,7 @@ export function NotAnswered({
         <Failed error={error} onRetry={reload} />
       ) : loading ? (
         <p className="st-quiet st-pad">Reading the answer log…</p>
-      ) : inAll === 0 ? (
+      ) : inAll === 0 && !linked ? (
         <p className="st-quiet st-pad">
           {sampled
             ? `None of the newest ${fig(read)} of the ${fig(entriesInWindow)} sessions, runs and answers in the last ${days} days went wrong, was rated unhelpful or was answered without facts. The older ones weren't checked.`
@@ -1404,6 +1601,11 @@ export function NotAnswered({
         </p>
       ) : (
         <div className="st-table-wrap st-pad-x">
+          {linked && (
+            <Linked key={linked} sel={sel} id={linked}>
+              {(e) => <GapOpened sel={sel} entry={e} onEpisode={onEpisode} onTrace={onTrace} />}
+            </Linked>
+          )}
           {gaps.length > 0 && (
             <table className="st-table">
               <thead>
@@ -1456,38 +1658,12 @@ export function NotAnswered({
                       {isOpen && (
                         <tr className="st-detail">
                           <td colSpan={4}>
-                            <div className="st-detail-in">
-                              {e.answer ? (
-                                <p className="st-answer">
-                                  {e.answer}
-                                  {e.answer_cut ? "…" : ""}
-                                </p>
-                              ) : (
-                                <p className="st-quiet">No answer was logged.</p>
-                              )}
-                              {e.reward_reason && <p className="st-quiet">{e.reward_reason}</p>}
-                              {e.transcript && (
-                                <p>
-                                  <button className="st-link" onClick={() => onTrace(e.id)}>
-                                    Trace the conversation
-                                  </button>
-                                </p>
-                              )}
-                              {e.episodes.length > 0 && (
-                                <p className="st-chips">
-                                  <b>Episodes</b>
-                                  {e.episodes.map((id) => (
-                                    <button
-                                      key={id}
-                                      className="st-chip mono"
-                                      onClick={() => onEpisode(id)}
-                                    >
-                                      {id.slice(0, 12)}
-                                    </button>
-                                  ))}
-                                </p>
-                              )}
-                            </div>
+                            <GapOpened
+                              sel={sel}
+                              entry={e}
+                              onEpisode={onEpisode}
+                              onTrace={onTrace}
+                            />
                           </td>
                         </tr>
                       )}
@@ -1497,9 +1673,65 @@ export function NotAnswered({
               </tbody>
             </table>
           )}
+          {onlyGaps && <ShowMore pages={pages} left={inAll - gaps.length} />}
         </div>
       )}
     </Sheet>
+  );
+}
+
+/** A `gaps_only` read's `why`, as the page names it. */
+const WHY = {
+  unhelpful: "unhelpful",
+  went_wrong: "went wrong",
+  no_facts: "no facts",
+} as const;
+
+/** An opened row of Not answered: the entry's answer, why it went wrong, its trace and episodes. */
+function GapOpened({
+  sel,
+  entry,
+  onEpisode,
+  onTrace,
+}: {
+  sel: Selection;
+  entry: Entry;
+  onEpisode: (id: string) => void;
+  onTrace: (id: string) => void;
+}) {
+  const whole = useWhole(sel, entry);
+  if (whole.error) return <Failed error={whole.error} onRetry={whole.reload} />;
+  const e = whole.e;
+  if (!e) return <p className="st-detail-in st-quiet">Reading it…</p>;
+  return (
+    <div className="st-detail-in">
+      {e.answer ? (
+        <p className="st-answer">
+          {e.answer}
+          {e.answer_cut ? "…" : ""}
+        </p>
+      ) : (
+        <p className="st-quiet">No answer was logged.</p>
+      )}
+      {e.reward_reason && <p className="st-quiet">{e.reward_reason}</p>}
+      {e.transcript && (
+        <p>
+          <button className="st-link" onClick={() => onTrace(e.id)}>
+            Trace the conversation
+          </button>
+        </p>
+      )}
+      {e.episodes.length > 0 && (
+        <p className="st-chips">
+          <b>Episodes</b>
+          {e.episodes.map((id) => (
+            <button key={id} className="st-chip mono" onClick={() => onEpisode(id)}>
+              {id.slice(0, 12)}
+            </button>
+          ))}
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -1548,16 +1780,29 @@ interface Item {
   helped: number;
   harmed: number;
 }
+/** A note's lists of runs and sessions. */
+type UseList = "learned_from" | "served_in" | "validated_in" | "withheld_in";
 interface Note {
   key: string;
   category: string;
   situation: string;
-  learned_from: Use[];
-  served_in: Use[];
-  validated_in: Use[];
+  // The lists, newest first. A light list (`light: true`) has only their counts and an opened note its newest few;
+  // an older engine sends all of them, with no counts.
+  learned_from?: Use[];
+  served_in?: Use[];
+  validated_in?: Use[];
   /** The sessions it was withheld from (the holdout); absent from older engines. */
   withheld_in?: Use[];
-  people: number;
+  learned_from_count?: number;
+  served_in_count?: number;
+  validated_in_count?: number;
+  withheld_in_count?: number;
+  /** A light list's: the newest session it was served in (µs). */
+  last_served?: number;
+  /** A light list's, for `note` and `items`: whether it has a note, and its items that harmed more than helped. */
+  has_note?: boolean;
+  harmed_items?: number;
+  people?: number;
   /** The note's text, where one is written and the reader may read it; a bare situation has none. */
   note?: string | null;
   /** What the note was last written from: its runs, and how many of them went wrong. */
@@ -1616,6 +1861,10 @@ const IMPACTS: { id: Impact; title: string; about: string }[] = [
 
 /** Served to at least this many people, a note applied in fewer than half of them is served where it doesn't fit. */
 const MISFIRE_MIN = 3;
+/** How many runs or sessions a note's list holds: its count, or (an older engine's) the list itself. */
+const many = (n: Note, list: UseList) => n[`${list}_count`] ?? n[list]?.length ?? 0;
+/** Whether the note has text (a light list says so without sending it). */
+const noted = (n: Note) => !!(n.note || n.has_note);
 const pct = (ok: number, bad: number) =>
   ok + bad ? `${Math.round((100 * ok) / (ok + bad))}% of ${ok + bad}` : "—";
 const points = (v: number) => `${v > 0 ? "+" : ""}${Math.round(v * 100)} pts`;
@@ -1623,10 +1872,10 @@ const points = (v: number) => `${v > 0 ? "+" : ""}${Math.round(v * 100)} pts`;
 /** Where a note stands, and the reason, from the server's tally (the one serving and ratification go by). */
 function impact(n: Note): { is: Impact; why: string } {
   const e = n.evidence;
-  if (!n.note) return { is: "none", why: "" };
-  const harmed = (n.items ?? []).filter((i) => i.harmed > i.helped);
+  if (!noted(n)) return { is: "none", why: "" };
+  const harmed = n.harmed_items ?? (n.items ?? []).filter((i) => i.harmed > i.helped).length;
   if (!e || e.served + e.withheld === 0) {
-    return n.served_in.length
+    return many(n, "served_in")
       ? { is: "early", why: "Served, no judged session yet." }
       : { is: "unserved", why: "" };
   }
@@ -1645,10 +1894,10 @@ function impact(n: Note): { is: Impact; why: string } {
   if (e.not_helped > e.helped) {
     return { is: "hurting", why: `The judge: didn't help ${e.not_helped}, helped ${e.helped}.` };
   }
-  if (harmed.length) {
+  if (harmed) {
     return {
       is: "hurting",
-      why: `${harmed.length} item${harmed.length > 1 ? "s" : ""} harmed more than helped.`,
+      why: `${harmed} item${harmed > 1 ? "s" : ""} harmed more than helped.`,
     };
   }
   // Served where it doesn't fit: an agent shown it mostly didn't use it, so it costs attention for nothing.
@@ -1674,15 +1923,21 @@ function impact(n: Note): { is: Impact; why: string } {
 }
 
 export function Advice({ sel, onUser }: { sel: Selection; onUser: (u: string) => void }) {
-  const { data, error, loading, reload } = useAdmin<AdviceTrail>(sel, { op: "advice_trail" });
+  // Each note's counts only: an opened note's text, runs and sessions are read as it opens (`Opened`).
+  const { data, error, loading, reload } = useAdmin<AdviceTrail>(sel, {
+    op: "advice_trail",
+    light: true,
+  });
   const [open, setOpen] = useOption("open");
   const owners = useOwners(sel.org);
   const notes = [...(data?.notes ?? [])].sort(
-    (a, b) => b.served_in.length - a.served_in.length || a.key.localeCompare(b.key),
+    (a, b) => many(b, "served_in") - many(a, "served_in") || a.key.localeCompare(b.key),
   );
-  const unproven = notes.filter((n) => n.served_in.length > 0 && n.validated_in.length === 0);
+  const unproven = notes.filter((n) => many(n, "served_in") > 0 && many(n, "validated_in") === 0);
   // Grouped by impact from the server's evidence; an engine that predates it gets the plain list.
-  const hasEvidence = notes.some((n) => n.withheld_in !== undefined);
+  const hasEvidence = notes.some(
+    (n) => n.withheld_in !== undefined || n.withheld_in_count !== undefined || !!n.evidence,
+  );
   const graded = notes.map((n) => ({ n, ...impact(n) }));
   const count = (i: Impact) => graded.filter((g) => g.is === i).length;
   const showImpact = hasEvidence;
@@ -1705,38 +1960,7 @@ export function Advice({ sel, onUser }: { sel: Selection; onUser: (u: string) =>
   const detail = (n: Note, cols: number) => (
     <tr className="st-detail">
       <td colSpan={cols}>
-        {n.note ? (
-          <div className="st-detail-in st-note">
-            <p className="st-note-src">
-              The note AmpUp Memory serves for this situation, learned from{" "}
-              <b>{n.written?.runs ?? n.learned_from.length} graded runs</b>
-              {n.written && (
-                <>
-                  {" "}
-                  ({n.written.runs - n.written.wrong} went right, {n.written.wrong} went wrong)
-                </>
-              )}
-              : the steps of the runs that went right and the pitfalls of the rest.
-            </p>
-            <Items items={n.items ?? []} />
-            <div className="st-note-body">
-              {/* Without its items' ids (`<!--i:…-->`), as an agent is served it. */}
-              <Markdown text={n.note.replace(/ ?<!--i:[0-9a-f]+-->/g, "")} />
-            </div>
-          </div>
-        ) : (
-          <p className="st-detail-in st-quiet">
-            No note yet: a situation gets one once enough of its runs went wrong, from enough
-            people.
-          </p>
-        )}
-        <div className="st-detail-in st-trail">
-          <Trail title="Served in" uses={n.served_in} onUser={onUser} />
-          {n.withheld_in && (
-            <Trail title="Withheld from (holdout)" uses={n.withheld_in} onUser={onUser} />
-          )}
-          <Trail title="Learned from" uses={n.learned_from} onUser={onUser} />
-        </div>
+        <Opened sel={sel} note={n} onUser={onUser} />
       </td>
     </tr>
   );
@@ -1751,7 +1975,7 @@ export function Advice({ sel, onUser }: { sel: Selection; onUser: (u: string) =>
       </button>
       <div className="st-quiet st-small">
         {n.category}
-        {!n.note && !showImpact && " · no note yet"}
+        {!noted(n) && !showImpact && " · no note yet"}
         {n.held && " · held back"}
         <OwnerHint who={owners.of("category", n.category)} />
       </div>
@@ -1767,7 +1991,7 @@ export function Advice({ sel, onUser }: { sel: Selection; onUser: (u: string) =>
             ? IMPACTS.map(({ id, title }): [string, React.ReactNode] => [title, jump(id)])
             : [
                 ["Notes", notes.length],
-                ["Served", notes.reduce((n, x) => n + x.served_in.length, 0)],
+                ["Served", notes.reduce((n, x) => n + many(x, "served_in"), 0)],
                 ["Never validated", unproven.length],
               ]
       }
@@ -1817,7 +2041,7 @@ export function Advice({ sel, onUser }: { sel: Selection; onUser: (u: string) =>
                             <Fragment key={n.key}>
                               <tr>
                                 <td>{name(n, isOpen)}</td>
-                                <td className="st-num st-fig">{n.learned_from.length}</td>
+                                <td className="st-num st-fig">{many(n, "learned_from")}</td>
                               </tr>
                               {isOpen && detail(n, 2)}
                             </Fragment>
@@ -1927,17 +2151,17 @@ export function Advice({ sel, onUser }: { sel: Selection; onUser: (u: string) =>
                   <Fragment key={n.key}>
                     <tr>
                       <td>{name(n, isOpen)}</td>
-                      <td className="st-num st-fig">{n.learned_from.length}</td>
-                      <td className="st-num st-fig">{n.served_in.length}</td>
+                      <td className="st-num st-fig">{many(n, "learned_from")}</td>
+                      <td className="st-num st-fig">{many(n, "served_in")}</td>
                       <td
                         className={`st-num st-fig ${
-                          n.served_in.length && !n.validated_in.length ? "st-watch" : ""
+                          many(n, "served_in") && !many(n, "validated_in") ? "st-watch" : ""
                         }`}
                       >
-                        {n.validated_in.length}
+                        {many(n, "validated_in")}
                       </td>
-                      <td className="st-num st-fig">{n.people}</td>
-                      <td className="st-quiet">{ago(n.served_in[0]?.at)}</td>
+                      <td className="st-num st-fig">{n.people ?? 0}</td>
+                      <td className="st-quiet">{ago(n.last_served ?? n.served_in?.[0]?.at)}</td>
                     </tr>
                     {isOpen && detail(n, 6)}
                   </Fragment>
@@ -1948,6 +2172,77 @@ export function Advice({ sel, onUser }: { sel: Selection; onUser: (u: string) =>
         </div>
       )}
     </Sheet>
+  );
+}
+
+/**
+ * An opened note: its text and items and the newest of its runs and sessions, read as it opens (`advice_trail` with
+ * its `key`), since the list has only their counts. A list that has them already (an older engine's) reads nothing.
+ */
+function Opened({ sel, note, onUser }: { sel: Selection; note: Note; onUser: (u: string) => void }) {
+  const full = note.served_in !== undefined;
+  const got = useAdmin<AdviceTrail>(
+    sel,
+    full ? null : { op: "advice_trail", key: note.key, light: true },
+  );
+  const n = full ? note : got.data?.notes.find((x) => x.key === note.key);
+  if (!full && got.error) return <Failed error={got.error} onRetry={got.reload} />;
+  if (!n) {
+    return (
+      <p className="st-detail-in st-quiet">
+        {got.loading ? "Reading the note and where it was served…" : "This note is gone."}
+      </p>
+    );
+  }
+  return (
+    <>
+      {n.note ? (
+        <div className="st-detail-in st-note">
+          <p className="st-note-src">
+            The note AmpUp Memory serves for this situation, learned from{" "}
+            <b>{n.written?.runs ?? many(n, "learned_from")} graded runs</b>
+            {n.written && (
+              <>
+                {" "}
+                ({n.written.runs - n.written.wrong} went right, {n.written.wrong} went wrong)
+              </>
+            )}
+            : the steps of the runs that went right and the pitfalls of the rest.
+          </p>
+          <Items items={n.items ?? []} />
+          <div className="st-note-body">
+            {/* Without its items' ids (`<!--i:…-->`), as an agent is served it. */}
+            <Markdown text={n.note.replace(/ ?<!--i:[0-9a-f]+-->/g, "")} />
+          </div>
+        </div>
+      ) : (
+        <p className="st-detail-in st-quiet">
+          No note yet: a situation gets one once enough of its runs went wrong, from enough people.
+        </p>
+      )}
+      <div className="st-detail-in st-trail">
+        <Trail
+          title="Served in"
+          uses={n.served_in ?? []}
+          count={many(n, "served_in")}
+          onUser={onUser}
+        />
+        {(n.withheld_in || n.withheld_in_count !== undefined) && (
+          <Trail
+            title="Withheld from (holdout)"
+            uses={n.withheld_in ?? []}
+            count={many(n, "withheld_in")}
+            onUser={onUser}
+          />
+        )}
+        <Trail
+          title="Learned from"
+          uses={n.learned_from ?? []}
+          count={many(n, "learned_from")}
+          onUser={onUser}
+        />
+      </div>
+    </>
   );
 }
 
@@ -1977,16 +2272,20 @@ function Items({ items }: { items: Item[] }) {
 function Trail({
   title,
   uses,
+  count,
   onUser,
 }: {
   title: string;
+  /** The newest of them (the first 20 are listed). */
   uses: Use[];
+  /** How many there are in all. */
+  count: number;
   onUser: (u: string) => void;
 }) {
   return (
     <section>
       <h3>
-        {title} <span className="st-quiet st-fig">{uses.length}</span>
+        {title} <span className="st-quiet st-fig">{count}</span>
       </h3>
       {uses.length === 0 ? (
         <p className="st-quiet">None yet.</p>

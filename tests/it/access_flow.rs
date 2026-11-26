@@ -1442,7 +1442,7 @@ async fn the_same_text_from_another_source_cannot_take_over_an_episodes_acl() {
 }
 
 /// A model API (OpenAI-compatible) that keeps every prompt it is sent and answers each with `reply`.
-async fn stand_in_model(
+pub(crate) async fn stand_in_model(
     reply: impl Fn(&str) -> String + Send + Sync + 'static,
 ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

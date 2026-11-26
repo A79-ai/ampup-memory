@@ -1,76 +1,51 @@
 # AmpUp Memory for Grok Bot
 
-A Cursor-format plugin for Grok Bot (and Cursor's cloud agents), which install Cursor plugins and run their hooks.
-It gives each Grok Bot session the team memory the way the Claude Code plugin does:
+AmpUp Memory for Grok Bot is the memory's MCP server plus skills that tell the Bot how to use it. There are no hooks.
 
-| Grok Bot event | Runs | What it does |
-|---|---|---|
-| `sessionStart` | `ampup-memory-client hook session-start --harness grok` | opens an AmpUp Memory session and adds what the memory knows about the repo |
-| `beforeSubmitPrompt` | `… hook prompt --harness grok` | asks the memory for advice on the prompt, and adds it with the notes that bear on it (`additional_context`) |
-| `stop` | `… hook stop --harness grok` | sends the session so far (its trace; remembered every five prompts) |
-| `preCompact` | `… hook session-end --harness grok` | remembers the session before the context is compacted |
-| `sessionEnd` | `… hook end --harness grok` | ends the AmpUp Memory session with its trace and outcome |
+## Why no hooks
 
-Every hook runs `"${CURSOR_PLUGIN_ROOT}/bin/ampup-memory-client"`, the plugin's launcher, not a client on the PATH:
-Grok Bot runs only a plugin's hooks on its cloud computer (a user-level `~/.cursor/hooks.json` there doesn't fire).
-The plugin also adds the memory's MCP tools (`search_memory`, `get_advice`, `remember_memory`, …) from AmpUp's hosted
-server, `https://memory-api.ampup.ai/mcp`, signed in with OAuth the first time a tool is used, and the skills and
-commands of the [AmpUp Memory plugin](../ampup-memory) (`ampup-memory-search`, `ampup-memory-remember`,
-`ampup-memory-brief`).
+Grok Bot runs on cloud agents. Its model calls happen on the provider's servers, not on the Bot's computer:
+
+- The only Cursor-format hooks that fire there are around its shell commands: `preToolUse`, `postToolUse`,
+  `beforeShellExecution` and `afterShellExecution`. They see no prompt and no answer.
+- The conversation is never written to the Bot's computer, so no hook could read a transcript either.
+
+The session therefore comes from the agent. The skills have it:
+
+- open a session when a task starts;
+- ask for advice as the task goes;
+- remember what the user settles, in the turn they say it;
+- close the session with a transcript when the task is done.
+
+| Skill | What it does |
+|---|---|
+| `ampup-memory-session` | Runs each task as an AmpUp Memory session: `start_session` (harness `grok`), `get_advice` at each step, `end_session` with a transcript when the task is finished. A Bot is one long conversation, so a session is one task, not the whole Bot. |
+| `ampup-memory-recall` | Reads the memory before guessing, and answers with sources (`search_memory`, `get_episode`, `get_brief`). |
+| `ampup-memory-remember` | Writes preferences, corrections and decisions in the turn they are said (`remember_memory`), and forgets them again. |
+
+The last two are the [AmpUp Memory plugin](../ampup-memory)'s own skills.
 
 ## Install
 
-1. In Grok Bot, add the plugin from its repository link, `https://github.com/A79-ai/ampup-memory` (the repository's
-   root is a Cursor marketplace; pick **ampup-memory-grok**), or from the Cursor Marketplace once it is listed there.
-2. Sign the cloud computer in to your team's memory, once. It has no browser, so it signs in with a personal API
-   key from the AmpUp Memory console:
+1. **Connect the MCP server.**
+   - In Grok Bot, open **Connect apps** and choose **Add a custom connector**.
+   - Set **Type** to **Remote HTTPS** and **Server URL** to `https://memory-api.ampup.ai/mcp`. For your own server,
+     use `https://<server>/mcp`.
+   - Save it, then sign in when it asks. The sign-in tokens stay with the provider's connector service; the Bot
+     calls the tools without seeing them.
+2. **Save the skill.** Grok Bot doesn't read skills from a repository, so paste
+   [the skill](skills/ampup-memory-session/SKILL.md) into a Bot and ask it to save it as a skill called
+   `ampup-memory-session`. The setup page in the AmpUp Memory console has it ready to copy. Private skills are one
+   library shared by all your Bots.
+3. **Turn it on.** In **Connect apps**, turn the skill on for each Bot under **Private skills**.
+4. **Check it.** Ask a Bot something, then ask it which AmpUp Memory session it used. The session shows in the
+   memory's console with harness `grok`.
 
-   ```sh
-   ~/.local/bin/ampup-memory-client join https://memory-api.ampup.ai --org <your org> --api-key <your key>
-   ```
+## What it can't do
 
-   Ask Grok Bot to run it in its terminal, or run it yourself. The client is installed by the first session's start
-   (below); to sign in before any session, install it first:
-
-   ```sh
-   curl -fsSL https://raw.githubusercontent.com/A79-ai/ampup-memory/main/plugins/ampup-memory/bin/install.sh | sh
-   ```
-
-3. Start a session. The first prompt's context carries an `AmpUp Memory session:` line when the hooks reach the
-   memory; `~/.local/bin/ampup-memory-client doctor` says where it is, who you are and how the last hook went.
-
-## The first session on a fresh computer
-
-Grok Bot's cloud computer may be new for a session, so the launcher doesn't do what it does on a laptop (install in
-the background, memory on from the next session). With `--harness grok`, a session's start (or a prompt, where no
-start hook ran first) installs `ampup-memory-client` into `~/.local/bin`, checking its checksum, waits for it, then
-runs it, so the memory is on from the first session. The install took 2 seconds in tests on fresh Linux x86_64 and
-arm64 containers; a start waits for it at most 75 seconds (its hook allows 90), a prompt at most 10 (its hook
-allows 15), and a hook that gives up leaves the install running for the next one. The other hooks never wait.
-
-What it needs:
-
-- Linux on x86_64 or arm64 (or macOS). The current Linux build needs glibc 2.38 or newer (Ubuntu 24.04, Debian 13,
-  Fedora 39 or newer). On an older system the client installs but can't run: the session's start says so once, and
-  the memory stays off there.
-- `curl` or `wget`, `tar` and `sha256sum` (or `shasum`).
-- GitHub's API, to find the newest client release: 60 lookups an hour from one address without a token, which a
-  shared egress address can use up. Set `GITHUB_TOKEN`, or name the release with `AMPUP_MEMORY_VERSION=client-v…`
-  (which also stops the client's hourly self-update).
-
-If the install fails, the session's start says so once, with the command to install it by hand, and the session
-goes on without the memory.
-
-## Your own server
-
-The hooks use whatever server the client signed in to (`join <server>`), so an org on its own AmpUp Memory server
-gets its hooks there. The MCP server in `mcp.json` is fixed to AmpUp's hosted one: Cursor's plugin `variables` are
-documented for an MCP server's headers and `env`, not its `url`. An org on its own server adds its MCP server in
-Grok Bot's MCP settings (`https://<server>/mcp`) and can leave this plugin's tools unused.
-
-## What isn't verified yet
-
-The manifest and hook shapes are checked against Cursor's plugin reference and Grok Bot's own validators (sessionStart
-and beforeSubmitPrompt both take `additional_context`), and the launcher's first-session install against fresh Linux
-containers. A live Grok Bot session, with `CURSOR_PLUGIN_ROOT` set for the hooks and the hooks' sends reaching the
-server, hasn't been run yet. The `grok` harness and `join --api-key` come with the client release after 0.1.19.
+- **Sessions only exist if the Bot opens them.** A Bot that skips the skill leaves no session. The server's own
+  instructions ask the same of every MCP client, so the skill is a second nudge, not a guarantee.
+- **The transcript is the Bot's summary,** at most 300 words, not the full conversation.
+- **A session the Bot never closes** ends on its own after a while, with only the last `conversation_so_far` it sent.
+- **On an Enterprise plan, inference hooks would remove the need for the skill.** They are a webhook that receives
+  every model call with the whole conversation. AmpUp Memory doesn't take them yet.
