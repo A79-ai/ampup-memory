@@ -365,7 +365,9 @@ pub async fn advice(
         let mut v = json!({"space": space, "key": l.key, "category": l.category, "situation": l.situation,
             "when": l.when, "skills": l.skills, "learned_at": l.note.as_ref().map(|(_, at, _)| at),
             "note_id": l.note.as_ref().map(|(id, _, _)| id), "note_chars": note.chars().count(),
-            "runs": l.runs, "wrong": l.wrong, "ratified": ratified_now, "evidence": evidence});
+            "runs": l.runs, "wrong": l.wrong, "ratified": ratified_now,
+            "untested": evidence.map_or(false, |e| e.served + e.withheld == 0),
+            "evidence": evidence});
         // Whether the holdout proves it by outcomes people gave (reported only; null until there are enough).
         if let Some(e) = evidence {
             v["proven"] = json!(e.proven());

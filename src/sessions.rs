@@ -5562,7 +5562,7 @@ impl Tally {
     pub fn line(&self, bar: usize, unbacked: bool, approved: bool) -> String {
         let ratified = crate::advice::team_ratified(approved, unbacked, self.ratified(bar));
         if self.served + self.withheld == 0 {
-            return "Evidence: none yet (no judged session has used it).".into();
+            return "Evidence (untested): no judged session has used it yet.".into();
         }
         let value = match self.value(bar) {
             Some(v) => format!(
