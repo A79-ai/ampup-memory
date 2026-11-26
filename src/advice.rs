@@ -3711,7 +3711,11 @@ fn gated(
             backed_steps.set(backed_steps.get() + 1);
         }
         // Embed basis metadata as a placeholder for stamp_ids to incorporate into the final id comment.
-        let run_ids = from.iter().map(|r| r.id.as_str()).collect::<Vec<_>>().join(",");
+        let run_ids = from
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         let meta = curate::BasisMeta {
             basis: basis.to_string(),
             because: curate::escape_comment(because_text.as_deref().unwrap_or("")),
@@ -4441,7 +4445,11 @@ fn stamp_ids(note: &str, key: &str) -> String {
             .find(|id| !taken.contains(id))
             .expect("an id");
         taken.insert(id.clone());
-        Some(curate::with_meta_id(item, &id, curate::extract_basis_meta(item).as_ref()))
+        Some(curate::with_meta_id(
+            item,
+            &id,
+            curate::extract_basis_meta(item).as_ref(),
+        ))
     })
     .0
 }

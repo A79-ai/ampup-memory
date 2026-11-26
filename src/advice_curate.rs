@@ -404,7 +404,7 @@ pub(crate) fn ids_shown(text: &str) -> (String, Vec<String>) {
         let Some(j) = rest[i..].find(ID_CLOSE) else {
             break;
         };
-        let content = rest[i + ID_OPEN.len()..i + j];
+        let content = &rest[i + ID_OPEN.len()..i + j];
         let id = content.split_ascii_whitespace().next().unwrap_or("").trim();
         out.push_str(&rest[..i]);
         // Show only valid hex ids; skip basis placeholders (content starts with space or `{`).
