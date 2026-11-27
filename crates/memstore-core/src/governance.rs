@@ -428,7 +428,7 @@ struct MainNow {
 
 impl MainNow {
     fn of(ledger: &Ledger, state: &State) -> Result<Self> {
-        Self::seen(ledger, state, Arc::new(ledger.visible(MAIN)))
+        Self::seen(ledger, state, ledger.main_visible())
     }
 
     /// Given what main sees in `ledger`.
@@ -719,7 +719,13 @@ impl Store {
     /// check and the commits' own read them from this one round trip. Without owners nothing more is loaded.
     async fn check_state(&self, scope: &Scope, ledger: &Ledger) -> Result<State> {
         let rows = self.governance_rows(scope, TABLE).await?;
-        if !fold(&rows, ledger)?.owners.is_empty() {
+        crate::phases::mark("governance read");
+        // What main sees, walked once for the ledger ([`Ledger::main_visible`]) and timed on its own.
+        let main = ledger.main_visible();
+        crate::phases::mark("main walked");
+        let owned = !fold_seen(&rows, ledger, &main)?.owners.is_empty();
+        crate::phases::mark("owners folded");
+        if owned {
             futures::future::try_join_all(
                 [
                     EPISODES,
@@ -733,12 +739,13 @@ impl Store {
                 .map(|t| self.governance_rows(scope, t)),
             )
             .await?;
+            crate::phases::mark("checked tables read");
         }
         self.governance_state(scope, ledger).await
     }
 
     async fn governance_state(&self, scope: &Scope, ledger: &Ledger) -> Result<State> {
-        self.governance_state_seen(scope, ledger, &ledger.visible(MAIN))
+        self.governance_state_seen(scope, ledger, &ledger.main_visible())
             .await
     }
 
@@ -751,7 +758,29 @@ impl Store {
     ) -> Result<State> {
         let rows = self.governance_rows(scope, TABLE).await?;
         let mut state = fold_seen(&rows, ledger, visible)?;
-        state.clear = self.moved_past(scope, ledger, &state, visible).await?;
+        crate::phases::mark("governance folded");
+        // A publication check ([`Store::authorize_publication`]) asks whether a proposal still describes what it
+        // publishes only of the accepted ones: what main moved past is worked out for those alone there. On staging
+        // ampup two proposals the decisions model rejected (an owner may still approve them, so they count as open)
+        // cost every commit a walk of the ledger from each one's base, half a second of each check.
+        let in_check = CHECK_ROWS.try_with(|_| ()).is_ok() && HELD.try_with(|_| ()).is_err();
+        state.clear = self
+            .moved_past(scope, ledger, &state, visible, in_check)
+            .await?;
+        if in_check && governance_oracle() {
+            let full = self
+                .moved_past(scope, ledger, &state, visible, false)
+                .await?;
+            let accepted: HashSet<String> = full
+                .into_iter()
+                .filter(|id| state.proposals.get(id).is_some_and(|p| state.accepted(p)))
+                .collect();
+            assert_eq!(
+                state.clear, accepted,
+                "governance oracle: what main moved past, of the accepted proposals"
+            );
+        }
+        crate::phases::mark("governance moved past");
         Ok(state)
     }
 
@@ -760,7 +789,12 @@ impl Store {
     /// whole graph for each.
     async fn governance_held(&self, scope: &Scope) -> Result<(Arc<Ledger>, State, MainNow)> {
         let ledger = self.governance_ledger(scope).await?;
+        crate::phases::mark("governance ledger");
+        // Numbered once per ledger: what main moved past, the proposals' standing and their readability walk it.
+        ledger.graph();
+        crate::phases::mark("governance graph");
         let visible = self.main_visible_held(&scope.namespace(), &ledger).await;
+        crate::phases::mark("governance main reach");
         let state = self.governance_state_seen(scope, &ledger, &visible).await?;
         let now = MainNow::seen(&ledger, &state, visible)?;
         Ok((ledger, state, now))
@@ -771,12 +805,16 @@ impl Store {
     /// facts, or anything about their evidence, and none changes the schema or withdraws an extractor's facts.
     /// Such a proposal still describes what publishing it changes, so a busy main (extraction commits every few
     /// seconds) doesn't void it. Anything else that moved main since its base makes it stale, as before.
+    ///
+    /// `accepted_only`: only of the proposals accepted for publishing ([`State::accepted`]), all a publication check
+    /// reads it for.
     async fn moved_past(
         &self,
         scope: &Scope,
         ledger: &Ledger,
         state: &State,
         main: &HashSet<String>,
+        accepted_only: bool,
     ) -> Result<HashSet<String>> {
         let heads = state.memory_heads(ledger);
         let open: Vec<&Proposal> = state
@@ -786,6 +824,7 @@ impl Store {
                 p.base != heads
                     && !state.rejected.contains(&p.id)
                     && !p.heads.iter().all(|h| main.contains(h))
+                    && (!accepted_only || state.accepted(p))
             })
             .collect();
         if open.is_empty() {
@@ -809,6 +848,7 @@ impl Store {
                 }
             )),
         )?;
+        crate::phases::mark("moved past tables");
         let text = |b: &RecordBatch, name: &str| -> Option<StringArray> {
             b.column_by_name(name)
                 .and_then(|c| c.as_string_opt::<i32>())
@@ -847,32 +887,57 @@ impl Store {
             evidence: HashSet<&'a str>,
             touched: bool,
         }
-        let mut opens: Vec<Open> = open
-            .iter()
-            .map(|p| {
-                let before = ledger.reachable(&p.base);
-                Open {
-                    since: main
+        // A read that only shows governance walks the commit graph by number ([`Ledger::reach`]): main's commits
+        // numbered once, not each looked up for every proposal. A publication check keeps the walk of the ledger.
+        let held = HELD.try_with(|_| ()).is_ok();
+        let numbered: Vec<(Option<u32>, &String)> = match held {
+            true => {
+                let graph = ledger.graph();
+                main.iter().map(|c| (graph.number(c), c)).collect()
+            }
+            false => vec![],
+        };
+        let mut opens = Vec::with_capacity(open.len());
+        for p in &open {
+            let since: HashSet<&str> = match held {
+                true => {
+                    let before = reach_of(ledger, &p.base);
+                    numbered
                         .iter()
+                        .filter(|(n, c)| match n {
+                            Some(n) => !before.has(*n),
+                            None => !before.contains(ledger.graph(), c),
+                        })
+                        .filter(|(_, c)| !state.metadata.contains(*c))
+                        .map(|(_, c)| c.as_str())
+                        .collect()
+                }
+                false => {
+                    let before = ledger.reachable(&p.base);
+                    main.iter()
                         .filter(|c| !before.contains(*c) && !state.metadata.contains(*c))
                         .map(String::as_str)
-                        .collect(),
-                    keys: p
-                        .changes
-                        .iter()
-                        .filter(|c| c["kind"] == "fact")
-                        .filter_map(|c| Some((c["entity"].as_str()?, c["predicate"].as_str()?)))
-                        .collect(),
-                    ids: p
-                        .changes
-                        .iter()
-                        .filter_map(|c| c["id"].as_str().or(c["fact_id"].as_str()))
-                        .collect(),
-                    evidence: p.evidence.iter().map(String::as_str).collect(),
-                    touched: false,
+                        .collect()
                 }
-            })
-            .collect();
+            };
+            opens.push(Open {
+                since,
+                keys: p
+                    .changes
+                    .iter()
+                    .filter(|c| c["kind"] == "fact")
+                    .filter_map(|c| Some((c["entity"].as_str()?, c["predicate"].as_str()?)))
+                    .collect(),
+                ids: p
+                    .changes
+                    .iter()
+                    .filter_map(|c| c["id"].as_str().or(c["fact_id"].as_str()))
+                    .collect(),
+                evidence: p.evidence.iter().map(String::as_str).collect(),
+                touched: false,
+            });
+        }
+        crate::phases::mark("moved past bases walked");
         // One pass over the facts for every proposal at once (not a pass each): which proposals each key is one of,
         // and which proposals each commit is since the base of. A row is looked at again only when its key is one
         // a proposal changes, or its commit one main made since a proposal's base.
@@ -923,6 +988,7 @@ impl Store {
                 }
             }
         }
+        crate::phases::mark("moved past facts scanned");
         for (table, rows) in &side {
             for b in rows.iter() {
                 let Some(commits) = text(b, "commit_id") else {
@@ -1946,6 +2012,7 @@ impl Store {
         crate::phases::mark("proposals main state");
         let (_, (_, episodes, _, _, _, retractions, retention, _), _) =
             self.vis_tables(&ns).await?;
+        crate::phases::mark("proposals main tables");
         // The caller's ledger may be behind the state's: then the one this server holds now, read once per snapshot
         // of the ledger table ([`Store::ledger_held`]), not out of the whole table again.
         let read;
@@ -1962,15 +2029,22 @@ impl Store {
         crate::phases::mark("proposals main ledger");
         // Kept with the held ledger ([`Store::main_visible_held`]): not a walk of main's whole graph.
         let main = self.main_visible_held(&ns, ledger).await;
+        // Walked by number ([`Ledger::reach`]), main's commits numbered once: what a branch reaches that main doesn't
+        // is then the bits one has and the other hasn't, not a lookup of each of the branch's commits.
+        let graph = ledger.graph();
+        let main_reach = graph.of_ids(main.iter());
         // Each branch: what it reaches, and of that what main doesn't (its own commits), unless those delete, retire,
         // withdraw or set the retention.
-        let mut branches: HashMap<&str, (HashSet<String>, HashSet<String>)> = HashMap::new();
+        let mut branches: HashMap<&str, (Reach, HashSet<String>)> = HashMap::new();
         for p in proposals {
             if branches.contains_key(p.branch.as_str()) || ledger.base(&p.branch).is_none() {
                 continue;
             }
-            let reach = ledger.visible(&p.branch);
-            let own: HashSet<String> = reach.difference(&*main).cloned().collect();
+            let reach = reach_of(ledger, &ledger.heads(&p.branch));
+            let own: HashSet<String> = reach
+                .without(graph, &main_reach)
+                .map(str::to_string)
+                .collect();
             let writes = |rows: &[RecordBatch]| {
                 rows.iter().any(|b| {
                     let c = b
@@ -1984,6 +2058,7 @@ impl Store {
                 branches.insert(&p.branch, (reach, own));
             }
         }
+        crate::phases::mark("proposals branches walked");
         // Every row of each episode cited: its commit, when it was recorded and its ACL.
         let wanted: HashSet<&str> = proposals
             .iter()
@@ -2018,6 +2093,7 @@ impl Store {
                 }
             }
         }
+        crate::phases::mark("proposals evidence rows");
         'proposals: for p in proposals {
             let Some((reach, own)) = branches.get(p.branch.as_str()) else {
                 continue;
@@ -2031,7 +2107,7 @@ impl Store {
                 {
                     continue 'proposals;
                 }
-                if !of.iter().any(|(c, _, _)| reach.contains(c)) {
+                if !of.iter().any(|(c, _, _)| reach.contains(graph, c)) {
                     evidence.push(None);
                 } else if !of.iter().any(|(c, _, _)| own.contains(c)) {
                     evidence.push(
@@ -2049,7 +2125,7 @@ impl Store {
                 } else {
                     let acl = latest_acls(
                         of.iter()
-                            .filter(|(c, _, _)| reach.contains(c) || main.contains(c))
+                            .filter(|(c, _, _)| reach.contains(graph, c) || main.contains(c))
                             .map(|(_, at, acl)| (e.clone(), *at, acl.clone()))
                             .collect(),
                     )
@@ -2176,7 +2252,7 @@ impl Store {
         anyhow::ensure!(ledger.base(branch).is_some(), "no such branch");
         let state = self.governance_state(scope, &ledger).await?;
         let heads = sorted(ledger.heads(branch));
-        let main = ledger.visible(MAIN);
+        let main = ledger.main_visible();
         let new: HashSet<_> = ledger
             .reachable(&heads)
             .difference(&main)
@@ -2272,14 +2348,15 @@ impl Store {
         // When it reached main: the earliest main row that brought a head in (the merge, or the head itself).
         let published_at = published
             .then(|| {
+                // The proposal's heads first: a few comparisons a row, where main's reach is a lookup a row.
                 ledger
                     .rows
                     .iter()
-                    .filter(|r| r.branch == MAIN && main.contains(&r.commit_id))
                     .filter(|r| {
                         p.heads.contains(&r.commit_id)
                             || r.parents.iter().any(|x| p.heads.contains(x))
                     })
+                    .filter(|r| r.branch == MAIN && main.contains(&r.commit_id))
                     .map(|r| r.recorded_at)
                     .min()
             })
@@ -2687,6 +2764,7 @@ impl Store {
                 stale_reason: s.stale_reason,
             });
         }
+        crate::phases::mark("proposals standing");
         out.sort_by(|a, b| {
             b.updated_at
                 .cmp(&a.updated_at)
@@ -2882,7 +2960,7 @@ impl Store {
         );
         anyhow::ensure!(p.digest == digest, "proposal digest changed");
         self.governance_readable(scope, p, who).await?;
-        if p.heads.iter().all(|h| ledger.visible(MAIN).contains(h)) {
+        if p.heads.iter().all(|h| ledger.main_visible().contains(h)) {
             return self.review_from(scope, &ledger, &state, p, who).await;
         }
         if !state.current(&ledger, p)? {
@@ -3047,7 +3125,7 @@ impl Store {
     pub async fn publish_auto_approved(&self, scope: &Scope) -> Result<usize> {
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
-        let main = ledger.visible(MAIN);
+        let main = ledger.main_visible();
         let mut n = 0;
         for p in state.proposals.values() {
             if state.auto.get(&p.id) != Some(&true)
@@ -3077,7 +3155,7 @@ impl Store {
     pub async fn renew_held(&self, scope: &Scope) -> Result<Vec<String>> {
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
-        let main = ledger.visible(MAIN);
+        let main = ledger.main_visible();
         let retired: HashSet<&str> = state
             .proposals
             .values()
@@ -3128,7 +3206,7 @@ impl Store {
     /// still reads (one it stages, the other on main or staged too). Returns the new branch.
     async fn restage_held(&self, scope: &Scope, held: &str) -> Result<Option<String>> {
         let ledger = self.governance_ledger(scope).await?;
-        let main = ledger.visible(MAIN);
+        let main = ledger.main_visible();
         let own: HashSet<String> = ledger
             .reachable(&ledger.heads(held))
             .difference(&main)
@@ -3373,7 +3451,7 @@ impl Store {
     async fn said_at(&self, scope: &Scope, ids: &[String]) -> Result<HashMap<String, i64>> {
         let ledger = self.governance_ledger(scope).await?;
         let times = ledger.times();
-        let main = ledger.visible(MAIN);
+        let main = ledger.main_visible();
         let mut out: HashMap<String, i64> = HashMap::new();
         for b in self.governance_rows(scope, EPISODES).await?.iter() {
             let (commit, id) = (strings(b, "commit_id"), strings(b, "episode_id"));
@@ -3405,7 +3483,7 @@ impl Store {
     ) -> Result<()> {
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
-        let main = ledger.visible(MAIN);
+        let main = ledger.main_visible();
         let new: HashSet<String> = ledger
             .reachable(&ledger.heads(branch))
             .difference(&main)
@@ -3443,7 +3521,7 @@ impl Store {
         }
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
-        let main = ledger.visible(MAIN);
+        let main = ledger.main_visible();
         let vis = self.visibility(scope, MAIN).await?;
         let retired: HashSet<&str> = state
             .proposals
@@ -3516,7 +3594,7 @@ impl Store {
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("no such proposal"))?;
         anyhow::ensure!(p.digest == digest, "proposal digest changed");
-        let main = ledger.visible(MAIN);
+        let main = ledger.main_visible();
         anyhow::ensure!(
             !p.heads.iter().all(|h| main.contains(h)),
             "proposal is published"
@@ -3580,10 +3658,11 @@ impl Store {
         if state.owners.is_empty() {
             return Ok(true);
         }
-        let main = ledger.visible(MAIN);
+        let main = ledger.main_visible();
         let new: HashSet<String> = ids.iter().cloned().collect();
         let checked = Instant::now();
         let impact = self.governance_impact(scope, &new, &main, &state).await?;
+        crate::phases::mark("impact");
         if checked.elapsed() > Duration::from_secs(1) {
             eprintln!(
                 "publication check of {} commits in {scope} took {} ms ({} owned changes)",
@@ -3621,15 +3700,33 @@ impl Store {
         if state.owners.is_empty() {
             return Ok(());
         }
-        let main = ledger.visible(MAIN);
-        let mut new: HashSet<_> = ledger
-            .reachable(parents)
-            .difference(&main)
-            .cloned()
-            .collect();
+        let main = ledger.main_visible();
+        // What the commit brings to main: none of its parents' history when main sees every parent (a commit on
+        // main's heads, as a rule), since main sees all a commit it sees reaches; else a walk from them.
+        let mut new: HashSet<String> = match parents.iter().all(|p| main.contains(p)) {
+            true => HashSet::new(),
+            false => ledger
+                .reachable(parents)
+                .difference(&main)
+                .cloned()
+                .collect(),
+        };
+        if governance_oracle() {
+            let walked: HashSet<String> = ledger
+                .reachable(parents)
+                .difference(&main)
+                .cloned()
+                .collect();
+            assert_eq!(
+                new, walked,
+                "governance oracle: what a commit brings to main"
+            );
+        }
         new.insert(commit.into());
+        crate::phases::mark("what it brings to main");
         let checked = Instant::now();
         let impact = self.governance_impact(scope, &new, &main, &state).await?;
+        crate::phases::mark("impact");
         // It runs inside the ledger's compare-and-set: a slow check is a slow (and retried) commit.
         if checked.elapsed() > Duration::from_secs(1) {
             eprintln!(
@@ -3689,7 +3786,7 @@ impl Store {
     ) -> Result<String> {
         let ledger = self.governance_ledger(scope).await?;
         let state = self.governance_state(scope, &ledger).await?;
-        let main = ledger.visible(MAIN);
+        let main = ledger.main_visible();
         let decoded: Vec<_> = self
             .governance_rows(scope, FACTS)
             .await?
@@ -3908,11 +4005,21 @@ fn cell(c: Option<&StringArray>, i: usize) -> Option<&str> {
 
 /// The governance state main's ledger holds: its events folded in ledger order.
 fn fold(rows: &[RecordBatch], ledger: &Ledger) -> Result<State> {
-    fold_seen(rows, ledger, &ledger.visible(MAIN))
+    fold_seen(rows, ledger, &ledger.main_visible())
 }
 
 /// [`fold`], given what main sees in `ledger` (`visible`).
 fn fold_seen(rows: &[RecordBatch], ledger: &Ledger, visible: &HashSet<String>) -> Result<State> {
+    // It places every event by the ledger's order, a pass over every row: off the async workers on a large ledger.
+    crate::running::cpu(ledger.big(), || fold_seen_here(rows, ledger, visible))
+}
+
+/// [`fold_seen`], on this thread.
+fn fold_seen_here(
+    rows: &[RecordBatch],
+    ledger: &Ledger,
+    visible: &HashSet<String>,
+) -> Result<State> {
     let mut events = HashMap::new();
     for b in rows.iter() {
         for (id, body) in strings(b, "commit_id").into_iter().zip(strings(b, "body")) {
@@ -4069,7 +4176,7 @@ fn approvals_in(ledger: &Ledger, state: &State) -> Result<Vec<Approval>> {
     let mut out = state.stated.clone();
     // When each commit reached main, as [`Store::status_of`] tells it (the earliest main row that brought it in: the
     // commit itself or a merge of it), read once for every proposal: this runs on each rebuild of a read's view.
-    let main = ledger.visible(MAIN);
+    let main = ledger.main_visible();
     let mut reached: HashMap<&str, i64> = HashMap::new();
     for r in ledger
         .rows
@@ -4294,7 +4401,25 @@ fn proposals_shadow() -> bool {
 /// Whether a commit whose publication check found nothing owned (by [`Store::touches_nothing_owned`]) is checked
 /// again in full, and fails if the full check finds an owner (`AMPUP_MEMORY_GOVERNANCE_ORACLE`: `1` on, `0` off;
 /// on by default in debug builds, so every test that commits to a scope with owners checks it, and off in release).
-fn governance_oracle() -> bool {
+/// [`Ledger::reach`]: with [`governance_oracle`] on, checked against a walk of the ledger's rows
+/// ([`Ledger::reachable`]), and a panic where they differ (as a branch's heads are checked: what a reader may see is
+/// worked out from these walks, so a difference is never let through as a logged line).
+fn reach_of(ledger: &Ledger, from: &[String]) -> Reach {
+    let reach = ledger.reach(from);
+    if governance_oracle() {
+        let walked: HashSet<&str> = reach.ids(ledger.graph()).collect();
+        let was = ledger.reachable(from);
+        assert!(
+            walked.len() == was.len() && was.iter().all(|c| walked.contains(c.as_str())),
+            "governance oracle: the commit graph reaches {} commits from {from:?}, the ledger's rows {}",
+            walked.len(),
+            was.len()
+        );
+    }
+    reach
+}
+
+pub(crate) fn governance_oracle() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         match std::env::var("AMPUP_MEMORY_GOVERNANCE_ORACLE").as_deref() {
             Ok("1") => true,

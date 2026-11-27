@@ -45,6 +45,14 @@ type Summary = {
     "verdict" | "summary" | "stale" | "proposed_at"
   > | null;
 };
+/** A skill's row in a list: what the row shows, the rest read when it is opened ([`Detail`]). */
+type Row = Pick<
+  Summary,
+  "key" | "name" | "origin" | "title" | "repo" | "path" | "feedback"
+> & {
+  graded: Pick<Graded, "uses" | "succeeded" | "failed" | "last_used">;
+  proposal: Pick<Proposal, "verdict" | "stale"> | null;
+};
 type Detail = Omit<Summary, "proposal"> & {
   body: string;
   proposal: Proposal | null;
@@ -66,7 +74,7 @@ const COMPILED = "Compiled by the memory";
 const down = (t: Tally) => t.negative + t.very_negative;
 
 /** The badge a skill's latest proposal shows on the list. */
-function badge(p: Summary["proposal"]) {
+function badge(p: Row["proposal"]) {
   if (!p) return null;
   if (p.stale)
     return <span className="rs-badge">Skill changed since review</span>;
@@ -402,14 +410,17 @@ export function RepoSkills({
   /** Revisions proposed: every skill, a repository's or a compiled one, whose newest review proposes a change. */
   proposed?: boolean;
 }) {
-  const [list, setList] = useState<Summary[] | null>(null);
+  const [list, setList] = useState<Row[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     if (skill) return;
-    call<{ skills: Summary[] }>(
+    call<{ skills: Row[] }>(
       sel,
       "skills",
-      proposed ? { op: "list" } : { op: "list", origin: "repo" },
+      // Revisions proposed: only the skills with a proposal are read, not the whole library.
+      proposed
+        ? { op: "list", proposed: true }
+        : { op: "list", origin: "repo" },
     )
       .then((r) => {
         setList(
@@ -439,7 +450,7 @@ export function RepoSkills({
       />
     );
 
-  const repos = new Map<string, Summary[]>();
+  const repos = new Map<string, Row[]>();
   for (const s of list ?? [])
     repos.set(s.repo ?? COMPILED, [
       ...(repos.get(s.repo ?? COMPILED) ?? []),
@@ -577,7 +588,10 @@ export function useProposedCount(sel: Selection, on: boolean): number {
   const [n, setN] = useState(0);
   useEffect(() => {
     if (!on) return;
-    call<{ skills: Summary[] }>(sel, "skills", { op: "list" }).then(
+    call<{ skills: Row[] }>(sel, "skills", {
+      op: "list",
+      proposed: true,
+    }).then(
       (r) =>
         setN(r.skills.filter((s) => s.proposal?.verdict === "revise").length),
       () => setN(0),

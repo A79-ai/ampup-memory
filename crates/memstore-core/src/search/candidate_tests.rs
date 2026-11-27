@@ -60,7 +60,7 @@ fn repeated_lists_prepare_each_physical_row_once_and_keep_each_lists_distance() 
                     (row.fact.value.split_whitespace().count(), distance)
                 });
                 assert_eq!(
-                    cache.for_list(row, &[1.0, 1.0], keyword, score, prepare),
+                    cache.for_list(row, &[1.0, 1.0], keyword, score, None, prepare),
                     expected,
                     "keyword={keyword}, score={score:?}, commit={}, value={}",
                     row.commit,
@@ -78,18 +78,18 @@ fn preparation_lives_for_one_pass_and_keeps_row_identity_alive() {
     let weak = Arc::downgrade(&row);
     let mut first = PreparedCandidates::default();
     assert_eq!(
-        first.for_list(&row, &[1.0, 1.0], true, None, |_, _| Some(2)),
+        first.for_list(&row, &[1.0, 1.0], true, None, None, |_, _| Some(2)),
         Some((2, Some(13.0)))
     );
     // A later ranking pass has its own principal/filter/query. A warmed row must still be checked,
     // and its distance and term matches recomputed for that query.
     let mut second = PreparedCandidates::default();
     assert_eq!(
-        second.for_list(&row, &[3.0, 4.0], true, None, |_, _| Some(1)),
+        second.for_list(&row, &[3.0, 4.0], true, None, None, |_, _| Some(1)),
         Some((1, Some(0.0)))
     );
     assert_eq!(
-        PreparedCandidates::default().for_list(&row, &[3.0, 4.0], true, None, |_, _| None),
+        PreparedCandidates::default().for_list(&row, &[3.0, 4.0], true, None, None, |_, _| None),
         None
     );
     drop(row);

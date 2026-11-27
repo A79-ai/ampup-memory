@@ -73,7 +73,8 @@ pub(super) async fn handle(
             // list would list them ([`Store::proposals_waiting`]), from governance as this server holds it. Null
             // while one of those needs its branch's state built (built in the background): Home asks again.
             if req["count"] == true {
-                let waiting = store.held(store.proposals_waiting(&scope, &reader)).await?;
+                let waiting = waiting_kept(store, &scope, &reader).await?;
+                let waiting = waiting.as_ref();
                 crate::phases::mark("proposals counted");
                 // The proposals page is most often opened from Home: once counted, its list is worked out meanwhile
                 // and kept for it ([`proposals_kept`]), never on this request.
@@ -163,21 +164,12 @@ static PROPOSALS: std::sync::LazyLock<
 /// the heads of every branch a proposal is on (the only others a list reads), and only main may have moved on for a
 /// kept list to answer while the next is made: a proposal's branch's change (a draft changed, evidence forgotten
 /// there) is listed on the read that follows it.
-async fn proposals_kept(
+pub(super) async fn proposals_kept(
     store: &Store,
     scope: &Scope,
     reader: &Principal,
 ) -> Result<std::sync::Arc<Vec<crate::governance::ProposalSummary>>> {
-    let mark = crate::kept_answers::Mark::read(store, scope).await?;
-    let vis = store.lagging_visibility(scope, crate::MAIN).await?;
-    let mut at = crate::kept_answers::At::of(mark, &vis);
-    at.pinned = store
-        .proposal_branch_heads_held(scope)
-        .await?
-        .into_iter()
-        .filter(|(b, _)| b != crate::MAIN)
-        .map(|(b, heads)| format!("{b} {}", heads.join(",")))
-        .collect();
+    let at = proposals_at(store, scope).await?;
     PROPOSALS
         .get(
             &scope.namespace(),
@@ -188,7 +180,7 @@ async fn proposals_kept(
                 let (store, scope, reader) = (store.clone(), scope.clone(), reader.clone());
                 async move {
                     // Worked out apart from the request that asked for it, which may stop waiting: its own line when
-                    // slow, with its steps.
+                    // slow (300 ms or more, what a page that opens on it may wait at most), with its steps.
                     let started = std::time::Instant::now();
                     let (list, timed) = crate::phases::timed(store.held(store.list_proposals(
                         &scope,
@@ -197,7 +189,7 @@ async fn proposals_kept(
                         usize::MAX,
                     )))
                     .await;
-                    if started.elapsed() >= Duration::from_secs(1) {
+                    if started.elapsed() >= Duration::from_millis(300) {
                         eprintln!(
                             "slow proposals list: {scope} in {} ms ({})",
                             started.elapsed().as_millis(),
@@ -206,6 +198,56 @@ async fn proposals_kept(
                     }
                     list
                 }
+            },
+        )
+        .await
+}
+
+/// The memory state a list or count of a scope's proposals is kept by ([`proposals_kept`]): main's state and the heads
+/// of every branch a proposal is on.
+async fn proposals_at(store: &Store, scope: &Scope) -> Result<crate::kept_answers::At> {
+    let mark = crate::kept_answers::Mark::read(store, scope).await?;
+    let vis = store.lagging_visibility(scope, crate::MAIN).await?;
+    let mut at = crate::kept_answers::At::of(mark, &vis);
+    at.pinned = store
+        .proposal_branch_heads_held(scope)
+        .await?
+        .into_iter()
+        .filter(|(b, _)| b != crate::MAIN)
+        .map(|(b, heads)| format!("{b} {}", heads.join(",")))
+        .collect();
+    Ok(at)
+}
+
+/// Each reader's count of the proposals waiting for review (Studio's Home), kept by the same memory state as their
+/// list ([`proposals_at`]): counting reads the governance tables and every waiting proposal's evidence (235-270 ms
+/// on staging, 1.5 s while a visit's other reads run), on every Home. A count not made yet (a branch's state still
+/// to build: null) is not kept. A page's number: answered however old while memory lost nothing since (a proposal's
+/// own branch moving is a loss here: its heads are pinned), the next counted in the background
+/// ([`crate::kept_answers::Kept::however_old`]), as Home's other parts are, so a visit long after the last isn't
+/// kept waiting on it.
+static WAITING: std::sync::LazyLock<crate::kept_answers::Kept<Option<crate::governance::Waiting>>> =
+    std::sync::LazyLock::new(|| {
+        crate::kept_answers::Kept::new_if(500, Option::is_some).however_old()
+    });
+
+/// How many proposals wait for `reader`'s review in `scope`, and how many on them ([`Store::proposals_waiting`]),
+/// kept as their list is.
+pub(super) async fn waiting_kept(
+    store: &Store,
+    scope: &Scope,
+    reader: &Principal,
+) -> Result<std::sync::Arc<Option<crate::governance::Waiting>>> {
+    let at = proposals_at(store, scope).await?;
+    WAITING
+        .get(
+            &scope.namespace(),
+            &crate::kept_answers::reader_key(reader),
+            at,
+            true,
+            || {
+                let (store, scope, reader) = (store.clone(), scope.clone(), reader.clone());
+                async move { store.held(store.proposals_waiting(&scope, &reader)).await }
             },
         )
         .await

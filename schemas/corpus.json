@@ -1,41 +1,41 @@
 {
   "name": "corpus",
-  "version": 1,
+  "version": 2,
   "description": "The synthetic verification corpus (ampup-memory gen): people, teams, projects, accounts and tickets, with ids like p000123.",
   "types": {
     "person": {
       "id_prefix": "p",
       "predicates": {
         "role": {"type": "enum", "values": ["Engineer", "Senior Engineer", "Staff Engineer", "Engineering Manager", "Account Executive", "Sales Engineer", "Product Manager", "Designer"]},
-        "team": {"type": "ref", "to": ["team"]},
+        "team": {"type": "ref", "to": ["team"], "label": "member of", "inverse": "members"},
         "private_note": {"type": "text", "description": "Visible only to the person (user scope)."},
-        "mentioned_with": {"type": "ref", "to": ["person", "account"], "card": "many"}
+        "mentioned_with": {"type": "ref", "to": ["person", "account"], "label": "mentioned with", "inverse": "mentioned with", "card": "many"}
       }
     },
     "team": {
       "id_prefix": "t",
       "predicates": {
-        "manager": {"type": "ref", "to": ["person"]}
+        "manager": {"type": "ref", "to": ["person"], "label": "managed by", "inverse": "manages"}
       }
     },
     "project": {
       "id_prefix": "proj",
       "predicates": {
-        "owner": {"type": "ref", "to": ["person"]}
+        "owner": {"type": "ref", "to": ["person"], "label": "owned by", "inverse": "owns"}
       }
     },
     "account": {
       "id_prefix": "acct",
       "predicates": {
         "stage": {"type": "enum", "values": ["prospect", "discovery", "evaluation", "negotiation", "closed_won", "renewal"]},
-        "account_owner": {"type": "ref", "to": ["person"]},
-        "last_contact": {"type": "ref", "to": ["person"]}
+        "account_owner": {"type": "ref", "to": ["person"], "label": "owned by", "inverse": "owns"},
+        "last_contact": {"type": "ref", "to": ["person"], "label": "last contacted by", "inverse": "last contacted"}
       }
     },
     "ticket": {
       "id_prefix": "ticket",
       "predicates": {
-        "opened_for": {"type": "ref", "to": ["account"], "card": "many"}
+        "opened_for": {"type": "ref", "to": ["account"], "label": "opened for", "inverse": "tickets", "card": "many"}
       }
     }
   }

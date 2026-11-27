@@ -8,6 +8,16 @@ default, where a newer value replaces the older; or `many`, where values accumul
 
 - A `ref` may be marked `part_of` (a meeting is part of its deal): passage search treats passages about the part
   as about the whole.
+- A `ref` may say how it reads each way, for a page that draws the schema: `label` from the type that holds it
+  toward its target, a short lowercase verb phrase, and `inverse` from the target back, usually the holder's
+  plural. Both are optional, at most 40 characters, and change nothing about writes or reads.
+
+  ```json
+  "objection": {"predicates": {
+    "about": {"type": "ref", "to": ["deal", "account"], "label": "raised on", "inverse": "objections"}}}
+  ```
+
+  reads "objection raised on deal" from the objection and "deal: objections" from the deal.
 - A `many` attribute may be marked `"list": true` when its values are held at once (the tools a customer uses).
 - An `enum` with `values` is closed: a write must name one of them, and is stored as the value it names, ignoring
   case (`HIGH` is stored as `high`). `aliases` maps the other spellings sources write onto those values, so a

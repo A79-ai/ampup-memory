@@ -48,10 +48,10 @@ struct Tally<'a> {
 }
 
 /// Each reader's answer, by memory state ([`crate::kept_answers`]): a page's summary (a console shows it beside
-/// each connected source, and asks again every minute), answered at once on a return visit within the hour while
-/// the next is worked out, never past a loss.
+/// each connected source, and asks again every minute), answered at once on a return visit however long after
+/// while the next is worked out, never past a loss ([`crate::kept_answers::Kept::however_old`]).
 static KEPT: std::sync::LazyLock<crate::kept_answers::Kept<Value>> =
-    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500));
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500).however_old());
 
 /// Answers `{op: "sources", prefixes?, top?, since?}` as `who`: on main as it is now, kept by memory state (it reads
 /// every episode and every fact the caller may read), by the reader (who, and every group they read as) and what

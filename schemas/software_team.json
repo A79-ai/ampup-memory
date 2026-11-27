@@ -1,6 +1,6 @@
 {
   "name": "software_team",
-  "version": 3,
+  "version": 4,
   "description": "A software team's working memory: the services it builds and runs, the changes that ship to them, the incidents and errors they have, the decisions taken and the procedures that fix things, from pull requests, error reports, chat threads, meeting notes and tickets.",
   "default_type": "topic",
   "types": {
@@ -8,27 +8,27 @@
       "description": "A service, app, component, package or other part of the system the team builds or runs, named in lower case by what the team calls it (service:checkout_api, service:billing_worker).",
       "predicates": {
         "purpose": {"type": "text", "description": "what it does, in a sentence"},
-        "owner": {"type": "ref", "to": ["person"], "card": "many", "freshness_days": 180, "description": "who owns or maintains it"},
-        "depends_on": {"type": "ref", "to": ["service"], "card": "many", "list": true, "description": "a service, database, queue or vendor it calls or needs"}
+        "owner": {"type": "ref", "to": ["person"], "label": "owned by", "inverse": "owns", "card": "many", "freshness_days": 180, "description": "who owns or maintains it"},
+        "depends_on": {"type": "ref", "to": ["service"], "label": "depends on", "inverse": "used by", "card": "many", "list": true, "description": "a service, database, queue or vendor it calls or needs"}
       }
     },
     "change": {
       "description": "A change that isn't a pull request: a deploy, rollback, migration, config change, commit or release, named by what it changes (change:checkout_api_rollback). A pull request is a pr.",
       "predicates": {
-        "author": {"type": "ref", "to": ["person"], "description": "who made it"},
-        "service": {"type": "ref", "to": ["service"], "card": "many", "description": "a service it changes"},
-        "fixes": {"type": "ref", "to": ["incident"], "card": "many", "description": "an incident or error it fixes"},
+        "author": {"type": "ref", "to": ["person"], "label": "made by", "inverse": "changes", "description": "who made it"},
+        "service": {"type": "ref", "to": ["service"], "label": "changes", "inverse": "changes", "card": "many", "description": "a service it changes"},
+        "fixes": {"type": "ref", "to": ["incident"], "label": "fixes", "inverse": "fixed by", "card": "many", "description": "an incident or error it fixes"},
         "released_in": {"type": "string", "description": "the release or version it shipped in"}
       }
     },
     "pr": {
       "description": "A pull request, by the id its connector gives it (pr:acme/api#412): what it changes and why, what its reviewers raised, and what it fixed.",
       "predicates": {
-        "repo": {"type": "ref", "to": ["repo"]},
-        "author": {"type": "ref", "to": ["person"], "description": "who opened it"},
-        "reviewer": {"type": "ref", "to": ["person"], "card": "many", "description": "who reviewed or approved it"},
-        "service": {"type": "ref", "to": ["service"], "card": "many", "description": "a service it changes"},
-        "fixes": {"type": "ref", "to": ["incident"], "card": "many", "description": "an incident or error it fixes"},
+        "repo": {"type": "ref", "to": ["repo"], "label": "in", "inverse": "pull requests"},
+        "author": {"type": "ref", "to": ["person"], "label": "opened by", "inverse": "pull requests", "description": "who opened it"},
+        "reviewer": {"type": "ref", "to": ["person"], "label": "reviewed by", "inverse": "reviewed", "card": "many", "description": "who reviewed or approved it"},
+        "service": {"type": "ref", "to": ["service"], "label": "changes", "inverse": "pull requests", "card": "many", "description": "a service it changes"},
+        "fixes": {"type": "ref", "to": ["incident"], "label": "fixes", "inverse": "fixed by", "card": "many", "description": "an incident or error it fixes"},
         "merged_at": {"type": "timestamp", "description": "when it was merged"},
         "released_in": {"type": "string", "description": "the release or version it shipped in"}
       }
@@ -37,17 +37,17 @@
       "description": "Something that went wrong: an outage, an error, a regression, a flaky test or a bug, by the id its tracker gives it (an error tracker's issue is incident:<org>/<project>/issues/<id>), else named by what goes wrong (incident:checkout_timeout).",
       "predicates": {
         "error": {"type": "text", "card": "many", "description": "the exception type and message, or the error text, verbatim"},
-        "service": {"type": "ref", "to": ["service"], "card": "many", "description": "a service it happens in"},
+        "service": {"type": "ref", "to": ["service"], "label": "in", "inverse": "incidents", "card": "many", "description": "a service it happens in"},
         "severity": {"type": "enum", "values": ["critical", "high", "medium", "low"], "aliases": {"fatal": "critical", "error": "high", "warning": "medium", "info": "low"}, "description": "how bad it is, as the text or the error level says"},
-        "assignee": {"type": "ref", "to": ["person"], "description": "who is fixing it"},
-        "fixed_by": {"type": "ref", "to": ["pr", "change"], "card": "many", "description": "the pull request or change that fixed it"}
+        "assignee": {"type": "ref", "to": ["person"], "label": "assigned to", "inverse": "incidents", "description": "who is fixing it"},
+        "fixed_by": {"type": "ref", "to": ["pr", "change"], "label": "fixed by", "inverse": "fixes", "card": "many", "description": "the pull request or change that fixed it"}
       }
     },
     "decision": {
       "description": "Something the team decided or agreed: a design, a convention, a trade-off, a rollout or a policy, named for what it decides (decision:retry_payments_in_gateway_client).",
       "predicates": {
-        "decided_by": {"type": "ref", "to": ["person"], "card": "many"},
-        "concerns": {"type": "ref", "to": ["service", "pr", "change", "incident"], "card": "many", "description": "what it is about"},
+        "decided_by": {"type": "ref", "to": ["person"], "label": "decided by", "inverse": "decisions", "card": "many"},
+        "concerns": {"type": "ref", "to": ["service", "pr", "change", "incident"], "label": "about", "inverse": "decisions", "card": "many", "description": "what it is about"},
         "decided_on": {"type": "date"}
       }
     },
@@ -55,28 +55,28 @@
       "description": "How to do something the team repeats: a runbook, a deploy or rollback, a fix for a known error, a setup, named for the task (procedure:rollback_checkout_api).",
       "predicates": {
         "step": {"type": "text", "card": "many", "list": true, "description": "one step, with the exact command, setting or check, in the order given"},
-        "service": {"type": "ref", "to": ["service"], "card": "many"},
-        "owner": {"type": "ref", "to": ["person"]}
+        "service": {"type": "ref", "to": ["service"], "label": "for", "inverse": "procedures", "card": "many"},
+        "owner": {"type": "ref", "to": ["person"], "label": "owned by", "inverse": "owns"}
       }
     },
     "repo": {
       "description": "A code repository, as repo:<owner>/<name>.",
       "predicates": {
-        "service": {"type": "ref", "to": ["service"], "card": "many", "description": "a service built from it"}
+        "service": {"type": "ref", "to": ["service"], "label": "builds", "inverse": "built from", "card": "many", "description": "a service built from it"}
       }
     },
     "issue": {
       "description": "An issue or ticket, by the id its connector gives it (issue:acme/api#88): a bug report, a feature request, a task or a question. An error seen in production is an incident, which an issue may report.",
       "predicates": {
-        "repo": {"type": "ref", "to": ["repo"]},
-        "service": {"type": "ref", "to": ["service"], "card": "many", "description": "a service it is about"}
+        "repo": {"type": "ref", "to": ["repo"], "label": "in", "inverse": "issues"},
+        "service": {"type": "ref", "to": ["service"], "label": "about", "inverse": "issues", "card": "many", "description": "a service it is about"}
       }
     },
     "person": {
       "description": "Someone on the team or someone it works with, named as the text names them: a full name (person:dana_kim), or a login when that is all there is (person:dana_k).",
       "predicates": {
         "role": {"type": "string", "freshness_days": 365, "description": "their role or team, as stated"},
-        "works_on": {"type": "ref", "to": ["service"], "card": "many", "freshness_days": 180}
+        "works_on": {"type": "ref", "to": ["service"], "label": "works on", "inverse": "people", "card": "many", "freshness_days": 180}
       }
     },
     "meeting": {
@@ -96,7 +96,7 @@
       "predicates": {
         "domain": {"type": "string"},
         "industry": {"type": "string"},
-        "owner": {"type": "ref", "to": ["rep"], "description": "who owns it in the CRM"},
+        "owner": {"type": "ref", "to": ["rep"], "label": "owned by", "inverse": "owns", "description": "who owns it in the CRM"},
         "status": {"type": "enum", "description": "its status in the CRM (open enum)"},
         "account_type": {"type": "enum", "description": "the CRM's type for it: customer, partner, prospect (open enum)"},
         "website": {"type": "string"},
@@ -111,8 +111,8 @@
         "amount": {"type": "money", "unit": "USD"},
         "currency": {"type": "string", "description": "the ISO 4217 code of the deal's currency (EUR); its amount is in it, in USD when it names none"},
         "close_date": {"type": "date", "plan": true},
-        "owner": {"type": "ref", "to": ["rep"], "description": "who owns it in the CRM"},
-        "account": {"type": "ref", "to": ["account"], "part_of": true},
+        "owner": {"type": "ref", "to": ["rep"], "label": "owned by", "inverse": "owns", "description": "who owns it in the CRM"},
+        "account": {"type": "ref", "to": ["account"], "label": "for", "inverse": "deals", "part_of": true},
         "deal_type": {"type": "enum", "description": "new business, renewal, upsell (open enum)"},
         "next_step": {"type": "text"},
         "lead_source": {"type": "string"},
@@ -126,9 +126,9 @@
       "predicates": {
         "email": {"type": "string"},
         "title": {"type": "string", "freshness_days": 365},
-        "account": {"type": "ref", "to": ["account"], "part_of": true},
+        "account": {"type": "ref", "to": ["account"], "label": "works at", "inverse": "contacts", "part_of": true},
         "company": {"type": "string", "description": "the company name on the CRM record, which may name a company that has no account"},
-        "owner": {"type": "ref", "to": ["rep"], "description": "who owns it in the CRM"},
+        "owner": {"type": "ref", "to": ["rep"], "label": "owned by", "inverse": "owns", "description": "who owns it in the CRM"},
         "lifecycle_stage": {"type": "enum", "description": "the CRM's lifecycle stage (open enum)"}
       }
     },
@@ -140,7 +140,7 @@
         "company": {"type": "string"},
         "status": {"type": "enum", "description": "its status in the CRM (open enum)"},
         "lead_source": {"type": "string"},
-        "owner": {"type": "ref", "to": ["rep"], "description": "who owns it in the CRM"}
+        "owner": {"type": "ref", "to": ["rep"], "label": "owned by", "inverse": "owns", "description": "who owns it in the CRM"}
       }
     },
     "rep": {

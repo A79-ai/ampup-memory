@@ -200,7 +200,41 @@ struct Listed {
 /// of the scope. Only what the memory holds: whether a pass runs here now, and the counts that depend on the time,
 /// are worked out on each list.
 static LISTED: LazyLock<crate::kept_answers::Kept<Listed>> =
-    LazyLock::new(|| crate::kept_answers::Kept::new(200));
+    LazyLock::new(|| crate::kept_answers::Kept::new(200).however_old());
+
+/// Warm-up's: the decisions list of `who` (signed in by `via`) on `scope` of org `org`, as `dream_decisions` works it out
+/// for them, kept on this server for their first Review page. Only for one of the org's admins as the directory says
+/// now (`dream_decisions` lists for no one else), and kept by the same reader key a request keeps it by: their own
+/// answer, nobody else's. Home's dream part may answer from what another server shared rather than through
+/// [`LISTED`], so a primed Home doesn't prime it. Whether it was worked out (false: not an admin).
+pub(super) async fn prime(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    via: &SignIn,
+    org: &str,
+) -> Result<bool> {
+    let dir = crate::people::directory::Directory::behind(store).await?;
+    if !dir.is_admin(who.user(), via, org) {
+        return Ok(false);
+    }
+    let reader = as_member(who, org);
+    let mark = crate::kept_answers::Mark::read(store, scope).await?;
+    let vis = store.lagging_visibility(scope, MAIN).await?;
+    LISTED
+        .get(
+            &scope.namespace(),
+            &crate::kept_answers::reader_key(&reader),
+            crate::kept_answers::At::of(mark, &vis),
+            true,
+            || {
+                let (store, scope, reader) = (store.clone(), scope.clone(), reader.clone());
+                async move { listed(&store, &scope, &reader).await }
+            },
+        )
+        .await?;
+    Ok(true)
+}
 
 async fn listed(store: &Store, scope: &Scope, reader: &Principal) -> Result<Listed> {
     let started = std::time::Instant::now();

@@ -267,6 +267,7 @@ pub(super) async fn at_once(
     let key = ahead_key(reader, &standing);
     crate::phases::mark("home key");
     watch(state, scope, reader, via, superuser, &key);
+    super::home_readers::seen(state, scope, reader.who, via, superuser);
     let shared = async {
         let shared = Shared::read(store, scope, reader.who, &standing, Read::Since).await?;
         let out = shared_whole(&shared, &wanted).await?;
@@ -429,6 +430,7 @@ pub(super) async fn run(
             let standing = standing(store, session.scope(), reader, via, superuser).await;
             let key = ahead_key(reader, &standing);
             watch(state, session.scope(), reader, via, superuser, &key);
+            super::home_readers::seen(state, session.scope(), reader.who, via, superuser);
             // A first ask looks within `FIRST` too (the answer log's first read since a restart is a catalog
             // read): past it every part is pending, as below.
             let first = !req["parts"].is_array();
@@ -1168,11 +1170,6 @@ impl Shared {
             }
             let after = classes_of(&store, scope, &shared.who, &shared.standing).await;
             let ns = scope.namespace();
-            // Each part's answer holds while only the answer log commits ([`crate::shared_answers::without_answers`]).
-            let without_answers =
-                crate::shared_answers::without_answers(&store, scope, &shared.ids)
-                    .await
-                    .ok();
             for (part, v) in worked {
                 let class = shared.classes.get(part);
                 if class.is_none_or(|c| after.get(part) != Some(c) || !class_covers(part, c, &v)) {
@@ -1197,7 +1194,6 @@ impl Shared {
                     class,
                     shared.hour,
                     &shared.ids,
-                    without_answers.clone(),
                     v,
                 );
                 let Ok(bytes) = last.and_then(|l| l.to_bytes()) else {
@@ -1374,16 +1370,19 @@ fn refresh(ns: &str, key: &str) {
 /// Warm-up's hook: works out `reader`'s Home on `scope`'s main as it is now, as their first answer on this server is
 /// worked out ahead, so each part another server put in the shared store at this state is read from it rather than
 /// worked out ([`Shared`]), and keeps it here for their first ask ([`at_once`]); they are watched from now on
-/// ([`watch`]). Warm-up names the readers (those who opened Home lately, say): no server keeps who did, and the store's
-/// keys hash who each answer is for, so they can't be listed from it.
-#[allow(dead_code)]
+/// ([`watch`]). Warm-up names the readers, those who opened Home lately ([`super::home_readers`]): no server keeps who
+/// did, and the store's keys hash who each answer is for, so they can't be listed from it. Kept, as every answer
+/// worked out ahead, by the reader's key ([`ahead_key`]) with their standing read now: only an ask by the same
+/// reader, signed in the same way and standing the same, is answered from it. Its parts wait up to [`AGAIN`], as an
+/// ask again does, and one still pending then is waited for once more: whether the answer it kept has every part
+/// ([`settled`]). The caller bounds how many are worked out at once.
 pub(super) async fn prime(
     state: &Arc<State>,
     scope: &Scope,
     reader: crate::browse::Reader<'_>,
     via: &SignIn,
     superuser: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let store = state.store.read().unwrap().clone();
     let standing = standing(&store, scope, reader, via, superuser).await;
     let key = ahead_key(reader, &standing);
@@ -1396,21 +1395,27 @@ pub(super) async fn prime(
         .and_then(|r| r.get(&key))
         .cloned()
     else {
-        return Ok(());
+        return Ok(false);
     };
-    let worked = {
-        let _turn = REFRESH_TURNS.acquire().await?;
-        work_out(&ns, &key, &w, AHEAD_WAIT, true).await?
-    };
-    if let Some(w) = WATCHED
-        .lock()
-        .unwrap()
-        .get_mut(&ns)
-        .and_then(|r| r.get_mut(&key))
-    {
-        w.worked = Some(worked);
+    let mut settled_now = false;
+    for again in [true, false] {
+        let worked = work_out(&ns, &key, &w, AGAIN, again).await?;
+        if let Some(w) = WATCHED
+            .lock()
+            .unwrap()
+            .get_mut(&ns)
+            .and_then(|r| r.get_mut(&key))
+        {
+            w.worked = Some(worked);
+        }
+        settled_now = AHEAD
+            .peek(&ns, &key, &state_now(&store, scope).await?.0)
+            .is_some_and(|(kept, _, _)| settled(&kept));
+        if settled_now {
+            break;
+        }
     }
-    Ok(())
+    Ok(settled_now)
 }
 
 /// Works out the answers of a memory's watched readers ahead, while any is watched: at most [`PER_RUN`] a run, the one

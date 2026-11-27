@@ -210,7 +210,8 @@ pub async fn embed_tail(texts: &[String]) -> Result<Vec<Vec<f32>>> {
 }
 
 /// Embeddings of recent search texts, so the next page of a search, or the same question asked again,
-/// doesn't embed it again. Cleared when it passes QUERY_CACHE_MAX texts.
+/// doesn't embed it again. Keyed by the text as [`query_key`] spells it; one embedder (provider and model) serves a
+/// process, so the text alone names a vector. Cleared when it passes QUERY_CACHE_MAX texts.
 static QUERY_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<f32>>>> =
     std::sync::LazyLock::new(Default::default);
 const QUERY_CACHE_MAX: usize = 1024;
@@ -223,8 +224,16 @@ static EMBEDDING: std::sync::LazyLock<
     std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Result<Vec<f32>, (String, bool)>>>>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// A search text as the query cache knows it: trimmed, its runs of white space one space. Texts that differ only
+/// there embed alike, so one asked again with another spacing (a pasted line, a trailing newline) is found.
+fn query_key(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// The unit-length embedding of one text (a search's), from the cache of recent ones when it is there.
 pub async fn embed_text(text: &str) -> Result<Vec<f32>> {
+    let key = query_key(text);
+    let text = key.as_str();
     if let Some(v) = QUERY_CACHE.lock().unwrap().get(text) {
         return Ok(v.clone());
     }
@@ -236,6 +245,18 @@ pub async fn embed_text(text: &str) -> Result<Vec<f32>> {
         .clone();
     let v = cell
         .get_or_init(|| async {
+            // `AMPUP_MEMORY_EMBED_DELAY_MS`: a wait before each embedding of a query, so a measurement with the
+            // local embedder waits about as long as a remote one does (0.3-1 s), and what a search reads meanwhile
+            // overlaps it as it would. A query found in the cache waits none, as it calls no API.
+            static DELAY: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+                std::env::var("AMPUP_MEMORY_EMBED_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            });
+            if *DELAY > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(*DELAY)).await;
+            }
             let v = embed(vec![text.to_string()])
                 .await
                 .map_err(|e| (format!("{e:#}"), e.is::<embed::Unavailable>()))?
@@ -292,23 +313,12 @@ pub fn keyword_only(e: &anyhow::Error) {
 /// another, and each would wait out the embedder again): they use a cached query's vector, or rank by keyword
 /// alone. A query the API refuses fails alone.
 pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
-    // `AMPUP_MEMORY_EMBED_DELAY_MS`: a wait before each query's embedding, so a measurement with the local embedder
-    // waits about as long as a remote one does (0.3-1 s), and what a search reads meanwhile overlaps it as it would.
-    static DELAY: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-        std::env::var("AMPUP_MEMORY_EMBED_DELAY_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    });
-    if *DELAY > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(*DELAY)).await;
-    }
     if QUERY_EMBED_FAILED
         .lock()
         .unwrap()
         .is_some_and(|t| t.elapsed() < QUERY_EMBED_REST)
     {
-        return QUERY_CACHE.lock().unwrap().get(text).cloned();
+        return QUERY_CACHE.lock().unwrap().get(&query_key(text)).cloned();
     }
     let per_try = query_embed_try();
     let unavailable = || *QUERY_EMBED_FAILED.lock().unwrap() = Some(std::time::Instant::now());
@@ -336,6 +346,22 @@ pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
         keyword_only(&e)
     })
     .ok()
+}
+
+/// Starts embedding a search's query (as the fact and passage searches will: without a leading request date) on a
+/// task of its own, for the org this one works for, while the search waits for its turn (the server's search
+/// turns): an API's embedding takes none of the cores a turn guards, and took 0.3-1 s of a search that waited for
+/// a turn 1-5 s. The search then finds it in the query cache, or joins it under way ([`embed_text`]). Nothing is
+/// started for a query the cache holds.
+pub fn embed_ahead(query: &str) {
+    let (_, query) = when::request_date(query);
+    let key = query_key(query);
+    if key.is_empty() || QUERY_CACHE.lock().unwrap().contains_key(&key) {
+        return;
+    }
+    crate::log_org::spawn(async move {
+        embed_query(&key).await;
+    });
 }
 
 /// How many fact searches ranked without a vector they would have had given longer (their query's, or the unindexed
@@ -2852,6 +2878,7 @@ impl PreparedCandidates {
         query: &[f32],
         keyword: bool,
         distance: Option<f32>,
+        known: Option<f32>,
         prepare: impl FnOnce(&Fact, &str) -> Option<usize>,
     ) -> Option<(usize, Option<f32>)> {
         let cached = self
@@ -2865,7 +2892,11 @@ impl PreparedCandidates {
         let matched = cached.matched?;
         let distance = if keyword {
             *cached.keyword_distance.get_or_insert_with(|| {
-                // No query vector (empty: the embedder failed), no distance.
+                // From the part's vector index when it was asked ([`index_distances`]); else from the stored
+                // embedding. No query vector (empty: the embedder failed), no distance.
+                if known.is_some() {
+                    return known;
+                }
                 row.vec.as_ref().filter(|_| !query.is_empty()).map(|e| {
                     e.iter()
                         .zip(query.iter())
@@ -2892,6 +2923,72 @@ const FACT_ROWS_MAX: usize = 100_000;
 
 static FACT_VECS: std::sync::LazyLock<rows::RowCache<Vec<f32>>> =
     std::sync::LazyLock::new(|| rows::RowCache::new(index_knob("FACT_ROWS", FACT_ROWS_MAX)));
+
+/// Whether a search's keyword hits in an index part are scored by vector from the part's vector index rather than
+/// from their stored embeddings (`AMPUP_MEMORY_RANK_KEYWORD_VECS_FROM_INDEX`, on): only a part with a vector index.
+/// Reading 300 hits' embeddings from object storage took 0.3-0.8 s of a search on a fresh staging pod; the index holds
+/// every row's vector (one byte a dimension) in memory, and a search over just those rows takes tens of ms. Its
+/// distances are within about 0.003 of the exact ones, and are what the vector list ranks by already.
+async fn vectors_by_index(ds: &Dataset) -> bool {
+    if knob("KEYWORD_VECS_FROM_INDEX", 1.0) == 0.0 {
+        return false;
+    }
+    let Some(field) = ds.schema().field("vec").map(|f| f.id) else {
+        return false;
+    };
+    ds.load_indices()
+        .await
+        .is_ok_and(|ix| ix.iter().any(|i| i.fields.contains(&field)))
+}
+
+/// The squared distance from `q` of each row `ids` of index part `ds`, by its vector index ([`vectors_by_index`]):
+/// a vector search over just those rows. A row it doesn't answer for is scored from its stored embedding.
+async fn index_distances(
+    ds: &Dataset,
+    ids: &HashSet<u64>,
+    q: &Float32Array,
+) -> Result<(HashMap<u64, f32>, usize)> {
+    if ids.is_empty() {
+        return Ok((HashMap::new(), 0));
+    }
+    let list = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+    let by_index = async {
+        let mut scan = ds.scan();
+        scan.filter(&format!("_rowid IN ({list})"))?.prefilter(true);
+        probe(scan.nearest("vec", q, ids.len())?);
+        rows::ids(scan).await
+    };
+    let mut out: HashMap<u64, f32> = match by_index.await {
+        Ok(found) => found
+            .into_iter()
+            .filter_map(|(id, d)| d.map(|d| (id, d)))
+            .collect(),
+        Err(e) => {
+            eprintln!("memstore: keyword hits scored from their embeddings (vector index: {e:#})");
+            HashMap::new()
+        }
+    };
+    let missing: Vec<u64> = ids
+        .iter()
+        .filter(|id| !out.contains_key(id))
+        .copied()
+        .collect();
+    let read = missing.len();
+    if !missing.is_empty() {
+        let (vecs, _) = FACT_VECS
+            .get_counted(ds, &missing, &["vec"], decode_vecs)
+            .await?;
+        for (id, v) in missing.into_iter().zip(vecs) {
+            let d = v
+                .iter()
+                .zip(q.values().iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            out.insert(id, d);
+        }
+    }
+    Ok((out, read))
+}
 
 fn decode_vecs(b: &RecordBatch) -> Result<Vec<Vec<f32>>> {
     let vs = b
@@ -4131,7 +4228,7 @@ async fn ranked(
     // index is open; then the ids the keyword lists named in each part, whose rows are read there (with their
     // embedding). A side that fails drops its sender, and the other stops waiting on it.
     let (setup_tx, setup_rx) =
-        tokio::sync::oneshot::channel::<(Vec<(Dataset, Option<String>)>, usize)>();
+        tokio::sync::oneshot::channel::<(Vec<(Dataset, Option<String>)>, usize, Vec<bool>)>();
     // Per part, the ids the keyword lists named, and the any-terms query's scorer (the rows only vector lists found
     // are scored by keyword with it, below).
     type Scorer = Option<Arc<std::sync::Mutex<bm25f::KeywordScorer>>>;
@@ -4145,32 +4242,62 @@ async fn ranked(
             }
             slow.mark("embed");
             let q_vec = v.map(Float32Array::from);
-            let (Some(q), Ok((parts, keywords))) = (q_vec.as_ref(), setup_rx.await) else {
-                return Ok::<_, anyhow::Error>((q_vec, vec![], vec![]));
+            let (Some(q), Ok((parts, keywords, by_index))) = (q_vec.as_ref(), setup_rx.await)
+            else {
+                return Ok::<_, anyhow::Error>((q_vec, vec![], vec![], vec![]));
             };
             // The vector lists as soon as both the vector and the index are in, beside the keyword lists.
             let wanted = lists_of(&parts, keywords);
-            let by_vector: Vec<Vec<(u64, Option<f32>)>> =
-                futures::future::try_join_all(wanted.iter().filter(|l| l.1.is_none()).map(
-                    |(part, signal, filter)| {
-                        list(
-                            &parts[*part].0,
-                            *part,
-                            *signal,
-                            filter.clone(),
-                            &[],
-                            Some(q),
-                        )
+            // The vector lists, and beside them the keyword hits' distances in each part whose vector index scores
+            // them ([`vectors_by_index`]), once the keyword lists name them.
+            let lists = futures::future::try_join_all(wanted.iter().filter(|l| l.1.is_none()).map(
+                |(part, signal, filter)| {
+                    list(
+                        &parts[*part].0,
+                        *part,
+                        *signal,
+                        filter.clone(),
+                        &[],
+                        Some(q),
+                    )
+                },
+            ));
+            let by_keyword = async {
+                let named = named_rx.await.ok()?;
+                let distances = futures::future::join_all(parts.iter().enumerate().map(
+                    |(part, (ds, _))| {
+                        let (named, by_index) = (&named[part].0, by_index[part]);
+                        async move {
+                            if !by_index {
+                                return Ok(None);
+                            }
+                            let t = std::time::Instant::now();
+                            let (d, read) = index_distances(ds, named, q).await?;
+                            if let Ok(mut l) = slow.lists.lock() {
+                                l.push(format!(
+                                    "part {part} keyword distances {} ms by the vector index, {read} of {} embeddings read",
+                                    t.elapsed().as_millis(),
+                                    named.len()
+                                ));
+                            }
+                            anyhow::Ok(Some(d))
+                        }
                     },
                 ))
-                .await?;
+                .await;
+                Some((named, distances))
+            };
+            let (by_vector, by_keyword) = tokio::join!(lists, by_keyword);
+            let by_vector: Vec<Vec<(u64, Option<f32>)>> = by_vector?;
             slow.mark("vector lists");
             // The rows only vector lists name, read without the embedding, a tenth of the bytes, from the cache
             // that keeps rows that way ([`KEYED_ROWS`]): on a production deployment most of a search's time was its
             // rows read from storage, 1 to 5 s, the embeddings most of their bytes.
-            let Ok(named) = named_rx.await else {
-                return Ok((q_vec, by_vector, vec![]));
+            let Some((named, distances)) = by_keyword else {
+                return Ok((q_vec, by_vector, vec![], vec![]));
             };
+            let distances: Vec<Option<HashMap<u64, f32>>> =
+                distances.into_iter().collect::<Result<_>>()?;
             let vector_rows = futures::future::try_join_all(parts.iter().enumerate().map(
                 |(part, (ds, _))| {
                     let ids: Vec<u64> = wanted
@@ -4184,6 +4311,7 @@ async fn ranked(
                         .into_iter()
                         .collect();
                     let scorer = named[part].1.clone();
+                    let by_index = by_index[part];
                     async move {
                         let t = std::time::Instant::now();
                         let asked = ids.len();
@@ -4207,6 +4335,12 @@ async fn ranked(
                             .flatten()
                             .filter_map(|(id, x)| x.map(|_| *id))
                             .collect();
+                        // Scored by vector from the distance their list gave, where the part's vector index
+                        // scores keyword hits too ([`vectors_by_index`]); else from their embeddings.
+                        let scored = match by_index {
+                            true => vec![],
+                            false => scored,
+                        };
                         let embedded = scored.len();
                         let (with, (taken_with, vecs_with)) = fact_rows_counted(ds, scored).await?;
                         rows.extend(with);
@@ -4224,7 +4358,7 @@ async fn ranked(
             ))
             .await?;
             slow.mark("vector rows");
-            Ok((q_vec, by_vector, vector_rows))
+            Ok((q_vec, by_vector, vector_rows, distances))
         },
         async {
             let index = index_for(store, scope, pin).await?;
@@ -4270,10 +4404,13 @@ async fn ranked(
             let keyword = keyword_queries(&ordered, rank.classic, keep.as_ref())?;
             // The keyword lists, all at once, then their rows: only a keyword list's rows need their embedding (a
             // keyword hit is scored by vector from it, `for_list`), so they are read with it, each part's in one
-            // read (see `fact_rows`).
+            // read (see `fact_rows`), except where the part's vector index scores them ([`vectors_by_index`]).
             let parts = parts_of(&index);
             let wanted = lists_of(&parts, keyword.len());
-            let _ = setup_tx.send((parts.clone(), keyword.len()));
+            // Whether each part's vector index scores its keyword hits, decided once for both sides.
+            let by_index: Vec<bool> =
+                futures::future::join_all(parts.iter().map(|(ds, _)| vectors_by_index(ds))).await;
+            let _ = setup_tx.send((parts.clone(), keyword.len(), by_index.clone()));
             // Each part's any-terms query's scorer, read beside the lists: the rows only vector lists found are scored
             // by it from their text, the scores the query would give them (no second keyword query, and no list of
             // every match). None where it can't be read exactly; those rows ask the index (below).
@@ -4338,10 +4475,15 @@ async fn ranked(
                         .filter(|(l, _)| l.0 == part)
                         .flat_map(|(_, ids)| ids.iter().map(|(id, _)| *id))
                         .collect();
+                    let by_index = by_index[part];
                     async move {
                         let t = std::time::Instant::now();
                         let asked = ids.len();
-                        let (rows, (taken, vecs)) = fact_rows_counted(ds, ids).await?;
+                        // Without their embeddings where the part's vector index scores them ([`vectors_by_index`]).
+                        let (rows, (taken, vecs)) = match by_index {
+                            true => (keyed_rows_counted(ds, ids).await.map(|(r, t)| (r, (t, 0))))?,
+                            false => fact_rows_counted(ds, ids).await?,
+                        };
                         if let Ok(mut l) = slow.lists.lock() {
                             l.push(format!(
                                 "part {part} keyword rows {} ms {taken} of {asked} taken from storage, {vecs} embeddings",
@@ -4367,7 +4509,7 @@ async fn ranked(
         }
     );
     let (index, current, tail_facts, tail_vecs, keyword, by_keyword, mut fetched, scorers) = found?;
-    let (q_vec, by_vector, vector_rows) = vector_side?;
+    let (q_vec, by_vector, vector_rows, distances) = vector_side?;
     // Per part, the keyword scores of the rows only vector lists found (None where the any-terms query doesn't match).
     let mut scores: Vec<Option<HashMap<u64, Option<f32>>>> = vec![None; fetched.len()];
     for (part, (rows, s)) in vector_rows.into_iter().enumerate() {
@@ -4421,7 +4563,8 @@ async fn ranked(
             .count())
     };
     // Index rows as candidates: each with its keyword score (`_score`, when the batch is a keyword ranking)
-    // or its distance (`_distance`). Keyword hits are scored by vector too, from their stored embedding, so
+    // or its distance (`_distance`). Keyword hits are scored by vector too (by the part's vector index, or from their
+    // stored embedding: [`vectors_by_index`]), so
     // every candidate has both signals: otherwise a fact that only keywords find (outside the nearest pool,
     // say behind hundreds of near-duplicates of one entity) is outvoted by any fact both lists happen to hold.
     let q: &[f32] = q_vec.as_ref().map_or(&[], |v| v.values().as_ref());
@@ -4429,13 +4572,33 @@ async fn ranked(
     let prepared: std::sync::Mutex<PreparedCandidates> = Default::default();
     // `signal`: which keyword ranking the rows are (see `keyword_queries`), none for the vector one; each row
     // with its score in that ranking, or its distance.
+    // Each read row's distance from the query by its part's vector index, where that scores keyword hits
+    // ([`vectors_by_index`]): the keyword hits', and the vector lists' own (scored by keyword too, below).
+    let mut known: HashMap<usize, f32> = HashMap::new();
+    for (part, d) in distances.iter().enumerate() {
+        let Some(d) = d else { continue };
+        let rows = &fetched[part];
+        let listed = wanted
+            .iter()
+            .filter(|l| l.1.is_none())
+            .zip(by_vector.iter())
+            .filter(|(l, _)| l.0 == part)
+            .flat_map(|(_, ids)| ids.iter().filter_map(|(id, x)| x.map(|x| (*id, x))));
+        for (id, x) in d.iter().map(|(id, x)| (*id, *x)).chain(listed) {
+            if let Some(r) = rows.get(&id) {
+                known.entry(Arc::as_ptr(r) as usize).or_insert(x);
+            }
+        }
+    }
     let take = |rows: &[(Arc<FactRow>, Option<f32>)], signal: Option<usize>| {
         let mut prepared = prepared.lock().unwrap();
         for (row, x) in rows {
             if !current.contains(&row.file) {
                 continue;
             }
-            let Some((matched, d)) = prepared.for_list(row, q, signal.is_some(), *x, prepare)
+            let known = known.get(&(Arc::as_ptr(row) as usize)).copied();
+            let Some((matched, d)) =
+                prepared.for_list(row, q, signal.is_some(), *x, known, prepare)
             else {
                 continue;
             };
@@ -4497,8 +4660,8 @@ async fn ranked(
                 let (scored, fetched, wanted_ids) = (&scores[part], &fetched[part], &wanted_ids);
                 let scorer = &scorers[part];
                 async move {
-                    // Every row the lists read of those facts (with its embedding: keyword rows are read with it, and
-                    // the vector lists' rows the query matches were), with its score: computed already for the vector
+                    // Every row the lists read of those facts (scored by vector by the part's vector index, or from
+                    // its embedding, read with the row: [`vectors_by_index`]), with its score: computed already for the vector
                     // lists' rows, from its text for the others. Best first, ties by row id, as the index lists them.
                     if let Some(scorer) = scorer {
                         let mut scorer = scorer.lock().unwrap();
@@ -4888,17 +5051,31 @@ async fn ranked(
     // a group isn't shown again, and a group is one of the `k`. Each group takes at most `rank.group` other
     // hits, so the `k`-th group's hit is among the first (group + 1) * k: their entities are every group's,
     // and a group is the same at every `k` that shows it.
-    let mut entities: Vec<Lit> = vec![];
-    let mut seen: HashSet<&str> = HashSet::new();
-    for h in kept.iter().take((rank.group + 1) * k + 10) {
-        let e = Lit::Str(h.fact.entity.clone());
-        if seen.insert(&h.fact.entity) {
-            entities.push(e);
-        }
-    }
+    //
+    // A group needs only its own entity's facts, so the facts of an entity are read when a hit about it is first
+    // to lead a group, with those of the next hits' entities (`GROUP_READ_AHEAD`): a search reads the facts of
+    // about as many entities as it shows groups, not of every entity among the first (group + 1) * k hits, and its
+    // groups are the same.
+    let groupable: HashSet<String> = kept
+        .iter()
+        .take((rank.group + 1) * k + 10)
+        .map(|h| h.fact.entity.clone())
+        .collect();
     let mut about: HashMap<String, Vec<Fact>> = HashMap::new();
-    if !entities.is_empty() {
-        for (commit, f) in scan(store, scope, &Filter::In(Col::Entity, entities), false).await? {
+    let mut read: HashSet<String> = HashSet::new();
+    let mut grouping = Grouping::default();
+    let read_about = async |entities: Vec<String>,
+                            about: &mut HashMap<String, Vec<Fact>>,
+                            grouping: &mut Grouping|
+           -> Result<()> {
+        let t = std::time::Instant::now();
+        grouping.reads += 1;
+        grouping.entities += entities.len();
+        let lits = entities.into_iter().map(Lit::Str).collect();
+        let rows = scan(store, scope, &Filter::In(Col::Entity, lits), false).await?;
+        grouping.scan_ms += t.elapsed().as_secs_f64() * 1000.0;
+        grouping.rows += rows.len();
+        for (commit, f) in rows {
             let key = (f.entity.clone(), f.predicate.clone());
             if crate::dream_name(&f)
                 || !vis.allows(&commit, &f, who, valid_at)
@@ -4912,8 +5089,9 @@ async fn ranked(
                 .or_default()
                 .push(vis.annotate(f, who));
         }
-    }
-    slow.mark("grouped");
+        grouping.ms += t.elapsed().as_secs_f64() * 1000.0;
+        Ok(())
+    };
     let rank_of: HashMap<String, usize> = kept
         .iter()
         .enumerate()
@@ -4932,6 +5110,24 @@ async fn ranked(
     while let Some((mut h, linked, own)) = queue.pop_front() {
         if groups.len() >= k {
             break;
+        }
+        if !shown.contains(&h.fact.fact_id)
+            && groupable.contains(&h.fact.entity)
+            && !read.contains(&h.fact.entity)
+        {
+            let ahead = k - groups.len() + GROUP_READ_AHEAD;
+            let mut next: Vec<String> = vec![];
+            for e in
+                std::iter::once(&h.fact.entity).chain(queue.iter().map(|(q, _, _)| &q.fact.entity))
+            {
+                if next.len() >= ahead {
+                    break;
+                }
+                if groupable.contains(e) && read.insert(e.clone()) {
+                    next.push(e.clone());
+                }
+            }
+            read_about(next, &mut about, &mut grouping).await?;
         }
         if !shown.insert(h.fact.fact_id.clone()) {
             // Shown already, in a better hit's group: what a dream's link folded into it would go unseen with it, so
@@ -4999,9 +5195,31 @@ async fn ranked(
         h.group = group;
         groups.push(h);
     }
+    slow.mark("grouped");
+    if let Ok(mut l) = slow.lists.lock() {
+        l.push(format!(
+            "groups {} entities in {} reads, {} rows, {:.0} ms ({:.0} ms reading them)",
+            grouping.entities, grouping.reads, grouping.rows, grouping.ms, grouping.scan_ms
+        ));
+    }
     missed.extend(misses_of(scored, &groups, cut));
     Ok((groups, saturated, missed))
 }
+
+/// What reading the facts for a search's groups took: how many entities' facts, in how many reads, how many rows.
+#[derive(Default)]
+struct Grouping {
+    entities: usize,
+    reads: usize,
+    rows: usize,
+    ms: f64,
+    scan_ms: f64,
+}
+
+/// Besides the entity of the hit about to lead a group, the facts of this many more of the next hits' entities are
+/// read with it (beyond one per group still to show), so a hit shown already in a group, or a second hit about one
+/// entity, rarely needs a read of its own.
+const GROUP_READ_AHEAD: usize = 10;
 
 /// The scored candidates (in rank order) that `shown` doesn't hold as a hit or in a hit's group, each with why: as
 /// `cut` says, else it ranked below. A dream's names of a thing are never one (they are never hits).

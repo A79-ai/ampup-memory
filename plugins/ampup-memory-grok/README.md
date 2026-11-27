@@ -33,10 +33,14 @@ The last two are the [AmpUp Memory plugin](../ampup-memory)'s own skills.
      use `https://<server>/mcp`.
    - Save it, then sign in when it asks. The sign-in tokens stay with the provider's connector service; the Bot
      calls the tools without seeing them.
-2. **Save the skill.** Grok Bot doesn't read skills from a repository, so paste
-   [the skill](skills/ampup-memory-session/SKILL.md) into a Bot and ask it to save it as a skill called
-   `ampup-memory-session`. The setup page in the AmpUp Memory console has it ready to copy. Private skills are one
-   library shared by all your Bots.
+2. **Save the skill.** Send a Bot this line. It reads [the skill](skills/ampup-memory-session/SKILL.md) from this
+   repository and saves it. Private skills are one library shared by all your Bots.
+
+   ```text
+   Read https://raw.githubusercontent.com/A79-ai/ampup-memory/main/plugins/ampup-memory-grok/skills/ampup-memory-session/SKILL.md and save it as a private skill called ampup-memory-session, with its description line as the description.
+   ```
+
+   If the Bot can't reach GitHub, paste the skill's text instead and ask it to save that.
 3. **Turn it on.** In **Connect apps**, turn the skill on for each Bot under **Private skills**.
 4. **Check it.** Ask a Bot something, then ask it which AmpUp Memory session it used. The session shows in the
    memory's console with harness `grok`.

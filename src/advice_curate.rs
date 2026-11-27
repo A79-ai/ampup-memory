@@ -283,11 +283,15 @@ fn marker(line: &str) -> (Option<Mark>, &str) {
 const ID_OPEN: &str = "<!--i:";
 const ID_CLOSE: &str = "-->";
 
-/// The permanent id an item's text carries on its first line, if any.
+/// The permanent id an item's text carries on its first line, if any. Extended comments place
+/// basis metadata after the id (`<!--i:3fa9c21b {"b":"mechanism",...}-->`); this returns only
+/// the hex part so callers that compare or store ids remain correct.
 pub(crate) fn item_id(text: &str) -> Option<&str> {
     let first = text.lines().next()?;
     let (_, rest) = first.rsplit_once(ID_OPEN)?;
-    let id = rest.split_once(ID_CLOSE)?.0.trim();
+    let content = rest.split_once(ID_CLOSE)?.0;
+    // The id is the first whitespace-separated token; extended comments follow it.
+    let id = content.split_ascii_whitespace().next().unwrap_or("").trim();
     (!id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())).then_some(id)
 }
 
@@ -306,15 +310,6 @@ pub(crate) fn without_ids(text: &str) -> String {
     out
 }
 
-/// Item text `text` carrying id `id` on its first line, in place of any id it had.
-pub(crate) fn with_id(text: &str, id: &str) -> String {
-    let t = without_ids(text);
-    match t.split_once('\n') {
-        Some((first, rest)) => format!("{first} {ID_OPEN}{id}{ID_CLOSE}\n{rest}"),
-        None => format!("{t} {ID_OPEN}{id}{ID_CLOSE}"),
-    }
-}
-
 /// A new id for an item of note `key` whose text is `text` (its id, case and spacing aside): a hash of both, so the
 /// same lesson written again in the same note gets the id it had. `salt` tells apart two items of the same text.
 pub(crate) fn mint_id(key: &str, text: &str, salt: usize) -> String {
@@ -328,8 +323,83 @@ pub(crate) fn mint_id(key: &str, text: &str, salt: usize) -> String {
     h[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Basis metadata written by [`crate::advice::gated`] on GATED section items and stored permanently once
+/// [`crate::advice::stamp_ids`] assigns the real hex ID. Tracks the trustworthiness of each step per the
+/// three principles (mechanism, prospective validation, independent people).
+#[derive(Debug, Clone)]
+pub(crate) struct BasisMeta {
+    /// "mechanism" when the item names why it works (a setting, a file, an error message, a service's
+    /// behavior); "observed" when the runs show it works but not why (`(because: unknown)`).
+    pub basis: String,
+    /// The cause text from `(because: <cause>)`, with `-->` escaped as `—>`.
+    pub because: String,
+    /// Full run IDs the item cited, comma-joined (empty when it cites only the procedures).
+    pub runs: String,
+}
+
+/// Escapes `-->` in a string for safe embedding inside an HTML comment.
+pub(crate) fn escape_comment(s: &str) -> String {
+    s.replace("-->", "—>")
+}
+
+/// Extracts basis metadata from a comment on `text`'s first line. Handles both the placeholder
+/// written by [`crate::advice::gated`] (`<!--i: {...}-->`) and the final stored form
+/// (`<!--i:HEXID {...}-->`). Returns `None` when no JSON metadata is present.
+pub(crate) fn extract_basis_meta(text: &str) -> Option<BasisMeta> {
+    // Any comment of the item's, not only its first line's: the placeholder lands after an item's last line. The
+    // last one wins: a placeholder written now follows a stored comment the item kept.
+    let mut found = None;
+    let mut rest = text;
+    while let Some(i) = rest.find(ID_OPEN) {
+        let after = &rest[i + ID_OPEN.len()..];
+        let Some((content, next)) = after.split_once(ID_CLOSE) else {
+            break;
+        };
+        rest = next;
+        // The JSON object inside the comment (after the optional hex id).
+        let Some(json_start) = content.find('{') else {
+            continue;
+        };
+        // Anything before `{` must be empty or a hex id; guard against accidental matches.
+        let before = content[..json_start].trim();
+        if !before.is_empty() && !before.chars().all(|c| c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&content[json_start..]) else {
+            continue;
+        };
+        found = Some(BasisMeta {
+            basis: v["b"].as_str().unwrap_or("observed").to_string(),
+            because: v["c"].as_str().unwrap_or("").to_string(),
+            runs: v["r"].as_str().unwrap_or("").to_string(),
+        });
+    }
+    found
+}
+
+/// `text` with a permanent id and basis metadata on its first line, replacing any existing id or
+/// basis placeholder. When `meta` is `None` or empty, writes the plain `<!--i:HEXID-->` form.
+pub(crate) fn with_meta_id(text: &str, id: &str, meta: Option<&BasisMeta>) -> String {
+    let t = without_ids(text);
+    let comment = match meta.filter(|m| !m.basis.is_empty()) {
+        Some(m) => {
+            let json = serde_json::json!({"b": m.basis, "c": m.because, "r": m.runs});
+            let json_str = serde_json::to_string(&json)
+                .unwrap_or_default()
+                .replace("-->", "—>");
+            format!("{ID_OPEN}{id} {json_str}{ID_CLOSE}")
+        }
+        None => format!("{ID_OPEN}{id}{ID_CLOSE}"),
+    };
+    match t.split_once('\n') {
+        Some((first, rest)) => format!("{first} {comment}\n{rest}"),
+        None => format!("{t} {comment}"),
+    }
+}
+
 /// `text` with each item id shown as `[item <id>]` where it stands (for a reader asked about items by id, such as
-/// the session judge), and the ids it shows, in order.
+/// the session judge), and the ids it shows, in order. Extended comments and basis placeholders are stripped
+/// without being shown; only the bare hex id appears.
 pub(crate) fn ids_shown(text: &str) -> (String, Vec<String>) {
     let mut out = String::with_capacity(text.len());
     let mut ids = vec![];
@@ -338,10 +408,14 @@ pub(crate) fn ids_shown(text: &str) -> (String, Vec<String>) {
         let Some(j) = rest[i..].find(ID_CLOSE) else {
             break;
         };
-        let id = rest[i + ID_OPEN.len()..i + j].trim();
+        let content = &rest[i + ID_OPEN.len()..i + j];
+        let id = content.split_ascii_whitespace().next().unwrap_or("").trim();
         out.push_str(&rest[..i]);
-        out.push_str(&format!("[item {id}]"));
-        ids.push(id.to_string());
+        // Show only valid hex ids; skip basis placeholders (content starts with space or `{`).
+        if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            out.push_str(&format!("[item {id}]"));
+            ids.push(id.to_string());
+        }
         rest = &rest[i + j + ID_CLOSE.len()..];
     }
     out.push_str(rest);
@@ -637,8 +711,11 @@ pub fn apply(note: &Note, edits: &[Edit]) -> (Note, Edits) {
                         done.skipped += 1;
                     } else {
                         // A modified item is the same lesson, refined: it keeps its id.
+                        // It keeps the cause it was written with too: the editor gives none.
                         slot.1.text = match item_id(&slot.1.text) {
-                            Some(id) => with_id(text, id),
+                            Some(id) => {
+                                with_meta_id(text, id, extract_basis_meta(&slot.1.text).as_ref())
+                            }
                             None => text.clone(),
                         };
                         done.modified += 1;
@@ -759,7 +836,9 @@ note for one situation, {situation} (when: {when}), each item under its id in br
 situation. Each run has its task, what the agent did (the end of its trace; for a long run, an account of its \
 whole trace and then its end), what it answered, and how it was \
 rewarded: a right run got the expected outcome, a wrong one didn't, and the reward reason may say what the right \
-outcome was. A run marked new came in after the note was last updated, and is shown whole; the others, which the \
+outcome was. Use a reward reason to tell right runs from wrong ones, never as content to copy. An expected \
+answer, a value a person accepted once, or a time or size from one case is not a target and not a fact: write \
+how to find or ask for it next time. A run marked new came in after the note was last updated, and is shown whole; the others, which the \
 note was written from already, are shown by their task and how they went alone.
 {procedures}
 Change the note only where the runs show it is wrong or missing something: the fewest, smallest edits that make \
@@ -778,9 +857,9 @@ Each edit is one of:
 - {\"op\": \"remove\", \"id\": \"<item id>\"} (only an item the runs show is wrong, one the rules leave out, or \
 one the judge found redundant)
 An item's text is the item alone, without its number or bullet. Triggers items read `tool: <tool name> — <what to \
-check before calling it>` or `error: <words a tool's result holds> — <what to do then>`. Update Evidence (how many \
-of these runs the note explains, right and wrong, and how many of their rewards a model judged) by modifying its \
-item.
+check before calling it>` or `error: <words a tool's result holds> — <what to do then>`. Update Evidence (how many runs went right and how many wrong, how many of their rewards a model judged, and \
+which steps rest on a contrast between right and wrong runs; never say how many runs the procedure explains) by \
+modifying its item.
 
 Answer with one JSON object, and nothing else:
 {\"edits\": [ ... ]}

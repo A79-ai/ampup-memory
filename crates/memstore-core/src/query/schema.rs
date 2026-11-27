@@ -241,6 +241,47 @@ mod outcomes_tests {
                 .unwrap();
         assert_eq!(e.facts_per_episode, Some(40));
     }
+
+    /// A link's `label` and `inverse` come back as written; a schema without them still loads and writes none;
+    /// one on a non-link, too long, or not a string is refused.
+    #[test]
+    fn link_names_round_trip_and_are_checked() {
+        use super::Schema;
+        let with = |pred: &str| {
+            format!(
+                r#"{{"name": "t", "types": {{"deal": {{}}, "objection": {{"predicates": {{"about": {pred}}}}}}}}}"#
+            )
+        };
+        let s = Schema::parse(&with(
+            r#"{"type": "ref", "to": ["deal"], "label": "raised on", "inverse": "objections"}"#,
+        ))
+        .unwrap();
+        let back = serde_json::to_value(&s).unwrap();
+        let about = &back["types"]["objection"]["predicates"]["about"];
+        assert_eq!(
+            (about["label"].as_str(), about["inverse"].as_str()),
+            (Some("raised on"), Some("objections"))
+        );
+        assert_eq!(Schema::parse(&back.to_string()).unwrap(), s);
+        let old = Schema::parse(&with(r#"{"type": "ref", "to": ["deal"]}"#)).unwrap();
+        let about =
+            &serde_json::to_value(&old).unwrap()["types"]["objection"]["predicates"]["about"];
+        assert!(about.get("label").is_none() && about.get("inverse").is_none());
+        for bad in [
+            r#"{"type": "text", "label": "raised on"}"#,
+            r#"{"type": "ref", "to": ["deal"], "inverse": "  "}"#,
+            &format!(
+                r#"{{"type": "ref", "to": ["deal"], "label": "{}"}}"#,
+                "x".repeat(41)
+            ),
+            r#"{"type": "ref", "to": ["deal"], "label": 3}"#,
+        ] {
+            assert!(Schema::parse(&with(bad)).is_err(), "{bad} was accepted");
+        }
+        for name in super::BUILTIN {
+            Schema::load(name).unwrap();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -357,7 +398,18 @@ pub struct PredicateDef {
     /// the schema's, so one thing is written once, under the schema's name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub same_as: Option<String>,
+    /// `ref`: how the link reads from this type toward the one it names, a short lowercase verb phrase
+    /// (an objection's `about`: `raised on`, so "objection raised on deal"). Display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// `ref`: how the link reads from the type it names back to this one, usually this type's plural
+    /// (an objection's `about`: `objections`, so "deal: objections"). Display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inverse: Option<String>,
 }
+
+/// The longest `label` or `inverse` a link predicate may carry.
+pub const LINK_NAME_MAX: usize = 40;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -531,6 +583,17 @@ impl Schema {
                         pd.to.is_empty(),
                         "predicate {ty}.{p}: `to` is only for ref values"
                     ),
+                }
+                for (field, name) in [("label", &pd.label), ("inverse", &pd.inverse)] {
+                    let Some(name) = name else { continue };
+                    ensure!(
+                        pd.value == ValueType::Ref,
+                        "predicate {ty}.{p}: `{field}` is only for ref values"
+                    );
+                    ensure!(
+                        !name.trim().is_empty() && name.chars().count() <= LINK_NAME_MAX,
+                        "predicate {ty}.{p}: `{field}` must be 1 to {LINK_NAME_MAX} characters"
+                    );
                 }
                 if let Some(vs) = &pd.values {
                     ensure!(
@@ -715,6 +778,8 @@ impl Schema {
             list: false,
             share: false,
             same_as: None,
+            label: None,
+            inverse: None,
         };
         match predicate {
             NAME => Some(plain(Card::One)),
@@ -1028,6 +1093,13 @@ impl Schema {
                 }
                 if np.share && !op.share {
                     out.push(format!("{ty}.{p} shared once enough people show it"));
+                }
+                if (&np.label, &np.inverse) != (&op.label, &op.inverse) {
+                    out.push(format!(
+                        "{ty}.{p} reads {:?}, back {:?}",
+                        np.label.as_deref().unwrap_or(""),
+                        np.inverse.as_deref().unwrap_or("")
+                    ));
                 }
             }
         }

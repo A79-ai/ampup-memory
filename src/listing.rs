@@ -159,11 +159,11 @@ pub async fn facts(
     let (limit, after) = (limit(req, MAX_FACTS)?, cursor(req)?);
 
     // The episodes the caller may read, for the sources filter and to say what each fact cites.
-    let eps: BTreeMap<String, String> = episodes(store, session, who)
-        .await?
-        .into_iter()
-        .map(|e| (e.id, e.source))
-        .collect();
+    let eps = episodes(store, session, who).await?;
+    let eps: BTreeMap<String, String> =
+        crate::running::cpu(eps.len() >= crate::running::CPU_ROWS, || {
+            eps.into_iter().map(|e| (e.id, e.source)).collect()
+        });
 
     // What the index can narrow on goes into one filter; the rest is checked on what comes back.
     let mut all = vec![];
@@ -212,6 +212,31 @@ pub async fn facts(
             .read_where(store, who, &Filter::And(all), None)
             .await?
     };
+    // What follows passes over every fact read, seconds of CPU on a large org (Home's week reads a month of them): off
+    // the async workers ([`crate::running::cpu`]).
+    let many = found.len() >= crate::running::CPU_ROWS;
+    crate::running::cpu(many, || {
+        page_of(
+            found, session, who, req, &eps, notes, &types, &text, oldest, &after, limit,
+        )
+    })
+}
+
+/// [`facts`]' page of `found`, on this thread.
+#[allow(clippy::too_many_arguments)]
+fn page_of(
+    found: Vec<Fact>,
+    session: &Session,
+    who: &Principal,
+    req: &Value,
+    eps: &BTreeMap<String, String>,
+    notes: bool,
+    types: &[String],
+    text: &Option<String>,
+    oldest: bool,
+    after: &Option<(i64, String)>,
+    limit: usize,
+) -> Result<Value> {
     let type_of = |f: &Fact| {
         f.entity_type
             .clone()
@@ -253,7 +278,7 @@ pub async fn facts(
         };
         by_time.then_with(|| a.fact_id.cmp(&b.fact_id))
     };
-    if let Some((t, id)) = &after {
+    if let Some((t, id)) = after {
         facts.retain(|f| {
             let key = (f.valid_from, &f.fact_id);
             let at = (*t, id);
@@ -349,7 +374,10 @@ pub async fn advice(
                    evidence: Option<&crate::sessions::Tally>,
                    ratified_now: bool| {
         let at = l.note.as_ref().map_or(0, |(_, at, _)| *at);
-        let note = l.note.as_ref().map(|(_, _, t)| t.as_str()).unwrap_or("");
+        // As an agent is served it: item ids and their basis metadata are no part of what it says.
+        let note = crate::advice_curate::without_ids(
+            l.note.as_ref().map(|(_, _, t)| t.as_str()).unwrap_or(""),
+        );
         if !categories.is_empty() && !categories.contains(&l.category)
             || !situations.is_empty() && !situations.contains(&l.situation)
             || text.as_ref().is_some_and(|t| {
@@ -365,7 +393,9 @@ pub async fn advice(
         let mut v = json!({"space": space, "key": l.key, "category": l.category, "situation": l.situation,
             "when": l.when, "skills": l.skills, "learned_at": l.note.as_ref().map(|(_, at, _)| at),
             "note_id": l.note.as_ref().map(|(id, _, _)| id), "note_chars": note.chars().count(),
-            "runs": l.runs, "wrong": l.wrong, "ratified": ratified_now, "evidence": evidence});
+            "runs": l.runs, "wrong": l.wrong, "ratified": ratified_now,
+            "untested": evidence.is_some_and(|e| e.served + e.withheld == 0),
+            "evidence": evidence});
         // Whether the holdout proves it by outcomes people gave (reported only; null until there are enough).
         if let Some(e) = evidence {
             v["proven"] = json!(e.proven());
@@ -472,9 +502,10 @@ struct Read {
 }
 
 /// Each reader's [`Read`], by memory state and the scope's sessions ([`crate::kept_answers`]): a page's summary,
-/// kept for a return visit within the hour, as the Advice page's.
+/// answered at once on a return visit however long after while the next is worked out, never past a loss
+/// ([`crate::kept_answers::Kept::however_old`]), as the Advice page's.
 static KEPT: std::sync::LazyLock<crate::kept_answers::Kept<Read>> =
-    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500));
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500).however_old());
 
 /// [`read`], kept by memory state for main as it is now: it reads every note the reader may read of the advice maps,
 /// and every session logged (the team's tallies). Kept by the reader (who, and every group they read as: an operator

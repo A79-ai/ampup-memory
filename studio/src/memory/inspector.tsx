@@ -300,25 +300,6 @@ function Overview({ sel, onFocus }: { sel: Selection; onFocus: (f: Focus) => voi
           )
         }
       </Loading>
-      <div className="h-section" style={{ marginTop: "var(--s8)" }}>
-        Start here
-      </div>
-      <div className="list">
-        <StartRow
-          icon="entity"
-          cls="k-entity"
-          title="Look up what is known about something"
-          sub="Open an entity to see its current facts, how they changed, and the episodes behind each"
-          onClick={() => onFocus({ kind: "folder", path: ["entities"] })}
-        />
-        <StartRow
-          icon="chat"
-          cls="k-chat"
-          title="Read what was said"
-          sub="Calls, threads, notes and records, by the source they came from"
-          onClick={() => onFocus({ kind: "folder", path: ["sources"] })}
-        />
-      </div>
     </section>
   );
 }

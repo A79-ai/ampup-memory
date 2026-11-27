@@ -12,7 +12,9 @@
 //!   before the forget too (a forget wins over a pin), and from every file in the warehouse and the search index;
 //!   everyone else's memory stays; a tombstone is in acme's audit and carol no longer belongs to acme; the
 //!   feedback she gave (a vote and a served-fact check's flag in her session) and others' feedback on the facts of
-//!   her episodes leave every tally and every file, while others' feedback on the rest stays;
+//!   her episodes leave every tally and every file, while others' feedback on the rest stays; she is no longer
+//!   written down as a recent reader of acme's or a1's Home (Bob, who stays, still is), nor is anyone once acme is
+//!   deleted;
 //! - the operator clears an org's memory (`clear_org`, its name repeated) and keeps the org: its admin and
 //!   another org's are refused and an unconfirmed clear changes nothing; after it nothing of the org's memory is
 //!   read or stored, and its admin still signs in and writes to it;
@@ -54,11 +56,15 @@ const ALICE_FILE_KEY: &str = "msk_plain_file_key_in_alices_name";
 
 /// The server's catalog, which, once armed, demotes alice from acme's admins right after the directory commit
 /// that takes carol out of acme: an admin demoted between a forget's removal and the deletion that follows it.
+/// And, once `rewrite` holds a scope and a recent reader, writes that reader back into the scope's readers file on
+/// the first commit after the reader is no longer in it: a server that read the directory before a forget's removal,
+/// writing its readers after the forget swept that scope.
 struct DemoteMidForget {
     inner: Arc<dyn Catalog>,
     /// The demotion's writer, straight on `inner`.
     store: Store,
     armed: Arc<AtomicBool>,
+    rewrite: Arc<std::sync::Mutex<Option<(Scope, memstore::recent_readers::RecentReader)>>>,
 }
 
 impl std::fmt::Debug for DemoteMidForget {
@@ -131,6 +137,16 @@ impl Catalog for DemoteMidForget {
         let directory =
             id.namespace().to_url_string() == "memory_system" && id.name() == "directory";
         let table = self.inner.update_table(commit).await?;
+        let late = self.rewrite.lock().unwrap().clone();
+        if let Some((scope, reader)) = late {
+            let mut now = self.store.recent_readers(&scope).await.unwrap();
+            if !now.iter().any(|r| r.user == reader.user)
+                && self.rewrite.lock().unwrap().take().is_some()
+            {
+                now.push(reader);
+                self.store.put_recent_readers(&scope, now).await.unwrap();
+            }
+        }
         if directory && self.armed.load(Ordering::SeqCst) {
             let dir = Directory::fresh(&self.store).await.unwrap();
             let carol_out = dir
@@ -522,10 +538,19 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     // The server keeps answers it shares with other servers in the object store, beside the catalog's tables in
     // the warehouse: every file check below covers them too.
     unsafe { std::env::set_var("AMPUP_MEMORY_SHARED_ANSWERS", "object") };
+    // Who read a scope's Studio lately is written down every second (`memstore::recent_readers`).
+    unsafe { std::env::set_var("AMPUP_MEMORY_HOME_READERS_SECS", "1") };
     let roots = [warehouse.as_path(), index_dir.as_path()];
     let in_files =
         |tag: &str| -> Vec<PathBuf> { roots.iter().flat_map(|r| files_with(r, tag)).collect() };
     // The ledger's files that hold `s` (a scope's namespace: every ledger row names its scope).
+    // The files that write down who opened a scope's Home lately and name `user`.
+    let readers_with = |user: &str| -> Vec<PathBuf> {
+        files_with(&warehouse, user)
+            .into_iter()
+            .filter(|p| p.ends_with("readers/home.json"))
+            .collect()
+    };
     let ledger_with = |s: &str| -> Vec<PathBuf> {
         files_with(&warehouse, s)
             .into_iter()
@@ -541,10 +566,12 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     store.ensure_scope(&Scope::Org).await.unwrap();
     // The server reads and writes through a catalog that demotes alice in the middle of a forget, once armed.
     let demote_mid_forget = Arc::new(AtomicBool::new(false));
+    let write_late = Arc::new(std::sync::Mutex::new(None));
     let served: Arc<dyn Catalog> = Arc::new(DemoteMidForget {
         inner: catalog.clone(),
         store: Store::new(catalog.clone()),
         armed: demote_mid_forget.clone(),
+        rewrite: write_late.clone(),
     });
     // The operator's admin key, and a plain file key the keys file gives alice's name.
     let keys = json!([{"id": "platform", "sha256": auth::hex(&sha2::Sha256::digest(ADMIN_KEY.as_bytes())),
@@ -1060,6 +1087,47 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
         assert!(t.elapsed() < Duration::from_secs(20), "{body}");
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    // A session of hers, once it shows in the activity alice reads and keeps, then ended discarded by her own run:
+    // what was kept of the activity is not answered again, the read right after the end doesn't show it.
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "start_session",
+        "arguments": {"context": "xqcaroldiscarded summarize the launch notes"}}});
+    let (status, raw) = post(&format!("{s}/mcp?org=acme"), &carol, &call).await;
+    assert_eq!(status, 200, "{raw}");
+    let text: Value = serde_json::from_str(&raw).unwrap();
+    let started: Value = serde_json::from_str(
+        text["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("{}"),
+    )
+    .unwrap_or_default();
+    let discarded = started["session_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!discarded.is_empty(), "{raw}");
+    memstore::sessions::flush().await.unwrap();
+    let t = Instant::now();
+    loop {
+        let (status, body) = admin_as(s, &alice, activity.clone()).await;
+        assert_eq!(status, 200, "{body}");
+        if body.contains("xqcaroldiscarded") {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "{body}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "end_session",
+        "arguments": {"session_id": discarded, "task": "summarize the launch notes", "discard": true,
+                      "transcript": "User: summarize the launch notes\nClaude: summarized"}}});
+    let (status, raw) = post(&format!("{s}/mcp?org=acme"), &carol, &call).await;
+    assert_eq!(status, 200, "{raw}");
+    memstore::sessions::flush().await.unwrap();
+    let (status, body) = admin_as(s, &alice, activity.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !body.contains("xqcaroldiscarded"),
+        "her discarded session read right after its end: {body}"
+    );
     // A branch's conflicts show their admin each side's values, but only those they may read: a value from Bob's
     // private note is withheld (counted, never shown). A member may not resolve them by merging.
     {
@@ -2020,6 +2088,34 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     ] {
         assert!(!in_files(t).is_empty(), "{t} should be in the warehouse");
     }
+    // Carol lists acme's and a1's sources in the Studio, and Bob acme's: the server writes them down as recent Studio
+    // readers of each (`memstore::recent_readers`), as they signed in, so a server that starts works their reads out
+    // before it is ready. The forget below takes her out of both.
+    let list = async |sel: &str, bearer: &str, path: &str| {
+        let (status, text) = post(
+            &format!("{s}/browse{sel}"),
+            bearer,
+            &json!({"op": "ls", "path": [path]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{text}");
+    };
+    list("?org=acme", &carol, "sources").await;
+    list("?org=acme&team=a1", &carol, "sources").await;
+    list("?org=acme", &bob, "sources").await;
+    let written = |user: &str, n: usize| {
+        let t = std::time::Instant::now();
+        while readers_with(user).len() != n {
+            assert!(
+                t.elapsed() < Duration::from_secs(30),
+                "{user} is written down as a recent reader of {:?}, not {n} scopes",
+                readers_with(user)
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    written("carol@acme.com", 2);
+    written("bob@acme.com", 1);
     // Acme's admin is demoted as she forgets Carol: right after the directory takes Carol out of acme, before
     // anything of hers is deleted. The forget stops there, refused, and says how to finish it: Carol is out of
     // acme, nothing of hers is deleted, and no tombstone is left. Made an admin again, Alice runs it again below,
@@ -2054,6 +2150,12 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
                 && e.user.as_deref() == Some("carol@acme.com")),
         "a demoted admin left a tombstone"
     );
+    // Out of acme, she is still written down (nothing of hers was deleted); the server's next write of acme's
+    // readers (Bob lists its notes) leaves her out, as every write leaves out who no longer reads the scope.
+    written("carol@acme.com", 2);
+    list("?org=acme", &bob, "notes").await;
+    written("carol@acme.com", 1);
+    written("bob@acme.com", 1);
     admin(
         s,
         json!({"op": "add_member", "org": "acme", "user": "alice@acme.com", "role": "admin"}),
@@ -2069,6 +2171,11 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     let (status, body) = admin_as(s, &alice, activity.clone()).await;
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("xqcarolasked"), "{body}");
+    // And as Traces lists it (`light`), kept however old while nothing was lost.
+    let listed = json!({"op": "activity", "org": "acme", "light": true, "limit": 40});
+    let (status, body) = admin_as(s, &alice, listed.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("xqcarolasked"), "{body}");
     let usage = json!({"op": "advice_usage", "days": 30});
     let (status, text) = post(&format!("{s}/browse?org=acme"), &alice, &usage).await;
     assert_eq!(status, 200, "{text}");
@@ -2076,6 +2183,16 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     share_answer(&acme, "xqcarolanswer").await;
     share_answer(&globex, "xqglobexanswer").await;
     assert!(!in_files("xqcarolanswer").is_empty() && !in_files("xqglobexanswer").is_empty());
+    // A server that read the directory before her removal writes her into a1's readers again after the forget swept
+    // a1 (the first commit after it): the forget's last sweep takes her out again.
+    let hers = store
+        .recent_readers(&a1)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.user == "carol@acme.com")
+        .expect("carol written down as a reader of a1");
+    *write_late.lock().unwrap() = Some((a1.clone(), hers));
     // Acme's admin forgets Carol.
     let (status, body) = admin_as(
         s,
@@ -2084,6 +2201,20 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
+    assert!(
+        write_late.lock().unwrap().is_none(),
+        "the forget made no commit after it swept a1's readers"
+    );
+    // She is in neither scope's readers any more; Bob still is in acme's.
+    assert_eq!(
+        readers_with("carol@acme.com"),
+        Vec::<PathBuf>::new(),
+        "she is still written down as a recent Home reader"
+    );
+    assert!(
+        !readers_with("bob@acme.com").is_empty(),
+        "the forget took Bob's reads too"
+    );
     // The answers acme's memory showed are purged with her; globex's are kept.
     assert!(memstore::shared_answers::settled(Duration::from_secs(20)).await);
     assert_eq!(
@@ -2101,6 +2232,12 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
     assert!(
         !text.contains("xqcarolasked") && !text.to_lowercase().contains("carol@acme.com"),
         "her activity read right after the forget: {text}"
+    );
+    let (status, text) = admin_as(s, &alice, listed.clone()).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(
+        !text.contains("xqcarolasked") && !text.to_lowercase().contains("carol@acme.com"),
+        "her activity listed (light) right after the forget: {text}"
     );
     let (status, text) = post(&format!("{s}/browse?org=acme"), &alice, &usage).await;
     assert_eq!(status, 200, "{text}");
@@ -2806,6 +2943,8 @@ async fn an_org_is_exported_a_person_forgotten_and_an_org_deleted_for_good() {
             in_files(t)
         );
     }
+    // Nobody is written down as a recent reader of its Home any more.
+    assert_eq!(readers_with("bob@acme.com"), Vec::<PathBuf>::new());
     // Its rows are gone from the audit and key usage tables (read with a fresh store, no cache).
     let fresh = Store::new(catalog.clone());
     assert!(

@@ -304,7 +304,7 @@ struct Full {
 }
 
 static FULL: std::sync::LazyLock<crate::kept_answers::Kept<Full>> =
-    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(200));
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(200).however_old());
 
 /// [`full`], kept by memory state ([`crate::kept_answers`]) for main as it is now: it reads every person's advice
 /// map and notes, and the sessions log. Kept by the reader, what they read (`space`, `person`, `limit`) and the
@@ -594,7 +594,7 @@ fn people_of(log: &[Logged], me: &str, every_session: bool, want: &Want) -> BTre
 type Noted = Vec<(Option<String>, String, i64)>;
 
 static NOTED: std::sync::LazyLock<crate::kept_answers::Kept<Noted>> =
-    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500));
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500).however_old());
 
 /// `"count": true`: how many lessons there are, of `only` and learned at `since` or later, and whose.
 async fn count(

@@ -526,6 +526,16 @@ pub static VIS_ORACLE_DIVERGENCE: std::sync::LazyLock<IntCounter> = std::sync::L
     },
 );
 
+/// Reads answered from an answer kept for their reader (`kept_answers`), rather than worked out while they waited: as
+/// it is now, or main's last while the next is worked out.
+pub static KEPT_ANSWERS_SERVED: std::sync::LazyLock<IntCounter> = std::sync::LazyLock::new(|| {
+    IntCounter::new(
+        "memstore_kept_answers_served_total",
+        "Reads answered from an answer kept for their reader, rather than worked out while they waited",
+    )
+    .unwrap()
+});
+
 /// Proposals whose readability a list worked out, by from what: `main` (main's visibility state and the rows their
 /// branches wrote) or `branch` (their branch's own state, built for it).
 pub static PROPOSAL_READS: std::sync::LazyLock<prometheus::IntCounterVec> =

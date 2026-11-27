@@ -210,6 +210,46 @@ pub fn decide_min() -> f64 {
 pub const ROUTE_ASK: &str = "The state is what a user asked an AI agent to do. How likely is it that doing it is this \
                              kind of task, so that advice for this kind of task applies: ";
 
+/// What the decisions model is asked of each line when the request comes with where in its session it was asked
+/// ([`Asked`]): the work the agent does next for it, read with the session's first request and the conversation before
+/// it. A later message ("Yes, build it", "Try again", "Launch it now") names no task of its own: read alone, it was
+/// routed to nothing, or to the wrong kind of task. On one production person's 55 real messages, labelled by an
+/// independent judge, routing with the context found the right note for 25 of 29 that had one (17 read alone), and
+/// picked a wrong one for 4 (6).
+pub const ROUTE_ASK_IN_SESSION: &str = "The state is a user's message to an AI agent (request), with where in the \
+                                        session it was asked (asked) and, when given, the end of the conversation \
+                                        before it (conversation_end). How likely is it that the work the agent does \
+                                        next for this message is this kind of task, so that advice for this kind of \
+                                        task applies: ";
+
+/// The request as routing reads it, and what each line is asked with it: with where in its session it was asked, when
+/// its caller said ([`asking`]), else the request alone.
+pub fn routed_request(question: &str) -> (serde_json::Value, &'static str) {
+    match asked() {
+        Some(a) => {
+            let mut state = serde_json::json!({"request": question, "asked": a.place});
+            if let Some(c) = a.conversation {
+                state["conversation_end"] = serde_json::json!(c);
+            }
+            (state, ROUTE_ASK_IN_SESSION)
+        }
+        None => (serde_json::json!(question), ROUTE_ASK),
+    }
+}
+
+/// The request in words for a chat router, with where in its session it was asked and the conversation's end, when
+/// its caller said.
+pub fn request_in_words(question: &str) -> String {
+    let Some(a) = asked() else {
+        return question.to_string();
+    };
+    let mut s = format!("{question}\n\nAsked: {}", a.place);
+    if let Some(c) = a.conversation {
+        s += &format!("\n\nConversation before it (its end):\n{c}");
+    }
+    s
+}
+
 /// Which of the lines (by their `texts`) `question` is, as a decisions model judges it ([`crate::decide`]): of the
 /// best `shown` ranked ([`DECIDE_LINES`], or [`kinds_cap`] for kinds of task), the one it finds likeliest, if at
 /// least [`decide_min`]. One request, a few hundred milliseconds, where a chat model reads every line and writes a
@@ -227,21 +267,21 @@ pub async fn decide(
         order.truncate(shown);
         order
     };
+    // Read with where in its session it was asked, when its caller said: a later message is routed by the work it
+    // asks for next, not by its own few words.
+    let (state, ask) = routed_request(question);
     let questions = top
         .iter()
         .map(|&i| {
             (
                 format!("line{i}"),
-                crate::decide::Question::Likely(format!(
-                    "{ROUTE_ASK}{}",
-                    texts[i].replace('\n', " ")
-                )),
+                crate::decide::Question::Likely(format!("{ask}{}", texts[i].replace('\n', " "))),
             )
         })
         .collect();
     // An agent waits on this: a slow decisions model gives way to the chat router rather than stall the turn.
     let wait = decide_wait();
-    let answers = tokio::time::timeout(wait, d.decide(&serde_json::json!(question), questions))
+    let answers = tokio::time::timeout(wait, d.decide(&state, questions))
         .await
         .map_err(|_| anyhow::anyhow!("no answer within {wait:?}"))??;
     // The likeliest, the better ranked on a tie.

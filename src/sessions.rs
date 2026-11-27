@@ -1150,6 +1150,58 @@ pub async fn name_tasks(
     Ok(counts)
 }
 
+/// What a person's day's ceiling bounds in a session already started: steps are never refused, but past one of these
+/// the step's extra work is skipped quietly (its advice still goes out). Each is far above any person's real day:
+/// it stops a client stuck in a loop from writing or calling the model without end, and nothing else.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Ceiling {
+    /// Mid-session conversation keeps (an episode commit each): `AMPUP_MEMORY_STEP_KEEPS_PER_DAY`, default 20,000.
+    Keeps,
+    /// Fires (a model call each): `AMPUP_MEMORY_FIRES_PER_DAY`, default 2,000.
+    Fires,
+}
+
+impl Ceiling {
+    fn max(self) -> usize {
+        let (var, default) = match self {
+            Ceiling::Keeps => ("AMPUP_MEMORY_STEP_KEEPS_PER_DAY", 20_000),
+            Ceiling::Fires => ("AMPUP_MEMORY_FIRES_PER_DAY", 2_000),
+        };
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
+    }
+}
+
+/// Per scope, person and ceiling: the UTC day counted and how many so far, in this server's memory (a cell's sessions
+/// are served by one server).
+type DayCounts = std::collections::HashMap<(String, String, Ceiling), (i64, usize)>;
+static TODAY: std::sync::LazyLock<std::sync::Mutex<DayCounts>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Counts one more of `what` for `user` today and whether it is within the day's ceiling; past it, logged once.
+fn within_day(scope: &Scope, user: &str, what: Ceiling) -> bool {
+    let day = crate::now_micros() / 86_400_000_000;
+    let max = what.max();
+    let mut all = TODAY.lock().unwrap();
+    all.retain(|_, (d, _)| *d == day);
+    let n = all
+        .entry((scope.namespace(), user.to_string(), what))
+        .or_insert((day, 0));
+    n.1 += 1;
+    if n.1 == max + 1 {
+        let what = match what {
+            Ceiling::Keeps => "mid-session conversation keeps",
+            Ceiling::Fires => "fires",
+        };
+        eprintln!(
+            "sessions {scope}: {user} passed today's {max} {what}; the rest of the day's are skipped"
+        );
+    }
+    n.1 <= max
+}
+
 /// How often held session rows are committed: `AMPUP_MEMORY_SESSION_FLUSH_SECS`, default 60.
 pub fn flush_interval() -> Duration {
     Duration::from_secs(
@@ -1228,6 +1280,13 @@ pub async fn flush() -> Result<usize> {
             dropped.len()
         );
         settle(&dropped).await;
+        // A loss in each scope they were held for, once they have left the buffer: an answer kept from a read that
+        // listed them (a Skills list, the lessons, the advice tallies) is never answered again.
+        let scopes: std::collections::BTreeSet<&String> =
+            dropped.iter().map(|((_, ns, _), _)| ns).collect();
+        for ns in scopes {
+            crate::count_lost(ns);
+        }
     }
     let mut written = 0;
     for ((_, ns, actor), (store, scope, rows, keys)) in groups {
@@ -2134,6 +2193,9 @@ pub async fn advise(
     let before = s.conversation.clone();
     // The advice routed for this step goes to the agent even when its conversation can't be kept now (a write main
     // refused): a later step or the session's end keeps it.
+    // Past the person's day's ceiling on mid-session keeps (a client stuck sending steps), the step's conversation
+    // waits for the session's end: its advice still goes out.
+    let conversation = conversation.filter(|_| within_day(scope, who.user(), Ceiling::Keeps));
     let kept = match keep_conversation(store, scope, who, signed, &id, s, conversation).await {
         Ok(kept) => kept,
         Err(e) => {
@@ -3628,7 +3690,7 @@ async fn fire_now(
         return Ok(none);
     };
     // A session at the day's cap, or at its own fire cap, costs no model call.
-    if s.fires.len() >= MAX_FIRES {
+    if s.fires.len() >= MAX_FIRES || !within_day(scope, who.user(), Ceiling::Fires) {
         return Ok(none);
     }
     let lines = |h: &str| crate::advice::section_body(&note, h).unwrap_or_else(|| "(none)".into());
@@ -5562,7 +5624,7 @@ impl Tally {
     pub fn line(&self, bar: usize, unbacked: bool, approved: bool) -> String {
         let ratified = crate::advice::team_ratified(approved, unbacked, self.ratified(bar));
         if self.served + self.withheld == 0 {
-            return "Evidence: none yet (no judged session has used it).".into();
+            return "Evidence (untested): no judged session has used it yet.".into();
         }
         let value = match self.value(bar) {
             Some(v) => format!(

@@ -1034,7 +1034,7 @@ async fn a_skill_s_proposal_goes_with_its_skill() {
     let feed = format!("msk_{}feed", uuid::Uuid::new_v4().simple());
     for change in [
         json!({"op": "create_org", "org": "acme", "admin": "alice@acme.com"}),
-        json!({"op": "invite", "org": "acme", "members": [{"user": "bob@acme.com"}]}),
+        json!({"op": "invite", "org": "acme", "members": [{"user": "bob@acme.com"}, {"user": "carol@acme.com"}]}),
         json!({"op": "create_key", "org": "acme", "name": "feed", "role": "ingest", "key": feed}),
     ] {
         let (status, body) = post(&format!("{s}/admin"), ADMIN_KEY, &[], &change).await;
@@ -1123,6 +1123,81 @@ async fn a_skill_s_proposal_goes_with_its_skill() {
         assert_eq!(status, 200, "{v}");
         assert!(!v.to_string().contains(tag), "{v}");
     }
+    // Carol, who wrote nothing here, votes against it; Alice's list counts her vote once it has read it.
+    let carol = id_token(&issuer, "carol@acme.com");
+    let (status, v) = post(
+        &format!("{s}/feedback"),
+        &carol,
+        &in_acme,
+        &json!({"fact_id": format!("skill:{key}"), "signal": "negative", "reason": "it skipped the check"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+    let against = async |who: &str| {
+        let (status, v) = post(
+            &format!("{s}/skills/review"),
+            who,
+            &in_acme,
+            &json!({"op": "list"}),
+        )
+        .await;
+        assert_eq!(status, 200, "{v}");
+        v["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["key"] == key)
+            .map(|k| k["feedback"]["negative"].as_u64().unwrap())
+    };
+    let t = Instant::now();
+    while against(&alice).await != Some(1) {
+        assert!(
+            t.elapsed() < Duration::from_secs(15),
+            "the vote never counted"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Carol forgotten by another server (or a maintenance run): her votes rewritten away there, with no loss
+    // counted here. Once this server reads the votes again, Alice's kept list is never answered with her vote.
+    let ns = Scope::org("acme").unwrap().namespace();
+    let removed = store
+        .rewrite_table(&ns, memstore::FEEDBACK, &mut |b| {
+            Ok(memstore::strings(b, "giver")
+                .iter()
+                .map(|g| Some(!g.contains("carol@acme.com")))
+                .collect())
+        })
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+    // Reads may be up to `AMPUP_MEMORY_MAX_STALENESS_MS` (1 s) behind another server: the first list past that may
+    // still be answered from the votes as last read, and has them read again behind it. The list after that has
+    // read the votes without Carol's, and is never the kept list that counted her.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    against(&alice).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(
+        against(&alice).await,
+        Some(0),
+        "a forgotten vote was still counted"
+    );
+    // Both list it, which keeps each one's list (`skill_review::list`): what is taken away below is never answered
+    // from those.
+    let list = async |who: &str| {
+        let (status, v) = post(
+            &format!("{s}/skills/review"),
+            who,
+            &in_acme,
+            &json!({"op": "list"}),
+        )
+        .await;
+        assert_eq!(status, 200, "{v}");
+        v
+    };
+    for who in [&alice, &bob] {
+        let v = list(who).await;
+        assert!(v.to_string().contains(key), "{v}");
+    }
     // The repository's readers narrowed to Alice: Bob loses the proposal with the skill.
     let (status, v) = post(
         &format!("{s}/acl"),
@@ -1135,6 +1210,8 @@ async fn a_skill_s_proposal_goes_with_its_skill() {
     let (status, v) = get(&bob).await;
     assert_eq!(status, 400, "{v}");
     assert!(!v.to_string().contains(tag), "{v}");
+    let v = list(&bob).await;
+    assert!(!v.to_string().contains(key), "{v}");
     let (status, v) = get(&alice).await;
     assert_eq!(status, 200, "{v}");
     assert!(
@@ -1153,15 +1230,11 @@ async fn a_skill_s_proposal_goes_with_its_skill() {
     assert_eq!((status, v), (200, json!({"retracted": 1})));
     let (status, v) = get(&alice).await;
     assert_eq!(status, 400, "{v}");
-    let (status, v) = post(
-        &format!("{s}/skills/review"),
-        &alice,
-        &in_acme,
-        &json!({"op": "list"}),
-    )
-    .await;
-    assert_eq!(status, 200, "{v}");
-    assert!(!v.to_string().contains(tag), "{v}");
+    let v = list(&alice).await;
+    assert!(
+        !v.to_string().contains(tag) && !v.to_string().contains(key),
+        "{v}"
+    );
     // The purge erases the skill and the proposal resting on it: nothing of either is left on disk.
     let ns = Scope::org("acme").unwrap().namespace();
     assert!(

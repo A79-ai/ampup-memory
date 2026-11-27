@@ -161,46 +161,58 @@ impl StoreAggregates for Store {
             self.rows(&ns, EPISODES),
             self.rows(&ns, FACTS)
         )?;
-        let mut episodes: BTreeMap<String, Ep> = BTreeMap::new();
-        for b in eps.rows.iter() {
-            let (commit, id, source) = (
-                strings(b, "commit_id"),
-                strings(b, "episode_id"),
-                strings(b, "source"),
-            );
-            let (at, about) = (timestamps(b, "occurred_at"), optional_strings(b, "about"));
-            for i in 0..b.num_rows() {
-                if !vis.committed.contains(&commit[i]) || vis.is_retracted(&id[i]) {
-                    continue;
+        // A pass over every episode and every fact: off the async workers on a large org ([`crate::running::cpu`]).
+        let rows = eps
+            .rows
+            .iter()
+            .chain(facts.rows.iter())
+            .map(|b| b.num_rows())
+            .sum::<usize>();
+        Ok(crate::running::cpu(
+            rows >= crate::running::CPU_ROWS,
+            || {
+                let mut episodes: BTreeMap<String, Ep> = BTreeMap::new();
+                for b in eps.rows.iter() {
+                    let (commit, id, source) = (
+                        strings(b, "commit_id"),
+                        strings(b, "episode_id"),
+                        strings(b, "source"),
+                    );
+                    let (at, about) = (timestamps(b, "occurred_at"), optional_strings(b, "about"));
+                    for i in 0..b.num_rows() {
+                        if !vis.committed.contains(&commit[i]) || vis.is_retracted(&id[i]) {
+                            continue;
+                        }
+                        episodes.entry(id[i].clone()).or_insert_with(|| Ep {
+                            id: id[i].clone(),
+                            source: source[i].clone(),
+                            occurred_at: at[i].unwrap_or_default(),
+                            about: about[i].as_deref().map(split_list).unwrap_or_default(),
+                            acl: vis.acls.get(&id[i]).cloned().unwrap_or_default(),
+                        });
+                    }
                 }
-                episodes.entry(id[i].clone()).or_insert_with(|| Ep {
-                    id: id[i].clone(),
-                    source: source[i].clone(),
-                    occurred_at: at[i].unwrap_or_default(),
-                    about: about[i].as_deref().map(split_list).unwrap_or_default(),
-                    acl: vis.acls.get(&id[i]).cloned().unwrap_or_default(),
-                });
-            }
-        }
-        let mut out = vec![];
-        for b in facts.rows.iter() {
-            for (commit, f) in decode_facts(b, "source_episodes") {
-                // A value a merge set aside for the other side's never held on main: left out, or the newest
-                // version would be it and the value kept would read as superseded.
-                if vis.committed.contains(&commit)
-                    && !vis.withheld(&f)
-                    && !vis.closed_by_merge(&f.fact_id)
-                    && !f.source_episodes.is_empty()
-                    && f.source_episodes.iter().all(|e| episodes.contains_key(e))
-                {
-                    out.push(f);
+                let mut out = vec![];
+                for b in facts.rows.iter() {
+                    for (commit, f) in decode_facts(b, "source_episodes") {
+                        // A value a merge set aside for the other side's never held on main: left out, or the newest
+                        // version would be it and the value kept would read as superseded.
+                        if vis.committed.contains(&commit)
+                            && !vis.withheld(&f)
+                            && !vis.closed_by_merge(&f.fact_id)
+                            && !f.source_episodes.is_empty()
+                            && f.source_episodes.iter().all(|e| episodes.contains_key(e))
+                        {
+                            out.push(f);
+                        }
+                    }
                 }
-            }
-        }
-        Ok(View {
-            episodes: episodes.into_values().collect(),
-            facts: out,
-        })
+                View {
+                    episodes: episodes.into_values().collect(),
+                    facts: out,
+                }
+            },
+        ))
     }
 
     /// Every committed aggregate row, newest run per (goal, subject, audience).

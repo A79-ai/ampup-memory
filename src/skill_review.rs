@@ -256,16 +256,153 @@ impl Skill {
     }
 }
 
+/// Documents read at once when listing skills: a library holds hundreds, each its own read from storage.
+const READS_AT_ONCE: usize = 16;
+
 /// The skills `who` may read: the repositories' by name, then the compiled ones by slug.
 pub async fn skills(session: &Session, store: &Store, who: &Principal) -> Result<Vec<Skill>> {
+    skills_of(session, store, who, None).await
+}
+
+/// The skills `who` may read of one origin (none: both), each read once and several at a time.
+pub async fn skills_of(
+    session: &Session,
+    store: &Store,
+    who: &Principal,
+    origin: Option<Origin>,
+) -> Result<Vec<Skill>> {
+    use futures::StreamExt;
+    let prefixes: &[&str] = match origin {
+        Some(Origin::Repo) => &[PREFIX],
+        Some(Origin::Compiled) => &[crate::compile::SKILLS],
+        None => &[PREFIX, crate::compile::SKILLS],
+    };
+    let keys: Vec<String> = prefixes
+        .iter()
+        .flat_map(|p| session.documents(who, p, None))
+        .filter(|k| !crate::compile::is_index(k))
+        .collect();
+    let reads: Vec<futures::future::BoxFuture<'_, Result<Option<Skill>>>> = keys
+        .into_iter()
+        .map(|key| {
+            Box::pin(async move {
+                Ok(match session.document(store, who, &key, None).await? {
+                    Some((id, at, body)) => Skill::of(&key, id, at, &body),
+                    None => None,
+                })
+            }) as futures::future::BoxFuture<'_, _>
+        })
+        .collect();
+    let read: Vec<Result<Option<Skill>>> = futures::stream::iter(reads)
+        .buffered(READS_AT_ONCE)
+        .collect()
+        .await;
+    let mut out: Vec<Skill> = read
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    out.sort_by(|a, b| {
+        (a.origin != Origin::Repo, &a.name, &a.key).cmp(&(
+            b.origin != Origin::Repo,
+            &b.name,
+            &b.key,
+        ))
+    });
+    Ok(out)
+}
+
+/// Each skill version's summary as a list shows it (no body), by scope namespace, key and episode: a version's body
+/// never changes, so a list reads from storage only the versions it hasn't summarised before. One is served only
+/// for the version the reader's visibility gives them ([`crate::Vis::version_at`]), and goes from here at the next
+/// list of its scope once its episode is gone (retracted, superseded, erased or forgotten).
+type Summaries = std::collections::HashMap<(String, String, String), Skill>;
+static SUMMARIES: std::sync::LazyLock<std::sync::Mutex<Summaries>> =
+    std::sync::LazyLock::new(Default::default);
+/// Most summaries kept, every scope's together: past it they are all read again.
+const MAX_SUMMARIES: usize = 50_000;
+
+/// [`skills_of`] for a list: each skill without its body, the version `who` may read, its summary read once per
+/// version ([`SUMMARIES`]). Only those not summarised before are read from storage, all at once. `proposed`: only
+/// the skills with a proposal kept ([`proposed`]), which is all a count of the revisions proposed needs.
+pub async fn listed(
+    session: &Session,
+    store: &Store,
+    who: &Principal,
+    origin: Option<Origin>,
+    proposed_only: bool,
+) -> Result<Vec<Skill>> {
+    let there = match proposed_only {
+        true => Some(proposed(session)),
+        false => None,
+    };
+    let prefixes: &[&str] = match origin {
+        Some(Origin::Repo) => &[PREFIX],
+        Some(Origin::Compiled) => &[crate::compile::SKILLS],
+        None => &[PREFIX, crate::compile::SKILLS],
+    };
+    let ns = session.scope().namespace();
+    let vis = session.vis();
+    let seen: Vec<(String, String, i64)> = prefixes
+        .iter()
+        .flat_map(|p| session.documents(who, p, None))
+        .filter(|k| !crate::compile::is_index(k))
+        .filter(|k| {
+            there
+                .as_ref()
+                .is_none_or(|p| proposal_key_of(k).is_some_and(|pk| p.contains(&pk)))
+        })
+        .filter_map(|k| {
+            let (t, id) = vis.version_at(&k, who, None)?;
+            let id = id.to_string();
+            Some((k, id, t))
+        })
+        .collect();
     let mut out = vec![];
-    for prefix in [PREFIX, crate::compile::SKILLS] {
-        for key in session.documents(who, prefix, None) {
-            if let Some((id, at, body)) = session.document(store, who, &key, None).await?
-                && let Some(s) = Skill::of(&key, id, at, &body)
-            {
-                out.push(s);
+    let mut missing = vec![];
+    {
+        let mut kept = SUMMARIES.lock().unwrap();
+        // What is gone from the scope goes from here.
+        kept.retain(|(n, _, id), _| *n != ns || !vis.is_gone(id));
+        for (key, id, t) in seen {
+            match kept.get(&(ns.clone(), key.clone(), id.clone())) {
+                Some(s) => out.push(s.clone()),
+                None => missing.push((key, id, t)),
             }
+        }
+    }
+    if !missing.is_empty() {
+        let mut bodies = store
+            .episode_bodies(
+                session.scope(),
+                missing.iter().map(|(_, id, _)| id.clone()).collect(),
+            )
+            .await?;
+        // A body the batched read left out is read again on its own, as a read of its document is: a failure fails
+        // the list rather than leaving the skill out of it (and out of every list kept from it). Only a body that is
+        // gone leaves its skill out.
+        for (_, id, _) in &missing {
+            if !bodies.contains_key(id)
+                && let Some(b) = session.episode_body(store, who, id).await?
+            {
+                bodies.insert(id.clone(), b);
+            }
+        }
+        let mut kept = SUMMARIES.lock().unwrap();
+        if kept.len() + missing.len() > MAX_SUMMARIES {
+            kept.clear();
+        }
+        for (key, id, t) in missing {
+            let Some(body) = bodies.remove(&id) else {
+                continue;
+            };
+            let Some(mut s) = Skill::of(&key, id.clone(), t, &body) else {
+                continue;
+            };
+            s.body = String::new();
+            kept.insert((ns.clone(), key, id), s.clone());
+            out.push(s);
         }
     }
     out.sort_by(|a, b| {
@@ -276,6 +413,16 @@ pub async fn skills(session: &Session, store: &Store, who: &Principal) -> Result
         ))
     });
     Ok(out)
+}
+
+/// Reads the summary of each skill's latest version in `scope` ([`SUMMARIES`]), so the first Skills list after a
+/// start reads none from storage: how many. Read as one reading every episode some reader may, which serves no one
+/// more: a summary is kept by its version's episode and listed only to a reader whose visibility gives them that
+/// version. A reader given another version has it read on their first list, as before.
+pub async fn warm(store: &Store, scope: &Scope) -> Result<usize> {
+    let session = store.pin(scope, crate::MAIN).await?;
+    let all = Principal::from_parts("warm-up".into(), vec![]).reading_all();
+    Ok(listed(&session, store, &all, None, false).await?.len())
 }
 
 /// The skill `who` may read under `key`, or the one named `name`: an [`Ambiguous`] error where several they read go by
@@ -350,39 +497,268 @@ pub async fn sessions(store: &Store, scope: &Scope) -> Result<Vec<Logged>> {
 
 /// How the sessions in `all` that used `skill` went (newest first, as `all` is), and its votes as `who` may see
 /// them.
-pub async fn grade(
+pub async fn grade<'a>(
     store: &Store,
     scope: &Scope,
     who: &Principal,
     skill: &Skill,
-    all: &[Logged],
-) -> Result<(Graded, Vec<Logged>)> {
-    let used: Vec<Logged> = all.iter().filter(|l| skill.used_in(l)).cloned().collect();
-    let mut g = Graded {
-        uses: used.len(),
-        people: used.iter().map(|l| &l.asker).collect::<BTreeSet<_>>().len(),
-        last_used: used.iter().map(|l| l.asked_at).max(),
-        ..Default::default()
-    };
-    for l in &used {
-        match crate::sessions::checked_outcome(l) {
-            Some(true) => g.succeeded += 1,
-            Some(false) => g.failed += 1,
-            None => g.unknown += 1,
-        }
-    }
-    let id = target(skill);
-    g.feedback = crate::feedback::tallies(
-        store,
-        scope,
-        who,
-        &[(id.clone(), vec![skill.episode_id.clone()])],
-        true,
+    all: &'a [Logged],
+) -> Result<(Graded, Vec<&'a Logged>)> {
+    Ok(
+        grade_many(store, scope, who, std::slice::from_ref(skill), all)
+            .await?
+            .pop()
+            .expect("one graded"),
     )
-    .await?
-    .remove(&id)
-    .unwrap_or_default();
-    Ok((g, used))
+}
+
+/// [`grade`] for each of `skills`, in order, their votes tallied at once (one read of the votes and the visibility,
+/// however many skills) and their sessions found in one pass over `all` ([`Uses`]), however many skills.
+pub async fn grade_many<'a>(
+    store: &Store,
+    scope: &Scope,
+    who: &Principal,
+    skills: &[Skill],
+    all: &'a [Logged],
+) -> Result<Vec<(Graded, Vec<&'a Logged>)>> {
+    let targets: Vec<(String, Vec<String>)> = skills
+        .iter()
+        .map(|s| (target(s), vec![s.episode_id.clone()]))
+        .collect();
+    let mut tallies = crate::feedback::tallies(store, scope, who, &targets, true).await?;
+    crate::phases::mark("skills votes");
+    let uses = Uses::of(all);
+    Ok(skills
+        .iter()
+        .map(|skill| {
+            let used = uses.of_skill(skill, all);
+            let mut g = uses.outcomes(&used, all);
+            g.feedback = tallies.remove(&target(skill)).unwrap_or_default();
+            (g, used.into_iter().map(|i| &all[i]).collect())
+        })
+        .collect())
+}
+
+/// The ended sessions of a list that used each skill, found in one pass over them rather than once a skill: a
+/// repository's skill by the names its sessions loaded (each as [`same_skill`] matches it: its bare name and its
+/// whole name, without the repository, ASCII-lowercased), a compiled one's by the `skill:<slug>` advice they were
+/// served. Each holds a session's place in the list once, in the list's order. What came of each session that used
+/// any is read once ([`crate::sessions::checked_outcome`] reads its verdicts), however many skills it used.
+struct Uses<'a> {
+    loaded: std::collections::HashMap<String, Vec<usize>>,
+    served: std::collections::HashMap<&'a str, Vec<usize>>,
+    outcome: std::collections::HashMap<usize, Option<bool>>,
+}
+
+impl<'a> Uses<'a> {
+    fn of(all: &'a [Logged]) -> Self {
+        let mut u = Uses {
+            loaded: Default::default(),
+            served: Default::default(),
+            outcome: Default::default(),
+        };
+        let add = |v: &mut Vec<usize>, i: usize| {
+            if v.last() != Some(&i) {
+                v.push(i)
+            }
+        };
+        for (i, l) in all.iter().enumerate() {
+            let Some(s) = l.session.as_ref().filter(|s| s.ended_at.is_some()) else {
+                continue;
+            };
+            for used in &s.skills {
+                let loaded = used.split_once('@').map_or(used.as_str(), |(n, _)| n);
+                let bare = loaded.rsplit(':').next().unwrap_or(loaded);
+                for name in [bare, loaded] {
+                    add(u.loaded.entry(name.to_ascii_lowercase()).or_default(), i);
+                }
+            }
+            let mut any = !s.skills.is_empty();
+            for slug in s.served.iter().filter_map(|a| a.strip_prefix("skill:")) {
+                add(u.served.entry(slug).or_default(), i);
+                any = true;
+            }
+            if any {
+                u.outcome.insert(i, crate::sessions::checked_outcome(l));
+            }
+        }
+        u
+    }
+
+    /// The places of the sessions that used `skill`, in the list's order: those found by its name, each as
+    /// [`Skill::used_in`] reads it (a use naming another repository is that repository's).
+    fn of_skill(&self, skill: &Skill, all: &'a [Logged]) -> Vec<usize> {
+        let found = match skill.origin {
+            Origin::Repo => self.loaded.get(&skill.name.to_ascii_lowercase()),
+            Origin::Compiled => self.served.get(skill.name.as_str()),
+        };
+        found
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&i| skill.used_in(&all[i]))
+            .collect()
+    }
+
+    /// What came of the sessions at `used` that used a skill, its votes aside.
+    fn outcomes(&self, used: &[usize], all: &[Logged]) -> Graded {
+        let mut g = Graded {
+            uses: used.len(),
+            people: used
+                .iter()
+                .map(|&i| &all[i].asker)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            last_used: used.iter().map(|&i| all[i].asked_at).max(),
+            ..Default::default()
+        };
+        for i in used {
+            match self.outcome.get(i).copied().flatten() {
+                Some(true) => g.succeeded += 1,
+                Some(false) => g.failed += 1,
+                None => g.unknown += 1,
+            }
+        }
+        g
+    }
+}
+
+/// What a skill's row in a list shows ([`list`]): what names it and where it is from, how many sessions used it and
+/// how they went, its votes and its newest proposal's verdict. Its description, version, the rest of its grades and
+/// the proposal's summary are on its page ([`summary`]): a large library's list is a few hundred bytes a skill.
+pub fn row(s: &Skill, g: &Graded, p: &Option<Value>) -> Value {
+    json!({
+        "key": s.key, "origin": s.origin, "name": s.name, "title": s.title, "repo": s.repo, "path": s.path,
+        "graded": {"uses": g.uses, "succeeded": g.succeeded, "failed": g.failed, "last_used": g.last_used},
+        "feedback": g.feedback.to_json(),
+        "proposal": p.as_ref().map(|p| json!({"verdict": p["verdict"], "stale": p["stale"]})),
+    })
+}
+
+/// What a skill shows on its page: the skill (no body), how the sessions that used it went, its votes, and its
+/// newest proposal's verdict and summary.
+pub fn summary(s: &Skill, g: &Graded, p: &Option<Value>) -> Value {
+    let mut v = json!(s);
+    v["graded"] = json!(g);
+    v["feedback"] = g.feedback.to_json();
+    v["proposal"] = json!(p.as_ref().map(|p| json!({
+        "verdict": p["verdict"], "summary": p["summary"], "stale": p["stale"], "proposed_at": p["proposed_at"],
+    })));
+    v
+}
+
+/// The Skills lists, kept by memory state ([`crate::kept_answers`]): a Studio page's read, answered from its kept
+/// answer however old while memory lost nothing since ([`crate::kept_answers::Kept::however_old`]), as the
+/// Explorer's skills listing is.
+static LISTS: std::sync::LazyLock<crate::kept_answers::Kept<Vec<Value>>> =
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(200).however_old());
+
+/// The skills `who` reads of `origin` (none: both; `proposed_only`: only those with a proposal), each as [`row`]
+/// has it, kept by memory state ([`crate::kept_answers`]) for main as it is now: working one out reads every session
+/// of the scope. Kept by the reader (who, and every group they read as), what they asked for, main's state, the
+/// sessions log (and the sessions held here for its next flush) and the votes: a session, a vote, a skill or a
+/// proposal written since is a newer state, answered as main moving on is (the last answer while the next is worked
+/// out in the background), and anything forgotten, retracted, erased or narrowed since (here, or a session row or a
+/// vote another server took away) is a loss, never answered from what was kept before it. A read of a branch or of a
+/// past state works its list out itself.
+pub async fn list(
+    store: &Store,
+    session: &Session,
+    who: &Principal,
+    origin: Option<Origin>,
+    proposed_only: bool,
+) -> Result<std::sync::Arc<Vec<Value>>> {
+    let scope = session.scope();
+    let at = match session.on_main_now() {
+        true => {
+            let mark = crate::kept_answers::Mark::read(store, scope).await?;
+            let now = store.lagging_visibility(scope, crate::MAIN).await?;
+            match std::ptr::eq(session.vis(), &*now) {
+                true => {
+                    let log = crate::kept_answers::Log::read(store, scope).await?;
+                    let mut at = crate::kept_answers::At::with_log(mark, &now, log);
+                    let (held, newest) = crate::sessions::held_mark(store, scope);
+                    at.heads.push(format!("held sessions {held} {newest}"));
+                    // The votes, as the log is: one taken away since (a person forgotten on another server) is a
+                    // loss, never answered from before.
+                    let votes =
+                        crate::kept_answers::Log::read_table(store, scope, crate::FEEDBACK).await?;
+                    Some(at.reading(votes))
+                }
+                false => None,
+            }
+        }
+        false => None,
+    };
+    crate::phases::mark("skills state");
+    let Some(at) = at else {
+        return Ok(std::sync::Arc::new(
+            list_now(store, session, who, origin, proposed_only).await?,
+        ));
+    };
+    let key = format!(
+        "{}\n{origin:?}\n{proposed_only}",
+        crate::kept_answers::reader_key(who)
+    );
+    let (store2, session2, who2) = (store.clone(), session.clone(), who.clone());
+    LISTS
+        .get(&scope.namespace(), &key, at, true, move || async move {
+            list_now(&store2, &session2, &who2, origin, proposed_only).await
+        })
+        .await
+}
+
+/// [`list`], worked out now.
+async fn list_now(
+    store: &Store,
+    session: &Session,
+    who: &Principal,
+    origin: Option<Origin>,
+    proposed_only: bool,
+) -> Result<Vec<Value>> {
+    let scope = session.scope();
+    let t = std::time::Instant::now();
+    let all = sessions(store, scope).await?;
+    crate::phases::mark("skills sessions");
+    let read_sessions = t.elapsed();
+    let skills = listed(session, store, who, origin, proposed_only).await?;
+    crate::phases::mark("skills read");
+    let read = t.elapsed();
+    let graded = grade_many(store, scope, who, &skills, &all).await?;
+    crate::phases::mark("skills graded");
+    let tallied = t.elapsed();
+    let proposals = proposals(session, store, &skills).await?;
+    crate::phases::mark("skills proposals");
+    eprintln!(
+        "skills list in {scope} ({}{}): {} skills ({} sessions), sessions {} ms, read {} ms, graded {} ms, proposals {} ms",
+        match origin {
+            Some(Origin::Repo) => "repo",
+            Some(Origin::Compiled) => "compiled",
+            None => "all",
+        },
+        if proposed_only { ", proposed" } else { "" },
+        skills.len(),
+        all.len(),
+        read_sessions.as_millis(),
+        (read - read_sessions).as_millis(),
+        (tallied - read).as_millis(),
+        (t.elapsed() - tallied).as_millis()
+    );
+    Ok(skills
+        .iter()
+        .zip(&graded)
+        .zip(&proposals)
+        .map(|((s, (g, _)), p)| row(s, g, p))
+        .collect())
+}
+
+/// The proposal key of the skill kept under `key`, as [`proposal_key`] has it.
+fn proposal_key_of(key: &str) -> Option<String> {
+    if let Some(rest) = key.strip_prefix(PREFIX) {
+        return Some(format!("{PROPOSALS}repo/{rest}"));
+    }
+    let slug = key.strip_prefix(crate::compile::SKILLS)?;
+    Some(format!("{PROPOSALS}compiled/{slug}"))
 }
 
 /// A skill's proposal key.
@@ -394,6 +770,38 @@ pub fn proposal_key(skill: &Skill) -> String {
         ),
         Origin::Compiled => format!("{PROPOSALS}compiled/{}", skill.name),
     }
+}
+
+/// The keys of the proposals there are: a skill with none isn't read for one.
+pub fn proposed(session: &Session) -> std::collections::HashSet<String> {
+    session.engine_documents(PROPOSALS).into_iter().collect()
+}
+
+/// [`proposal`] for each of `skills`, in order, read only where there is one, several at a time.
+pub async fn proposals(
+    session: &Session,
+    store: &Store,
+    skills: &[Skill],
+) -> Result<Vec<Option<Value>>> {
+    use futures::StreamExt;
+    let there = proposed(session);
+    let reads: Vec<futures::future::BoxFuture<'_, Result<Option<Value>>>> = skills
+        .iter()
+        .map(|s| {
+            let there = there.contains(&proposal_key(s));
+            Box::pin(async move {
+                match there {
+                    true => proposal(session, store, s).await,
+                    false => Ok(None),
+                }
+            }) as futures::future::BoxFuture<'_, _>
+        })
+        .collect();
+    let read: Vec<Result<Option<Value>>> = futures::stream::iter(reads)
+        .buffered(READS_AT_ONCE)
+        .collect()
+        .await;
+    read.into_iter().collect()
 }
 
 /// The newest proposal for `skill`, which the caller found readable, as written, with when it was made and whether
@@ -421,7 +829,7 @@ pub async fn proposal(session: &Session, store: &Store, skill: &Skill) -> Result
 /// Whether `serve` reviews `skill` now, given the sessions that used it (newest first), its votes and its last
 /// proposal: never within [`EVERY_SKILL`] of the last; then only on evidence since: [`ENOUGH_USES`] new sessions, a
 /// new one that failed, more votes against it than the last review read, or the skill changed since (with a use).
-pub fn due(used: &[Logged], g: &Graded, last: Option<&Value>, now: i64) -> bool {
+pub fn due(used: &[&Logged], g: &Graded, last: Option<&Value>, now: i64) -> bool {
     if used.is_empty() {
         return false;
     }
@@ -435,7 +843,7 @@ pub fn due(used: &[Logged], g: &Graded, last: Option<&Value>, now: i64) -> bool 
     if now - at < EVERY_SKILL.as_micros() as i64 {
         return false;
     }
-    let new: Vec<&Logged> = used.iter().filter(|l| l.asked_at > at).collect();
+    let new: Vec<&Logged> = used.iter().copied().filter(|l| l.asked_at > at).collect();
     let against = (g.feedback.negative + g.feedback.very_negative) as u64;
     new.len() >= ENOUGH_USES
         || new
@@ -487,7 +895,7 @@ pub async fn review(
         );
     }
     let (graded, used) = grade(store, scope, who, skill, all).await?;
-    let used: Vec<&Logged> = used.iter().take(MAX_REVIEWED).collect();
+    let used: Vec<&Logged> = used.into_iter().take(MAX_REVIEWED).collect();
     let transcripts: BTreeMap<String, String> = match excerpts {
         true => {
             let ids: Vec<String> = used
@@ -647,9 +1055,11 @@ pub async fn round(
     let all = sessions(store, scope).await?;
     let now = now_micros();
     let mut queue = vec![];
-    for skill in skills(&session, store, &who).await? {
-        let (g, used) = grade(store, scope, &who, &skill, &all).await?;
-        let last = proposal(&session, store, &skill).await?;
+    // Only the skills a review is due for are read whole.
+    let library = listed(&session, store, &who, None, false).await?;
+    let graded = grade_many(store, scope, &who, &library, &all).await?;
+    let last = proposals(&session, store, &library).await?;
+    for ((skill, (g, used)), last) in library.into_iter().zip(graded).zip(last) {
         if due(&used, &g, last.as_ref(), now) {
             queue.push((g.failed, skill));
         }
@@ -659,7 +1069,10 @@ pub async fn round(
         due: queue.len(),
         ..Default::default()
     };
-    for (_, skill) in queue.into_iter().take(PER_ROUND) {
+    for (_, listed) in queue.into_iter().take(PER_ROUND) {
+        let Some(skill) = find(&session, store, &who, &listed.key).await? else {
+            continue;
+        };
         match review(store, scope, &who, cx, &skill, &all, excerpts).await {
             Ok(_) => r.reviewed += 1,
             Err(e) => {

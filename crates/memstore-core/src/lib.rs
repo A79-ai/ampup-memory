@@ -35,6 +35,7 @@ pub mod pins;
 pub mod platform;
 pub mod priority;
 pub mod query;
+pub mod recent_readers;
 pub mod retention;
 pub mod retry;
 pub mod running;
@@ -734,6 +735,233 @@ struct LedgerRow {
 /// everything reachable from its heads, as in git.
 pub struct Ledger {
     rows: Vec<LedgerRow>,
+    /// Its commit graph by number ([`Ledger::graph`]), worked out on first use.
+    graph: std::sync::OnceLock<Arc<LedgerGraph>>,
+    /// The graph of the ledger this one was appended to, and how many of this one's rows it numbers
+    /// ([`Store::ledger_held`]): its graph is that one with the rows appended since, not all of them numbered again.
+    base: Mutex<Option<(Arc<LedgerGraph>, usize)>>,
+    /// What main sees in it ([`Ledger::main_visible`]), worked out on first use: a commit's owner check asks for it
+    /// several times (each governance fold, then the check itself), each a walk of every row.
+    main: std::sync::OnceLock<Arc<HashSet<String>>>,
+}
+
+/// A ledger's commit graph with each commit numbered ([`Ledger::graph`]): a walk of a branch's history over it copies
+/// and hashes no commit id, and each branch's heads are worked out once, not on every ask. A list of proposals walks
+/// main's history once per proposal (what it reaches, what it reached when proposed): on a busy memory that is
+/// hundreds of thousands of commits each, every time the list is worked out.
+#[derive(Clone)]
+pub(crate) struct LedgerGraph {
+    /// Each commit the ledger names (a row's, or only a row's parent), numbered.
+    num: HashMap<Arc<str>, u32>,
+    names: Vec<Arc<str>>,
+    /// Each commit's parents, as its last row names them (as [`Ledger::reachable`] reads them): none for a commit
+    /// only named as a parent.
+    parents: Vec<Vec<u32>>,
+    /// Each branch's heads, as [`Ledger::heads`] has them.
+    heads: HashMap<String, Vec<String>>,
+    /// What each branch's rows name as parents: a row on it whose commit none of them names is a head.
+    named: HashMap<String, HashSet<u32>>,
+}
+
+/// What a walk of a [`LedgerGraph`] reached ([`Ledger::reach`]): [`Ledger::reachable`] as numbers, with the commits it
+/// set out from that the ledger doesn't name.
+pub(crate) struct Reach {
+    bits: Vec<u64>,
+    unnamed: HashSet<String>,
+}
+
+impl LedgerGraph {
+    fn of(rows: &[LedgerRow]) -> Self {
+        let mut g = LedgerGraph {
+            num: HashMap::with_capacity(rows.len()),
+            names: Vec::with_capacity(rows.len()),
+            parents: Vec::with_capacity(rows.len()),
+            heads: HashMap::new(),
+            named: HashMap::new(),
+        };
+        g.extend(rows);
+        g
+    }
+
+    /// Adds `rows`, appended after the rows it numbers: numbered as a graph of all of them is, commits in the order
+    /// their rows first name them.
+    fn extend(&mut self, rows: &[LedgerRow]) {
+        let mut row_num = Vec::with_capacity(rows.len());
+        for r in rows {
+            let n = self.intern(&r.commit_id);
+            let ps: Vec<u32> = r.parents.iter().map(|p| self.intern(p)).collect();
+            match self.named.get_mut(r.branch.as_str()) {
+                Some(named) => named.extend(ps.iter().copied()),
+                None => {
+                    self.named
+                        .insert(r.branch.clone(), ps.iter().copied().collect());
+                }
+            }
+            self.parents[n as usize] = ps;
+            row_num.push(n);
+        }
+        // A branch's heads: those it had that the new rows don't name, then the new rows none names.
+        let LedgerGraph {
+            num, heads, named, ..
+        } = self;
+        for b in rows
+            .iter()
+            .map(|r| r.branch.as_str())
+            .collect::<HashSet<_>>()
+        {
+            if let Some(h) = heads.get_mut(b) {
+                h.retain(|id| !named[b].contains(&num[id.as_str()]));
+            }
+        }
+        for (r, n) in rows.iter().zip(row_num) {
+            if !heads.contains_key(r.branch.as_str()) {
+                heads.insert(r.branch.clone(), vec![]);
+            }
+            if !named[r.branch.as_str()].contains(&n) {
+                heads
+                    .get_mut(r.branch.as_str())
+                    .expect("inserted")
+                    .push(r.commit_id.clone());
+            }
+        }
+    }
+
+    fn intern(&mut self, id: &str) -> u32 {
+        if let Some(n) = self.num.get(id) {
+            return *n;
+        }
+        let n = self.names.len() as u32;
+        let id: Arc<str> = Arc::from(id);
+        self.num.insert(id.clone(), n);
+        self.names.push(id);
+        self.parents.push(vec![]);
+        n
+    }
+
+    /// The commit's number, if the ledger names it.
+    pub(crate) fn number(&self, id: &str) -> Option<u32> {
+        self.num.get(id).copied()
+    }
+
+    /// The numbered commits among `ids`, as a [`Reach`] (the rest kept by id): one lookup each, for a set asked
+    /// about many times over.
+    pub(crate) fn of_ids<'a>(&self, ids: impl IntoIterator<Item = &'a String>) -> Reach {
+        let mut out = Reach::empty(self.names.len());
+        for id in ids {
+            match self.number(id) {
+                Some(n) => {
+                    out.insert(n);
+                }
+                None => {
+                    out.unnamed.insert(id.clone());
+                }
+            }
+        }
+        out
+    }
+
+    fn reach(&self, from: &[String]) -> Reach {
+        let mut out = Reach::empty(self.names.len());
+        let mut stack = vec![];
+        for id in from {
+            match self.number(id) {
+                Some(n) => stack.push(n),
+                None => {
+                    out.unnamed.insert(id.clone());
+                }
+            }
+        }
+        while let Some(n) = stack.pop() {
+            // Merges make diamonds: a commit is walked past once.
+            if !out.insert(n) {
+                continue;
+            }
+            stack.extend(
+                self.parents[n as usize]
+                    .iter()
+                    .copied()
+                    .filter(|p| !out.has(*p)),
+            );
+        }
+        out
+    }
+}
+
+impl Reach {
+    fn empty(names: usize) -> Self {
+        Reach {
+            bits: vec![0; names.div_ceil(64)],
+            unnamed: HashSet::new(),
+        }
+    }
+
+    /// Whether commit number `n` was reached.
+    pub(crate) fn has(&self, n: u32) -> bool {
+        self.bits[(n / 64) as usize] & (1 << (n % 64)) != 0
+    }
+
+    fn insert(&mut self, n: u32) -> bool {
+        let (word, bit) = ((n / 64) as usize, 1u64 << (n % 64));
+        let new = self.bits[word] & bit == 0;
+        self.bits[word] |= bit;
+        new
+    }
+
+    /// Whether `id` was reached, in `graph` (the one walked).
+    pub(crate) fn contains(&self, graph: &LedgerGraph, id: &str) -> bool {
+        match graph.number(id) {
+            Some(n) => self.has(n),
+            None => self.unnamed.contains(id),
+        }
+    }
+
+    /// The commits reached and not in `other` (of the same graph).
+    pub(crate) fn without<'a>(
+        &'a self,
+        graph: &'a LedgerGraph,
+        other: &'a Reach,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.bits
+            .iter()
+            .zip(&other.bits)
+            .enumerate()
+            .flat_map(|(w, (a, b))| {
+                let mut left = a & !b;
+                std::iter::from_fn(move || {
+                    (left != 0).then(|| {
+                        let bit = left.trailing_zeros();
+                        left &= left - 1;
+                        w as u32 * 64 + bit
+                    })
+                })
+            })
+            .map(|n| &*graph.names[n as usize])
+            .chain(
+                self.unnamed
+                    .iter()
+                    .filter(|id| !other.unnamed.contains(*id))
+                    .map(String::as_str),
+            )
+    }
+
+    /// Every commit reached.
+    pub(crate) fn ids<'a>(&'a self, graph: &'a LedgerGraph) -> impl Iterator<Item = &'a str> + 'a {
+        self.bits
+            .iter()
+            .enumerate()
+            .flat_map(|(w, a)| {
+                let mut left = *a;
+                std::iter::from_fn(move || {
+                    (left != 0).then(|| {
+                        let bit = left.trailing_zeros();
+                        left &= left - 1;
+                        w as u32 * 64 + bit
+                    })
+                })
+            })
+            .map(|n| &*graph.names[n as usize])
+            .chain(self.unnamed.iter().map(String::as_str))
+    }
 }
 
 impl Ledger {
@@ -742,34 +970,86 @@ impl Ledger {
     // ponytail: forks stay forked until the next commit names every head as a parent; a
     // strictly linear ledger needs a conditional append (M7 check=concurrent-commits).
     pub fn heads(&self, branch: &str) -> Vec<String> {
-        let on_branch = || self.rows.iter().filter(|r| r.branch == branch);
-        let named: HashSet<&str> = on_branch()
-            .flat_map(|r| r.parents.iter().map(String::as_str))
-            .collect();
-        on_branch()
-            .filter(|r| !named.contains(r.commit_id.as_str()))
-            .map(|r| r.commit_id.clone())
-            .collect()
+        if let Some(g) = self.graph.get() {
+            let heads = g.heads.get(branch).cloned().unwrap_or_default();
+            if governance::governance_oracle() {
+                assert_eq!(
+                    heads,
+                    self.heads_scanned(branch),
+                    "governance oracle: heads of {branch}"
+                );
+            }
+            return heads;
+        }
+        self.heads_scanned(branch)
     }
 
-    fn reachable(&self, from: &[String]) -> HashSet<String> {
-        let parents: HashMap<&str, &[String]> = self
-            .rows
-            .iter()
-            .map(|r| (r.commit_id.as_str(), r.parents.as_slice()))
-            .collect();
-        let mut seen = HashSet::new();
-        let mut stack: Vec<String> = from.to_vec();
-        while let Some(c) = stack.pop() {
-            // Merges make diamonds; visiting a commit twice would make this exponential.
-            if !seen.insert(c.clone()) {
-                continue;
+    /// [`Ledger::heads`], from a pass over every row.
+    fn heads_scanned(&self, branch: &str) -> Vec<String> {
+        // A pass over every row: off the async workers on a large ledger ([`running::cpu`]).
+        running::cpu(self.big(), || {
+            let on_branch = || self.rows.iter().filter(|r| r.branch == branch);
+            let named: HashSet<&str> = on_branch()
+                .flat_map(|r| r.parents.iter().map(String::as_str))
+                .collect();
+            on_branch()
+                .filter(|r| !named.contains(r.commit_id.as_str()))
+                .map(|r| r.commit_id.clone())
+                .collect()
+        })
+    }
+
+    /// Whether a pass over every row is long enough to keep off the async workers ([`running::cpu`]).
+    fn big(&self) -> bool {
+        self.rows.len() >= running::CPU_ROWS
+    }
+
+    pub(crate) fn reachable(&self, from: &[String]) -> HashSet<String> {
+        running::cpu(self.big(), || {
+            let parents: HashMap<&str, &[String]> = self
+                .rows
+                .iter()
+                .map(|r| (r.commit_id.as_str(), r.parents.as_slice()))
+                .collect();
+            let mut seen = HashSet::new();
+            let mut stack: Vec<String> = from.to_vec();
+            while let Some(c) = stack.pop() {
+                // Merges make diamonds; visiting a commit twice would make this exponential.
+                if !seen.insert(c.clone()) {
+                    continue;
+                }
+                if let Some(ps) = parents.get(c.as_str()) {
+                    stack.extend(ps.iter().filter(|p| !seen.contains(*p)).cloned());
+                }
             }
-            if let Some(ps) = parents.get(c.as_str()) {
-                stack.extend(ps.iter().filter(|p| !seen.contains(*p)).cloned());
+            seen
+        })
+    }
+
+    /// The commit graph by number, worked out on first use and kept with the ledger: once it is, each branch's heads
+    /// are read from it.
+    pub(crate) fn graph(&self) -> &LedgerGraph {
+        self.graph.get_or_init(|| {
+            let Some((base, from)) = self.base.lock().unwrap().take() else {
+                return Arc::new(running::cpu(self.big(), || LedgerGraph::of(&self.rows)));
+            };
+            // The ledger it was appended to is let go of by now, as a rule: its graph is taken, not copied.
+            let mut g = Arc::try_unwrap(base).unwrap_or_else(|g| (*g).clone());
+            g.extend(&self.rows[from..]);
+            if governance::governance_oracle() {
+                let full = LedgerGraph::of(&self.rows);
+                assert!(
+                    g.names == full.names && g.parents == full.parents && g.heads == full.heads,
+                    "governance oracle: the commit graph carried across appends differs from one worked out anew"
+                );
             }
-        }
-        seen
+            Arc::new(g)
+        })
+    }
+
+    /// [`Ledger::reachable`] as a walk of [`Ledger::graph`].
+    pub(crate) fn reach(&self, from: &[String]) -> Reach {
+        self.graph().reach(from)
     }
 
     /// Every branch with a commit.
@@ -779,6 +1059,13 @@ impl Ledger {
 
     fn visible(&self, branch: &str) -> HashSet<String> {
         self.reachable(&self.heads(branch))
+    }
+
+    /// [`Ledger::visible`] of main, walked once for this ledger.
+    pub(crate) fn main_visible(&self) -> Arc<HashSet<String>> {
+        self.main
+            .get_or_init(|| Arc::new(self.visible(MAIN)))
+            .clone()
     }
 
     /// `seen`, what main saw in a ledger, made what main sees once `added` rows are appended to it. False when a row
@@ -1639,6 +1926,12 @@ pub fn on_loss(f: fn(&str, bool)) {
 /// `ns` lost something: and so did every namespace under it (`<ns>__…`, an org's teams), when `under`.
 fn lost(ns: &str, under: bool) {
     count_loss(ns, under, true)
+}
+
+/// Scope namespace `ns` lost something this process made go that no removal here counts ([`LOSSES`]): rows held
+/// for the answer log and dropped rather than written (their asker disabled or removed since).
+pub fn count_lost(ns: &str) {
+    lost(ns, false)
 }
 
 /// [`lost`], telling [`on_loss`] only when `tell`.
@@ -4353,6 +4646,8 @@ struct PendingCommit {
     _workspace: Option<workspace::WsReservation>,
     /// The committing store's fence ([`Store::fenced`]), checked again just before the batch is written.
     fence: Option<Fence>,
+    /// When it joined the queue: a slow batch's line says how long its commits waited for their turn.
+    queued_at: Instant,
 }
 
 #[derive(Default)]
@@ -4360,6 +4655,66 @@ struct Group {
     queue: Vec<PendingCommit>,
     leading: bool,
 }
+
+/// Where a group commit's time went ([`Store::commit_batch`]): the adds-only check, the tables' appends (all, then
+/// the slowest scope's for episodes, facts, extractions and closures), and the ledger's compare-and-set.
+#[derive(Default)]
+struct CommitTimes {
+    adds_only: Duration,
+    appends: Duration,
+    tables: [Duration; 4],
+    ledger: Duration,
+}
+
+impl CommitTimes {
+    /// A line for a batch that took [`SLOW_COMMIT`] or more, or whose commits waited that long for their turn:
+    /// what it held, how long its longest-queued commit waited, and where the time went.
+    fn say(&self, batch: &[PendingCommit], waited: Duration, took: Duration, ok: bool) {
+        if took < SLOW_COMMIT && waited < SLOW_COMMIT {
+            return;
+        }
+        let n = |f: fn(&PendingCommit) -> usize| batch.iter().map(f).sum::<usize>();
+        let ms = |d: Duration| d.as_millis();
+        let scopes: BTreeSet<String> = batch.iter().map(|p| p.scope.namespace()).collect();
+        eprintln!(
+            "group commit {} in {} ms: {} commits ({} episodes, {} facts, {} extractions, {} closures) to {} \
+             scopes, the longest queued {} ms before it; adds-only check {} ms, appends {} ms (episodes {}, \
+             facts {}, extractions {}, closures {}), ledger {} ms",
+            if ok { "landed" } else { "failed" },
+            ms(took),
+            batch.len(),
+            n(|p| p.episodes.len()),
+            n(|p| p.facts.len()),
+            n(|p| p.extractions.len()),
+            n(|p| p.closures.len()),
+            scopes.len(),
+            ms(waited),
+            ms(self.adds_only),
+            ms(self.appends),
+            ms(self.tables[0]),
+            ms(self.tables[1]),
+            ms(self.tables[2]),
+            ms(self.tables[3]),
+            ms(self.ledger),
+        );
+    }
+}
+
+/// `f`, its time kept in `slowest[i]` when longer than what is there.
+async fn timed<F: std::future::Future<Output = Result<()>>>(
+    slowest: &std::sync::Mutex<[Duration; 4]>,
+    i: usize,
+    f: F,
+) -> Result<()> {
+    let at = Instant::now();
+    let r = f.await;
+    let mut s = slowest.lock().unwrap();
+    s[i] = s[i].max(at.elapsed());
+    r
+}
+
+/// A group commit this slow, or a commit queued this long for one, is logged ([`CommitTimes::say`]).
+const SLOW_COMMIT: Duration = Duration::from_secs(2);
 
 /// The group-commit leader's hold on the queue. The leader runs in a task of its own, so a caller that
 /// goes away (an HTTP client that disconnects) cancels neither its commit nor the ones queued with it.
@@ -4745,17 +5100,43 @@ impl Store {
     /// so a snapshot that copies its files shows), the decoded fact files held for the index (`tail`), and the
     /// counts of visibility states and fact plans. The largest namespaces first.
     pub fn memory_report(&self) -> String {
+        // The batches held, taken out under the locks (each a handle on its buffers), then walked without them: a walk
+        // of every buffer of a large org's tables took 2.5 s on staging, and every table read waits on the cache's
+        // lock.
+        let tables: Vec<(String, Vec<RecordBatch>)> = self
+            .cache
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, e)| {
+                let ns = key.rsplit_once('.').map_or(key.as_str(), |(n, _)| n);
+                let files = e.files.values().flat_map(|b| b.iter());
+                (
+                    ns.to_string(),
+                    files.chain(e.snap.rows.iter()).cloned().collect(),
+                )
+            })
+            .collect();
+        let tails: Vec<(String, Vec<RecordBatch>)> = self
+            .tail
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(ns, files)| {
+                (
+                    ns.clone(),
+                    files.values().flat_map(|b| b.iter()).cloned().collect(),
+                )
+            })
+            .collect();
         let mut seen = HashSet::new();
         let mut by: HashMap<String, (usize, usize)> = HashMap::new();
-        for (key, e) in self.cache.entries.lock().unwrap().iter() {
-            let ns = key.rsplit_once('.').map_or(key.as_str(), |(n, _)| n);
-            let files = e.files.values().flat_map(|b| b.iter());
-            by.entry(ns.to_string()).or_default().0 +=
-                distinct_bytes(files.chain(e.snap.rows.iter()), &mut seen);
+        for (ns, batches) in &tables {
+            by.entry(ns.clone()).or_default().0 += distinct_bytes(batches.iter(), &mut seen);
         }
-        for (ns, files) in self.tail.lock().unwrap().iter() {
-            by.entry(ns.clone()).or_default().1 +=
-                distinct_bytes(files.values().flat_map(|b| b.iter()), &mut seen);
+        for (ns, batches) in &tails {
+            by.entry(ns.clone()).or_default().1 += distinct_bytes(batches.iter(), &mut seen);
         }
         let (tables, tail): (usize, usize) =
             by.values().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
@@ -5454,14 +5835,19 @@ impl Store {
             );
         }
         let wanted: HashMap<&str, i64> = ends.iter().copied().collect();
-        let mut began: HashMap<String, i64> = HashMap::new();
-        for b in facts.rows.iter() {
-            for (commit, f) in decode_facts(b, "source_episodes") {
-                if wanted.contains_key(f.fact_id.as_str()) && vis.committed.contains(&commit) {
-                    began.insert(f.fact_id, f.valid_from);
+        // A decode of every fact: off the async workers when there are many.
+        let many = facts.rows.iter().map(RecordBatch::num_rows).sum::<usize>() >= running::CPU_ROWS;
+        let began = running::cpu(many, || {
+            let mut began: HashMap<String, i64> = HashMap::new();
+            for b in facts.rows.iter() {
+                for (commit, f) in decode_facts(b, "source_episodes") {
+                    if wanted.contains_key(f.fact_id.as_str()) && vis.committed.contains(&commit) {
+                        began.insert(f.fact_id, f.valid_from);
+                    }
                 }
             }
-        }
+            began
+        });
         for (fact, end) in &wanted {
             let from = began
                 .get(*fact)
@@ -6127,15 +6513,19 @@ impl Store {
         newest_first: bool,
     ) -> Result<(Vec<Episode>, Vec<String>)> {
         let (heads, snap) = self.episode_heads(scope, branch).await?;
-        let mut todo: Vec<Episode> = heads
-            .into_iter()
-            .filter(|e| !done.contains(&e.episode_id) && keep(e))
-            .collect();
-        todo.sort_by_key(|e| e.occurred_at);
-        if newest_first {
-            todo.reverse();
-        }
-        todo.truncate(limit);
+        // A pass over every episode (staging ampup's took 3 s): off the async workers when there are many.
+        let todo = running::cpu(heads.len() >= running::CPU_ROWS, || {
+            let mut todo: Vec<Episode> = heads
+                .into_iter()
+                .filter(|e| !done.contains(&e.episode_id) && keep(e))
+                .collect();
+            todo.sort_by_key(|e| e.occurred_at);
+            if newest_first {
+                todo.reverse();
+            }
+            todo.truncate(limit);
+            todo
+        });
         let table = snap.table.clone();
         let reads = todo.into_iter().map(|e| {
             let (io, path) = (table.file_io().clone(), body_path(&table, &e.episode_id));
@@ -6181,35 +6571,40 @@ impl Store {
         let ns = scope.namespace();
         let vis = self.visibility(scope, branch).await?;
         let snap = self.rows(&ns, EPISODES).await?;
-        let mut todo: BTreeMap<String, Episode> = BTreeMap::new();
-        for b in snap.rows.iter() {
-            let (commit, id, source) = (
-                strings(b, "commit_id"),
-                strings(b, "episode_id"),
-                strings(b, "source"),
-            );
-            let at = timestamps(b, "occurred_at");
-            let about = optional_strings(b, "about");
-            let docs = optional_strings(b, "document");
-            for i in 0..b.num_rows() {
-                if !vis.committed.contains(&commit[i]) || vis.is_retracted(&id[i]) {
-                    continue;
+        // A pass over every episode (56,000 on staging's ampup, seconds of CPU): off the async workers when large.
+        let rows = snap.rows.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let heads = running::cpu(rows >= running::CPU_ROWS, || {
+            let mut todo: BTreeMap<String, Episode> = BTreeMap::new();
+            for b in snap.rows.iter() {
+                let (commit, id, source) = (
+                    strings(b, "commit_id"),
+                    strings(b, "episode_id"),
+                    strings(b, "source"),
+                );
+                let at = timestamps(b, "occurred_at");
+                let about = optional_strings(b, "about");
+                let docs = optional_strings(b, "document");
+                for i in 0..b.num_rows() {
+                    if !vis.committed.contains(&commit[i]) || vis.is_retracted(&id[i]) {
+                        continue;
+                    }
+                    let acl = vis.acls.get(&id[i]).cloned().unwrap_or_default();
+                    todo.entry(id[i].clone()).or_insert_with(|| Episode {
+                        episode_id: id[i].clone(),
+                        source: source[i].clone(),
+                        occurred_at: at[i].unwrap_or_default(),
+                        acl,
+                        about: about[i].as_deref().map(split_list).unwrap_or_default(),
+                        index_text: true,
+                        body: vec![],
+                        recorded_at: None,
+                        document: docs[i].clone(),
+                    });
                 }
-                let acl = vis.acls.get(&id[i]).cloned().unwrap_or_default();
-                todo.entry(id[i].clone()).or_insert_with(|| Episode {
-                    episode_id: id[i].clone(),
-                    source: source[i].clone(),
-                    occurred_at: at[i].unwrap_or_default(),
-                    acl,
-                    about: about[i].as_deref().map(split_list).unwrap_or_default(),
-                    index_text: true,
-                    body: vec![],
-                    recorded_at: None,
-                    document: docs[i].clone(),
-                });
             }
-        }
-        Ok((todo.into_values().collect(), snap))
+            todo.into_values().collect()
+        });
+        Ok((heads, snap))
     }
 
     /// How far `extractor` has read the episodes `keep` takes on `branch`: how many it has read, and how many
@@ -6306,6 +6701,7 @@ impl Store {
                 capped,
                 _workspace,
                 fence: self.fence.clone(),
+                queued_at: Instant::now(),
             });
             !std::mem::replace(&mut g.leading, true)
         };
@@ -6757,6 +7153,8 @@ impl Store {
 
     /// Commit whatever is queued, batch after batch, until the queue is empty.
     async fn lead_commits(&self) {
+        // Listed while it leads, so a stall or a memory jump it causes names it ([`running`]).
+        let running = running::running("group commit");
         let mut guard = LeaderGuard {
             group: self.group.clone(),
             armed: true,
@@ -6787,10 +7185,19 @@ impl Store {
                 .iter()
                 .map(|_| uuid::Uuid::new_v4().to_string())
                 .collect();
+            running.step(format!("group commit of {}", batch.len()));
+            let waited = batch
+                .iter()
+                .map(|p| p.queued_at.elapsed())
+                .max()
+                .unwrap_or_default();
+            let mut took = CommitTimes::default();
+            let started = Instant::now();
             let result = self
-                .commit_batch(&batch, &ids)
+                .commit_batch(&batch, &ids, &mut took)
                 .await
                 .map_err(|e| format!("{e:#}"));
+            took.say(&batch, waited, started.elapsed(), result.is_ok());
             // An owner's refusal is one commit's, not its batch's: the others (another org's write, say) are
             // committed again one at a time, and only what the owner holds is refused. Each under a new id: the
             // refused attempt's rows are in the tables under the old ones, which no ledger row names.
@@ -6801,9 +7208,13 @@ impl Store {
                     for (p, id) in batch.iter().zip(ids.iter_mut()) {
                         *id = uuid::Uuid::new_v4().to_string();
                         each.push(
-                            self.commit_batch(std::slice::from_ref(p), std::slice::from_ref(id))
-                                .await
-                                .map_err(|e| format!("{e:#}")),
+                            self.commit_batch(
+                                std::slice::from_ref(p),
+                                std::slice::from_ref(id),
+                                &mut CommitTimes::default(),
+                            )
+                            .await
+                            .map_err(|e| format!("{e:#}")),
                         );
                     }
                     each
@@ -6836,7 +7247,12 @@ impl Store {
 
     /// One batch of commits: rows grouped per scope into one append per table, then one ledger
     /// append whose rows are chained per (scope, branch).
-    async fn commit_batch(&self, batch: &[PendingCommit], ids: &[String]) -> Result<()> {
+    async fn commit_batch(
+        &self,
+        batch: &[PendingCommit],
+        ids: &[String],
+        took: &mut CommitTimes,
+    ) -> Result<()> {
         type Rows<'a> = (
             Vec<(&'a str, &'a Episode)>,
             Vec<(&'a str, &'a Fact)>,
@@ -6851,15 +7267,48 @@ impl Store {
             e.2.extend(p.extractions.iter().map(|x| (id.as_str(), x)));
             e.3.extend(p.closures.iter().map(|x| (id.as_str(), x)));
         }
-        futures::future::try_join_all(by_ns.iter().map(|(ns, (eps, fs, xs, cs))| async move {
-            tokio::try_join!(
-                self.write_episodes(ns, eps),
-                self.write_facts(ns, fs),
-                self.write_extractions(ns, xs),
-                self.write_closure_rows(ns, cs)
-            )
+        // Each scope's appends say whether its commits here only add ([`Store::adds_only_tag`]).
+        let mut tags: HashMap<String, String> = HashMap::new();
+        if adds_only_checked() {
+            let mut of_ns: BTreeMap<String, Vec<(&PendingCommit, &str)>> = BTreeMap::new();
+            for (p, id) in batch.iter().zip(ids) {
+                of_ns
+                    .entry(p.scope.namespace())
+                    .or_default()
+                    .push((p, id.as_str()));
+            }
+            let at = Instant::now();
+            for (ns, commits) in &of_ns {
+                if let Some(tag) = self.adds_only_tag(ns, commits).await {
+                    tags.insert(ns.clone(), tag);
+                }
+            }
+            took.adds_only = at.elapsed();
+        }
+        // Each table's append, timed: the slowest of the scopes' for each table.
+        let slowest = std::sync::Mutex::new([Duration::ZERO; 4]);
+        let at = Instant::now();
+        futures::future::try_join_all(by_ns.iter().map(|(ns, (eps, fs, xs, cs))| {
+            let tag = tags.get(ns).cloned();
+            let slowest = &slowest;
+            async move {
+                let writes = async {
+                    tokio::try_join!(
+                        timed(slowest, 0, self.write_episodes(ns, eps)),
+                        timed(slowest, 1, self.write_facts(ns, fs)),
+                        timed(slowest, 2, self.write_extractions(ns, xs)),
+                        timed(slowest, 3, self.write_closure_rows(ns, cs))
+                    )
+                };
+                match tag {
+                    Some(tag) => adds_only(ns, &[EPISODES, FACTS, EXTRACTIONS], tag, writes).await,
+                    None => writes.await,
+                }
+            }
         }))
         .await?;
+        took.appends = at.elapsed();
+        took.tables = *slowest.lock().unwrap();
         let entries: Vec<(&str, String, &str, &str, &Scope)> = batch
             .iter()
             .zip(ids)
@@ -6873,7 +7322,77 @@ impl Store {
                 )
             })
             .collect();
-        self.append_ledger_rows(&entries).await
+        let at = Instant::now();
+        let r = self.append_ledger_rows(&entries).await;
+        took.ledger = at.elapsed();
+        r
+    }
+
+    /// [`ADDS_ONLY_PROP`]'s value for this batch's `commits` (with their ids, in the batch's order) to namespace
+    /// `ns`, when every one only adds to what main's readers may read; none otherwise, and their appends carry none.
+    /// Each must be on main, end no fact (no closure), and write only:
+    /// - episodes new to the scope: no row of the episodes table has its id, read after main's heads (so every
+    ///   commit those heads hold is in it), and none twice here. An id written again is a forget, a narrowed ACL or
+    ///   a change of what it says; a row of a commit not yet landed counts too. Not a version of a document (a new
+    ///   version hides the old one from who reads it), nor one of the engine's own records (a dream's decision or a
+    ///   review, a conflict's record: each changes what others show);
+    /// - the note facts of those episodes (`note:<episode>`): a fact extraction writes may be an old fact written
+    ///   again under its id, or a newer value of a one-valued predicate, hiding the older;
+    /// - the extraction records of those episodes (one of an episode read before may stand for facts retired).
+    ///
+    /// The value names main's heads as read: a reader takes the commits for additions only when the first one's
+    /// ledger row names them as its parents. An error reading either refuses.
+    async fn adds_only_tag(&self, ns: &str, commits: &[(&PendingCommit, &str)]) -> Option<String> {
+        let mut ids: HashSet<&str> = HashSet::new();
+        for (p, _) in commits {
+            if p.branch != MAIN || !p.closures.is_empty() {
+                return None;
+            }
+            let own: HashSet<&str> = p.episodes.iter().map(|e| e.episode_id.as_str()).collect();
+            for e in &p.episodes {
+                if e.document.is_some()
+                    || episode_types::engine_source(&e.source)
+                    || !ids.insert(e.episode_id.as_str())
+                {
+                    return None;
+                }
+            }
+            // A note's own fact ([`is_note_fact`]: its id, entity, predicate and one source all the note's), of one
+            // of these episodes: never a fact under a note's id about some other thing, whose value may hide another.
+            let notes = p.facts.iter().all(|f| {
+                is_note_fact(f) && f.source_episodes.iter().all(|e| own.contains(e.as_str()))
+            });
+            if !notes
+                || !p
+                    .extractions
+                    .iter()
+                    .all(|x| own.contains(x.episode_id.as_str()))
+            {
+                return None;
+            }
+        }
+        // No episode: nothing either written to the tables marked, or only a fact or a record of none.
+        if ids.is_empty() {
+            return None;
+        }
+        let order: Vec<&str> = commits.iter().map(|(_, id)| *id).collect();
+        let ledger = self.ledger_now().await.ok()?;
+        let mut heads = self.ledger_of(&ledger.rows, ns).heads(MAIN);
+        heads.sort();
+        let episodes = {
+            let loading = self.cache.loading(&format!("{ns}.{EPISODES}"));
+            let _turn = loading.lock().await;
+            refresh(&*self.catalog(), &self.cache, ns, EPISODES)
+                .await
+                .ok()?
+        };
+        for b in episodes.rows.iter() {
+            let col = b.column_by_name("episode_id")?.as_string::<i32>();
+            if (0..b.num_rows()).any(|i| !col.is_null(i) && ids.contains(col.value(i))) {
+                return None;
+            }
+        }
+        Some(adds_only_value(Some(&heads), &order))
     }
 
     /// Append several commits' ledger rows in one compare-and-set. Within the batch, each
@@ -6884,8 +7403,13 @@ impl Store {
         entries: &[(&str, String, &str, &str, &Scope)],
     ) -> Result<()> {
         let started = Instant::now();
+        // Where a slow append went ([`LedgerSteps`]), said once it lands or fails.
+        let mut steps = LedgerSteps::default();
         for attempt in 0u32.. {
+            steps.attempts = attempt + 1;
+            let at = Instant::now();
             let snap = self.ledger_now().await?;
+            steps.snapshot += at.elapsed();
             let mut ledgers: HashMap<&str, Ledger> = HashMap::new();
             // One owner check per scope for all of the batch's commits to main: when none of them touches what an
             // owner holds (the usual case), that one check clears them all, not one check each inside this
@@ -6909,7 +7433,13 @@ impl Store {
                 let ledger = ledgers
                     .entry(ns)
                     .or_insert_with(|| self.ledger_of(&snap.rows, ns));
-                if self.publications_untouched(scope, ids, ledger).await? {
+                let at = Instant::now();
+                let (untouched, timed) =
+                    crate::phases::timed(Box::pin(self.publications_untouched(scope, ids, ledger)))
+                        .await;
+                steps.checked(ns, at.elapsed(), timed.marks);
+                let untouched = untouched?;
+                if untouched {
                     cleared.insert(ns);
                 }
             }
@@ -6934,9 +7464,21 @@ impl Store {
                 };
                 let recorded = latest.map_or(self.now(), |t| self.now().max(t + 1));
                 if *branch == MAIN && !cleared.contains(ns.as_str()) {
-                    self.authorize_publication(scope, id, &ps, ledger).await?;
+                    let at = Instant::now();
+                    let (checked, timed) = crate::phases::timed(Box::pin(
+                        self.authorize_publication(scope, id, &ps, ledger),
+                    ))
+                    .await;
+                    steps.checked(ns, at.elapsed(), timed.marks);
+                    if checked.is_err() {
+                        steps.say(started.elapsed(), "refused");
+                    }
+                    checked?;
                 }
                 // Later rows in this atomic batch are checked against its earlier rows too.
+                ledger.graph.take();
+                ledger.base.get_mut().unwrap().take();
+                ledger.main.take();
                 ledger.rows.push(LedgerRow {
                     commit_id: id.to_string(),
                     branch: branch.to_string(),
@@ -6960,12 +7502,15 @@ impl Store {
                 ("recorded_at", ts(times)),
                 ("parents", s(parents)),
             ];
-            match self
+            let at = Instant::now();
+            let appended = self
                 .append_own(SYSTEM_NS, LEDGER, &snap.table, columns, OnConflict::Fail)
-                .await
-            {
+                .await;
+            steps.append += at.elapsed();
+            match appended {
                 Ok(()) => {
                     note_ledger_wait(started);
+                    steps.say(started.elapsed(), "landed");
                     return Ok(());
                 }
                 // A lost race, or the ledger renamed aside by a rewrite under this commit.
@@ -6977,7 +7522,10 @@ impl Store {
                             * (attempt.min(8) as u64 + 1);
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    steps.say(started.elapsed(), "failed");
+                    return Err(e);
+                }
             }
         }
         unreachable!()
@@ -7927,6 +8475,15 @@ impl Store {
         })
     }
 
+    /// Whether this process holds a visibility state of `branch` of `scope`, however old: none before its first
+    /// build here, or after the state was let go. That build counts a loss ([`losses`]).
+    pub fn holds_visibility(&self, scope: &Scope, branch: &str) -> bool {
+        self.vis
+            .lock()
+            .unwrap()
+            .contains_key(&(scope.namespace(), branch.to_string()))
+    }
+
     /// [`Store::pin`] when it would build nothing: the branch's state already built is served only where
     /// [`Store::pin`] would serve that same state (one built from the tables as they are now, or another branch's
     /// state that a build of them gives unchanged, [`Vis::branch_unchanged`]). `None` where it would build: nothing
@@ -8037,13 +8594,16 @@ impl Store {
     }
 
     /// Build `branches`' states of `scope` in the background, one after another, each once however many ask: what
-    /// a listing that waits for no build ([`Store::pin_if_built`]) found unbuilt is there for the next one.
+    /// a listing that waits for no build ([`Store::pin_if_built`]) found unbuilt is there for the next one. At most
+    /// as many as the server keeps ([`MAX_SIDE_STATES`]): each is a build of the whole memory, and one more would
+    /// let go of one just built.
     pub fn build_later(&self, scope: &Scope, branches: Vec<String>) {
         let ns = scope.namespace();
         let todo: Vec<String> = {
             let mut all = self.vis_refresh.lock().unwrap();
             branches
                 .into_iter()
+                .take(MAX_SIDE_STATES)
                 .filter(|b| {
                     let r = all.entry((ns.clone(), b.clone())).or_default();
                     !std::mem::replace(&mut r.scheduled, true)
@@ -10894,8 +11454,22 @@ impl Store {
             self.visibility(scope, MAIN),
             self.rows(&ns, FACTS)
         )?;
+        // A pass over the whole ledger and every fact: off the async workers on a large scope.
+        let big = facts.rows.iter().map(RecordBatch::num_rows).sum::<usize>() >= running::CPU_ROWS;
+        Ok(running::cpu(big, || {
+            Self::fact_authors_here(&ns, &snap.rows, &vis, &facts.rows)
+        }))
+    }
+
+    /// [`Store::fact_authors`]' pass over the ledger's rows and the facts, on this thread.
+    fn fact_authors_here(
+        ns: &str,
+        ledger: &[RecordBatch],
+        vis: &Vis,
+        facts: &[RecordBatch],
+    ) -> HashMap<String, String> {
         let mut actor_of: HashMap<String, String> = HashMap::new();
-        for b in snap.rows.iter() {
+        for b in ledger.iter() {
             let (commit, actor, sc) = (
                 strings(b, "commit_id"),
                 strings(b, "actor"),
@@ -10908,7 +11482,7 @@ impl Store {
             }
         }
         let mut out = HashMap::new();
-        for b in facts.rows.iter() {
+        for b in facts.iter() {
             let (commit, id) = (strings(b, "commit_id"), strings(b, "fact_id"));
             for i in 0..b.num_rows() {
                 if vis.committed.contains(&commit[i])
@@ -10918,7 +11492,7 @@ impl Store {
                 }
             }
         }
-        Ok(out)
+        out
     }
 
     /// Who last changed each of `ids` in `scope` on main: the actor of the commit of its newest committed row (the
@@ -12203,7 +12777,14 @@ impl Store {
                 });
                 let mut all = l.rows.clone();
                 all.extend(added);
-                (Ledger { rows: all }, visible)
+                let ledger = Ledger::of(all);
+                // Its commit graph, once asked for, is the one before with the new rows: numbering every commit again
+                // each time main moves is most of a list of proposals worked out after it did.
+                *ledger.base.lock().unwrap() = match l.graph.get() {
+                    Some(g) => Some((g.clone(), l.rows.len())),
+                    None => l.base.lock().unwrap().clone(),
+                };
+                (ledger, visible)
             }
             _ => (self.ledger_of(&snap.rows, &ns), None),
         };
@@ -12312,6 +12893,12 @@ impl Ledger {
     }
 
     fn from_batches(batches: &[RecordBatch], ns: &str) -> Ledger {
+        let big = batches.iter().map(RecordBatch::num_rows).sum::<usize>() >= running::CPU_ROWS;
+        running::cpu(big, || Self::from_batches_here(batches, ns))
+    }
+
+    /// [`Ledger::from_batches`], on this thread.
+    fn from_batches_here(batches: &[RecordBatch], ns: &str) -> Ledger {
         let mut rows = vec![];
         for b in batches {
             let (id, branch, sc) = (
@@ -12333,7 +12920,16 @@ impl Ledger {
                 }
             }
         }
-        Ledger { rows }
+        Ledger::of(rows)
+    }
+
+    fn of(rows: Vec<LedgerRow>) -> Ledger {
+        Ledger {
+            rows,
+            graph: Default::default(),
+            base: Default::default(),
+            main: Default::default(),
+        }
     }
 }
 
@@ -13305,6 +13901,10 @@ pub async fn appended(
     // Every snapshot this append makes carries its id: a commit whose answer was lost is found by it, in any snapshot
     // the table still has (not only the current one: a rewrite may have replaced it since).
     let append_id = uuid::Uuid::new_v4().to_string();
+    let mut props = HashMap::from([(APPEND_ID_PROP.to_string(), append_id.clone())]);
+    if let Some(v) = adds_only_for(table) {
+        props.insert(ADDS_ONLY_PROP.to_string(), v);
+    }
     let mut table = table.clone();
     for attempt in 0u32.. {
         // A manifest path of this try's own: refused for sure, it is deleted (its column bounds hold our values).
@@ -13315,10 +13915,7 @@ pub async fn appended(
             .fast_append()
             .with_check_duplicate(false)
             .set_commit_uuid(commit_uuid)
-            .set_snapshot_properties(HashMap::from([(
-                APPEND_ID_PROP.to_string(),
-                append_id.clone(),
-            )]))
+            .set_snapshot_properties(props.clone())
             .add_data_files(files.clone())
             .apply(tx)?;
         let result = match on_conflict {
@@ -13426,6 +14023,71 @@ impl iceberg::writer::file_writer::location_generator::LocationGenerator for Dat
 
 /// The snapshot summary property naming the append that made it ([`append`]).
 const APPEND_ID_PROP: &str = "memstore.append-id";
+
+/// The snapshot summary property an append carries when the commit it writes for only adds to what readers of its
+/// scope may read ([`adds_only`]): nothing it writes hides, narrows or ends anything already readable. A snapshot
+/// without it may have taken something away. Its value ([`adds_only_value`]) names the commits and, for a commit
+/// that adds episodes, main's heads it was checked against: the commit adds only if its ledger row's parents are
+/// those heads (nothing else landed on main between the check and the commit).
+pub const ADDS_ONLY_PROP: &str = "memstore.adds-only";
+
+tokio::task_local! {
+    /// Set ([`adds_only`]) while a commit that only adds is written: the namespace, the tables it covers, the value.
+    static ADDS_ONLY: (String, &'static [&'static str], String);
+}
+
+/// `fut`, whose appends ([`append`], [`appended`]) to tables `tables` of namespace `ns` carry [`ADDS_ONLY_PROP`]
+/// with `value` ([`adds_only_value`]). Only for a write its caller knows takes nothing away: any other append
+/// carries none, and a reader then takes the table for one that may have lost something.
+pub async fn adds_only<F: std::future::Future>(
+    ns: &str,
+    tables: &'static [&'static str],
+    value: String,
+    fut: F,
+) -> F::Output {
+    ADDS_ONLY.scope((ns.to_string(), tables, value), fut).await
+}
+
+/// [`ADDS_ONLY_PROP`]'s value: the rule's version ([`ADDS_ONLY_RULE`]), main's `heads` (sorted) the commits were checked against (none for an
+/// answer-log commit: where it lands among main's commits doesn't change what it adds), and the commits, in the
+/// order their ledger rows chain.
+pub fn adds_only_value(heads: Option<&[String]>, commits: &[&str]) -> String {
+    serde_json::json!({"v": ADDS_ONLY_RULE, "heads": heads, "commits": commits}).to_string()
+}
+
+/// The version of the rule that decides what is marked as only adding ([`Store::adds_only_tag`], and the answer
+/// log's `write_qa_rows_as` in the server crate), written in every mark ([`adds_only_value`]). A reader trusts only
+/// marks of this version, so a mark another build wrote under another rule is no mark. **Raise it whenever the rule
+/// changes**: above all when it marks more (a widened rule's marks read by a build of the narrower one would vouch
+/// for what that build doesn't take as only adding). 1: the first rule; 2: answer-log rows only where each starts
+/// its entry, note facts checked whole ([`is_note_fact`]).
+pub const ADDS_ONLY_RULE: u32 = 2;
+
+/// [`ADDS_ONLY_PROP`]'s value for an append to `table`, when one is set for it ([`adds_only`]).
+fn adds_only_for(table: &Table) -> Option<String> {
+    let ident = table.identifier();
+    ADDS_ONLY
+        .try_with(|(ns, tables, value)| {
+            (ident.namespace().as_ref() == &vec![ns.clone()] && tables.contains(&ident.name()))
+                .then(|| value.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+/// Whether commits are checked for [`ADDS_ONLY_PROP`] ([`Store::adds_only_tag`]): only where answers are shared
+/// (`AMPUP_MEMORY_SHARED_ANSWERS` set to `memory` or `object`), as the check reads main's heads and the episodes
+/// table on each commit.
+fn adds_only_checked() -> bool {
+    matches!(
+        std::env::var("AMPUP_MEMORY_SHARED_ANSWERS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "memory" | "object"
+    )
+}
 
 /// Whether a snapshot `table` still has carries `key` = `id` in its summary.
 pub(crate) fn tagged(table: &Table, key: &str, id: &str) -> bool {
@@ -13887,6 +14549,54 @@ impl std::error::Error for Rewriting {}
 /// The longest a ledger append of this process took to land (µs: from its first read of the ledger to its commit,
 /// retries included) since [`take_ledger_wait`] last read it: how long a writer waited around a ledger compaction.
 static LEDGER_WAIT_MAX_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Where one ledger append's time went ([`Store::append_ledger_rows`]): reading the ledger's snapshot, the owner
+/// checks, the compare-and-set append, over how many attempts (a lost race tries again from the snapshot). The rest
+/// is the ledger's rows read for each scope and their heads found. The slowest owner check's steps are kept too, with
+/// its scope: the tables it read, main walked, the governance state folded, and the commits' impact.
+#[derive(Default)]
+struct LedgerSteps {
+    attempts: u32,
+    snapshot: Duration,
+    owners: Duration,
+    append: Duration,
+    /// The slowest owner check's scope, its steps as ms since it began, and how long it took.
+    slowest: Option<(String, String, u128)>,
+}
+
+impl LedgerSteps {
+    /// One owner check of `ns` done in `took`, its steps `marks` (`step ms, …`): kept when it is the slowest so far.
+    fn checked(&mut self, ns: &str, took: Duration, marks: String) {
+        self.owners += took;
+        let took = took.as_millis();
+        if self.slowest.as_ref().is_none_or(|(_, _, t)| took >= *t) {
+            self.slowest = Some((ns.to_string(), marks, took));
+        }
+    }
+
+    /// Logs where the append's time went, when it took [`SLOW_COMMIT`] or longer.
+    fn say(&self, took: Duration, how: &str) {
+        if took < SLOW_COMMIT {
+            return;
+        }
+        let rest = took.saturating_sub(self.snapshot + self.owners + self.append);
+        let slowest = match &self.slowest {
+            Some((ns, marks, took)) if !marks.is_empty() => {
+                format!(" (slowest owner check, of {ns}, ms since it began: {marks}, done {took})")
+            }
+            _ => String::new(),
+        };
+        eprintln!(
+            "ledger append {how} in {} ms over {} attempts: snapshot {} ms, ledger rows and heads {} ms, owner checks {} ms, append {} ms{slowest}",
+            took.as_millis(),
+            self.attempts,
+            self.snapshot.as_millis(),
+            rest.as_millis(),
+            self.owners.as_millis(),
+            self.append.as_millis()
+        );
+    }
+}
 
 fn note_ledger_wait(started: Instant) {
     LEDGER_WAIT_MAX_US.fetch_max(

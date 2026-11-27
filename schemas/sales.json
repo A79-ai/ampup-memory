@@ -1,6 +1,6 @@
 {
   "name": "sales",
-  "version": 6,
+  "version": 7,
   "description": "B2B sales memory: deals, accounts, contacts and reps from the CRM, plus what calls, emails and notes say about them (stakeholders, commitments, objections, competitors, qualification).",
   "types": {
     "deal": {
@@ -11,11 +11,11 @@
         "amount": {"type": "money", "unit": "USD", "freshness_days": 90},
         "currency": {"type": "string", "description": "The ISO 4217 code of the deal's currency (EUR); its amount is in it, in USD when it names none."},
         "close_date": {"type": "date", "plan": true},
-        "owner": {"type": "ref", "to": ["rep"]},
-        "account": {"type": "ref", "to": ["account"], "part_of": true},
-        "champion": {"type": "ref", "to": ["contact", "person"], "card": "many"},
-        "economic_buyer": {"type": "ref", "to": ["contact", "person"], "card": "many"},
-        "competitor": {"type": "ref", "to": ["competitor"], "card": "many"},
+        "owner": {"type": "ref", "to": ["rep"], "label": "owned by", "inverse": "owns"},
+        "account": {"type": "ref", "to": ["account"], "label": "for", "inverse": "deals", "part_of": true},
+        "champion": {"type": "ref", "to": ["contact", "person"], "label": "championed by", "inverse": "champions", "card": "many"},
+        "economic_buyer": {"type": "ref", "to": ["contact", "person"], "label": "approved by", "inverse": "approves", "card": "many"},
+        "competitor": {"type": "ref", "to": ["competitor"], "label": "competing with", "inverse": "deals", "card": "many"},
         "current_tool": {"type": "string", "card": "many", "list": true, "description": "a tool they use today relevant to the deal, including in-house tools and home-built attempts that failed; keep the key specifics"},
         "next_step": {"type": "text", "freshness_days": 21},
         "budget_status": {"type": "enum", "values": ["unknown", "identified", "approved", "rejected"], "freshness_days": 90},
@@ -36,7 +36,7 @@
         "industry": {"type": "string"},
         "tier": {"type": "enum"},
         "status": {"type": "enum"},
-        "owner": {"type": "ref", "to": ["rep"]},
+        "owner": {"type": "ref", "to": ["rep"], "label": "owned by", "inverse": "owns"},
         "current_process": {"type": "string", "card": "many", "list": true, "description": "one step of how they onboard, train or coach reps today, e.g. 'two weeks shadowing a senior rep before taking calls'"},
         "product_line": {"type": "string", "card": "many", "list": true, "description": "a line of business, including the business mix ('mostly commercial accounts') and lines they no longer sell"},
         "sales_language": {"type": "string", "card": "many", "list": true, "description": "a language their reps sell in"}
@@ -47,7 +47,7 @@
       "predicates": {
         "email": {"type": "string"},
         "title": {"type": "string", "freshness_days": 365},
-        "account": {"type": "ref", "to": ["account"], "part_of": true},
+        "account": {"type": "ref", "to": ["account"], "label": "works at", "inverse": "contacts", "part_of": true},
         "company": {"type": "string", "description": "The company name on the CRM record, which may name a company that has no account."},
         "last_contacted_at": {"type": "timestamp"}
       }
@@ -55,8 +55,8 @@
     "stakeholder": {
       "description": "A contact's part in one deal: an edge with properties. Ids are stakeholder:<deal id>:<contact id>.",
       "predicates": {
-        "deal": {"type": "ref", "to": ["deal"], "part_of": true},
-        "contact": {"type": "ref", "to": ["contact", "person"]},
+        "deal": {"type": "ref", "to": ["deal"], "label": "on", "inverse": "stakeholders", "part_of": true},
+        "contact": {"type": "ref", "to": ["contact", "person"], "label": "played by", "inverse": "stakeholder roles"},
         "role": {"type": "enum", "values": ["champion", "economic_buyer", "technical_evaluator", "decision_maker", "influencer", "blocker", "other"]},
         "stance": {"type": "enum", "values": ["supportive", "neutral", "skeptical", "opposed"], "freshness_days": 90},
         "engagement": {"type": "enum", "values": ["high", "medium", "low", "none"], "freshness_days": 60},
@@ -69,7 +69,7 @@
         "email": {"type": "string"},
         "role": {"type": "string"},
         "region": {"type": "string"},
-        "manager": {"type": "ref", "to": ["rep"]}
+        "manager": {"type": "ref", "to": ["rep"], "label": "reports to", "inverse": "manages"}
       }
     },
     "meeting": {
@@ -77,21 +77,21 @@
       "predicates": {
         "scheduled_at": {"type": "timestamp"},
         "status": {"type": "enum", "values": ["scheduled", "completed", "cancelled", "no_show"]},
-        "deal": {"type": "ref", "to": ["deal"], "part_of": true},
-        "account": {"type": "ref", "to": ["account"], "part_of": true},
-        "participant": {"type": "ref", "to": ["contact", "rep", "person"], "card": "many"},
+        "deal": {"type": "ref", "to": ["deal"], "label": "about", "inverse": "meetings", "part_of": true},
+        "account": {"type": "ref", "to": ["account"], "label": "with", "inverse": "meetings", "part_of": true},
+        "participant": {"type": "ref", "to": ["contact", "rep", "person"], "label": "attended by", "inverse": "meetings", "card": "many"},
         "series": {"type": "string"}
       }
     },
     "commitment": {
       "description": "Something someone said they would do. Ids are commitment:<id>.",
       "predicates": {
-        "owner": {"type": "ref", "to": ["rep", "contact", "person"]},
+        "owner": {"type": "ref", "to": ["rep", "contact", "person"], "label": "owed by", "inverse": "commitments"},
         "action": {"type": "text"},
         "due": {"type": "date", "plan": true},
         "status": {"type": "enum", "values": ["open", "done", "stale", "dropped"], "pending": ["open", "stale"], "freshness_days": 30},
-        "about": {"type": "ref", "to": ["deal", "account", "topic"], "part_of": true},
-        "stated_in": {"type": "ref", "to": ["meeting"]}
+        "about": {"type": "ref", "to": ["deal", "account", "topic"], "label": "about", "inverse": "commitments", "part_of": true},
+        "stated_in": {"type": "ref", "to": ["meeting"], "label": "made in", "inverse": "commitments"}
       }
     },
     "task": {
@@ -100,13 +100,13 @@
         "status": {"type": "enum", "description": "open, completed, dismissed, expired and the like (open enum).", "pending": ["open", "not_started", "in_progress", "waiting"]},
         "priority": {"type": "enum", "values": ["low", "medium", "high"], "description": "How urgent the task is. A CRM's own spellings are stored as one of these (Normal as medium, P0 as high).", "aliases": {"critical": "high", "none": "low", "normal": "medium", "p0": "high", "p1": "medium", "p2": "low", "urgent": "high"}},
         "due": {"type": "timestamp", "plan": true},
-        "owner": {"type": "ref", "to": ["rep", "person"]},
+        "owner": {"type": "ref", "to": ["rep", "person"], "label": "assigned to", "inverse": "tasks"},
         "source": {"type": "string", "description": "Where the task came from, such as AmpUp or hubspot."},
         "resolved_at": {"type": "timestamp"},
-        "deal": {"type": "ref", "to": ["deal"], "card": "many", "part_of": true},
-        "account": {"type": "ref", "to": ["account"], "card": "many", "part_of": true},
-        "meeting": {"type": "ref", "to": ["meeting"], "card": "many", "part_of": true},
-        "contact": {"type": "ref", "to": ["contact", "person"], "card": "many"}
+        "deal": {"type": "ref", "to": ["deal"], "label": "for", "inverse": "tasks", "card": "many", "part_of": true},
+        "account": {"type": "ref", "to": ["account"], "label": "for", "inverse": "tasks", "card": "many", "part_of": true},
+        "meeting": {"type": "ref", "to": ["meeting"], "label": "from", "inverse": "tasks", "card": "many", "part_of": true},
+        "contact": {"type": "ref", "to": ["contact", "person"], "label": "involves", "inverse": "tasks", "card": "many"}
       }
     },
     "objection": {
@@ -114,9 +114,9 @@
       "predicates": {
         "category": {"type": "enum", "description": "The org's own objection categories (open enum)."},
         "text": {"type": "text"},
-        "about": {"type": "ref", "to": ["deal", "account"], "part_of": true},
-        "raised_by": {"type": "ref", "to": ["contact", "person"]},
-        "raised_in": {"type": "ref", "to": ["meeting"], "card": "many", "description": "The meetings it came up in, so counts per meeting work."},
+        "about": {"type": "ref", "to": ["deal", "account"], "label": "raised on", "inverse": "objections", "part_of": true},
+        "raised_by": {"type": "ref", "to": ["contact", "person"], "label": "raised by", "inverse": "objections raised"},
+        "raised_in": {"type": "ref", "to": ["meeting"], "label": "raised in", "inverse": "objections", "card": "many", "description": "The meetings it came up in, so counts per meeting work."},
         "status": {"type": "enum", "values": ["open", "addressed", "resolved"], "pending": ["open"], "freshness_days": 60}
       }
     },
@@ -129,7 +129,7 @@
     "coaching_signal": {
       "description": "An observation about a rep's selling. Ids are coaching_signal:<id>.",
       "predicates": {
-        "rep": {"type": "ref", "to": ["rep"]},
+        "rep": {"type": "ref", "to": ["rep"], "label": "for", "inverse": "coaching signals"},
         "skill": {"type": "enum"},
         "observation": {"type": "text"},
         "period_start": {"type": "date"},
@@ -145,7 +145,7 @@
     "issue": {
       "description": "An issue or ticket, by the id its tracker gives it: issue:<owner>/<repo>#<number> from a code host, issue:<workspace>/<KEY-123> from a tracker.",
       "predicates": {
-        "repo": {"type": "ref", "to": ["repo"], "part_of": true},
+        "repo": {"type": "ref", "to": ["repo"], "label": "in", "inverse": "issues", "part_of": true},
         "title": {"type": "text"}
       }
     },
@@ -157,7 +157,7 @@
         "company": {"type": "string", "description": "The company name on the lead."},
         "status": {"type": "enum", "description": "Its status in the CRM (open enum)."},
         "lead_source": {"type": "string"},
-        "owner": {"type": "ref", "to": ["rep"], "description": "Who owns it in the CRM."}
+        "owner": {"type": "ref", "to": ["rep"], "label": "owned by", "inverse": "owns", "description": "Who owns it in the CRM."}
       }
     },
     "person": {
@@ -171,7 +171,7 @@
       "description": "A merged pull request. Ids are pr:<owner>/<repo>#<number>.",
       "predicates": {
         "merged_at": {"type": "date"},
-        "repo": {"type": "ref", "to": ["repo"], "part_of": true},
+        "repo": {"type": "ref", "to": ["repo"], "label": "in", "inverse": "pull requests", "part_of": true},
         "title": {"type": "text"}
       }
     },
@@ -195,11 +195,11 @@
       "description": "What an internal meeting or Slack thread is about when it is not one deal: a project, product area or feature, a customer's issue, a process, hiring, an incident. Ids are topic:<slug>, such as topic:notetaker_recording or topic:q4_pricing.",
       "predicates": {
         "decision": {"type": "text", "card": "many", "description": "A decision taken, with who took it when that is said."},
-        "discussed_in": {"type": "ref", "to": ["meeting"], "card": "many"},
+        "discussed_in": {"type": "ref", "to": ["meeting"], "label": "discussed in", "inverse": "topics", "card": "many"},
         "issue": {"type": "text", "card": "many", "description": "A problem raised and not yet resolved."},
         "next_step": {"type": "text", "card": "many", "description": "What someone said happens next, with the owner's name when said."},
-        "owner": {"type": "ref", "to": ["rep", "person"], "card": "many"},
-        "related_deal": {"type": "ref", "to": ["deal", "account"], "card": "many", "description": "Deals or accounts the topic touches, when any."},
+        "owner": {"type": "ref", "to": ["rep", "person"], "label": "owned by", "inverse": "owns", "card": "many"},
+        "related_deal": {"type": "ref", "to": ["deal", "account"], "label": "related to", "inverse": "topics", "card": "many", "description": "Deals or accounts the topic touches, when any."},
         "summary": {"type": "text", "description": "Where it stands, one or two lines, as of the latest discussion."}
       }
     }

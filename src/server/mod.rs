@@ -38,6 +38,7 @@ mod episode_page;
 mod file_keys;
 mod governance;
 mod home;
+mod home_readers;
 mod index_notes;
 mod join;
 mod learn;
@@ -655,6 +656,7 @@ pub async fn serve_with(
     metrics.register(Box::new(crate::metrics::VIS_ORACLE_DIVERGENCE.clone()));
     metrics.register(Box::new(crate::metrics::VIS_BUILDS.clone()));
     metrics.register(Box::new(crate::metrics::PROPOSAL_READS.clone()));
+    metrics.register(Box::new(crate::metrics::KEPT_ANSWERS_SERVED.clone()));
     metrics.register(Box::new(crate::metrics::PROPOSAL_READ_DIVERGENCE.clone()));
     metrics.register(Box::new(crate::metrics::MAIN_VISIBLE_SECONDS.clone()));
     metrics.register(Box::new(
@@ -2067,19 +2069,35 @@ pub async fn serve_with(
     {
         tokio::spawn(crate::running::watch_jumps(allocated, jump_mb << 20));
     }
+    // A stall of the async runtime of `AMPUP_MEMORY_STALL_MS` (default 1000) or more, with why and what ran then
+    // (`crate::running`); 0 turns it off.
+    let stall_ms = std::env::var("AMPUP_MEMORY_STALL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1000);
+    if stall_ms > 0 {
+        crate::running::watch_stalls(std::time::Duration::from_millis(stall_ms));
+    }
     if memory_every > 0 {
         let st = state.clone();
         tokio::spawn(async move {
             loop {
                 let store = st.store.read().unwrap().clone();
-                eprintln!(
-                    "memory: {} | store: {} | search: {} | {} | {}",
-                    crate::metrics::process_memory(),
-                    store.memory_report(),
-                    search::memory_report(),
-                    crate::qa_log::memory_report(),
-                    crate::sessions::memory_report()
-                );
+                // A walk of every buffer held: seconds on a large org, on a thread of its own, never an async worker's.
+                let line = tokio::task::spawn_blocking(move || {
+                    format!(
+                        "memory: {} | store: {} | search: {} | {} | {}",
+                        crate::metrics::process_memory(),
+                        store.memory_report(),
+                        search::memory_report(),
+                        crate::qa_log::memory_report(),
+                        crate::sessions::memory_report()
+                    )
+                })
+                .await;
+                if let Ok(line) = line {
+                    eprintln!("{line}");
+                }
                 tokio::time::sleep(Duration::from_secs(memory_every)).await;
             }
         });
@@ -2259,9 +2277,16 @@ pub async fn serve_with(
     Ok(())
 }
 
-/// Writes the buffered audit events and the held session rows, each bounded: a catalog that doesn't answer
-/// doesn't keep the process from stopping.
+/// Writes the buffered audit events, the held session rows and the Studio readers not written down yet, each bounded:
+/// a catalog that doesn't answer doesn't keep the process from stopping.
 async fn flush_buffers(state: &State) {
+    // A reader seen within the last write's interval is still read by the next server's warm-up.
+    if tokio::time::timeout(Duration::from_secs(10), home_readers::write_due(state))
+        .await
+        .is_err()
+    {
+        eprintln!("home readers not written at shutdown: the catalog took over 10s");
+    }
     let store = state.store.read().unwrap().clone();
     match tokio::time::timeout(Duration::from_secs(10), state.audit.flush(&store)).await {
         Ok(Ok(n)) => eprintln!("audit: wrote {n} buffered events"),
@@ -2516,7 +2541,7 @@ async fn listen(
                             .observe(took.as_secs_f64());
                         // A Studio read, by its op and org: timed where it was answered, never on a front that
                         // forwarded it (which names none).
-                        if let Some(read) = timed.studio_read {
+                        if let Some(read) = &timed.studio_read {
                             state
                                 .metrics
                                 .studio_read_seconds
@@ -2530,8 +2555,13 @@ async fn listen(
                                 .with_label_values(&[route, r.status().as_str()])
                                 .inc();
                             if took >= slow {
+                                // A Studio read says which: a `/browse` is any of them.
+                                let op = timed
+                                    .studio_read
+                                    .as_ref()
+                                    .map_or(String::new(), |r| format!(" {}", r.op));
                                 eprintln!(
-                                    "slow request: {route} {} in {} ms (ms since start: {})",
+                                    "slow request: {route}{op} {} in {} ms (ms since start: {})",
                                     r.status().as_u16(),
                                     took.as_millis(),
                                     timed.marks
@@ -4858,11 +4888,19 @@ async fn warm_needed(st: &State) -> Result<()> {
 
 /// Load what the first reads after a start would otherwise load in a caller's request: what a sign-in needs
 /// ([`warm_needed`], tried until it loads; `needed` hears when it has), then the served scope's indexes and
-/// every scope in the directory whose memory was written in the last [`warm_days`] and not named in [`warm_skip`],
+/// every scope in the directory whose memory was written in the last [`warm_days`] (on an org's own cell, its org
+/// and teams also when someone read them in Studio lately) and not named in [`warm_skip`],
 /// [`warm_concurrency`] at a time (an
 /// idle one is loaded by its first read instead). A scope that fails to warm is logged and left to the
 /// reads, as before.
 async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
+    let began = Instant::now();
+    // The scopes this server is for (its served scope, and on an org's own cell that org and its teams) are warmed
+    // first, and their recent Home readers primed before `/ready`, up to its bound: their first visits after a deploy
+    // are why priming is done at all. Every other scope's priming shares one shorter deadline, and goes on in the
+    // background past it.
+    let served_until = tokio::time::Instant::from_std(began + ready_timeout());
+    let prime_until = home_readers::prime_deadline(began, ready_timeout());
     let mut wait = Duration::from_secs(1);
     loop {
         // Not held to the background read rate: the server takes no sign-ins until it has this.
@@ -4910,6 +4948,11 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
         }
         warm_advice(&store, &st.scope).await;
         warm_home(&st, &store, &st.scope, false).await;
+        // Its readers primed as soon as its Home is, beside the rest of its warming.
+        tokio::join!(
+            home_readers::prime_readers(&st, &store, &st.scope, served_until),
+            warm_extractions(&store, &st.scope),
+        );
     }
     if st.fixed() && !st.workspaces {
         return;
@@ -4942,6 +4985,7 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
     let store = &store;
     let read_at = &st.read_at;
     let state = &*st;
+    let shared_state = &st;
     // Only a scope that holds memory written lately: warming never makes tables, and an idle org's indexes would
     // hold memory no one reads (its first read loads them). Which those are, from the ledger every server reads
     // anyway, not a catalog call per org and team in the directory (a deploy restarting every server made those
@@ -4954,12 +4998,38 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
             return;
         }
     };
-    scopes.retain(|s| written.contains(&s.namespace()));
+    // An org's own cell also warms its org and teams that people read in Studio lately though nothing was written
+    // to them since (a team's page, its counts on the Overview): their first visits after a deploy are why their
+    // readers are primed. Which those are, from each one's file of recent readers, read [`warm_concurrency`] at a
+    // time: a catalog read each, only for the cell's own org and teams.
+    let written = &written;
+    let scopes: Vec<Scope> = futures::stream::iter(scopes)
+        .map(|s| async move {
+            let warm = written.contains(&s.namespace())
+                || (s.org_name().is_some_and(own_org)
+                    && store
+                        .recent_readers_held(&s)
+                        .await
+                        .is_ok_and(|r| !r.is_empty()));
+            warm.then_some(s)
+        })
+        .buffered(warm_concurrency())
+        .filter_map(futures::future::ready)
+        .collect()
+        .await;
     // Kept warm for a while after (`keep_warm`), as if read `warm_grace` before `keep_warm_idle` runs out.
     let kept_until = Instant::now()
         .checked_sub(keep_warm_idle().saturating_sub(warm_grace()))
         .unwrap_or_else(Instant::now);
-    futures::stream::iter(scopes)
+    // An org's own cell's org and its teams first, each primed before `/ready` as the served scope is.
+    let (own, others): (Vec<Scope>, Vec<Scope>) = scopes
+        .into_iter()
+        .partition(|s| s.org_name().is_some_and(own_org));
+    let deadline = |s: &Scope| match s.org_name().is_some_and(own_org) {
+        true => served_until,
+        false => prime_until,
+    };
+    futures::stream::iter(own.into_iter().chain(others))
         .for_each_concurrent(warm_concurrency(), |scope| async move {
             let t = Instant::now();
             match search::warm(store, &scope).await {
@@ -4970,8 +5040,15 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
                         crate::metrics::process_memory()
                     );
                     warm_advice(store, &scope).await;
-                    warm_qa_log(store, &scope).await;
                     warm_home(state, store, &scope, true).await;
+                    // Its readers primed as soon as its Home is, beside the rest of its warming.
+                    tokio::join!(
+                        home_readers::prime_readers(shared_state, store, &scope, deadline(&scope)),
+                        async {
+                            warm_qa_log(store, &scope).await;
+                            warm_extractions(store, &scope).await;
+                        },
+                    );
                     // An org's episodes, as `show` counts them for a plan's page.
                     if matches!(scope, Scope::NamedOrg(_))
                         && let Some(org) = scope.org_name()
@@ -4993,6 +5070,15 @@ async fn warm_up(st: Arc<State>, needed: tokio::sync::oneshot::Sender<()>) {
             }
         })
         .await;
+}
+
+/// Whether `org` is one an org's own cell is for: mapped to this cell, which isn't the default one (which serves every
+/// org mapped nowhere).
+fn own_org(org: &str) -> bool {
+    !memstore_core::cell::is_default()
+        && memstore_core::cell::map()
+            .get(org)
+            .is_some_and(|c| c == memstore_core::cell::me())
 }
 
 /// How many scopes the start warms at once (`AMPUP_MEMORY_WARM_CONCURRENCY`, default 1): each loads every one
@@ -5282,6 +5368,28 @@ async fn warm_qa_log(store: &Store, scope: &Scope) {
         }
         Ok(()) => {}
         Err(e) => eprintln!("warming {scope}'s QA log failed (its first read loads it): {e:#}"),
+    }
+}
+
+/// Loads `scope`'s extractions table (which episodes each extractor read), which a dated search's arrivals (which
+/// episodes in its window no extraction read yet, [`crate::arrivals`]) and the extractor's first round would otherwise
+/// load from the catalog while they wait (4 s on a fresh server).
+async fn warm_extractions(store: &Store, scope: &Scope) {
+    let t = Instant::now();
+    match store
+        .side_rows(&scope.namespace(), crate::EXTRACTIONS)
+        .await
+    {
+        Ok(_) if t.elapsed() > Duration::from_millis(500) => {
+            eprintln!(
+                "warmed {scope}'s extractions in {} ms",
+                t.elapsed().as_millis()
+            )
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("warming {scope}'s extractions failed (their first read loads them): {e:#}")
+        }
     }
 }
 
@@ -6587,7 +6695,7 @@ async fn handle(
     if skill_review_route && req.method() != hyper::Method::POST {
         return Ok(reply(
             StatusCode::METHOD_NOT_ALLOWED,
-            json!({"error": "POST {op: list} to /skills/review, {op: get, skill} or {op: review, skill}"}),
+            json!({"error": "POST {op: list, origin?, proposed?} to /skills/review, {op: get, skill} or {op: review, skill}"}),
         ));
     }
     if (learn_route || learn_status) && req.method() != hyper::Method::POST {
@@ -7245,6 +7353,18 @@ async fn handle(
             match directory_change(&state, &who, &via, superuser, &body).await {
                 Ok(v) => {
                     record_signin(&state, &who, &via, org);
+                    // A Studio list of the org's activity, noted beside its reader for a new server to make again, as
+                    // a read of the org an alias names.
+                    if let Some(named) = named.as_deref()
+                        && req["op"] == "activity"
+                    {
+                        let store = state.store.read().unwrap().clone();
+                        if let Ok(f) = store.directory_behind().await
+                            && let Some(org) = f.dir.org_named(named)
+                        {
+                            home_readers::admin_read(&state, org, &who, &via, superuser, &req);
+                        }
+                    }
                     reply(StatusCode::OK, v)
                 }
                 // A dream job asked for an org past its limits (`dream_jobs::handle`).
@@ -8210,6 +8330,16 @@ async fn handle(
             }
             _ => Reads::alone(session),
         };
+        // Studio's advice list (`list_advice`) on main, noted beside its reader as the advice list it shares its kept
+        // answer with (`/advice/list`), so a new server works it out for them before it is ready.
+        if view.is_main()
+            && let Ok(r) = serde_json::from_slice::<Value>(&body)
+            && r["method"] == "tools/call"
+            && r["params"]["name"] == "list_advice"
+        {
+            let q = json!({"op": "advice", "space": r["params"]["arguments"]["space"]});
+            home_readers::read(&state, &scope, &who, &via, superuser, &q, None);
+        }
         let began = Instant::now();
         let answer = mcp(
             &state,
@@ -9081,6 +9211,16 @@ async fn handle(
         let who = who.expect("public port");
         let store = state.store.read().unwrap().clone();
         let args = serde_json::from_slice::<Value>(&body).unwrap_or_default();
+        // Timed apart by its op and org (`memstore_studio_read_seconds`), as the Studio's other reads are.
+        crate::phases::studio_read(
+            match args["op"].as_str().unwrap_or("list") {
+                "list" => "skills list",
+                "get" => "skills get",
+                "review" => "skills review",
+                _ => "skills other",
+            },
+            scope.org_name().unwrap_or("-"),
+        );
         // A review asks the learning model and writes a proposal: the memory's admins ask for one.
         let may_review = superuser
             || state.fixed()
@@ -9097,6 +9237,11 @@ async fn handle(
                 || Box::pin(crate::people::directory::Directory::load(&store))
                     .await
                     .is_ok_and(|d| d.learns_advice(&scope)));
+        // The Skills list on main, noted beside its reader so a new server works it out for them before it is ready.
+        if view.is_main() && args["op"].as_str().unwrap_or("list") == "list" {
+            let q = json!({"op": "skills_list", "origin": args["origin"], "proposed": args["proposed"]});
+            home_readers::read(&state, &scope, &who, &via, superuser, &q, None);
+        }
         let done = skill_review_op(&store, &session, &scope, &who, &args, may_review, learns).await;
         return Ok(match done {
             Ok(v) => {
@@ -9252,6 +9397,19 @@ async fn handle(
                 },
             );
         }
+        // A Studio read on main, noted beside its reader so a new server works it out for them before it is ready.
+        if view.is_main() {
+            let schema = session.schema();
+            home_readers::read(
+                &state,
+                &scope,
+                &who,
+                &via,
+                superuser,
+                &req,
+                schema.as_deref(),
+            );
+        }
         // Boxed: browse's future is large, and inline it would grow the handler's for every request.
         return Ok(
             match Box::pin(crate::browse::run(&store, &session, reader, &req)).await {
@@ -9283,7 +9441,10 @@ async fn handle(
         _ => Reads::alone(session),
     };
     let _turn = match (path.as_str(), &who) {
-        ("/search", Some(w)) => Some(state.limiter.search(&search_lane(&state, w, &via)).await),
+        ("/search", Some(w)) => {
+            embed_ahead(&body);
+            Some(state.limiter.search(&search_lane(&state, w, &via)).await)
+        }
         _ => None,
     };
     Ok(
@@ -9846,35 +10007,40 @@ async fn skill_review_op(
             },
         }
     };
-    let summary = |s: &rs::Skill, g: &rs::Graded, p: &Option<Value>| {
-        let mut v = json!(s);
-        v["graded"] = json!(g);
-        v["feedback"] = g.feedback.to_json();
-        v["proposal"] = json!(p.as_ref().map(|p| json!({
-            "verdict": p["verdict"], "summary": p["summary"], "stale": p["stale"], "proposed_at": p["proposed_at"],
-        })));
-        v
+    // The scope's sessions, for a skill's own page and its review: a list is kept (`rs::list`), and reads them
+    // only when it is worked out.
+    let sessions = || async {
+        let t = std::time::Instant::now();
+        let all = rs::sessions(store, scope).await?;
+        crate::phases::mark("skills sessions");
+        if t.elapsed() > std::time::Duration::from_secs(2) {
+            eprintln!(
+                "skills: reading {}'s {} sessions took {} ms",
+                scope,
+                all.len(),
+                t.elapsed().as_millis()
+            );
+        }
+        anyhow::Ok(all)
     };
-    let all = rs::sessions(store, scope).await?;
     match args["op"].as_str().unwrap_or("list") {
         "list" => {
-            let origin = args["origin"].as_str();
-            let mut out = vec![];
-            for s in rs::skills(session, store, who).await? {
-                if origin.is_some_and(|o| json!(s.origin) != json!(o)) {
-                    continue;
-                }
-                let (g, _) = rs::grade(store, scope, who, &s, &all).await?;
-                let p = rs::proposal(session, store, &s).await?;
-                out.push(summary(&s, &g, &p));
-            }
-            Ok(json!({"skills": out, "may_review": may_review}))
+            let origin = match args["origin"].as_str() {
+                Some("repo") => Some(rs::Origin::Repo),
+                Some("compiled") => Some(rs::Origin::Compiled),
+                _ => None,
+            };
+            // Only those with a proposal (`proposed`): the Studio's count of revisions proposed, and their list.
+            let proposed_only = args["proposed"].as_bool().unwrap_or(false);
+            let out = rs::list(store, session, who, origin, proposed_only).await?;
+            Ok(json!({"skills": *out, "may_review": may_review}))
         }
         "get" => {
             let s = one().await?;
+            let all = sessions().await?;
             let (g, _) = rs::grade(store, scope, who, &s, &all).await?;
             let p = rs::proposal(session, store, &s).await?;
-            let mut v = summary(&s, &g, &p);
+            let mut v = rs::summary(&s, &g, &p);
             v["body"] = json!(s.body);
             v["proposal"] = p.unwrap_or(Value::Null);
             v["may_review"] = json!(may_review);
@@ -9888,7 +10054,11 @@ async fn skill_review_op(
             let Some(cx) = crate::extract::Extractor::advice_from_env()? else {
                 return Err(bad("no learning model is set here (AMPUP_MEMORY_ADVICE)"));
             };
+            let all = sessions().await?;
             let mut p = rs::review(store, scope, who, &cx, &s, &all, learns).await?;
+            // The scope's kept answers (its Skills lists among them) are worked out again on their next read, so
+            // the proposal shows there at once.
+            crate::kept_answers::changed(&scope.namespace());
             // What it rests on is the engine's to check, as `get` serves it.
             p.as_object_mut().map(|o| o.remove("rests_on"));
             Ok(json!({"proposal": p}))
@@ -12558,15 +12728,23 @@ fn renew_store(state: &State) {
     *state.store.write().unwrap() = fresh;
 }
 
-/// Each admin's activity page (`/admin {op: "activity"}`), by memory state and answer log.
+/// Each admin's activity page (`/admin {op: "activity"}`), by memory state and answer log: Home's week and the
+/// Advice page's serving, whose numbers lag what was added since by an hour at most.
 static ACTIVITY: std::sync::LazyLock<crate::kept_answers::Kept<Value>> =
     std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(200));
+
+/// [`ACTIVITY`] as Studio's Traces and Not answered list it (`light: true`, a page at a time): answered from its kept
+/// answer however old while memory lost nothing since, the next worked out in the background
+/// ([`crate::kept_answers::Kept::however_old`]), as the sidebar's other reads are.
+static ACTIVITY_LISTED: std::sync::LazyLock<crate::kept_answers::Kept<Value>> =
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(200).however_old());
 
 /// `/admin {op: "activity"}` in `scope` for `who`, already let read it: every person's sessions and asks in the
 /// window, kept by memory state and the scope's answer log ([`crate::kept_answers`]), as it reads the whole log. Kept
 /// by the reader (who, and every group they read as) and what they asked for (the person, the window, the page): the
 /// window ends when the answer was worked out ([`crate::kept_answers::At::windowed`]), never more than
-/// [`crate::kept_answers::SUMMARY_STALE`] before now.
+/// [`crate::kept_answers::SUMMARY_STALE`] before now; for a list's read (`light`), however long before, while memory
+/// lost nothing since ([`ACTIVITY_LISTED`]).
 async fn activity_kept(
     store: &Store,
     scope: &Scope,
@@ -12604,7 +12782,11 @@ async fn activity_kept(
         how.key(),
     );
     let (store2, scope2) = (store.clone(), scope.clone());
-    let v = ACTIVITY
+    let kept: &'static crate::kept_answers::Kept<Value> = match how.light {
+        true => &ACTIVITY_LISTED,
+        false => &ACTIVITY,
+    };
+    let v = kept
         .get(&scope.namespace(), &key, at, true, || async move {
             let (since, _) = audit_window(&json!({"since_secs": since_secs}))?;
             // Only the entries the page counts are copied out of the log (a GB in a large org): those of the window,
@@ -13254,6 +13436,29 @@ async fn count_key_use(state: &State, via: &SignIn, org: &str) {
 /// nothing matches well, [`weak_match`]); `/episode`
 /// takes (episode_id, around?, max_chars?) and returns an excerpt of the episode's text centred on
 /// `around` (a fact's quote), or null when the episode doesn't exist or isn't visible.
+/// A `/search` request's queries start embedding while it waits for its turn ([`crate::search::embed_ahead`]): those
+/// of its first few rows, as a Studio search or an agent's sends one or a few.
+fn embed_ahead(body: &[u8]) {
+    let Ok(req) = serde_json::from_slice::<Value>(body) else {
+        return;
+    };
+    let (rows, arg) = match (req["data"].as_array(), req["calls"].as_array()) {
+        (Some(rows), _) => (rows, 1),
+        (None, Some(calls)) => (calls, 0),
+        _ => return,
+    };
+    for q in rows
+        .iter()
+        .take(EMBED_AHEAD_ROWS)
+        .filter_map(|r| r[arg].as_str())
+    {
+        crate::search::embed_ahead(q);
+    }
+}
+
+/// The rows of a `/search` request whose queries [`embed_ahead`] starts embedding.
+const EMBED_AHEAD_ROWS: usize = 4;
+
 async fn search_rows(
     state: &State,
     reads: &Reads,
@@ -14516,6 +14721,9 @@ async fn mcp(
             );
             let result = match name {
                 "search_memory" => {
+                    if let Some(q) = args["query"].as_str() {
+                        crate::search::embed_ahead(q);
+                    }
                     let _turn = state.limiter.search(&search_lane(state, who, via)).await;
                     crate::phases::mark("search turn");
                     let json_format = match args["format"].as_str() {

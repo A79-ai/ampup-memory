@@ -190,6 +190,8 @@ pub(super) fn schema(base: &Schema, kind: &dyn EpisodeType) -> anyhow::Result<Sc
                 list: false,
                 share: false,
                 same_as: None,
+                label: None,
+                inverse: None,
             });
         }
     }

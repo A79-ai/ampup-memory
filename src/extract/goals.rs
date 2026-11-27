@@ -454,7 +454,10 @@ impl Extractor {
         ep: &Episode,
         listing: Option<&Listing>,
     ) -> Result<Found> {
-        let p = prepare(offer, ep, listing)?;
+        // Finding the subjects the text names stems every listed subject's name: over a second on staging ampup's
+        // listing, so off the async workers there ([`crate::running::cpu`]).
+        let many = listing.is_some_and(|l| l.subjects.len() >= LISTING_CPU);
+        let p = crate::running::cpu(many, || prepare(offer, ep, listing))?;
         // A delta reads only what was added since; the engine's facts were written by the first read.
         let engine = if offer.delta_from.is_some() {
             vec![]
@@ -1029,6 +1032,10 @@ fn nameable(offer: &Offer) -> Vec<String> {
 /// The subjects a scope already holds facts about or pointing to, of the types its episodes may name by what they
 /// are ([`nameable`]), read once per batch: each episode is shown those its text names ([`Listing::named_in`]), so
 /// the model reuses `deal:northwind_traders` instead of making up `deal:northwind_traders_group` in the next thread.
+/// Listed subjects from which preparing an episode's read ([`prepare`]) runs off the async workers: each subject's
+/// name is stemmed against the text, a tokenizer run per subject.
+const LISTING_CPU: usize = 1_000;
+
 pub(super) struct Listing {
     vis: Arc<crate::Vis>,
     /// Each subject and the facts that name it (as their entity or their ref value), as (commit, fact).

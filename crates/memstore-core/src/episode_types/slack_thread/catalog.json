@@ -67,7 +67,9 @@
      "to": [
       "deal"
      ],
-     "same_as": "about"
+     "same_as": "about",
+     "label": "about",
+     "inverse": "commitments"
     }
    }
   }

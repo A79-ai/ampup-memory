@@ -35,6 +35,7 @@ mod local_serve;
 mod mcp_act_as;
 mod merge_subjects;
 mod offboarding;
+mod ontology;
 mod org_retract;
 mod personal_advice;
 mod rest_catalog;

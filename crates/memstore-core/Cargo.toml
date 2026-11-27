@@ -59,6 +59,8 @@ rand.workspace = true
 parking_lot.workspace = true
 quick_cache.workspace = true
 libc.workspace = true
+# Names what a stalled async worker was running (`running::watch_stalls`).
+backtrace.workspace = true
 prometheus.workspace = true
 schemars.workspace = true
 ed25519-dalek.workspace = true

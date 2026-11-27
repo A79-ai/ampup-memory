@@ -5003,6 +5003,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
+ "backtrace",
  "base64 0.22.1",
  "bytes",
  "chrono",

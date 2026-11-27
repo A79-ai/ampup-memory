@@ -513,6 +513,8 @@ fn drafted(
                     list: false,
                     share: false,
                     same_as: None,
+                    label: None,
+                    inverse: None,
                 },
             );
         }

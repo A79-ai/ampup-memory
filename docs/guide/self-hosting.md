@@ -108,7 +108,8 @@ branch's tree each round, with the token `github` uses. Each is a version of the
 `repo-skills/OWNER/REPO/<path>` (source `github:OWNER/REPO#skill/<path>`), written again only when its blob changed.
 A session's skill uses are read from its transcript as it ends; `/skills/review` (`list`, `get`, `review`) grades a
 skill by what came of those sessions and the votes on `skill:<name>` (`/feedback`), and `review` writes a proposed
-revision under `skill-proposals/` for the skill's readers. A file removed from the repository stays in memory.
+revision under `skill-proposals/` for the skill's readers (`list` with `proposed: true` lists only the skills that
+have one). A file removed from the repository stays in memory.
 `serve` also reviews by itself, every `AMPUP_MEMORY_SKILL_REVIEW_SECS` (default an hour), in every org that doesn't
 set `skill_review` false: a repository's skill or a compiled one, once it has new evidence since its last review
 (five sessions that used it, one that failed, a new vote against it, or the skill changed), at most once a day a skill

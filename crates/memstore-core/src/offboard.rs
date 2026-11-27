@@ -2001,6 +2001,8 @@ impl Store {
                     .collect())
             })
             .await?;
+        // That they read the scope's Home lately ([`crate::recent_readers`]), and how they signed in to.
+        self.forget_recent_reader(ns, user).await?;
         // So is the feedback they gave.
         let voted = self
             .rewrite_table(ns, FEEDBACK, &mut |b| {
@@ -3469,6 +3471,12 @@ pub async fn forget_user(
         for ns in store.org_namespaces(o).await? {
             still(&Directory::fresh(store).await?)?;
             total.add(&store.forget_in_with(&ns, &user, sole_reader).await?);
+        }
+        // Last, out of every scope's recent Home readers again: a server that read the directory before the removal
+        // may have written them into a scope's file after its forget above (each server checks the directory again
+        // after it writes, which covers a write after this).
+        for ns in store.org_namespaces(o).await? {
+            store.forget_recent_reader(&ns, &user).await?;
         }
         let detail = serde_json::to_string(&total)?;
         let tomb = store

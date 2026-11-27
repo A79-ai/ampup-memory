@@ -54,7 +54,9 @@
       "person"
      ],
      "card": "many",
-     "description": "a prospect who says they want this or will push for it"
+     "description": "a prospect who says they want this or will push for it",
+     "label": "backed by",
+     "inverse": "backs"
     },
     "competitor": {
      "type": "string",
@@ -193,7 +195,9 @@
      "to": [
       "deal"
      ],
-     "same_as": "about"
+     "same_as": "about",
+     "label": "about",
+     "inverse": "commitments"
     }
    }
   },
@@ -227,7 +231,9 @@
      "to": [
       "deal"
      ],
-     "same_as": "about"
+     "same_as": "about",
+     "label": "raised on",
+     "inverse": "objections"
     },
     "response": {
      "type": "string",
@@ -263,7 +269,9 @@
       "person"
      ],
      "card": "many",
-     "description": "Written by the engine, not the model: calendar metadata, not extraction."
+     "description": "Written by the engine, not the model: calendar metadata, not extraction.",
+     "label": "invited",
+     "inverse": "invited to"
     },
     "attended_by": {
      "type": "ref",
@@ -273,7 +281,9 @@
       "person"
      ],
      "card": "many",
-     "description": "Written by the engine, not the model: who spoke in the recording, not extraction."
+     "description": "Written by the engine, not the model: who spoke in the recording, not extraction.",
+     "label": "attended by",
+     "inverse": "meetings"
     },
     "scheduled_at": {
      "type": "timestamp",

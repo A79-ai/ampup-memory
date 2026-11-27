@@ -319,7 +319,7 @@ pub const MCP_WRITES: [&str; 3] = [
 /// `memstore_http_requests_total` and the slow-request line), so a latency dashboard tells the console's pages and
 /// the hooks apart. Not in [`ROUTES`]: the audit log's routes are what analytics reads (the control plane's
 /// funnel counts `other` as a hook's call and `/document` as an upload), so they stay as they are.
-const METRIC_ROUTES: [&str; 20] = [
+const METRIC_ROUTES: [&str; 21] = [
     "/mcp/hook",
     "/lessons",
     "/facts",
@@ -340,6 +340,7 @@ const METRIC_ROUTES: [&str; 20] = [
     "/close",
     "/doctor",
     "/digest/preview",
+    "/skills/review",
 ];
 
 /// A request path as a metric's `route` label: one of the server's routes ([`route`], or one only metrics name),

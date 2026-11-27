@@ -216,11 +216,24 @@ impl Searches {
         let any = all.clone().acquire_owned().await.ok();
         let waited = t.elapsed();
         if waited >= SEARCH_WAIT_SAID {
+            // Whose searches ran or waited meanwhile: each caller's searches under way (running or waiting).
+            let mut by: Vec<(String, usize)> = self
+                .lanes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, l)| (said(k), Arc::strong_count(l) - 1))
+                .filter(|(_, n)| *n > 0)
+                .collect();
+            by.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let by: Vec<String> = by.into_iter().map(|(k, n)| format!("{k} {n}")).collect();
             eprintln!(
-                "search: waited {} ms for a turn ({} at once on this server, {} a caller)",
+                "search: waited {} ms for a turn for {} ({} at once on this server, {} a caller; under way by caller: {})",
                 waited.as_millis(),
+                said(who),
                 self.cap,
-                self.per_caller
+                self.per_caller,
+                by.join(", ")
             );
         }
         SearchTurn {
@@ -228,6 +241,14 @@ impl Searches {
             mine,
             lane: Some((who.to_string(), self.lanes.clone(), self.per_caller)),
         }
+    }
+}
+
+/// A search lane's key as a log line says it: a key by the start of its hash.
+fn said(lane: &str) -> String {
+    match lane.strip_prefix("key:") {
+        Some(h) => format!("key:{}", &h[..h.len().min(12)]),
+        None => lane.to_string(),
     }
 }
 

@@ -26,7 +26,9 @@
 //! Requests: `{"op": "ls", "path": [...], "limit"?, "after"?}` lists a folder (children sorted by name,
 //! `after` the last name of the previous page) or, at `entities/<type>/<key>`, the entity's facts; at `entities`
 //! and `entities/<type>`, `"from"` (source prefixes) and `"by"` (a person, for the org's admins) narrow the
-//! entities and their counts to what was learned from those sources or that person ([`Narrow`]);
+//! entities and their counts to what was learned from those sources or that person ([`Narrow`]), and `"sources":
+//! true` at `entities` counts each type's records by source, `"facts": true` at `entities/<type>` lists each record's
+//! current facts with it ([`With`]);
 //! `{"op": "sources", "prefixes"?, "top"?}` says what each source taught the memory (`crate::learned_from`);
 //! `{"op": "entity", "path": [...]}` reads one entity as its page shows it (`crate::entity_page`);
 //! `{"op": "episode", "id": "..."}` reads one episode with the facts that cite it; `{"op": "branches"}` names
@@ -35,7 +37,8 @@
 //! the scope's schema on the branch read, with every version committed there; `{"op": "lessons", …}` what it
 //! learned, lesson by lesson, with each one's trail (`crate::lessons`, also `POST /lessons`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -196,18 +199,20 @@ pub async fn run(
                 .clamp(1, MAX_LIMIT);
             let after = req["after"].as_str();
             let narrow = Narrow::of(req, reader)?;
-            // The entities and their types, the sessions and the skills, unnarrowed: kept ([`entities_kept`]).
+            let with = With::of(req, &path)?;
+            // The entities and their types, the sessions, the sources, the notes and the skills, unnarrowed: kept
+            // ([`entities_kept`]).
             if narrow.is_empty()
                 && match path.first().map(String::as_str) {
                     Some("entities") => path.len() <= 2,
-                    Some("sessions") => true,
-                    Some("skills") => path.len() == 1,
+                    Some("sessions" | "sources") => true,
+                    Some("skills" | "notes") => path.len() == 1,
                     _ => false,
                 }
             {
-                return entities_kept(store, session, reader, &path, limit, after).await;
+                return entities_kept(store, session, reader, &path, limit, after, with).await;
             }
-            ls(store, session, reader, &path, limit, after, &narrow).await
+            ls(store, session, reader, &path, limit, after, &narrow, with).await
         }
         // What each source taught the memory: its episodes, the facts drawn from them and the entities they are
         // about (`crate::learned_from`).
@@ -231,8 +236,10 @@ pub async fn run(
             )?;
             crate::names::attach(store, session, who, page, &eps).await
         }
-        // `build: false`: the branches not built are left so, not built in the background for the next listing.
-        "branches" => branches(store, session.scope(), who, req["build"] != false).await,
+        // `build: true`: the branches not built are built in the background for the next listing. Not by default:
+        // each is a build of the whole memory, and a server keeps only a few branches' states, so a listing that
+        // built every branch built most of them for nothing, each time it was asked.
+        "branches" => branches(store, session.scope(), who, req["build"] == true).await,
         // The schema the memory is typed with on the branch read, and every version committed there (oldest
         // first): it holds no memory, only the types and what its `extract` section names.
         // `history: false`: only how many versions there are (`versions`), not each of them (a page counting them
@@ -264,8 +271,8 @@ async fn branches(store: &Store, scope: &Scope, who: &Principal, build: bool) ->
         names.push(crate::MAIN.to_string());
     }
     // Main as a request's reads pin it; another branch only as a state already built ([`Store::pin_if_built`]): a
-    // listing waits for no branch's build. A branch without one has its skills unknown (null) and is built in the
-    // background, one branch at a time, for the next listing.
+    // listing waits for no branch's build. A branch without one has its skills unknown (null), and with `build` is
+    // built in the background, one branch at a time, for the next listing.
     let pinned = futures::future::try_join_all(names.iter().map(|b| async move {
         match b == crate::MAIN {
             true => store.pin_lagging(scope, b).await.map(Some),
@@ -290,6 +297,54 @@ async fn branches(store: &Store, scope: &Scope, who: &Principal, build: bool) ->
         store.build_later(scope, unbuilt);
     }
     Ok(json!({"branches": out}))
+}
+
+/// What a listing of entities carries beside each child, in the one read (the Team page's ontology):
+/// - `sources: true` at `entities`: each type's records by the source they were learned from (`{"slack": 12}`), as
+///   one read of `entities` narrowed to each source (`from: "<source>:"`) would count them: a record counts under
+///   every source of the episodes its facts cite, of those episodes the caller may read.
+/// - `facts: true` at `entities/<type>`: each listed record's current facts (no `valid_to`), their predicate and value
+///   alone: what a sample of the record shows, in place of listing each record (`entities/<type>/<key>`) after.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct With {
+    sources: bool,
+    facts: bool,
+}
+
+impl With {
+    fn of(req: &Value, path: &[String]) -> Result<With> {
+        let flag = |k: &str| match &req[k] {
+            Value::Null | Value::Bool(false) => Ok(false),
+            Value::Bool(true) => Ok(true),
+            _ => Err(bad(format!("{k} is true or false"))),
+        };
+        let with = With {
+            sources: flag("sources")?,
+            facts: flag("facts")?,
+        };
+        let at = |n: usize| path.first().map(String::as_str) == Some("entities") && path.len() == n;
+        if with.sources && !at(1) {
+            return Err(bad(
+                "sources is for a listing of entities' types (path [\"entities\"])",
+            ));
+        }
+        if with.facts && !at(2) {
+            return Err(bad(
+                "facts is for a listing of one type's entities (path [\"entities\", type])",
+            ));
+        }
+        Ok(with)
+    }
+
+    /// As a kept answer's key has it.
+    fn key(self) -> &'static str {
+        match (self.sources, self.facts) {
+            (false, false) => "",
+            (true, false) => "sources",
+            (false, true) => "facts",
+            (true, true) => "sources facts",
+        }
+    }
 }
 
 /// What the Explorer's lists of entities are narrowed to (`ls` at `entities` and `entities/<type>`): the facts
@@ -367,13 +422,13 @@ impl Narrow {
 
 /// Each reader's advice page (`advice_usage`), by memory state and answer log.
 static USAGE: std::sync::LazyLock<crate::kept_answers::Kept<Value>> =
-    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500));
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500).however_old());
 
 /// `advice_usage` over the last `days` (none: all), of every note or only `note`, kept by memory state and the scope's
 /// answer log ([`crate::kept_answers`]): it reads every note the reader may read and every session logged. Kept by
 /// the reader (who, every group they read as, and whether they read everyone's sessions), the note and the days asked
-/// for. A window of days ends when the answer was worked out ([`crate::kept_answers::At::windowed`]), never more than
-/// [`crate::kept_answers::SUMMARY_STALE`] before now.
+/// for. A window of days ends when the answer was worked out ([`crate::kept_answers::At::windowed`]): one answered
+/// while the next is worked out ends its window then, and the next read's ends it now.
 async fn usage_kept(
     store: &Store,
     scope: &crate::Scope,
@@ -423,20 +478,20 @@ async fn usage_kept(
     Ok((*usage).clone())
 }
 
-/// Each reader's listing of the entity types, of one type's entities, of their sessions or of the skills, by memory
-/// state (none: no such type or folder).
+/// Each reader's listing of the entity types, of one type's entities, of their sessions, of the sources, of the notes
+/// or of the skills, by memory state (none: no such type or folder).
 static ENTITIES: std::sync::LazyLock<crate::kept_answers::Kept<Option<Value>>> =
-    std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(500));
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::new(500).however_old());
 
-/// [`ENTITIES`] for the skills (`ls skills`): the Skills page's list, a page's summary kept for a return visit within
-/// the hour ([`crate::kept_answers::Kept::summary`]).
+/// [`ENTITIES`] for the skills (`ls skills`): the Skills page's list, a page's summary answered at once on a return visit
+/// however long after while the next is worked out ([`crate::kept_answers::Kept::however_old`]).
 static SKILLS: std::sync::LazyLock<crate::kept_answers::Kept<Option<Value>>> =
-    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500));
+    std::sync::LazyLock::new(|| crate::kept_answers::Kept::summary(500).however_old());
 
-/// `ls` of `entities` or `entities/<type>`, of `sessions` (and its folders) or of `skills`, unnarrowed, kept by memory
-/// state ([`crate::kept_answers`]) for main as it is now: listing them reads every fact, every episode or every
-/// routing index the reader may read. Kept by the reader (who, and every group they read
-/// as) and what they listed (the path, the page); a read of a branch or of a past state lists them itself.
+/// `ls` of `entities` or `entities/<type>`, of `sessions` or `sources` (and their folders), of `notes` or of `skills`,
+/// unnarrowed, kept by memory state ([`crate::kept_answers`]) for main as it is now: listing them reads every fact,
+/// every episode or every routing index the reader may read. Kept by the reader (who, and every group they read as)
+/// and what they listed (the path, the page); a read of a branch or of a past state lists them itself.
 async fn entities_kept(
     store: &Store,
     session: &Session,
@@ -444,6 +499,7 @@ async fn entities_kept(
     path: &[String],
     limit: usize,
     after: Option<&str>,
+    with: With,
 ) -> Result<Value> {
     let at = match session.on_main_now() {
         true => {
@@ -464,14 +520,19 @@ async fn entities_kept(
             limit,
             after,
             &Narrow::default(),
+            with,
         )
         .await;
     };
     let key = format!(
-        "{}\n{}\n{limit}\n{}",
+        "{}\n{}\n{limit}\n{}{}",
         crate::kept_answers::reader_key(reader.who),
         path.join("\u{1f}"),
-        after.unwrap_or_default()
+        after.unwrap_or_default(),
+        match with.key() {
+            "" => String::new(),
+            k => format!("\n{k}"),
+        }
     );
     let (store2, session2, who, every) = (
         store.clone(),
@@ -505,6 +566,7 @@ async fn entities_kept(
                     limit,
                     after.as_deref(),
                     &narrow,
+                    with,
                 )
                 .await
                 {
@@ -520,6 +582,119 @@ async fn entities_kept(
     }
 }
 
+/// Listings worked out at once that read every fact or every episode the reader may read
+/// (`AMPUP_MEMORY_WHOLE_LISTINGS`, default 3; 0 no cap). One holds an async worker for its CPU for 1-3 s on a large
+/// org, decoding and copying each fact or episode, and a page asks for several at once. On staging ampup a burst of
+/// seven, when a new server met Studio with nothing kept, held all eight of the runtime's workers for 1.5-7 s, and
+/// every other request (`/ready` too) waited that long for a worker before it started. Past the cap a listing waits
+/// its turn without holding a worker, so the rest of the server keeps answering.
+static WHOLE_LISTINGS: std::sync::LazyLock<Option<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        let n = std::env::var("AMPUP_MEMORY_WHOLE_LISTINGS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3);
+        (n > 0).then(|| tokio::sync::Semaphore::new(n))
+    });
+
+/// One read of every fact and of every episode a reader may see at one memory state, shared by the whole listings
+/// worked out side by side ([`Pass::join`]): Studio asks for the entities, notes, sessions and sources and the root's
+/// counts at once, and each read every episode (or every fact) again, a second or more of CPU each on a large org.
+/// Kept only while a listing that joined it is worked out: none of it outlives them.
+#[derive(Default)]
+struct Pass {
+    facts: tokio::sync::OnceCell<Arc<Vec<Fact>>>,
+    episodes: tokio::sync::OnceCell<Arc<Vec<Ep>>>,
+}
+
+/// The passes being worked out, by memory state (its visibility's address), scope and reader: each with the state
+/// it is of, so an address reused by a later state never answers for it.
+type Passes =
+    HashMap<(usize, String, String), (std::sync::Weak<crate::Vis>, std::sync::Weak<Pass>)>;
+
+static PASSES: std::sync::LazyLock<std::sync::Mutex<Passes>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl Pass {
+    /// The pass of `who` at `session`'s state, joined while a listing beside it holds it, else a new one.
+    fn join(session: &Session, who: &Principal) -> Arc<Pass> {
+        let vis = session.vis_arc();
+        let key = (
+            Arc::as_ptr(vis) as usize,
+            session.scope().namespace(),
+            crate::kept_answers::reader_key(who),
+        );
+        let mut passes = PASSES.lock().unwrap();
+        passes.retain(|_, (_, pass)| pass.strong_count() > 0);
+        if let Some((of, pass)) = passes.get(&key)
+            && of.upgrade().is_some_and(|of| Arc::ptr_eq(&of, vis))
+            && let Some(pass) = pass.upgrade()
+        {
+            return pass;
+        }
+        let pass = Arc::new(Pass::default());
+        passes.insert(key, (Arc::downgrade(vis), Arc::downgrade(&pass)));
+        pass
+    }
+
+    /// [`facts`], read once for the pass.
+    async fn facts(
+        &self,
+        store: &Store,
+        session: &Session,
+        who: &Principal,
+    ) -> Result<Arc<Vec<Fact>>> {
+        let mut read = false;
+        let got = self
+            .facts
+            .get_or_try_init(|| {
+                read = true;
+                async { facts(store, session, who).await.map(Arc::new) }
+            })
+            .await?;
+        if !read {
+            crate::phases::mark("facts from the pass");
+        }
+        Ok(got.clone())
+    }
+
+    /// [`episodes`], read once for the pass.
+    async fn episodes(
+        &self,
+        store: &Store,
+        session: &Session,
+        who: &Principal,
+    ) -> Result<Arc<Vec<Ep>>> {
+        let mut read = false;
+        let got = self
+            .episodes
+            .get_or_try_init(|| {
+                read = true;
+                async { episodes(store, session, who).await.map(Arc::new) }
+            })
+            .await?;
+        if !read {
+            crate::phases::mark("episodes from the pass");
+        }
+        Ok(got.clone())
+    }
+}
+
+/// A turn at working out a listing of every fact or episode ([`WHOLE_LISTINGS`]), held while it is worked out: none
+/// with no cap. A wait for one is marked in the phases of the request, or of the background work it is
+/// ([`crate::kept_answers`] logs slow work with its phases).
+async fn whole_listing_turn() -> Option<tokio::sync::SemaphorePermit<'static>> {
+    let turns = WHOLE_LISTINGS.as_ref()?;
+    if let Ok(turn) = turns.try_acquire() {
+        return Some(turn);
+    }
+    // Never closed, so acquire can't fail.
+    let turn = turns.acquire().await.unwrap();
+    crate::phases::mark("listing turn waited");
+    Some(turn)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn ls(
     store: &Store,
     session: &Session,
@@ -528,8 +703,37 @@ async fn ls(
     limit: usize,
     after: Option<&str>,
     narrow: &Narrow,
+    with: With,
 ) -> Result<Value> {
     let who = reader.who;
+    // The listings that read every fact or every episode share those reads with the others worked out beside them
+    // ([`Pass`]), joined before their turn so one waiting for it keeps the reads of those before it.
+    let whole = match path.first().map(String::as_str) {
+        Some("entities") => path.len() < 3,
+        Some("notes" | "sessions" | "sources") => true,
+        _ => false,
+    };
+    let pass = match whole {
+        true => Pass::join(session, who),
+        false => Default::default(),
+    };
+    // They take a turn too ([`WHOLE_LISTINGS`]); the root (its counts are worked out in the background,
+    // [`count_root`]), one entity, the skills and the advice don't.
+    let _turn = match path.first().map(String::as_str) {
+        Some("entities") if path.len() < 3 => {
+            crate::phases::mark("ls entities");
+            whole_listing_turn().await
+        }
+        Some(listing @ ("notes" | "sessions" | "sources")) => {
+            crate::phases::mark(match listing {
+                "notes" => "ls notes",
+                "sessions" => "ls sessions",
+                _ => "ls sources",
+            });
+            whole_listing_turn().await
+        }
+        _ => None,
+    };
     let page = |mut children: Vec<Value>| {
         children.retain(|c| after.is_none_or(|a| c["name"].as_str().unwrap_or_default() > a));
         let more = children.len() > limit;
@@ -557,7 +761,7 @@ async fn ls(
         Some("skills") => skills(store, session, who, path, page).await,
         // The notes: no folders, each one its fact.
         Some("notes") if path.len() == 1 => {
-            let eps = episodes(store, session, who).await?;
+            let eps = pass.episodes(store, session, who).await?;
             let children = notes(store, session, who, &eps)
                 .await?
                 .iter()
@@ -572,7 +776,7 @@ async fn ls(
             Ok(page(children))
         }
         Some("sessions") => {
-            let eps = episodes(store, session, who).await?;
+            let eps = pass.episodes(store, session, who).await?;
             let leaves = filed(&eps, who);
             let children = folder(path, &leaves)?;
             titled(store, session.scope(), page(children)).await
@@ -640,7 +844,7 @@ async fn ls(
         }
         Some("sources") => {
             let at: Vec<&str> = path[1..].iter().map(String::as_str).collect();
-            let eps = episodes(store, session, who).await?;
+            let eps = pass.episodes(store, session, who).await?;
             let under: Vec<&Ep> = eps
                 .iter()
                 .filter(|e| listed_source(&e.source) && e.segments().starts_with(&at))
@@ -708,17 +912,28 @@ async fn ls(
                       "facts": fs.iter().map(|f| fact_json(f)).collect::<Vec<_>>()}))
         }
         Some("entities") => {
-            let mut facts = facts(store, session, who).await?;
             // Named from every fact the caller may read, the narrowing aside: a name from another source is still
             // theirs to read.
-            let shown = if path.len() == 2 {
-                crate::query::schema::display_names(&facts, crate::now_micros())
-            } else {
-                Default::default()
+            let names = |facts: &[Fact]| match path.len() == 2 {
+                true => crate::query::schema::display_names(facts, crate::now_micros()),
+                false => Default::default(),
             };
-            if !narrow.is_empty() {
-                facts = narrow.keep(store, session, who, facts).await?;
-            }
+            // Narrowed, its own read (the narrowing keeps what it reads); else the pass's.
+            let (facts, shown) = match narrow.is_empty() {
+                true => {
+                    let facts = pass.facts(store, session, who).await?;
+                    let shown = names(&facts);
+                    (facts, shown)
+                }
+                false => {
+                    let facts = facts(store, session, who).await?;
+                    let shown = names(&facts);
+                    (
+                        Arc::new(narrow.keep(store, session, who, facts).await?),
+                        shown,
+                    )
+                }
+            };
             let entities = by_entity(&facts);
             match &path[1..] {
                 [] => {
@@ -726,11 +941,22 @@ async fn ls(
                     for (t, _) in entities.keys() {
                         *types.entry(t).or_default() += 1;
                     }
+                    let by_source = match with.sources {
+                        true => Some(by_source(
+                            &entities,
+                            &pass.episodes(store, session, who).await?,
+                        )),
+                        false => None,
+                    };
                     Ok(page(
                         types
                             .into_iter()
                             .map(|(t, n)| {
-                                json!({"name": t, "kind": "folder", "path": ["entities", t], "count": n})
+                                let mut c = json!({"name": t, "kind": "folder", "path": ["entities", t], "count": n});
+                                if let Some(by) = &by_source {
+                                    c["sources"] = json!(by.get(t).cloned().unwrap_or_default());
+                                }
+                                c
                             })
                             .collect(),
                     ))
@@ -756,7 +982,21 @@ async fn ls(
                     if children.is_empty() && narrow.is_empty() {
                         return Err(NotFound.into());
                     }
-                    named(store, session, who, page(children)).await
+                    let mut listed = page(children);
+                    if with.facts {
+                        for c in listed["children"].as_array_mut().into_iter().flatten() {
+                            let k = c["name"].as_str().unwrap_or_default();
+                            let held: Vec<Value> = entities
+                                .get(&(t.as_str(), k))
+                                .into_iter()
+                                .flatten()
+                                .filter(|f| f.valid_to.is_none())
+                                .map(|f| json!({"predicate": f.predicate, "value": f.value}))
+                                .collect();
+                            c["facts"] = json!(held);
+                        }
+                    }
+                    named(store, session, who, listed).await
                 }
                 _ => Err(NotFound.into()),
             }
@@ -1017,12 +1257,54 @@ fn by_entity(facts: &[Fact]) -> BTreeMap<(&str, &str), Vec<&Fact>> {
     out
 }
 
+/// Each type's records by the source they were learned from ([`With::sources`]): a record counts once under each
+/// source (the first part of its name, `slack` of `slack:C09`) of the episodes its facts cite, of `eps`, the episodes
+/// the caller may read; an engine's own episodes name no source.
+fn by_source(
+    entities: &BTreeMap<(&str, &str), Vec<&Fact>>,
+    eps: &[Ep],
+) -> BTreeMap<String, BTreeMap<String, usize>> {
+    let source: HashMap<&str, &str> = eps
+        .iter()
+        .filter(|e| listed_source(&e.source))
+        .filter_map(|e| Some((e.id.as_str(), e.source.split_once(':')?.0)))
+        .collect();
+    let mut out: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    for ((t, _), fs) in entities {
+        let from: std::collections::BTreeSet<&str> = fs
+            .iter()
+            .flat_map(|f| f.source_episodes.iter())
+            .filter_map(|e| source.get(e.as_str()).copied())
+            .collect();
+        for s in from {
+            *out.entry(t.to_string())
+                .or_default()
+                .entry(s.to_string())
+                .or_default() += 1;
+        }
+    }
+    out
+}
+
 /// Every fact the caller may read, over all valid time (history included), once each: a corpus loaded
 /// twice into one catalog commits each fact twice, under the same id.
 /// The facts `entities/` files: every one the caller may read but the notes', which `notes` lists.
 pub(crate) async fn facts(store: &Store, session: &Session, who: &Principal) -> Result<Vec<Fact>> {
-    let mut facts = once_each(session.read(store, who, None).await?);
-    facts.retain(|f| !crate::is_note_fact(f));
+    // As [`Session::read`], its two steps marked apart: the table's rows (kept by the store), then each decoded.
+    let rows = store
+        .rows(&session.scope().namespace(), crate::FACTS)
+        .await?;
+    crate::phases::mark("facts table read");
+    // Seconds of CPU on a large org: off the async workers ([`crate::running::cpu`]).
+    let many = rows.rows.iter().map(|b| b.num_rows()).sum::<usize>() >= crate::running::CPU_ROWS;
+    let facts = crate::running::cpu(many, || {
+        let read = session.read_rows(&rows.rows, who, None);
+        crate::phases::mark("facts decoded");
+        let mut facts = once_each(read);
+        facts.retain(|f| !crate::is_note_fact(f));
+        facts
+    });
+    crate::phases::mark("facts once each");
     Ok(facts)
 }
 
@@ -1277,14 +1559,17 @@ async fn engine_path(
 
 /// Counts the root's folders: the episodes (and from them the notes), the facts and the advice read side by side.
 async fn count_root(store: &Store, session: &Session, who: &Principal) -> Result<Counts> {
+    // It reads every fact and every episode, as the listings do ([`Pass`], [`WHOLE_LISTINGS`]).
+    let pass = Pass::join(session, who);
+    let _turn = whole_listing_turn().await;
     let read_eps = async {
-        let eps = episodes(store, session, who).await?;
+        let eps = pass.episodes(store, session, who).await?;
         let notes = notes(store, session, who, &eps).await?.len();
         crate::phases::mark("ls episodes+notes");
         anyhow::Ok((eps, notes))
     };
     let read_facts = async {
-        let n = by_entity(&facts(store, session, who).await?).len();
+        let n = by_entity(&pass.facts(store, session, who).await?).len();
         crate::phases::mark("ls facts");
         anyhow::Ok(n)
     };
@@ -1484,12 +1769,21 @@ async fn titled(store: &Store, scope: &Scope, mut listed: Value) -> Result<Value
 /// Every committed episode the session sees that the caller may read, once each.
 pub(crate) async fn episodes(store: &Store, session: &Session, who: &Principal) -> Result<Vec<Ep>> {
     let files = store.episode_files(session.scope()).await?;
-    Ok(episodes_in(&files, session, who))
+    crate::phases::mark("episode files read");
+    let many = files
+        .values()
+        .flat_map(|bs| bs.iter())
+        .map(|b| b.num_rows())
+        .sum::<usize>()
+        >= crate::running::CPU_ROWS;
+    let eps = crate::running::cpu(many, || episodes_in(&files, session, who));
+    crate::phases::mark("episodes listed");
+    Ok(eps)
 }
 
 /// [`episodes`] of the episodes table's files as already read ([`Store::episode_files`]).
 pub(crate) fn episodes_in(
-    files: &std::collections::HashMap<String, std::sync::Arc<Vec<arrow_array::RecordBatch>>>,
+    files: &std::collections::HashMap<String, Arc<Vec<arrow_array::RecordBatch>>>,
     session: &Session,
     who: &Principal,
 ) -> Vec<Ep> {

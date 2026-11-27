@@ -3078,13 +3078,15 @@ async fn run_with(
             break;
         }
         if reconciling.is_none() {
-            let engine = store
-                .fact_authors(scope)
-                .await?
-                .into_iter()
-                .filter(|(_, a)| a.starts_with("extract:"))
-                .map(|(f, _)| f)
-                .collect();
+            let authors = store.fact_authors(scope).await?;
+            // Every fact's id, copied into a set: off the async workers on a large scope.
+            let engine = crate::running::cpu(authors.len() >= crate::running::CPU_ROWS, || {
+                authors
+                    .into_iter()
+                    .filter(|(_, a)| a.starts_with("extract:"))
+                    .map(|(f, _)| f)
+                    .collect()
+            });
             reconciling = Some((engine, crate::conflicts::on(store, scope).await));
         }
         let Some((engine, conflicts)) = reconciling.as_mut() else {

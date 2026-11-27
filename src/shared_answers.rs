@@ -16,31 +16,32 @@
 //!   nothing between its state and the state the server reading it would read now, and never past its expiry or
 //!   across an hour's turn. Fail-closed: what can't be read or told refuses, and the answer is worked out as on a
 //!   miss.
-//!   - Every table a visibility state is built from ([`VIS`]) and the scope's rows in the ledger must be as they
-//!     were. A removal there is mostly an *append*: a retraction or a withdrawal is a row added to the
-//!     retractions; a forget or a narrowed ACL writes the episode again (the same id, as its id hashes its source and
-//!     body, not its ACL), through the same append a new episode takes, and so may a plain write from a connector;
-//!     a new version of a document with a narrower ACL hides the old one under a new id; a forget of a sentence is a
-//!     quote added; a merge adds only a ledger row, and can bring a branch's rows written long before. Which
-//!     appended rows take something away is told only against the state before them ([`crate::Store::main_lost_nothing`]),
-//!     which a server that hasn't built that state doesn't have. So any write to them refuses: a stored answer is
-//!     answered only while the scope committed nothing since it but the answer log's commits. Every answer logged
-//!     (and every session's step) commits one, so a busy memory's ledger moves every few seconds; each makes only
-//!     its own answer-log rows readable, and the ledger's rows are compared with those commits left out
-//!     ([`without_answers`]).
-//!   - The directory (one table for every org) must be as stored too: a member removed, an admin demoted or an
-//!     org's setting turned off is a row written there, and which of them narrows a part's answer isn't told apart
-//!     here. It moves rarely beside commits.
-//!   - Every other table it reads (the facts, the summaries, the extraction records, the answer log) may have moved
-//!     only by appends: each snapshot from the stored one to the current one is an Iceberg `append`
-//!     ([`appended_since`]). Those take nothing away: a fact is read only once its commit is committed (a commit
-//!     moves the ledger, above), and the summaries and the records only grow between rewrites. The answer log grows
-//!     too: an admin's clear of empty sessions, or a name or grade one person gives another's entry, is a row
-//!     added, which a stored answer's activity may not show until the next is worked out; nothing a reader may no
-//!     longer read is in it (an erasure rewrites it). A rewrite (a compaction, an erasure, an offboarding) refuses,
-//!     as does a stored snapshot no longer in the table's history (`AMPUP_MEMORY_MAINTAIN_KEEP` keeps the newest 10
-//!     to 20). The process-local loss signals ([`crate::Vis::removals`], the facts generation) are none of it: each
-//!     is a counter of one process, and a first build takes a fresh one.
+//!   - A removal is mostly an *append*: a retraction or a withdrawal is a row added to the retractions; a forget or
+//!     a narrowed ACL writes the episode again (the same id, as its id hashes its source and body, not its ACL),
+//!     through the same append a new episode takes; a new version of a document with a narrower ACL hides the old
+//!     one under a new id; a forget of a sentence is a quote added; a merge adds only a ledger row, and can bring a
+//!     branch's rows written long before; and memstore commits its rewrites (a compaction, an erasure, an
+//!     offboarding) as a fast append too. Which appended rows take something away is told only against the state
+//!     before them, which a server that hasn't built that state doesn't have. So the writer says it: a commit
+//!     checked to only add marks each append it makes ([`crate::ADDS_ONLY_PROP`]), and nothing else is marked.
+//!   - Every table the part reads, [`VIS`]'s too, may have moved only by snapshots so marked, from the stored one
+//!     ([`added_only_since`]): a snapshot without the mark (a removal, a rewrite, a write of an older binary)
+//!     refuses, as does a stored snapshot no longer in the table's history (`AMPUP_MEMORY_MAINTAIN_KEEP` keeps the
+//!     newest 10 to 20). The directory (one table for every org) must be as stored: a member removed, an admin
+//!     demoted or a setting turned off is a row written there, and it moves rarely.
+//!   - The scope's rows in the ledger may have gained only the commits the marks name, each placed where it was
+//!     checked ([`Last::holds`]): a merge, a forget or any commit no mark names leaves them unlike the stored rows.
+//!   - What is marked: a commit on main of new episodes only (no row of the episodes table has the id; not a
+//!     document's version, nor the engine's own record), with only those episodes' note facts and extraction records,
+//!     and no closure (`memstore_core`'s `adds_only_tag`, checked against main's heads, which the commit's ledger row
+//!     must then name); a person's new answer, whose row starts its entry (not a later row of one: a rating, a
+//!     reward, a session's step or end, which is read in place of the earlier and may take from it). Not marked:
+//!     every session row, extraction's facts (one may be an old fact written again under its id, or a newer value of
+//!     a one-valued predicate, which hides the older), an extraction record of an episode read before, summaries (a
+//!     newer one is read in place of the older), closures, retractions, forgets, ACL changes, versions, merges, the
+//!     engine's records, feedback, schema, retention and governance writes, and every rewrite. The process-local loss
+//!     signals ([`crate::Vis::removals`], the facts generation) are none of it: each is a counter of one process, and
+//!     a first build takes a fresh one.
 //!   - Answered while moved, the answer is the last one memory lost nothing since, as a kept answer is
 //!     ([`crate::kept_answers`]): its numbers may miss what was added since, and the asker's next answer is worked out
 //!     in the background.
@@ -77,7 +78,7 @@
 //! No caller reads or puts answers yet (Home's wiring does): the store a server installs ([`ObjectAnswers`]) and
 //! the purges are in place.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -848,8 +849,8 @@ pub fn part_tables(part: &str) -> Option<&'static [Table]> {
 pub struct Snapshots {
     /// By `<namespace>.<table>`: the table's label ([`Snapshots::read`]).
     ids: HashMap<String, String>,
-    /// The ledger's rows its label was worked out from, kept to label them again without the answer log's commits
-    /// ([`without_answers`]).
+    /// The ledger's rows its label was worked out from, kept to label them again without the commits that only add
+    /// ([`Last::holds`]) and to read those commits' parents.
     ledger: LedgerRows,
 }
 
@@ -923,13 +924,10 @@ impl Snapshots {
     }
 }
 
-/// The actor of every ledger row the answer log's commits make (`qa_log`'s `write_qa_rows`), before who logged.
-const ANSWER_LOG_ACTOR: &str = "log_answer:";
-
 /// A label of namespace `ns`'s own rows in the ledger `rows`: `<rows>:<sha256>`, the SHA-256 over each row's own
-/// SHA-256 (every column, each length-prefixed, a null marked apart from any value), sorted. Rows whose commit is in
-/// `skip` are left out when they are the answer log's ([`ANSWER_LOG_ACTOR`], on main). The same on every server for
-/// the same rows. Worked out once per ledger read for the whole ledger ([`ledger_label`]).
+/// SHA-256 (every column, each length-prefixed, a null marked apart from any value), sorted. Rows of the commits in
+/// `skip` are left out. The same on every server for the same rows. Worked out once per ledger read for the whole
+/// ledger ([`ledger_label`]).
 fn rows_label(batches: &[RecordBatch], ns: &str, skip: &HashSet<String>) -> String {
     use arrow_array::Array;
     use arrow_array::cast::AsArray;
@@ -949,10 +947,7 @@ fn rows_label(batches: &[RecordBatch], ns: &str, skip: &HashSet<String>) -> Stri
             if scope.is_null(i) || scope.value(i) != ns {
                 continue;
             }
-            if value(0, i).is_some_and(|id| skip.contains(id))
-                && value(1, i) == Some(crate::MAIN)
-                && value(2, i).is_some_and(|a| a.starts_with(ANSWER_LOG_ACTOR))
-            {
+            if value(0, i).is_some_and(|id| skip.contains(id)) {
                 continue;
             }
             let mut h = Sha256::new();
@@ -999,44 +994,6 @@ async fn ledger_label(rows: Arc<Vec<RecordBatch>>, ns: &str) -> Result<String> {
     labels.retain(|_, (of, _)| of.strong_count() > 0);
     labels.insert(ns.to_string(), (Arc::downgrade(&rows), label.clone()));
     Ok(label)
-}
-
-/// [`rows_label`] of `scope`'s rows in the ledger `snapshots` read, without the answer log's commits: each commit
-/// some row of `scope`'s answer log holds, as this server reads that log now (after the ledger, which a commit
-/// reaches only once its rows are written). Only `qa_log`'s `write_qa_rows` writes that table, each time under a
-/// commit id of its own, and that commit makes only those rows readable: a ledger whose rows, these left out, are
-/// as they were has had no commit since but the answer log's. A log read behind the ledger leaves a commit in, and
-/// the labels differ: never the other way.
-pub async fn without_answers(
-    store: &Store,
-    scope: &Scope,
-    snapshots: &Snapshots,
-) -> Result<String> {
-    use arrow_array::Array;
-    use arrow_array::cast::AsArray;
-    let rows = snapshots
-        .ledger
-        .0
-        .clone()
-        .ok_or_else(|| anyhow!("the ledger wasn't read"))?;
-    let log = store.side_rows(&scope.namespace(), crate::QA_LOG).await?;
-    let ns = scope.namespace();
-    Ok(tokio::task::spawn_blocking(move || {
-        let mut answers = HashSet::new();
-        for b in log.iter() {
-            let Some(ids) = b.column_by_name("commit_id") else {
-                continue;
-            };
-            let ids = ids.as_string::<i32>();
-            answers.extend(
-                (0..ids.len())
-                    .filter(|i| !ids.is_null(*i))
-                    .map(|i| ids.value(i).to_string()),
-            );
-        }
-        rows_label(&rows, &ns, &answers)
-    })
-    .await?)
 }
 
 /// The settings that change what a reader may read or how Home's parts are worked out for them: who a caller is and
@@ -1120,10 +1077,9 @@ pub struct Last {
     /// Each table the part reads (`<namespace>.<table>`) and its label as read before the answer was worked out
     /// ([`Snapshots::read`]).
     state: BTreeMap<String, String>,
-    /// The ledger's label as read then, without the answer log's commits ([`without_answers`]): none when it wasn't
-    /// worked out, and then any commit since refuses it.
-    #[serde(default)]
-    ledger_without_answers: Option<String>,
+    /// Every table the ask read (`<namespace>.<table>`, [`Snapshots::read`]) and its label then: where the commits
+    /// that only add since are looked for, in the tables the part doesn't read too ([`Last::holds`]).
+    all: BTreeMap<String, String>,
     /// The part's answer.
     pub answer: Value,
 }
@@ -1169,15 +1125,13 @@ pub enum Holds {
 
 impl Last {
     /// Part `part`'s answer `answer` in `scope`, worked out from a state pinned after `snapshots` were read in hour
-    /// `hour`, the ledger's label then without the answer log's commits `ledger_without_answers`
-    /// ([`without_answers`] of `snapshots`): an error for a part not listed, or one of its tables not read.
+    /// `hour`: an error for a part not listed, or one of its tables not read.
     pub fn new(
         scope: &Scope,
         part: &str,
         class: &str,
         hour: i64,
         snapshots: &Snapshots,
-        ledger_without_answers: Option<String>,
         answer: Value,
     ) -> Result<Last> {
         let tables =
@@ -1193,7 +1147,11 @@ impl Last {
             part: part.to_string(),
             hour,
             state,
-            ledger_without_answers,
+            all: snapshots
+                .ids
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             answer,
         })
     }
@@ -1212,16 +1170,18 @@ impl Last {
     /// anything the reader is answered from is pinned): how, or why not. Fail-closed: a table not stored, not read or
     /// whose history can't be read refuses.
     ///
-    /// - Each of [`VIS`]'s tables (the ledger by the scope's own rows) must be as stored: a removal there is mostly
-    ///   an append (a retraction, an episode written again under a narrower ACL or forgotten, a narrower new version,
-    ///   a forget's quote, a merge), told apart from an addition only against the state before it. The ledger alone
-    ///   may have gained the answer log's commits ([`without_answers`]): each makes only its own answer-log rows
-    ///   readable, and every answer logged commits one, so a busy org's ledger moves every few seconds.
     /// - The directory must be as stored: a member removed, an admin demoted or a setting turned off is a row written
     ///   there.
-    /// - Each other table the part reads may have moved only by appends from the stored snapshot ([`appended_since`],
-    ///   in `histories` as the catalog has them now): a fact is read only once its commit is committed (a commit
-    ///   moves the ledger), and the answer log, the summaries and the extraction records only grow between rewrites.
+    /// - Each other table the part reads may have moved only by snapshots that say they only add
+    ///   ([`crate::ADDS_ONLY_PROP`], [`added_only_since`]), from the stored one, in `histories` as the catalog has them
+    ///   now. That holds of [`VIS`]'s tables too: a removal there is mostly an append (a retraction, an episode
+    ///   written again under a narrower ACL or forgotten, a forget's quote), told apart from an addition only by the
+    ///   writer, which marks only what it checked adds.
+    /// - The scope's rows in the ledger may have gained only the commits those marks name, each placed: a commit
+    ///   that adds episodes, only when its ledger row's parents are the heads it was checked against, or reach them
+    ///   through answer-log commits alone ([`proven`]); an answer-log commit wherever it is. A merge, a forget or any commit no mark names leaves the
+    ///   ledger's rows unlike the stored ones. The marks are looked for in every table the ask read that moved: a
+    ///   commit's mark is on each table it wrote, which the part may not read.
     ///
     /// Its expiry (retention ageing writes no table) is the store's to keep: a store never answers past it.
     #[allow(clippy::too_many_arguments)]
@@ -1264,83 +1224,333 @@ impl Last {
             if was == is {
                 continue;
             }
-            if *t == LEDGER {
-                ledger_moved = true;
-                continue;
-            }
-            if VIS.contains(t) || *t == DIRECTORY {
-                return Err(Refused::at("written since", t));
-            }
-            moved.push((t, was));
-        }
-        if ledger_moved {
-            let was = self
-                .ledger_without_answers
-                .as_deref()
-                .ok_or(Refused::at("written since", &LEDGER))?;
-            let is = histories
-                .without_answers(store, scope, now)
-                .await
-                .map_err(|_| Refused::at("answer log not read", &LEDGER))?;
-            if was != is {
-                return Err(Refused::at("written since", &LEDGER));
+            match *t {
+                LEDGER => ledger_moved = true,
+                DIRECTORY => return Err(Refused::at("written since", t)),
+                _ => moved.push((*t, was.as_str())),
             }
         }
         if moved.is_empty() && !ledger_moved {
             return Ok(Holds::Exact);
         }
-        let checked = futures::future::join_all(moved.into_iter().map(|(t, was)| async move {
+        let walk = |t: Table, was: String, marked: bool| async move {
             let from = match was.as_str() {
                 "-" => None,
                 id => Some(
                     id.parse::<i64>()
-                        .map_err(|_| Refused::at("stored as no snapshot", t))?,
+                        .map_err(|_| Refused::at("stored as no snapshot", &t))?,
                 ),
             };
-            let meta = histories.of(store, scope, t).await.map_err(|e| {
+            let meta = histories.of(store, scope, &t).await.map_err(|e| {
                 eprintln!("shared answers: {e}");
-                Refused::at("history not read", t)
+                Refused::at("history not read", &t)
             })?;
-            appended_since(&meta, from).map_err(|why| Refused::at(why, t))
-        }))
-        .await;
-        checked
-            .into_iter()
-            .collect::<std::result::Result<(), Refused>>()?;
+            added_only_since(&meta, from, marked).map_err(|why| Refused::at(why, &t))
+        };
+        let marks =
+            futures::future::join_all(moved.iter().map(|(t, was)| walk(*t, was.to_string(), true)))
+                .await
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, Refused>>()?;
+        if ledger_moved {
+            let mut marks: Vec<Mark> = marks.into_iter().flatten().collect();
+            // The marks on the tables the part doesn't read: only where they are found, as evidence.
+            let others: Vec<(Table, &str)> = VIS_AND_READS
+                .iter()
+                .filter(|t| !tables.contains(t) && **t != LEDGER && **t != DIRECTORY)
+                .filter_map(|t| {
+                    let was = self.all.get(&t.name(scope))?;
+                    (now.label(scope, t).ok() != Some(was.as_str())).then_some((*t, was.as_str()))
+                })
+                .collect();
+            for found in futures::future::join_all(
+                others
+                    .iter()
+                    .map(|(t, was)| walk(*t, was.to_string(), false)),
+            )
+            .await
+            {
+                marks.extend(found.into_iter().flatten());
+            }
+            let was = self
+                .state
+                .get(&LEDGER.name(scope))
+                .ok_or(Refused::at("not stored", &LEDGER))?;
+            let rows = now
+                .ledger
+                .0
+                .clone()
+                .ok_or(Refused::at("not read", &LEDGER))?;
+            let ns = scope.namespace();
+            let is = {
+                let (rows, ns, marks) = (rows.clone(), ns.clone(), marks.clone());
+                tokio::task::spawn_blocking(move || {
+                    let skip = proven(&rows, &ns, &marks);
+                    format!("rows of {ns}: {}", rows_label(&rows, &ns, &skip))
+                })
+                .await
+                .map_err(|_| Refused::at("not read", &LEDGER))?
+            };
+            if *was != is {
+                // The labels were read one after the other at the put, each as this server held it: a commit's
+                // append may have been in a table's label and not yet its ledger row in the ledger's, or the other
+                // way round. Looked at once more with the commits nearest the stored state ([`second_look`]).
+                let before = futures::future::join_all(
+                    VIS_AND_READS
+                        .iter()
+                        .filter(|t| **t != LEDGER && **t != DIRECTORY)
+                        .filter_map(|t| {
+                            let from = self.all.get(&t.name(scope))?.parse::<i64>().ok()?;
+                            Some(async move {
+                                histories
+                                    .of(store, scope, t)
+                                    .await
+                                    .map(|meta| marks_up_to(&meta, from, SECOND_LOOK))
+                                    .unwrap_or_default()
+                            })
+                        }),
+                )
+                .await
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                let was = was.clone();
+                let held = tokio::task::spawn_blocking(move || {
+                    second_look(&rows, &ns, &marks, &before, &was)
+                })
+                .await
+                .unwrap_or(false);
+                if !held {
+                    return Err(Refused::at("written since", &LEDGER));
+                }
+            }
+        }
         Ok(Holds::Since)
     }
 }
 
+/// What a snapshot that only adds says of its commits ([`crate::ADDS_ONLY_PROP`], [`crate::adds_only_value`]).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct Mark {
+    v: u32,
+    /// Main's heads the commits were checked against: none for answer-log rows (no other part reads them).
+    heads: Option<Vec<String>>,
+    /// The commits, in the order their ledger rows chain.
+    commits: Vec<String>,
+    /// When the snapshot that carries it was made (ms since the epoch): not part of the mark.
+    #[serde(skip)]
+    at: i64,
+}
+
+impl Mark {
+    /// The mark a snapshot's summary carries: none for no mark, or one written under another rule
+    /// ([`crate::ADDS_ONLY_RULE`]).
+    fn of(props: &HashMap<String, String>) -> Option<Mark> {
+        let m: Mark = serde_json::from_str(props.get(crate::ADDS_ONLY_PROP)?).ok()?;
+        (m.v == crate::ADDS_ONLY_RULE).then_some(m)
+    }
+}
+
+/// Of `marks`, the commits of namespace `ns` the ledger `rows` places as only adding: each marked without heads (an
+/// answer-log commit: where it lands doesn't matter), and of each mark with heads, its commits from the first while
+/// each is placed: the first when its row's parents are the mark's heads, or reach them back through commits marked
+/// without heads alone (nothing else was committed to main between the check and it), each next
+/// when its parent is the one before (the rows one batch chains). A commit whose row isn't here yet adds nothing
+/// readable, and isn't taken out.
+fn proven(rows: &[RecordBatch], ns: &str, marks: &[Mark]) -> HashSet<String> {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    for b in rows {
+        let text = |c: &str| b.column_by_name(c).map(|c| c.as_string::<i32>());
+        let (Some(scope), Some(id), Some(ps)) = (text("scope"), text("commit_id"), text("parents"))
+        else {
+            continue;
+        };
+        for i in 0..b.num_rows() {
+            if scope.is_null(i) || scope.value(i) != ns || id.is_null(i) {
+                continue;
+            }
+            let ps = match ps.is_null(i) {
+                true => vec![],
+                false => ps
+                    .value(i)
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(String::from)
+                    .collect(),
+            };
+            parents.insert(id.value(i).to_string(), ps);
+        }
+    }
+    let free: HashSet<&str> = marks
+        .iter()
+        .filter(|m| m.heads.is_none())
+        .flat_map(|m| m.commits.iter().map(String::as_str))
+        .collect();
+    let mut out: HashSet<String> = free.iter().map(|c| c.to_string()).collect();
+    for m in marks {
+        let Some(heads) = &m.heads else {
+            continue;
+        };
+        let heads: BTreeSet<&str> = heads.iter().map(String::as_str).collect();
+        let mut prev: Option<&str> = None;
+        for c in &m.commits {
+            let Some(ps) = parents.get(c) else {
+                break;
+            };
+            let placed = match prev {
+                None => reaches(ps, &heads, &parents, &free),
+                Some(p) => ps.len() == 1 && ps[0] == p,
+            };
+            if !placed {
+                break;
+            }
+            out.insert(c.clone());
+            prev = Some(c);
+        }
+    }
+    out
+}
+
+/// Whether the parents `ps` of a commit are `heads`, or reach them back through commits in `free` alone (those
+/// marked without heads), by the ledger's `parents`.
+fn reaches<'a>(
+    mut ps: &'a Vec<String>,
+    heads: &BTreeSet<&str>,
+    parents: &'a HashMap<String, Vec<String>>,
+    free: &HashSet<&str>,
+) -> bool {
+    for _ in 0..100_000 {
+        if ps.iter().map(String::as_str).collect::<BTreeSet<_>>() == *heads {
+            return true;
+        }
+        match ps.as_slice() {
+            [q] if free.contains(q.as_str()) => match parents.get(q) {
+                Some(next) => ps = next,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// How many commits [`second_look`] takes in or leaves out at most, and how many snapshots back from a stored one
+/// [`marks_up_to`] reads.
+const SECOND_LOOK: usize = 16;
+
+/// The marks of the snapshot `from` of the table `meta` describes and of the `n` - 1 before it, newest first: the
+/// commits a put's labels may have torn ([`second_look`]). An unmarked one is passed over.
+fn marks_up_to(meta: &iceberg::spec::TableMetadata, from: i64, n: usize) -> Vec<Mark> {
+    let mut out = vec![];
+    let mut at = meta.snapshot_by_id(from).cloned();
+    for _ in 0..n {
+        let Some(s) = at else {
+            break;
+        };
+        if let Some(m) = Mark::of(&s.summary().additional_properties) {
+            out.push(Mark {
+                at: s.timestamp_ms(),
+                ..m
+            });
+        }
+        at = s
+            .parent_snapshot_id()
+            .and_then(|p| meta.snapshot_by_id(p).cloned());
+    }
+    out
+}
+
+/// Whether namespace `ns`'s rows in the ledger `rows` are the stored label `was`, once more: with the marked
+/// commits `after` (marks since the stored state) placed ([`proven`]) left out, and then, by the count of rows the
+/// labels differ by, either as many more marked commits of `before` (marks at and before the stored state, a commit
+/// whose ledger row the put's ledger read didn't have yet), placed and nearest the stored state first, left out too,
+/// or as many of `after`'s commits, earliest first (one whose ledger row the put's ledger read had already), left in.
+/// Safe whichever are chosen: the labels are then equal, so every row the stored one doesn't have is of a marked,
+/// placed commit. The choice only decides how often a torn put is answered.
+fn second_look(rows: &[RecordBatch], ns: &str, after: &[Mark], before: &[Mark], was: &str) -> bool {
+    let prefix = format!("rows of {ns}: ");
+    let count = |l: &str| {
+        l.strip_prefix(&prefix)?
+            .split(':')
+            .next()?
+            .parse::<usize>()
+            .ok()
+    };
+    let label = |skip: &HashSet<String>| format!("{prefix}{}", rows_label(rows, ns, skip));
+    let mut skip = proven(rows, ns, after);
+    let (Some(stored), Some(now)) = (count(was), count(&label(&skip))) else {
+        return false;
+    };
+    let present = commits_in(rows, ns);
+    if now > stored && now - stored <= SECOND_LOOK {
+        let all: Vec<Mark> = after.iter().chain(before).cloned().collect();
+        let placed = proven(rows, ns, &all);
+        let mut nearest: Vec<&Mark> = before.iter().collect();
+        nearest.sort_by_key(|m| std::cmp::Reverse(m.at));
+        let mut more = now - stored;
+        for c in nearest.iter().flat_map(|m| m.commits.iter().rev()) {
+            if more == 0 {
+                break;
+            }
+            if placed.contains(c) && present.contains(c) && skip.insert(c.clone()) {
+                more -= 1;
+            }
+        }
+        if more > 0 {
+            return false;
+        }
+    } else if now < stored && stored - now <= SECOND_LOOK {
+        let mut earliest: Vec<&Mark> = after.iter().collect();
+        earliest.sort_by_key(|m| m.at);
+        let mut fewer = stored - now;
+        for c in earliest.iter().flat_map(|m| m.commits.iter()) {
+            if fewer == 0 {
+                break;
+            }
+            if present.contains(c) && skip.remove(c) {
+                fewer -= 1;
+            }
+        }
+        if fewer > 0 {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    label(&skip) == was
+}
+
+/// The commits namespace `ns` has rows of in the ledger `rows`.
+fn commits_in(rows: &[RecordBatch], ns: &str) -> HashSet<String> {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+    let mut out = HashSet::new();
+    for b in rows {
+        let text = |c: &str| b.column_by_name(c).map(|c| c.as_string::<i32>());
+        let (Some(scope), Some(id)) = (text("scope"), text("commit_id")) else {
+            continue;
+        };
+        for i in 0..b.num_rows() {
+            if !scope.is_null(i) && scope.value(i) == ns && !id.is_null(i) {
+                out.insert(id.value(i).to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Tables' metadata as the catalog has them now, each loaded once (for one ask's parts): their histories, for
-/// [`appended_since`].
+/// [`added_only_since`].
 #[derive(Default)]
-pub struct Histories(
-    tokio::sync::Mutex<HashMap<String, Arc<History>>>,
-    tokio::sync::OnceCell<std::result::Result<String, String>>,
-);
+pub struct Histories(tokio::sync::Mutex<HashMap<String, Arc<History>>>);
 
 /// One table's metadata, once loaded ([`Histories`]): what loading it failed with, else.
 type History = tokio::sync::OnceCell<std::result::Result<iceberg::spec::TableMetadataRef, String>>;
 
 impl Histories {
-    /// [`without_answers`] of `now`, worked out once.
-    async fn without_answers(
-        &self,
-        store: &Store,
-        scope: &Scope,
-        now: &Snapshots,
-    ) -> std::result::Result<String, String> {
-        self.1
-            .get_or_init(|| async {
-                without_answers(store, scope, now).await.map_err(|e| {
-                    eprintln!("shared answers: the ledger without answers not read: {e:#}");
-                    format!("{e:#}")
-                })
-            })
-            .await
-            .clone()
-    }
-
     /// Table `t` of `scope` as the catalog has it now.
     async fn of(
         &self,
@@ -1372,30 +1582,33 @@ const APPEND_ID_PROP: &str = "memstore.append-id";
 /// The summary property memstore's rewrites carry (`memstore_core::offboard`'s `REWRITE_ID_PROP`).
 const REWRITE_ID_PROP: &str = "memstore.rewrite-id";
 
-/// Whether every snapshot of the table `meta` describes, after snapshot `from` (none: from the table's first) up to
-/// its current one, only added rows: Err(why) when one may have taken rows away, or `from` isn't on the current
+/// The marks ([`Mark`]) of every snapshot of the table `meta` describes after snapshot `from` (none: from the
+/// table's first) up to its current one, when each is an append of memstore's own that deleted nothing, and, with
+/// `marked`, says it only adds ([`crate::ADDS_ONLY_PROP`]): Err(why) otherwise, or when `from` isn't on the current
 /// snapshot's line in the history the table keeps (`AMPUP_MEMORY_MAINTAIN_KEEP`: the newest 10 to 20 snapshots).
+/// Without `marked`, the marks found.
 ///
 /// The operation alone doesn't tell: iceberg-rust 0.10 has no overwrite, so memstore commits its rewrites (an
-/// erasure, an offboarding, a purge, a compaction) as a fast append too, of a snapshot that lists only what it kept.
-/// A snapshot counts as added rows only when its operation is `append`, it carries the property memstore's own
-/// appends carry and not the one its rewrites carry, and its summary counts nothing deleted. Anything else refuses,
-/// a rewrite that kept every row too (no proof of that is written yet).
-pub fn appended_since(
+/// erasure, an offboarding, a purge, a compaction) as a fast append too, of a snapshot that lists only what it kept;
+/// and most removals are appends. A snapshot counts only when its operation is `append`, it carries the property
+/// memstore's own appends carry and not the one its rewrites carry, and its summary counts nothing deleted.
+pub fn added_only_since(
     meta: &iceberg::spec::TableMetadata,
     from: Option<i64>,
-) -> std::result::Result<(), &'static str> {
+    marked: bool,
+) -> std::result::Result<Vec<Mark>, &'static str> {
+    let mut marks = vec![];
     let mut at = meta.current_snapshot().cloned();
     loop {
         let Some(s) = at else {
             // The start of the table's line: only a state before any snapshot is on it here.
             return match from {
-                None => Ok(()),
+                None => Ok(marks),
                 Some(_) => Err("not on the table's line"),
             };
         };
         if Some(s.snapshot_id()) == from {
-            return Ok(());
+            return Ok(marks);
         }
         let summary = s.summary();
         let props = &summary.additional_properties;
@@ -1417,6 +1630,14 @@ pub fn appended_since(
             || deleted
         {
             return Err("rewritten since");
+        }
+        match Mark::of(props) {
+            Some(m) => marks.push(Mark {
+                at: s.timestamp_ms(),
+                ..m
+            }),
+            None if marked => return Err("written since, not marked as only adding"),
+            None => {}
         }
         at = match s.parent_snapshot_id() {
             None => None,

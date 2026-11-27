@@ -11,7 +11,9 @@
 //! - Once main moved on, a reader's last answer is answered at once while the new state's is worked out in the
 //!   background for the next read, but only while memory lost nothing since it was worked out, and for at most
 //!   [`STALE`], or [`SUMMARY_STALE`] for a page's summary ([`Kept::summary`]: a return visit within the hour is
-//!   answered at once). Lost nothing: main's [`crate::Vis::removals`] is the same, so is the scope's loss count
+//!   answered at once), or however long ago it was for a Studio page's read ([`Kept::however_old`]: what was only
+//!   added since, episodes, facts, closures, quotes, decisions or sessions logged, never keeps its reader waiting,
+//!   on a page visited every few hours as on one visited every minute). Lost nothing: main's [`crate::Vis::removals`] is the same, so is the scope's loss count
 //!   ([`crate::losses`], counted by every forget, delete, retraction, narrowed ACL, retired version, retention
 //!   policy, purge and offboarding made here, and by every loss a build of main's state finds, what aged out
 //!   included), so is the facts table's generation (it moves when an erasure or a forget rewrites facts away),
@@ -28,10 +30,13 @@
 //!   is (their sessions, their own advice, what they own, their standing) stays one reader's.
 //! - A change this server makes to what these read (a conflict resolved, a proposal decided, a dream decision
 //!   undone or applied, an owner set) drops the scope's answers ([`changed`]): its maker's next read is worked out
-//!   on it. Another server's change reaches this one's readers as any write does, within [`STALE`].
+//!   on it. Another server's change reaches this one's readers as any write does: within [`STALE`], or on the
+//!   read after the next for an answer kept however old ([`Kept::however_old`]).
 //! - An answer over a window that ends now (the last 30 days, [`At::windowed`]) is answered as it is for
 //!   [`WINDOW_FRESH`] at the same state; past it, it is answered while the next is worked out in the background, as
 //!   when main moved on: its window never ends more than its kind's [`STALE`] (or [`SUMMARY_STALE`]) before now.
+//! - The answers worked out again in the background while an older one is answered take turns across the server,
+//!   a few at a time behind the reads people wait on ([`REFRESHES_AT_ONCE`]).
 //! - An answer is worked out once at a time: a read that finds the reader's being worked out waits for it rather
 //!   than working it out again, if it is at the same state, or (a read that may lag) at one an answer kept from
 //!   would be served at, as above. The work runs on its own, so a request that
@@ -55,6 +60,37 @@ fn past_endings<F: Future>(
 ) -> tokio::task::futures::TaskLocalFuture<std::cell::Cell<bool>, F> {
     crate::lagging_past_endings(crate::lags_past_endings(), work)
 }
+
+/// How long an answer's work may take before [`timed_work`] says where it went.
+const SLOW_WORK: Duration = Duration::from_secs(1);
+
+/// `job`, an answer's work run in the background, with its steps timed ([`crate::phases`]): the reads that wait on it
+/// see only how long they waited, so work taking [`SLOW_WORK`] or longer logs its own steps (a wait for a listing's
+/// turn among them). `why`: a read waiting on it, or a refresh while a kept answer is served.
+async fn timed_work<T>(ns: &str, why: &str, job: impl Future<Output = Result<T>>) -> Result<T> {
+    let began = Instant::now();
+    // Boxed: the work is large, and a spawned task's future is built on the stack before it is moved to the heap.
+    let (got, timed) = crate::phases::timed(Box::pin(job)).await;
+    let took = began.elapsed();
+    if took >= SLOW_WORK {
+        eprintln!(
+            "kept answer in {ns} worked out in {} ms ({why}{}): {}",
+            took.as_millis(),
+            if got.is_err() { ", failed" } else { "" },
+            timed.marks
+        );
+    }
+    got
+}
+
+/// How many kept answers are worked out again in the background at once across the server, while an older one is
+/// answered ([`Kept::get`]): a visit a while after the last finds every answer its pages read behind main, and
+/// their refreshes, all started at once, held the workers that visit's own reads were waiting for (six at once, 1-6 s
+/// each, on staging). Each waits its turn; the reads asked meanwhile are answered the older answer, as before.
+const REFRESHES_AT_ONCE: usize = 2;
+
+/// The turns of [`REFRESHES_AT_ONCE`].
+static REFRESH_TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(REFRESHES_AT_ONCE);
 
 /// How old a kept answer may be and still be answered while the memory moved on, its next worked out in the
 /// background meanwhile (it never is past a loss): a review list's or a listing's ([`Kept::new`]).
@@ -101,7 +137,16 @@ pub struct Mark {
 impl Mark {
     /// Read before pinning the state: a removal that ends after it moves the loss count, so what is worked out
     /// from a state pinned before the removal ended is never answered after it.
+    ///
+    /// A process's first build of main's state counts a loss (it can't tell one from none), so a mark read before it
+    /// would never match the count again: the first answer worked out on a fresh server, or once its state was let
+    /// go, would not be kept, and every read stayed cold until a background refresh ran. That build comes first,
+    /// then the mark: the answer reads the state it built, which holds whatever it counted.
     pub async fn read(store: &crate::Store, scope: &crate::Scope) -> Result<Mark> {
+        if !store.holds_visibility(scope, crate::MAIN) {
+            // A read that fails to build it fails on its own read of the state, as it would have.
+            let _ = store.lagging_visibility(scope, crate::MAIN).await;
+        }
         let losses = crate::losses(&scope.namespace());
         Ok(Mark {
             losses,
@@ -126,6 +171,9 @@ pub struct At {
     pub pinned: Vec<String>,
     /// The scope's answer log as read before the answer was worked out, for an answer that reads it ([`Log`]).
     log: Option<Log>,
+    /// Other side tables the answer reads that are only added to except by a removal (the votes), as read before it
+    /// was worked out ([`At::reading`]): a batch of one gone since is a loss, as for the answer log.
+    tables: Vec<Log>,
     /// Whether the answer is over a window that ends when it is worked out ([`At::windowed`]).
     window: bool,
 }
@@ -140,9 +188,13 @@ pub struct Log(Arc<Vec<arrow_array::RecordBatch>>);
 impl Log {
     /// The log of `scope` as the next read of it would have it.
     pub async fn read(store: &crate::Store, scope: &crate::Scope) -> Result<Log> {
-        Ok(Log(store
-            .side_rows(&scope.namespace(), crate::QA_LOG)
-            .await?))
+        Self::read_table(store, scope, crate::QA_LOG).await
+    }
+
+    /// Side table `name` of `scope` (one only added to except by a removal, as the log is) as the next read of it
+    /// would have it: for [`At::reading`].
+    pub async fn read_table(store: &crate::Store, scope: &crate::Scope, name: &str) -> Result<Log> {
+        Ok(Log(store.side_rows(&scope.namespace(), name).await?))
     }
 
     /// Each batch's identity: its first column, shared by every read of the same data file.
@@ -192,6 +244,7 @@ impl At {
             removals: vis.removals,
             pinned: vec![],
             log: None,
+            tables: vec![],
             window: false,
         }
     }
@@ -203,6 +256,15 @@ impl At {
             window: true,
             ..self
         }
+    }
+
+    /// The same state, for an answer that also reads side table `table` ([`Log::read_table`], read before the answer
+    /// is worked out, after the mark): answered again at once only while it holds the same rows, and while the
+    /// next is worked out only while it lost none of them. A removal another server made (a person forgotten there
+    /// whose votes were all this scope held of them) counts no loss here, but takes its batches away.
+    pub fn reading(mut self, table: Log) -> At {
+        self.tables.push(table);
+        self
     }
 
     /// Whether an answer worked out at `self` `age` ago is answered as it is at `now`: the same state, and for an
@@ -224,15 +286,38 @@ impl At {
     /// Whether memory lost nothing between `self` and `now` (the same removals, loss count, facts generation and
     /// pins): only then may an answer worked out at `self` be answered at `now` while `now`'s is worked out.
     pub fn lost_nothing(&self, now: &At) -> bool {
-        self.removals == now.removals
-            && self.mark.losses == now.mark.losses
-            && self.mark.facts.1 == now.mark.facts.1
-            && self.pinned == now.pinned
-            && match (&self.log, &now.log) {
-                (None, None) => true,
-                (Some(was), Some(now)) => was.kept_in(now),
-                _ => false,
-            }
+        self.lost(now).is_none()
+    }
+
+    /// What [`At::lost_nothing`] found moved between `self` and `now`, as a read's step names it ([`Kept::get`]):
+    /// none when nothing did.
+    fn lost(&self, now: &At) -> Option<&'static str> {
+        if self.removals != now.removals {
+            return Some("kept answer not served: main lost something");
+        }
+        if self.mark.losses != now.mark.losses {
+            return Some("kept answer not served: a loss counted");
+        }
+        if self.mark.facts.1 != now.mark.facts.1 {
+            return Some("kept answer not served: facts rewritten");
+        }
+        if self.pinned != now.pinned {
+            return Some("kept answer not served: its pins moved");
+        }
+        if self.tables.len() != now.tables.len()
+            || self
+                .tables
+                .iter()
+                .zip(&now.tables)
+                .any(|(was, now)| !was.kept_in(now))
+        {
+            return Some("kept answer not served: a table it read lost rows");
+        }
+        match (&self.log, &now.log) {
+            (None, None) => None,
+            (Some(was), Some(now)) if was.kept_in(now) => None,
+            _ => Some("kept answer not served: the answer log lost rows"),
+        }
     }
 }
 
@@ -282,6 +367,8 @@ pub struct Kept<T> {
     stale: Duration,
     /// Whether an answer may be kept: one that isn't is still answered to the reads that waited for it.
     keepable: fn(&T) -> bool,
+    /// Whether [`Kept::get`] answers a kept answer that lost nothing however old it is ([`Kept::however_old`]).
+    any_age: bool,
 }
 
 impl<T: Send + Sync + 'static> Kept<T> {
@@ -305,6 +392,18 @@ impl<T: Send + Sync + 'static> Kept<T> {
             max,
             stale: STALE,
             keepable,
+            any_age: false,
+        }
+    }
+
+    /// These answers, answered by [`Kept::get`] once main moved on while memory lost nothing since, however old,
+    /// the next worked out in the background meanwhile: a Studio page's read, visited every few hours, never waits
+    /// on what was only added since. A loss makes the next read work its answer out, as for any kept answer;
+    /// `stale` still bounds [`Kept::peek`] and says which answers go first when the kept answers are full.
+    pub fn however_old(self) -> Self {
+        Kept {
+            any_age: true,
+            ..self
         }
     }
 
@@ -325,37 +424,71 @@ impl<T: Send + Sync + 'static> Kept<T> {
     {
         let key = format!("{ns}\n{reader}");
         let generation = generation(ns);
-        {
+        // Why the answer is worked out on this read, when it is: a step of the read ([`crate::phases`]).
+        let why = {
             let mut kept = self.entries.lock().unwrap();
-            if let Some(e) = kept.get_mut(&key)
-                && e.generation == generation
-            {
-                let age = e.made.elapsed();
-                if e.at.current(&at, age) {
-                    return Ok(e.answer.clone());
+            match kept.get_mut(&key) {
+                None => "kept answer not served: none kept",
+                Some(e) if e.generation != generation => {
+                    "kept answer not served: changed here since"
                 }
-                if (e.at == at || lag && e.at.lost_nothing(&at)) && age < self.stale {
-                    // Not this state's answer as it is now: shown while the next is worked out, never shared.
-                    not_sharable();
-                    if !e.refreshing {
-                        e.refreshing = true;
-                        let (job, ns) = (past_endings(work()), ns.to_string());
-                        tokio::spawn(async move {
-                            match job.await {
-                                Ok(answer) => self.keep(&ns, key, at, generation, Arc::new(answer)),
-                                Err(err) => {
-                                    eprintln!("kept answer in {ns} not refreshed: {err:#}");
-                                    if let Some(e) = self.entries.lock().unwrap().get_mut(&key) {
-                                        e.refreshing = false;
-                                    }
-                                }
-                            }
-                        });
+                Some(e) => {
+                    let age = e.made.elapsed();
+                    if e.at.current(&at, age) {
+                        crate::metrics::KEPT_ANSWERS_SERVED.inc();
+                        return Ok(e.answer.clone());
                     }
-                    return Ok(e.answer.clone());
+                    let lost = match e.at == at {
+                        true => None,
+                        false if !lag => Some("kept answer not served: a pinned state moved"),
+                        false => e.at.lost(&at),
+                    };
+                    match lost {
+                        Some(why) => why,
+                        None if !self.any_age && age >= self.stale => {
+                            "kept answer not served: too old"
+                        }
+                        None => {
+                            // Not this state's answer as it is now: shown while the next is worked out, never shared.
+                            not_sharable();
+                            if !e.refreshing {
+                                e.refreshing = true;
+                                let (job, ns) = (past_endings(work()), ns.to_string());
+                                let queued = Instant::now();
+                                // Behind the reads people wait on, [`REFRESHES_AT_ONCE`] at a time.
+                                tokio::spawn(crate::loads::later(async move {
+                                    let _turn = REFRESH_TURNS.acquire().await;
+                                    // Worked out meanwhile (by a read that couldn't be answered the older one): not
+                                    // again.
+                                    if let Some(e) = self.entries.lock().unwrap().get_mut(&key)
+                                        && (e.made > queued || e.at == at)
+                                    {
+                                        e.refreshing = false;
+                                        return;
+                                    }
+                                    match timed_work(&ns, "refresh", job).await {
+                                        Ok(answer) => {
+                                            self.keep(&ns, key, at, generation, Arc::new(answer))
+                                        }
+                                        Err(err) => {
+                                            eprintln!("kept answer in {ns} not refreshed: {err:#}");
+                                            if let Some(e) =
+                                                self.entries.lock().unwrap().get_mut(&key)
+                                            {
+                                                e.refreshing = false;
+                                            }
+                                        }
+                                    }
+                                }));
+                            }
+                            crate::metrics::KEPT_ANSWERS_SERVED.inc();
+                            return Ok(e.answer.clone());
+                        }
+                    }
                 }
             }
-        }
+        };
+        crate::phases::mark(why);
         self.worked_out(ns, key, at, generation, lag, work).await
     }
 
@@ -384,6 +517,7 @@ impl<T: Send + Sync + 'static> Kept<T> {
                     if r.at != at {
                         not_sharable();
                     }
+                    crate::phases::mark("kept answer being worked out: waited for it");
                     r.done.clone()
                 }
                 _ => {
@@ -398,7 +532,7 @@ impl<T: Send + Sync + 'static> Kept<T> {
                     );
                     let (job, ns) = (past_endings(work()), ns.to_string());
                     tokio::spawn(async move {
-                        let got = job.await.map(Arc::new);
+                        let got = timed_work(&ns, "read", job).await.map(Arc::new);
                         if let Ok(answer) = &got {
                             self.keep(&ns, key.clone(), at.clone(), generation, answer.clone());
                         }

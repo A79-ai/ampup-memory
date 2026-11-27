@@ -264,7 +264,7 @@ pub async fn log(store: &Store, scope: &Scope, who: &Principal, args: &Value) ->
         return Ok(id.to_string());
     }
     let l = checked(store, scope, who, args, rating).await?;
-    store.write_qa(scope, who.user(), &l).await?;
+    store.write_new_qa(scope, who.user(), &l).await?;
     Ok(l.answer_id)
 }
 
@@ -968,6 +968,33 @@ pub async fn review(
     Ok(row)
 }
 
+/// Who writes the engine's judgements of runs ([`judged`]), each as a row of the run's own recorder.
+pub const JUDGE: &str = "advice:judge";
+
+/// Whether row `l`, written by `actor`, may take something away from what this server kept of the pages that read
+/// the log (activity, advice usage, lessons, list_advice, Home's counts), so they are worked out again on their next
+/// read ([`crate::kept_answers::changed`]) rather than answered while the next is worked out:
+/// - every row ending a session as one that doesn't count ([`crate::sessions::discarded`]: discarded, or empty as an
+///   admin's clear ends it), whoever writes it: the session leaves the activity, the day's count and advice;
+/// - every row one person writes for another's entry (an admin naming their tasks or marking them automated, a
+///   reviewer's grade replacing a reward, an admin's or operator's import of runs), but
+/// - not the judge's judgement of a run nobody rewarded ([`judged`]): it is written only while the run's row has no
+///   reward, rating or judgement, and keeps all of that row, so it only adds.
+///
+/// A row its own asker writes otherwise (an ask, a step, an end that counts, a rating, a reward, a name) only adds
+/// to what the pages show, or replaces what the asker said with what they say now.
+pub fn narrows(l: &Logged, actor: &str) -> bool {
+    if crate::sessions::discarded(l) {
+        return true;
+    }
+    let judgement = actor == JUDGE
+        && l.kind.as_deref() == Some("run")
+        && l.reward_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with(JUDGED));
+    l.asker != actor && !judgement
+}
+
 /// What a judgement of a run says (`crate::advice_loop`): its reward, none when the judge couldn't tell, and
 /// why, starting with [`JUDGED`].
 pub struct Judgement {
@@ -1013,7 +1040,7 @@ pub async fn judged(store: &Store, scope: &Scope, judgements: &[Judgement]) -> R
         store
             .write_qa(
                 scope,
-                "advice:judge",
+                JUDGE,
                 &Logged {
                     reward: j.reward,
                     reward_reason: Some(j.reason.clone()),
@@ -1052,7 +1079,9 @@ pub async fn list_where(
     crate::phases::mark("qa_log view");
     let rows = store.side_rows(&scope.namespace(), QA_LOG).await?;
     let decoded = decoded(scope, rows);
-    let out = newest(&view, &decoded, goal, keep);
+    // A pass over every row of the log, 0.8 s on staging ampup's 83k: off the async workers ([`crate::running::cpu`]).
+    let many = decoded.iter().map(|c| c.len()).sum::<usize>() >= crate::running::CPU_ROWS;
+    let out = crate::running::cpu(many, || newest(&view, &decoded, goal, keep));
     crate::phases::mark("qa_log newest");
     Ok(out)
 }
@@ -1165,16 +1194,24 @@ fn decoded(scope: &Scope, rows: Arc<Vec<arrow_array::RecordBatch>>) -> Chunks {
         None => HashMap::new(),
     };
     let mut fresh = 0;
-    let d: Chunks = Arc::new(
-        rows.iter()
-            .map(|b| {
-                known.get(&batch_id(b)).cloned().unwrap_or_else(|| {
-                    fresh += 1;
-                    Arc::new(decode(std::slice::from_ref(b)))
+    // A decode of a large log, off the async workers ([`crate::running::cpu`]).
+    let unknown: usize = rows
+        .iter()
+        .filter(|b| !known.contains_key(&batch_id(b)))
+        .map(arrow_array::RecordBatch::num_rows)
+        .sum();
+    let d: Chunks = crate::running::cpu(unknown >= crate::running::CPU_ROWS, || {
+        Arc::new(
+            rows.iter()
+                .map(|b| {
+                    known.get(&batch_id(b)).cloned().unwrap_or_else(|| {
+                        fresh += 1;
+                        Arc::new(decode(std::slice::from_ref(b)))
+                    })
                 })
-            })
-            .collect(),
-    );
+                .collect(),
+        )
+    });
     crate::phases::mark(match fresh == rows.len() {
         true => "qa_log decoded",
         false => "qa_log appended",
@@ -1355,7 +1392,18 @@ fn newest(
 /// The QA log's reads and writes on a [`Store`] (an inherent impl until the store moved to memstore-core).
 pub(crate) trait StoreQaLog {
     async fn write_qa_rows(&self, scope: &Scope, actor: &str, rows: &[Logged]) -> Result<()>;
+    /// [`StoreQaLog::write_qa_rows`], saying with `new` that each row starts an entry of its own (its id minted for
+    /// it here, so no row of the log has it): only then may its append be marked as only adding.
+    async fn write_qa_rows_as(
+        &self,
+        scope: &Scope,
+        actor: &str,
+        rows: &[Logged],
+        new: bool,
+    ) -> Result<()>;
     async fn write_qa(&self, scope: &Scope, actor: &str, l: &Logged) -> Result<()>;
+    /// [`StoreQaLog::write_qa`] of an entry that starts here: its id was minted for it ([`checked`]).
+    async fn write_new_qa(&self, scope: &Scope, actor: &str, l: &Logged) -> Result<()>;
     async fn qa_rows_since(&self, scope: &Scope, asker: &str, since: i64) -> Result<usize> {
         Ok(self.qa_row_times_since(scope, asker, since).await?.len())
     }
@@ -1419,7 +1467,22 @@ impl StoreQaLog for Store {
 
     /// Rows in one commit, recorded a microsecond apart in their order, so a later row of an entry (its reward)
     /// is the newer one.
+    async fn write_new_qa(&self, scope: &Scope, actor: &str, l: &Logged) -> Result<()> {
+        self.write_qa_rows_as(scope, actor, std::slice::from_ref(l), true)
+            .await
+    }
+
     async fn write_qa_rows(&self, scope: &Scope, actor: &str, rows: &[Logged]) -> Result<()> {
+        self.write_qa_rows_as(scope, actor, rows, false).await
+    }
+
+    async fn write_qa_rows_as(
+        &self,
+        scope: &Scope,
+        actor: &str,
+        rows: &[Logged],
+        new: bool,
+    ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -1437,8 +1500,17 @@ impl StoreQaLog for Store {
         let sp =
             |l: &Logged, f: &dyn Fn(&SessionPart) -> Option<String>| l.session.as_ref().and_then(f);
         let before = self.generation(&ns, QA_LOG);
-        let after = appended(
-            &*self.catalog(),
+        // Rows that only add (`crate::ADDS_ONLY_PROP`): each starts an entry of its own (`new`, its id minted for it),
+        // is the asker's own, and is no session's. A later row of an entry is read in its place, and may take from
+        // what Home shows: a session's end that doesn't count (discarded, empty) drops it from the activity, a
+        // rating or a reward changes it, an admin's clear or a grade one person gives another's entry changes what
+        // is shown of them. A session's rows reach the log through a buffer that holds its newest state, under an
+        // id its caller may name, so none is known to start its entry; none is marked. Changing this rule changes
+        // what a mark means: raise `crate::ADDS_ONLY_RULE` with it, above all when it marks more.
+        let adds = new && rows.iter().all(|l| l.asker == actor && l.session.is_none());
+        let catalog = self.catalog();
+        let write = appended(
+            &*catalog,
             &table,
             vec![
                 ("commit_id", col(&|_| id.clone())),
@@ -1528,8 +1600,13 @@ impl StoreQaLog for Store {
                 ),
             ],
             OnConflict::Recommit,
-        )
-        .await?;
+        );
+        let after = match adds {
+            true => {
+                crate::adds_only(&ns, &[QA_LOG], crate::adds_only_value(None, &[&id]), write).await
+            }
+            false => write.await,
+        }?;
         // The session log is read at every session's step: the rows just written are cached here, not read back
         // from the catalog by the next step.
         self.wrote(&ns, QA_LOG, after, before).await;
@@ -1541,10 +1618,9 @@ impl StoreQaLog for Store {
         }) {
             forget_counts(scope);
         }
-        // Rows one person writes for another's entries (an admin clearing empty sessions, naming their tasks or
-        // marking them automated, a reviewer's grade) change what the activity and advice pages show of them: what
-        // was kept of those pages is worked out again on their next read here.
-        if rows.iter().any(|l| l.asker != actor) {
+        // Rows that may take something away from what the activity, advice and lessons pages showed ([`narrows`]):
+        // what was kept of those pages is worked out again on their next read here.
+        if rows.iter().any(|l| narrows(l, actor)) {
             crate::kept_answers::changed(&ns);
         }
         self.append_ledger(
